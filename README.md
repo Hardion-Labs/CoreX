@@ -1,5 +1,13 @@
 # CoreX
 
+<p align="center">
+  <img
+    src="assets/branding/LogoBanner_CoreX_1.png"
+    alt="CoreX Engine"
+    width="100%"
+  />
+</p>
+
 **Uma engine de jogos modular, escrita 100% em Zig.**
 
 CoreX está sendo construída para oferecer uma base clara e extensível para jogos: núcleo, ECS, memória, renderização, recursos e sistemas fundamentais — com foco em desempenho, controle explícito e código fácil de manter.
@@ -25,13 +33,16 @@ CoreX está sendo construída para oferecer uma base clara e extensível para jo
 
 ```text
 CoreX/
-├── build.zig          # Configuração de build
+├── assets/
+│   └── branding/
+│       └── LogoBanner_CoreX_1.png
+├── docs/
+│   └── architecture.md
 ├── src/
 │   ├── main.zig       # Ponto de entrada do scaffold
 │   └── corex.zig      # Módulo público inicial
-├── docs/
-│   └── architecture.md
 ├── .gitignore
+├── build.zig          # Configuração de build
 ├── LICENSE
 └── README.md
 ```
