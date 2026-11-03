@@ -1,0 +1,13 @@
+# Normalize text files and keep consistent line endings.
+* text=auto eol=lf
+
+# Branding and other binary assets.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.7z binary

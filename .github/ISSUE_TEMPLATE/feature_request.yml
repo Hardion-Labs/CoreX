@@ -1,0 +1,31 @@
+name: Feature request
+description: Propose a problem to solve or capability to consider for CoreX.
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem description
+      description: What problem or need would this address, and who is affected?
+    validations:
+      required: true
+  - type: textarea
+    id: proposed-solution
+    attributes:
+      label: Proposed solution
+      description: Describe a possible outcome or solution. It is fine if the implementation is undecided.
+    validations:
+      required: true
+  - type: textarea
+    id: technical-considerations
+    attributes:
+      label: Technical considerations
+      description: Note architectural impact, performance, memory ownership, compatibility, or dependencies if known.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe other approaches or explain why none seem suitable.
+    validations:
+      required: true

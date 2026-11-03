@@ -1,0 +1,61 @@
+name: Bug report
+description: Report a reproducible problem in CoreX.
+body:
+  - type: markdown
+    attributes:
+      value: Before submitting, search for existing reports. Do not report security vulnerabilities here; see [SECURITY.md](../../SECURITY.md).
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: Explain the problem and its impact.
+      placeholder: A clear description of what went wrong.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Provide the smallest set of steps or example that reproduces the issue.
+      placeholder: |
+        1. Run ...
+        2. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead? Include relevant error output.
+    validations:
+      required: true
+  - type: input
+    id: zig-version
+    attributes:
+      label: Zig version
+      description: Include the output of `zig version`.
+      placeholder: 0.17.0
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Operating system and architecture
+      description: Include OS name/version and machine architecture.
+      placeholder: Linux x86_64
+    validations:
+      required: true
+  - type: textarea
+    id: additional-information
+    attributes:
+      label: Logs and additional information
+      description: Add relevant logs or context. Remove credentials and personal information.
+    validations:
+      required: false

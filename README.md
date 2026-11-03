@@ -37,14 +37,30 @@ CoreX/
 │   └── branding/
 │       └── LogoBanner_CoreX_1.png
 ├── docs/
-│   └── architecture.md
+│   ├── architecture.md
+│   ├── development/
+│   │   └── coding-standards.md
+│   └── policies/
+│       └── AI_POLICY.md
 ├── src/
 │   ├── main.zig       # Ponto de entrada do scaffold
 │   └── corex.zig      # Módulo público inicial
+├── .github/
+│   ├── ISSUE_TEMPLATE/
+│   │   ├── bug_report.yml
+│   │   └── feature_request.yml
+│   └── PULL_REQUEST_TEMPLATE.md
+├── .editorconfig
+├── .gitattributes
 ├── .gitignore
 ├── build.zig          # Configuração de build
+├── CHANGELOG.md
+├── CODE_OF_CONDUCT.md
+├── CONTRIBUTING.md
 ├── LICENSE
-└── README.md
+├── README.md
+├── SECURITY.md
+└── SUPPORT.md
 ```
 
 ## Requisitos
@@ -68,6 +84,8 @@ zig build
 zig build run
 ```
 
+Os passos acima estão definidos em `build.zig`, mas a validação atual com Zig 0.17.0 está bloqueada por uma incompatibilidade nessa configuração de build (`Build.args` não existe nessa versão). Portanto, ainda não há build ou execução confirmados.
+
 > O scaffold valida a estrutura inicial do projeto; ainda não é uma engine pronta para produção nem inclui sistemas de jogo implementados.
 
 ## Roadmap
@@ -86,7 +104,7 @@ O roadmap é indicativo e pode mudar à medida que as decisões técnicas forem 
 
 ## Desenvolvimento
 
-Antes de propor uma contribuição, confira [`docs/architecture.md`](docs/architecture.md). Mantenha o código em Zig, minimize dependências e inclua testes para comportamentos novos ou alterados.
+Antes de contribuir, leia [`CONTRIBUTING.md`](CONTRIBUTING.md), [`docs/architecture.md`](docs/architecture.md), [`docs/development/coding-standards.md`](docs/development/coding-standards.md) e [`docs/policies/AI_POLICY.md`](docs/policies/AI_POLICY.md). Mantenha o código em Zig, minimize dependências e inclua testes para comportamentos novos ou alterados.
 
 Sugestão de verificação local:
 
@@ -97,7 +115,7 @@ zig build test
 
 ## Contribuições
 
-Issues e pull requests são bem-vindos. Para mudanças grandes, abra primeiro uma issue para discutir objetivo, escopo e impacto na arquitetura.
+Issues e pull requests são bem-vindos. Para mudanças grandes, abra primeiro uma issue para discutir objetivo, escopo e impacto na arquitetura. Consulte também as orientações de [`suporte`](SUPPORT.md) e [`segurança`](SECURITY.md).
 
 ## Licença
 

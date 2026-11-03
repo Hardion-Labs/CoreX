@@ -1,4 +1,38 @@
 .zig-cache/
 zig-out/
 .zig-cache-*
+
+# Compiled objects, libraries, and executables
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Debug and profiling output
+*.pdb
+*.dSYM/
+*.prof
+*.profraw
+*.profdata
+*.trace
+*.gcda
+*.gcno
+
+# Editors and operating systems
+.idea/
+.vscode/
 .DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Local environment and temporary files
+.env
+.env.*
+!.env.example
+*.tmp
+*.bak
