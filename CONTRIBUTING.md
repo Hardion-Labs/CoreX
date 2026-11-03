@@ -65,7 +65,7 @@ Maintainers may request revisions, additional tests, or an explanation of the im
 
 ## Commit messages
 
-Use concise messages that describe the change. A suggested convention is the Conventional Commits style, for example `docs: clarify allocator ownership`. This is a recommendation, not an automated repository requirement.
+See the [commit guidelines](docs/development/commit-guidelines.md) for the recommended message format, examples, and guidance on commit bodies. These are recommendations, not an automated repository requirement.
 
 ## Documentation
 
