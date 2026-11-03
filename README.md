@@ -8,28 +8,28 @@
   />
 </p>
 
-**Uma engine de jogos modular, escrita 100% em Zig.**
+**A modular game engine written entirely in Zig.**
 
-CoreX está sendo construída para oferecer uma base clara e extensível para jogos: núcleo, ECS, memória, renderização, recursos e sistemas fundamentais — com foco em desempenho, controle explícito e código fácil de manter.
+CoreX is being built to provide a clear, extensible foundation for games: core, ECS, memory, rendering, resources, and fundamental systems—with a focus on performance, explicit control, and maintainable code.
 
-> **Status:** início do desenvolvimento. A estrutura atual é um scaffold; os subsistemas listados no roadmap ainda serão implementados. A versão-alvo é Zig **0.17.0**.
+> **Status:** early development. The current structure is a scaffold; the subsystems listed on the roadmap have yet to be implemented. The target version is Zig **0.17.0**.
 
-## Visão geral
+## Overview
 
-- **Linguagem:** Zig 0.17.0
-- **Licença:** MIT — consulte [`LICENSE`](LICENSE)
-- **Abordagem:** modular, orientada a dados e sem dependências de runtime externas
-- **Plataformas e backends:** a definir conforme o desenvolvimento
+- **Language:** Zig 0.17.0
+- **License:** MIT — see [`LICENSE`](LICENSE)
+- **Approach:** modular, data-oriented, with no external runtime dependencies
+- **Platforms and backends:** to be determined as development progresses
 
-## Objetivos
+## Goals
 
-- Manter o núcleo pequeno, explícito e previsível.
-- Dar controle sobre alocação e ciclo de vida dos recursos.
-- Construir sistemas desacoplados e testáveis.
-- Evitar dependências externas no runtime sempre que possível.
-- Documentar decisões de arquitetura e compatibilidade.
+- Keep the core small, explicit, and predictable.
+- Provide control over allocation and resource lifetimes.
+- Build decoupled and testable systems.
+- Avoid external runtime dependencies wherever possible.
+- Document architectural and compatibility decisions.
 
-## Estrutura do projeto
+## Project Structure
 
 ```text
 CoreX/
@@ -43,8 +43,8 @@ CoreX/
 │   └── policies/
 │       └── AI_POLICY.md
 ├── src/
-│   ├── main.zig       # Ponto de entrada do scaffold
-│   └── corex.zig      # Módulo público inicial
+│   ├── main.zig       # Scaffold entry point
+│   └── corex.zig      # Initial public module
 ├── .github/
 │   ├── ISSUE_TEMPLATE/
 │   │   ├── bug_report.yml
@@ -53,7 +53,7 @@ CoreX/
 ├── .editorconfig
 ├── .gitattributes
 ├── .gitignore
-├── build.zig          # Configuração de build
+├── build.zig          # Build configuration
 ├── CHANGELOG.md
 ├── CODE_OF_CONDUCT.md
 ├── CONTRIBUTING.md
@@ -63,60 +63,60 @@ CoreX/
 └── SUPPORT.md
 ```
 
-## Requisitos
+## Requirements
 
-- Zig **0.17.0** (versão-alvo do projeto)
+- Zig **0.17.0** (the project's target version)
 - Git
 
-## Começar
+## Getting Started
 
-Clone o repositório e entre no diretório:
+Clone the repository and enter the directory:
 
 ```sh
 git clone https://github.com/Hardion-Labs/CoreX.git
 cd CoreX
 ```
 
-Compile e execute o scaffold:
+Build and run the scaffold:
 
 ```sh
 zig build
 zig build run
 ```
 
-Os passos acima estão definidos em `build.zig`, mas a validação atual com Zig 0.17.0 está bloqueada por uma incompatibilidade nessa configuração de build (`Build.args` não existe nessa versão). Portanto, ainda não há build ou execução confirmados.
+The commands above are defined in `build.zig`, but validation with Zig 0.17.0 is currently blocked by an incompatibility in this build configuration (`Build.args` does not exist in this version). Therefore, neither a successful build nor execution has been confirmed.
 
-> O scaffold valida a estrutura inicial do projeto; ainda não é uma engine pronta para produção nem inclui sistemas de jogo implementados.
+> The scaffold validates the initial project structure; it is not a production-ready engine and does not include implemented game systems.
 
 ## Roadmap
 
-- [x] Criar a estrutura inicial do projeto e definir o escopo.
-- [ ] Validar build e testes continuamente com Zig 0.17.0.
-- [ ] Núcleo: ciclo de vida, configuração e logging.
-- [ ] Memória: allocators e políticas de propriedade documentadas.
-- [ ] ECS: entidades, componentes e sistemas.
-- [ ] Recursos: carregamento, cache e liberação explícita.
-- [ ] Renderização: definir API e backends suportados.
-- [ ] Janela, entrada, áudio e tempo.
-- [ ] Exemplos, documentação de API e pipeline de CI.
+- [x] Create the initial project structure and define its scope.
+- [ ] Continuously validate builds and tests with Zig 0.17.0.
+- [ ] Core: lifecycle, configuration, and logging.
+- [ ] Memory: allocators and documented ownership policies.
+- [ ] ECS: entities, components, and systems.
+- [ ] Resources: loading, caching, and explicit release.
+- [ ] Rendering: define the API and supported backends.
+- [ ] Windowing, input, audio, and timing.
+- [ ] Examples, API documentation, and CI pipeline.
 
-O roadmap é indicativo e pode mudar à medida que as decisões técnicas forem validadas.
+The roadmap is indicative and may change as technical decisions are validated.
 
-## Desenvolvimento
+## Development
 
-Antes de contribuir, leia [`CONTRIBUTING.md`](CONTRIBUTING.md), [`docs/architecture.md`](docs/architecture.md), [`docs/development/coding-standards.md`](docs/development/coding-standards.md) e [`docs/policies/AI_POLICY.md`](docs/policies/AI_POLICY.md). Mantenha o código em Zig, minimize dependências e inclua testes para comportamentos novos ou alterados.
+Before contributing, read [`CONTRIBUTING.md`](CONTRIBUTING.md), [`docs/architecture.md`](docs/architecture.md), [`docs/development/coding-standards.md`](docs/development/coding-standards.md), and [`docs/policies/AI_POLICY.md`](docs/policies/AI_POLICY.md). Keep code in Zig, minimize dependencies, and include tests for new or changed behavior.
 
-Sugestão de verificação local:
+Suggested local checks:
 
 ```sh
 zig build
 zig build test
 ```
 
-## Contribuições
+## Contributions
 
-Issues e pull requests são bem-vindos. Para mudanças grandes, abra primeiro uma issue para discutir objetivo, escopo e impacto na arquitetura. Consulte também as orientações de [`suporte`](SUPPORT.md) e [`segurança`](SECURITY.md).
+Issues and pull requests are welcome. For substantial changes, open an issue first to discuss the goal, scope, and architectural impact. Also see the [support](SUPPORT.md) and [security](SECURITY.md) guidelines.
 
-## Licença
+## License
 
-CoreX é distribuída sob a licença MIT. Consulte [`LICENSE`](LICENSE).
+CoreX is distributed under the MIT License. See [`LICENSE`](LICENSE).

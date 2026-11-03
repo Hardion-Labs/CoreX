@@ -1,32 +1,32 @@
-# Arquitetura e princípios
+# Architecture and Principles
 
-Este documento registra os princípios iniciais da CoreX. A arquitetura ainda está em desenvolvimento; as decisões abaixo são diretrizes, não promessas de funcionalidades já implementadas.
+This document records CoreX's initial principles. The architecture is still under development; the decisions below are guidelines, not promises of already implemented features.
 
-## Princípios
+## Principles
 
-1. **Zig de ponta a ponta:** código do runtime e ferramentas do projeto em Zig; dependências nativas externas só serão adotadas com justificativa documentada.
-2. **Propriedade explícita:** APIs devem deixar claro quem aloca, possui e libera cada recurso.
-3. **Composição:** subsistemas devem poder ser usados e testados de forma independente sempre que possível.
-4. **Dados antes de abstrações:** priorizar estruturas e percursos adequados ao trabalho real da engine, evitando abstrações sem necessidade comprovada.
-5. **Compatibilidade visível:** documentar a versão de Zig suportada e validar mudanças com build e testes.
+1. **Zig end to end:** runtime code and project tools are written in Zig; external native dependencies will be adopted only with documented justification.
+2. **Explicit ownership:** APIs should make clear who allocates, owns, and releases each resource.
+3. **Composition:** subsystems should be independently usable and testable wherever possible.
+4. **Data before abstractions:** prioritize data structures and access patterns suited to the engine's actual workload, avoiding abstractions without a demonstrated need.
+5. **Visible compatibility:** document the supported Zig version and validate changes with builds and tests.
 
-## Subsistemas planejados
+## Planned Subsystems
 
-- **Core:** inicialização, configuração, logging e utilitários compartilhados.
-- **Memória:** políticas de alocação com allocators explícitos e limites de vida documentados.
-- **ECS:** entidades, componentes e sistemas com API orientada a dados.
-- **Recursos:** carregamento, cache, dependências e liberação previsível.
-- **Renderização:** API independente de backend; escolha de backends após protótipos e avaliação de plataformas.
-- **Sistemas de plataforma:** janela, entrada, áudio e relógio, conforme o escopo for definido.
+- **Core:** initialization, configuration, logging, and shared utilities.
+- **Memory:** allocation policies with explicit allocators and documented lifetimes.
+- **ECS:** entities, components, and systems with a data-oriented API.
+- **Resources:** loading, caching, dependencies, and predictable release.
+- **Rendering:** a backend-independent API; backends will be selected after prototyping and platform evaluation.
+- **Platform systems:** windowing, input, audio, and clock, as scope is defined.
 
-## Diretrizes para APIs
+## API Guidelines
 
-- Preferir passar allocators explicitamente em operações que podem alocar.
-- Evitar estado global mutável; quando inevitável, documentar ciclo de vida e sincronização.
-- Definir comportamento de erro e propriedade dos dados nas APIs públicas.
-- Adicionar testes para regras, invariantes e casos de erro.
-- Manter a superfície pública concentrada em `src/corex.zig`, conforme os subsistemas forem implementados.
+- Prefer passing allocators explicitly to operations that may allocate.
+- Avoid mutable global state; when unavoidable, document its lifecycle and synchronization.
+- Define error behavior and data ownership in public APIs.
+- Add tests for rules, invariants, and error cases.
+- Keep the public surface concentrated in `src/corex.zig` as subsystems are implemented.
 
-## Estado atual
+## Current Status
 
-O repositório contém apenas o scaffold inicial de build, ponto de entrada e metadados. ECS, alocadores especializados, renderização, gerenciamento de recursos e sistemas de plataforma ainda não estão implementados.
+The repository contains only the initial build scaffold, entry point, and metadata. ECS, specialized allocators, rendering, resource management, and platform systems have not yet been implemented.
