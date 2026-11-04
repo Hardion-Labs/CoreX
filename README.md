@@ -1,4 +1,4 @@
-# CoreX
+# CoreXEngine
 
 <p align="center">
   <img
@@ -8,60 +8,56 @@
   />
 </p>
 
-**A modular game engine written entirely in Zig.**
+**A modular game engine written in Zig 0.17.0.**
 
-CoreX is being built to provide a clear, extensible foundation for games: core, ECS, memory, rendering, resources, and fundamental systems—with a focus on performance, explicit control, and maintainable code.
+CoreXEngine provides a clear, extensible foundation for games: an independent
+runtime, its own graphical editor and GUI library, tiered renderers, ECS, scenes,
+assets, scripting, and production tooling — with a focus on performance, explicit
+control, and maintainable code.
 
-> **Status:** early development. The current structure is a scaffold; the subsystems listed on the roadmap have yet to be implemented. The target version is Zig **0.17.0**.
+> **Scope:** this repository is exclusively the **CoreXEngine**. The
+> **CoreXHub** (project creation/registration, recent projects, engine
+> installation and version selection) is a separate product in another
+> repository and is **not** implemented here. See [`docs/scope.md`](docs/scope.md).
+
+> **Status:** early development. The startup spine (CLI, project manifest,
+> compatibility, jobs, configuration, asset indexing, splash contract,
+> diagnostics, and the project-open pipeline) is implemented and tested. The
+> larger subsystems (ECS, scenes, renderers, GUI, editor, Lua, export, native
+> modules) are in scope and either contract-defined or planned. See
+> [`docs/architecture.md`](docs/architecture.md) for the per-subsystem status.
 
 ## Overview
 
 - **Language:** Zig 0.17.0
 - **License:** MIT — see [`LICENSE`](LICENSE)
-- **Approach:** modular, data-oriented, with no external runtime dependencies
-- **Platforms and backends:** to be determined as development progresses
+- **Approach:** modular, data-oriented, explicit allocators, no external runtime
+  dependencies
+- **Independence:** the engine never depends on the CoreXHub to run
 
-## Goals
+## Launch contract
 
-- Keep the core small, explicit, and predictable.
-- Provide control over allocation and resource lifetimes.
-- Build decoupled and testable systems.
-- Avoid external runtime dependencies wherever possible.
-- Document architectural and compatibility decisions.
+The engine is started with a project entry point (a `.corex` file). It accepts
+the same arguments whether launched directly or by the CoreXHub:
 
-## Project Structure
+```sh
+# Open the editor for a project:
+corex-engine --project "/path/MyGame/MyGame.corex"
 
-```text
-CoreX/
-├── assets/
-│   └── branding/
-│       └── LogoBanner_CoreX_1.png
-├── docs/
-│   ├── architecture.md
-│   ├── development/
-│   │   └── coding-standards.md
-│   └── policies/
-│       └── AI_POLICY.md
-├── src/
-│   ├── main.zig       # Scaffold entry point
-│   └── corex.zig      # Initial public module
-├── .github/
-│   ├── ISSUE_TEMPLATE/
-│   │   ├── bug_report.yml
-│   │   └── feature_request.yml
-│   └── PULL_REQUEST_TEMPLATE.md
-├── .editorconfig
-├── .gitattributes
-├── .gitignore
-├── build.zig          # Build configuration
-├── CHANGELOG.md
-├── CODE_OF_CONDUCT.md
-├── CONTRIBUTING.md
-├── LICENSE
-├── README.md
-├── SECURITY.md
-└── SUPPORT.md
+# As launched by the CoreXHub:
+corex-engine --project "/path/MyGame/MyGame.corex" --hub-launch
+
+# Validate a project without opening the editor:
+corex-engine --project "/path/MyGame/MyGame.corex" --mode validate
 ```
+
+The full argument list, startup sequence, and stable exit codes are documented
+in [`docs/launch-contract.md`](docs/launch-contract.md). The `.corex` format is
+in [`docs/project-format.md`](docs/project-format.md).
+
+On receiving a project, the engine: initializes essential services, opens the
+splash screen, validates the manifest and compatibility, loads configuration in
+workers, indexes assets, prepares the initial scene, and opens the editor.
 
 ## Requirements
 
@@ -77,46 +73,91 @@ git clone https://github.com/Hardion-Labs/CoreX.git
 cd CoreX
 ```
 
-Build and run the scaffold:
+Build, test, and run:
 
 ```sh
-zig build
-zig build run
+zig build           # builds zig-out/bin/corex-engine
+zig build test      # runs the engine test suite
+zig build run -- --help
 ```
 
-The commands above are defined in `build.zig`, but validation with Zig 0.17.0 is currently blocked by an incompatibility in this build configuration (`Build.args` does not exist in this version). Therefore, neither a successful build nor execution has been confirmed.
+Try the bundled example project:
 
-> The scaffold validates the initial project structure; it is not a production-ready engine and does not include implemented game systems.
+```sh
+zig build run -- --project examples/hello-project/HelloProject.corex --mode validate
+zig build run -- --project examples/hello-project/HelloProject.corex --headless
+```
+
+These commands are validated with Zig 0.17.0. The graphical editor, GUI and
+renderers are not implemented yet, so editor/runtime sessions currently open
+headless and report readiness.
+
+## Project Structure
+
+```text
+CoreX/
+├── assets/branding/            # Logo and branding
+├── docs/
+│   ├── scope.md                # Definitive project scope (Engine vs Hub)
+│   ├── architecture.md         # Subsystem map and implementation status
+│   ├── launch-contract.md      # Stable startup contract (CLI, exit codes)
+│   ├── project-format.md       # .corex manifest format
+│   ├── versioning.md           # Versioning and compatibility policy
+│   ├── native-module-api.md    # C++ native module ABI contract
+│   ├── development/            # Coding standards, commit guidelines
+│   └── policies/               # AI-assisted development policy
+├── examples/hello-project/     # Minimal example project (.corex)
+├── include/corex/              # Native Module ABI header (C)
+├── src/
+│   ├── main.zig                # Executable entry point
+│   ├── corex.zig               # Public module
+│   └── core/                   # Implemented startup-spine subsystems
+├── build.zig                   # Build configuration
+└── CHANGELOG.md, CONTRIBUTING.md, LICENSE, README.md, ...
+```
 
 ## Roadmap
 
-- [x] Create the initial project structure and define its scope.
-- [ ] Continuously validate builds and tests with Zig 0.17.0.
-- [ ] Core: lifecycle, configuration, and logging.
-- [ ] Memory: allocators and documented ownership policies.
-- [ ] ECS: entities, components, and systems.
-- [ ] Resources: loading, caching, and explicit release.
-- [ ] Rendering: define the API and supported backends.
-- [ ] Windowing, input, audio, and timing.
-- [ ] Examples, API documentation, and CI pipeline.
+Indicative; subject to change as technical decisions are validated.
 
-The roadmap is indicative and may change as technical decisions are validated.
+- [x] Definitive scope and Engine/Hub boundary.
+- [x] Build and tests validated with Zig 0.17.0.
+- [x] Launch contract: CLI, `.corex` manifest, compatibility, exit codes.
+- [x] Startup pipeline: services, splash, manifest, config, assets, scene, editor.
+- [x] Job system and async loading foundation.
+- [x] Diagnostics and profiling foundation.
+- [ ] ECS: entities, components, systems.
+- [ ] Scene system and serialization.
+- [ ] Asset import pipeline and cache.
+- [ ] Renderer Low / Medium; Advanced contract.
+- [ ] GUI library and graphical editor.
+- [ ] Lua VM and gameplay scripting.
+- [ ] Native Module API loader (C++).
+- [ ] Runtime player and export system / Export Templates.
+- [ ] CI pipeline.
 
 ## Development
 
-Before contributing, read [`CONTRIBUTING.md`](CONTRIBUTING.md), [`docs/architecture.md`](docs/architecture.md), [`docs/development/coding-standards.md`](docs/development/coding-standards.md), and [`docs/policies/AI_POLICY.md`](docs/policies/AI_POLICY.md). Keep code in Zig, minimize dependencies, and include tests for new or changed behavior.
+Before contributing, read [`CONTRIBUTING.md`](CONTRIBUTING.md),
+[`docs/architecture.md`](docs/architecture.md),
+[`docs/development/coding-standards.md`](docs/development/coding-standards.md),
+and [`docs/policies/AI_POLICY.md`](docs/policies/AI_POLICY.md). Keep code in Zig,
+minimize dependencies, and include tests for new or changed behavior.
 
-Suggested local checks:
+Local checks:
 
 ```sh
 zig build
 zig build test
+zig fmt --check src/ build.zig
 ```
 
 ## Contributions
 
-Issues and pull requests are welcome. For substantial changes, open an issue first to discuss the goal, scope, and architectural impact. Also see the [support](SUPPORT.md) and [security](SECURITY.md) guidelines.
+Issues and pull requests are welcome. For substantial changes, open an issue
+first to discuss the goal, scope, and architectural impact. Also see the
+[support](SUPPORT.md) and [security](SECURITY.md) guidelines.
 
 ## License
 
-CoreX is distributed under the MIT License. See [`LICENSE`](LICENSE).
+CoreXEngine is distributed under the MIT License. See [`LICENSE`](LICENSE).

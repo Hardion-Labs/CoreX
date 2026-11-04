@@ -1,0 +1,7 @@
+{
+  "window_width": 1280,
+  "window_height": 720,
+  "renderer": "medium",
+  "vsync": true,
+  "target_fps": 60
+}

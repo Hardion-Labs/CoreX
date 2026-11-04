@@ -1,0 +1,9 @@
+{
+  "format_version": 1,
+  "name": "HelloProject",
+  "id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+  "engine_version": "0.1.0",
+  "initial_scene": "scenes/main.scene",
+  "asset_directories": ["assets"],
+  "script_directories": ["scripts"]
+}
