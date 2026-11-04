@@ -26,6 +26,10 @@ pub const core = struct {
     pub const startup = @import("core/startup.zig");
 };
 
+/// Entity-Component-System: generational entities, sparse-set component pools,
+/// and a type-safe world with multi-component views.
+pub const ecs = @import("ecs.zig");
+
 // Pull every submodule's tests into the test build.
 test {
     std.testing.refAllDecls(@This());
@@ -39,4 +43,5 @@ test {
     _ = core.splash;
     _ = core.diagnostics;
     _ = core.startup;
+    _ = ecs;
 }

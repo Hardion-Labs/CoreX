@@ -40,29 +40,34 @@ selection, and installation management belong to the CoreXHub (separate repo).
 ## Module layout
 
 The public surface is concentrated in `src/corex.zig`. Implemented modules live
-under `src/core/`:
+under `src/core/` (startup spine) and `src/ecs/` (entity-component-system):
 
 ```text
 src/
 ├── main.zig              # Executable entry point (CLI -> startup pipeline)
 ├── corex.zig             # Public module; re-exports subsystems
-└── core/
-    ├── version.zig       # Engine version + compatibility policy      [implemented]
-    ├── cli.zig           # Launch argument parsing (the Hub contract)  [implemented]
-    ├── manifest.zig      # .corex manifest parsing + validation        [implemented]
-    ├── paths.zig         # Safe relative-path validation + resolution  [implemented]
-    ├── jobs.zig          # Job system / async loading foundation       [implemented]
-    ├── config.zig        # Project configuration loading               [implemented]
-    ├── assets.zig        # Asset indexing                              [implemented]
-    ├── splash.zig        # Splash screen contract + headless impl      [implemented]
-    ├── diagnostics.zig   # Timers + stage profiling                    [implemented]
-    └── startup.zig       # The 7-step startup pipeline                 [implemented]
+├── core/
+│   ├── version.zig       # Engine version + compatibility policy      [implemented]
+│   ├── cli.zig           # Launch argument parsing (the Hub contract)  [implemented]
+│   ├── manifest.zig      # .corex manifest parsing + validation        [implemented]
+│   ├── paths.zig         # Safe relative-path validation + resolution  [implemented]
+│   ├── jobs.zig          # Job system / async loading foundation       [implemented]
+│   ├── config.zig        # Project configuration loading               [implemented]
+│   ├── assets.zig        # Asset indexing                              [implemented]
+│   ├── splash.zig        # Splash screen contract + headless impl      [implemented]
+│   ├── diagnostics.zig   # Timers + stage profiling                    [implemented]
+│   └── startup.zig       # The 7-step startup pipeline                 [implemented]
+├── ecs.zig               # ECS public module; re-exports entity/pool/world
+└── ecs/
+    ├── entity.zig        # Generational entity handles + lifecycle     [implemented]
+    ├── pool.zig          # Sparse-set component storage                [implemented]
+    └── world.zig         # Type-safe world + multi-component views     [implemented]
 ```
 
-Planned subsystems will be added as sibling modules (e.g. `src/ecs/`,
-`src/scene/`, `src/render/`, `src/gui/`, `src/editor/`, `src/script/`,
-`src/export/`) once an approved change gives them meaningful content. Empty
-placeholder modules are not created.
+Planned subsystems will be added as sibling modules (e.g. `src/scene/`,
+`src/render/`, `src/gui/`, `src/editor/`, `src/script/`, `src/export/`) once an
+approved change gives them meaningful content. Empty placeholder modules are not
+created.
 
 ## The startup spine (implemented)
 
@@ -117,9 +122,32 @@ The project selects a tier via `settings.json` (`config.RendererTier`). The
 backend-independent render API, the Low/Medium implementations and the Advanced
 contract will be specified before implementation. No GPU backend is chosen yet.
 
-### ECS — planned
-Entities, components and systems with a data-oriented API. Will live in
-`src/ecs/` with storage, queries and scheduling designed around the job system.
+### ECS — implemented (storage + queries), planned (scheduling)
+A data-oriented ECS in `src/ecs/`, re-exported as `corex.ecs`:
+
+- **`Entity`** — a generational handle (`index: u32`, `generation: u32`, packed
+  into 64 bits). Destroying an entity bumps its slot's generation, so stale
+  handles fail liveness checks even when the slot is recycled. Slots whose
+  generation would reach the retired sentinel are never recycled, eliminating
+  wraparound aliasing. This gives use-after-free safety at the ECS boundary
+  without refcounting.
+- **`Entities`** — lifecycle with free-list slot recycling, an occupancy bitset
+  and O(1) `create` / `destroy` / `alive`. `destroy` is infallible (free-list
+  capacity is reserved by `create`).
+- **`Pool(T)`** — sparse-set component storage: O(1) `add` / `remove` / `get` /
+  `has`, with tightly packed dense arrays for cache-friendly iteration. Removal
+  is swap-remove, so dense order is not stable across removals.
+- **`World(components)`** — comptime-parameterized by a tuple of component types;
+  owns one `Pool` per type and the entity lifecycle. Type-safe `add` / `remove` /
+  `get` / `has` reject dead handles (a stale handle can never reach a recycled
+  entity's components). `destroy` removes the entity's components from every
+  pool. `view(.{ A, B, ... })` iterates entities having all listed components and
+  yields `{ Entity, *A, *B, ... }` for system-style passes.
+
+Storage and queries are implemented and tested (including under `ReleaseSafe`
+and `ReleaseFast`). System scheduling across the job system, change detection,
+and relation/graph components are planned extensions. The world depends only on
+`entity.zig` and `pool.zig` (low coupling); scenes and scripting build on it.
 
 ### Sistema de cenas — contract defined (entry), planned (full)
 A scene is referenced by the manifest (`initial_scene`) and resolved at startup.
@@ -185,8 +213,8 @@ profiling, memory tracking, a metrics overlay and trace export are planned.
 
 ## Current status
 
-The startup spine is implemented and tested (CLI, manifest, compatibility,
-jobs, configuration, asset indexing, splash contract, diagnostics, and the
-7-step pipeline), and the executable builds and runs on Zig 0.17.0. The larger
-subsystems (ECS, scenes, renderers, GUI, editor, Lua, export, native modules)
-are in scope and either contract-defined or planned, as marked above.
+The startup spine and the ECS (generational entities, sparse-set component
+pools, type-safe world and multi-component views) are implemented and tested,
+and the executable builds and runs on Zig 0.17.0. The remaining larger
+subsystems (scenes, renderers, GUI, editor, Lua, export, native modules) are in
+scope and either contract-defined or planned, as marked above.
