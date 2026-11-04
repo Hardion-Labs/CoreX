@@ -22,10 +22,12 @@ control, and maintainable code.
 
 > **Status:** early development. The startup spine (CLI, project manifest,
 > compatibility, jobs, configuration, asset indexing, splash contract,
-> diagnostics, and the project-open pipeline) is implemented and tested. The
-> larger subsystems (ECS, scenes, renderers, GUI, editor, Lua, export, native
-> modules) are in scope and either contract-defined or planned. See
-> [`docs/architecture.md`](docs/architecture.md) for the per-subsystem status.
+> diagnostics, and the project-open pipeline) and the ECS (generational entities,
+> sparse-set component pools, type-safe world and multi-component views) are
+> implemented and tested. The larger subsystems (scenes, renderers, GUI, editor,
+> Lua, export, native modules) are in scope and either contract-defined or
+> planned. See [`docs/architecture.md`](docs/architecture.md) for the
+> per-subsystem status.
 
 ## Overview
 
@@ -92,6 +94,36 @@ These commands are validated with Zig 0.17.0. The graphical editor, GUI and
 renderers are not implemented yet, so editor/runtime sessions currently open
 headless and report readiness.
 
+## ECS
+
+The engine ships a data-oriented ECS (`corex.ecs`): generational entity handles
+(use-after-free safe), sparse-set component storage (O(1) add/remove/get/has,
+cache-friendly iteration), and a comptime-typed world with multi-component views.
+
+```zig
+const corex = @import("corex");
+const Transform = struct { x: f32, y: f32 };
+const Velocity = struct { dx: f32, dy: f32 };
+
+const World = corex.ecs.World(.{ Transform, Velocity });
+var world = World.init(allocator);
+defer world.deinit();
+
+const e = try world.create();
+try world.add(e, Transform{ .x = 0, .y = 0 });
+try world.add(e, Velocity{ .dx = 1, .dy = 0 });
+
+// A "movement system": iterate entities that have both components.
+var it = world.view(.{ Transform, Velocity });
+while (it.next()) |entry| {
+    // entry = { Entity, *Transform, *Velocity }
+    entry[1].x += entry[2].dx;
+    entry[1].y += entry[2].dy;
+}
+```
+
+See [`docs/architecture.md`](docs/architecture.md) for the design and status.
+
 ## Project Structure
 
 ```text
@@ -111,7 +143,9 @@ CoreX/
 ├── src/
 │   ├── main.zig                # Executable entry point
 │   ├── corex.zig               # Public module
-│   └── core/                   # Implemented startup-spine subsystems
+│   ├── core/                   # Implemented startup-spine subsystems
+│   ├── ecs.zig                 # ECS public module
+│   └── ecs/                    # Entities, component pools, world + views
 ├── build.zig                   # Build configuration
 └── CHANGELOG.md, CONTRIBUTING.md, LICENSE, README.md, ...
 ```
@@ -126,7 +160,8 @@ Indicative; subject to change as technical decisions are validated.
 - [x] Startup pipeline: services, splash, manifest, config, assets, scene, editor.
 - [x] Job system and async loading foundation.
 - [x] Diagnostics and profiling foundation.
-- [ ] ECS: entities, components, systems.
+- [x] ECS: generational entities, sparse-set components, type-safe world + views.
+- [ ] ECS system scheduling over the job system.
 - [ ] Scene system and serialization.
 - [ ] Asset import pipeline and cache.
 - [ ] Renderer Low / Medium; Advanced contract.

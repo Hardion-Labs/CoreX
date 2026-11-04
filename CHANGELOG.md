@@ -26,10 +26,15 @@ declared yet.
 - Diagnostics: monotonic timers and a stage profiler (`src/core/diagnostics.zig`).
 - The 7-step startup pipeline (`src/core/startup.zig`), running configuration and
   asset indexing concurrently in workers.
+- Data-oriented ECS (`src/ecs/`, re-exported as `corex.ecs`): generational entity
+  handles with safe slot recycling (`entity.zig`), sparse-set component storage
+  with O(1) add/remove/get/has (`pool.zig`), and a comptime-typed world with
+  type-safe component access and multi-component views (`world.zig`).
 - Native Module ABI contract for C++ (`docs/native-module-api.md`,
   `include/corex/native_module.h`); the loader is not implemented yet.
 - A minimal example project (`examples/hello-project/`).
-- Test suite covering the startup spine (63 tests).
+- Test suite covering the startup spine and the ECS (88 tests), validated in
+  Debug, ReleaseSafe and ReleaseFast.
 
 ### Changed
 
@@ -53,5 +58,8 @@ declared yet.
 
 - Manifest paths are validated to stay within the project root (no absolute
   paths, no `..` traversal, no control characters).
+- ECS generational handles prevent use-after-free: a stale handle cannot access a
+  recycled entity's components, and slots are retired before generation
+  wraparound can alias a live entity.
 - Added guidance for responsible vulnerability reporting and secure
   contributions.
