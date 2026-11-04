@@ -1,0 +1,381 @@
+//! Startup pipeline — the documented project-open sequence.
+//!
+//! See `docs/launch-contract.md`. Given launch options, the pipeline runs:
+//!   1. Initialize essential services (jobs, diagnostics).
+//!   2. Open the splash screen.
+//!   3. Validate the manifest and engine compatibility.
+//!   4. Load configuration in workers.
+//!   5. Index assets (concurrently with configuration).
+//!   6. Prepare the initial scene (skipped in `validate` mode).
+//!   7. Open the editor / prepare the runtime (skipped in `validate` mode).
+//!
+//! The engine never depends on the CoreXHub. `--hub-launch` only affects an
+//! informational log line.
+
+const std = @import("std");
+const cli = @import("cli.zig");
+const version = @import("version.zig");
+const manifest = @import("manifest.zig");
+const paths = @import("paths.zig");
+const jobs = @import("jobs.zig");
+const config = @import("config.zig");
+const assets = @import("assets.zig");
+const splash_mod = @import("splash.zig");
+const diagnostics = @import("diagnostics.zig");
+
+const Allocator = std.mem.Allocator;
+const Io = std.Io;
+const log = std.log.scoped(.startup);
+
+/// Maximum accepted `.corex` manifest size (1 MiB).
+pub const max_manifest_bytes = 1024 * 1024;
+
+pub const StartupError = error{
+    InvalidManifest,
+    IncompatibleVersion,
+    ProjectNotFound,
+    PreparationFailed,
+    OutOfMemory,
+    Internal,
+};
+
+/// Map a startup error to the stable process exit code (docs/launch-contract.md).
+pub fn exitCode(err: StartupError) u8 {
+    return switch (err) {
+        error.InvalidManifest => 3,
+        error.IncompatibleVersion => 4,
+        error.ProjectNotFound => 5,
+        error.PreparationFailed => 6,
+        error.OutOfMemory, error.Internal => 1,
+    };
+}
+
+/// A resolved initial-scene request. `path` is project-relative and borrowed
+/// from the manifest or launch options; it is valid while those live.
+pub const SceneRequest = struct {
+    path: []const u8,
+    exists: bool,
+};
+
+/// Prepared project state returned by a successful startup. Owns the manifest
+/// and asset index; call `deinit` to release them.
+pub const StartupResult = struct {
+    manifest: manifest.Manifest,
+    config: config.ProjectConfig,
+    asset_index: assets.AssetIndex,
+    scene: ?SceneRequest,
+    mode: cli.Mode,
+
+    pub fn deinit(self: *StartupResult) void {
+        self.manifest.deinit();
+        self.asset_index.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Run the startup pipeline. The splash is opened after services are ready and
+/// closed on every exit path. On success, the caller owns the returned result.
+pub fn run(
+    gpa: Allocator,
+    io: Io,
+    opts: cli.LaunchOptions,
+    splash: splash_mod.SplashScreen,
+) StartupError!StartupResult {
+    const total = diagnostics.Timer.start(io);
+    var profiler = diagnostics.Profiler.init(gpa, io);
+    defer profiler.deinit();
+    var stage_timer = diagnostics.Timer.start(io);
+
+    // Step 1: essential services.
+    var js: jobs.JobSystem = undefined;
+    js.init(gpa, opts.jobs);
+    defer js.deinit();
+    log.debug("services initialized ({d} workers)", .{js.worker_count});
+
+    const project_path = opts.project_path orelse return error.Internal;
+    const abs_path = paths.resolveAbsolute(gpa, io, project_path) catch return error.ProjectNotFound;
+    defer gpa.free(abs_path);
+    const project_root = std.fs.path.dirname(abs_path) orelse return error.InvalidManifest;
+
+    // Step 2: splash screen.
+    splash.show(std.fs.path.basename(abs_path));
+    defer splash.hide();
+    splash.setProgress("initializing services", 0.1);
+
+    // Informational: the version the Hub selected (never acted upon).
+    if (opts.hub_launch) log.info("launched via CoreXHub", .{});
+    if (opts.hub_engine_version) |hv| {
+        if (version.Version.parse(hv)) |selected| {
+            var a: [64]u8 = undefined;
+            var b: [64]u8 = undefined;
+            if (selected.order(version.engine) != .eq) {
+                log.warn("Hub selected engine {s}, but this binary is {s}", .{
+                    version.format(selected, &a), version.format(version.engine, &b),
+                });
+            }
+        } else |_| {
+            log.warn("Hub reported an invalid engine version: {s}", .{hv});
+        }
+    }
+
+    // Step 3: validate manifest and compatibility.
+    splash.setProgress("validating manifest", 0.2);
+    const bytes = Io.Dir.cwd().readFileAlloc(io, abs_path, gpa, .limited(max_manifest_bytes)) catch
+        return error.ProjectNotFound;
+    defer gpa.free(bytes);
+
+    var man = manifest.parse(gpa, bytes) catch |err| return mapManifestError(err);
+    errdefer man.deinit();
+
+    const compat = man.compatibility(version.engine);
+    if (!compat.isCompatible()) {
+        var a: [64]u8 = undefined;
+        var b: [64]u8 = undefined;
+        // Warn (not err): this is an expected, handled rejection. The caller
+        // receives error.IncompatibleVersion and maps it to exit code 4.
+        log.warn("project \"{s}\" targets engine {s}; running {s} ({s})", .{
+            man.name,
+            version.format(man.engine_version, &a),
+            version.format(version.engine, &b),
+            compat.describe(),
+        });
+        return error.IncompatibleVersion;
+    }
+    profiler.record("manifest", stage_timer.elapsedNanoseconds());
+    stage_timer.restart();
+    splash.setProgress("manifest validated", 0.35);
+
+    // Steps 4 & 5: load configuration and index assets concurrently in workers.
+    splash.setProgress("loading configuration and indexing assets", 0.45);
+    var assets_future = js.spawn(assets.indexDirectories, .{ gpa, js.io(), project_root, man.asset_directories });
+    var config_future = js.spawn(config.load, .{ gpa, js.io(), project_root });
+
+    // Await both jobs so neither is left running. `config.load` returns a value
+    // type (no heap ownership), so discarding it on the assets-error path is
+    // leak-free; the asset index owns memory and is cleaned via errdefer.
+    const assets_result = assets_future.await(js.io());
+    const config_result = config_future.await(js.io());
+
+    var index = assets_result catch |err| return mapAssetsError(err);
+    errdefer index.deinit();
+    const cfg = config_result catch |err| return mapConfigError(err);
+    profiler.record("config+assets", stage_timer.elapsedNanoseconds());
+    stage_timer.restart();
+    splash.setProgress("configuration loaded and assets indexed", 0.7);
+    log.info("indexed {d} assets ({d} bytes)", .{ index.count(), index.totalBytes() });
+
+    // Step 6: prepare the initial scene.
+    var scene: ?SceneRequest = null;
+    if (opts.mode != .validate) {
+        splash.setProgress("preparing initial scene", 0.8);
+        scene = try prepareScene(io, project_root, man.initial_scene, opts.scene_override);
+        profiler.record("scene", stage_timer.elapsedNanoseconds());
+        stage_timer.restart();
+    }
+
+    // Step 7: open the editor / prepare the runtime.
+    if (opts.mode != .validate) {
+        splash.setProgress("opening editor", 0.95);
+        // The graphical editor and GUI library are planned subsystems; until
+        // they exist the session is opened headless and readiness is reported.
+        log.info("{s} session ready (headless)", .{opts.mode.name()});
+        profiler.record("editor", stage_timer.elapsedNanoseconds());
+    }
+
+    log.info("startup completed in {d:.1} ms", .{total.elapsedMilliseconds()});
+    return .{
+        .manifest = man,
+        .config = cfg,
+        .asset_index = index,
+        .scene = scene,
+        .mode = opts.mode,
+    };
+}
+
+fn prepareScene(
+    io: Io,
+    project_root: []const u8,
+    initial_scene: ?[]const u8,
+    override: ?[]const u8,
+) StartupError!?SceneRequest {
+    const rel = override orelse initial_scene orelse return null;
+    paths.validateRelative(rel) catch return error.PreparationFailed;
+
+    var dir = Io.Dir.openDirAbsolute(io, project_root, .{}) catch return error.PreparationFailed;
+    defer dir.close(io);
+    dir.access(io, rel, .{}) catch return error.PreparationFailed;
+    return .{ .path = rel, .exists = true };
+}
+
+fn mapManifestError(err: manifest.ParseError) StartupError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidManifest,
+    };
+}
+
+fn mapConfigError(err: config.LoadError) StartupError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.PreparationFailed,
+    };
+}
+
+fn mapAssetsError(err: assets.IndexError) StartupError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.PreparationFailed,
+    };
+}
+
+// --- tests -----------------------------------------------------------------
+
+const TestProject = struct {
+    tmp: std.testing.TmpDir,
+    root: [Io.Dir.max_path_bytes]u8,
+    root_len: usize,
+
+    fn init() !TestProject {
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        var self = TestProject{ .tmp = tmp, .root = undefined, .root_len = 0 };
+        self.root_len = try tmp.dir.realPath(std.testing.io, &self.root);
+        return self;
+    }
+
+    fn deinit(self: *TestProject) void {
+        self.tmp.cleanup();
+    }
+
+    fn rootPath(self: *const TestProject) []const u8 {
+        return self.root[0..self.root_len];
+    }
+
+    fn write(self: *TestProject, sub: []const u8, data: []const u8) !void {
+        // Ensure parent directories exist.
+        if (std.fs.path.dirname(sub)) |parent| {
+            if (parent.len > 0) try self.tmp.dir.createDirPath(std.testing.io, parent);
+        }
+        try self.tmp.dir.writeFile(std.testing.io, .{ .sub_path = sub, .data = data });
+    }
+
+    fn manifestPath(self: *TestProject, buf: []u8) ![]const u8 {
+        return std.fmt.bufPrint(buf, "{s}/Game.corex", .{self.rootPath()});
+    }
+};
+
+const minimal_manifest =
+    \\{ "format_version": 1, "name": "TestGame", "engine_version": "0.1.0" }
+;
+
+test "startup: validate mode succeeds on a minimal project" {
+    var proj = try TestProject.init();
+    defer proj.deinit();
+    try proj.write("Game.corex", minimal_manifest);
+
+    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const mpath = try proj.manifestPath(&path_buf);
+    const opts = cli.LaunchOptions{ .mode = .validate, .project_path = mpath, .headless = true };
+
+    var splash = splash_mod.HeadlessSplash{};
+    var result = try run(std.testing.allocator, std.testing.io, opts, splash.interface());
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings("TestGame", result.manifest.name);
+    try std.testing.expect(result.scene == null);
+    try std.testing.expect(!splash.is_open);
+}
+
+test "startup: editor mode prepares scene and indexes assets" {
+    var proj = try TestProject.init();
+    defer proj.deinit();
+    try proj.write("Game.corex",
+        \\{ "format_version": 1, "name": "TestGame", "engine_version": "0.1.0", "initial_scene": "scenes/main.scene" }
+    );
+    try proj.write("scenes/main.scene", "{}");
+    try proj.write("assets/tex/hero.png", "png");
+    try proj.write("settings.json", "{ \"window_width\": 800 }");
+
+    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const mpath = try proj.manifestPath(&path_buf);
+    const opts = cli.LaunchOptions{ .mode = .editor, .project_path = mpath, .headless = true };
+
+    var splash = splash_mod.HeadlessSplash{};
+    var result = try run(std.testing.allocator, std.testing.io, opts, splash.interface());
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 800), result.config.window_width);
+    try std.testing.expectEqual(@as(usize, 1), result.asset_index.countByKind(.texture));
+    try std.testing.expectEqualStrings("scenes/main.scene", result.scene.?.path);
+    try std.testing.expect(!splash.is_open);
+}
+
+test "startup: missing project file -> ProjectNotFound" {
+    var proj = try TestProject.init();
+    defer proj.deinit();
+    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const mpath = try proj.manifestPath(&path_buf);
+    const opts = cli.LaunchOptions{ .mode = .validate, .project_path = mpath };
+    var splash = splash_mod.HeadlessSplash{};
+    try std.testing.expectError(error.ProjectNotFound, run(std.testing.allocator, std.testing.io, opts, splash.interface()));
+    try std.testing.expect(!splash.is_open);
+}
+
+test "startup: invalid manifest -> InvalidManifest" {
+    var proj = try TestProject.init();
+    defer proj.deinit();
+    try proj.write("Game.corex", "{ not valid json");
+    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const mpath = try proj.manifestPath(&path_buf);
+    const opts = cli.LaunchOptions{ .mode = .validate, .project_path = mpath };
+    var splash = splash_mod.HeadlessSplash{};
+    try std.testing.expectError(error.InvalidManifest, run(std.testing.allocator, std.testing.io, opts, splash.interface()));
+}
+
+test "startup: incompatible version -> IncompatibleVersion" {
+    var proj = try TestProject.init();
+    defer proj.deinit();
+    try proj.write("Game.corex",
+        \\{ "format_version": 1, "name": "FutureGame", "engine_version": "0.99.0" }
+    );
+    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const mpath = try proj.manifestPath(&path_buf);
+    const opts = cli.LaunchOptions{ .mode = .validate, .project_path = mpath };
+    var splash = splash_mod.HeadlessSplash{};
+    try std.testing.expectError(error.IncompatibleVersion, run(std.testing.allocator, std.testing.io, opts, splash.interface()));
+}
+
+test "startup: missing referenced scene -> PreparationFailed" {
+    var proj = try TestProject.init();
+    defer proj.deinit();
+    try proj.write("Game.corex",
+        \\{ "format_version": 1, "name": "TestGame", "engine_version": "0.1.0", "initial_scene": "scenes/missing.scene" }
+    );
+    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const mpath = try proj.manifestPath(&path_buf);
+    const opts = cli.LaunchOptions{ .mode = .editor, .project_path = mpath };
+    var splash = splash_mod.HeadlessSplash{};
+    try std.testing.expectError(error.PreparationFailed, run(std.testing.allocator, std.testing.io, opts, splash.interface()));
+}
+
+test "startup: scene override is used" {
+    var proj = try TestProject.init();
+    defer proj.deinit();
+    try proj.write("Game.corex", minimal_manifest);
+    try proj.write("scenes/other.scene", "{}");
+    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const mpath = try proj.manifestPath(&path_buf);
+    const opts = cli.LaunchOptions{ .mode = .editor, .project_path = mpath, .scene_override = "scenes/other.scene" };
+    var splash = splash_mod.HeadlessSplash{};
+    var result = try run(std.testing.allocator, std.testing.io, opts, splash.interface());
+    defer result.deinit();
+    try std.testing.expectEqualStrings("scenes/other.scene", result.scene.?.path);
+}
+
+test "exitCode mapping is stable" {
+    try std.testing.expectEqual(@as(u8, 3), exitCode(error.InvalidManifest));
+    try std.testing.expectEqual(@as(u8, 4), exitCode(error.IncompatibleVersion));
+    try std.testing.expectEqual(@as(u8, 5), exitCode(error.ProjectNotFound));
+    try std.testing.expectEqual(@as(u8, 6), exitCode(error.PreparationFailed));
+    try std.testing.expectEqual(@as(u8, 1), exitCode(error.Internal));
+}
