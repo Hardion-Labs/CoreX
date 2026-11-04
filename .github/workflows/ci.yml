@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    name: Build & test (Zig 0.17.0)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Check formatting
+        run: zig fmt --check src/ build.zig
+
+      - name: Build
+        run: zig build
+
+      - name: Test
+        run: zig build test --summary all
+
+      - name: Smoke-test the launch contract
+        run: |
+          ./zig-out/bin/corex-engine --version
+          ./zig-out/bin/corex-engine --project examples/hello-project/HelloProject.corex --mode validate

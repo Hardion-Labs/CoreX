@@ -11,7 +11,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const exe = b.addExecutable(.{
-        .name = "corex",
+        .name = "corex-engine",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
@@ -22,14 +22,11 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
-    if (b.args) |args| run_cmd.addArgs(args);
-    b.step("run", "Run the CoreX scaffold").dependOn(&run_cmd.step);
+    // Forward `zig build run -- <args>` to the engine. Zig 0.17 removed
+    // `Build.args`; passthru args are the supported mechanism.
+    run_cmd.addPassthruArgs();
+    b.step("run", "Run the CoreXEngine").dependOn(&run_cmd.step);
 
-    const test_module = b.createModule(.{
-        .root_source_file = b.path("src/corex.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const tests = b.addTest(.{ .root_module = test_module });
-    b.step("test", "Run CoreX tests").dependOn(&b.addRunArtifact(tests).step);
+    const tests = b.addTest(.{ .root_module = corex_module });
+    b.step("test", "Run CoreXEngine tests").dependOn(&b.addRunArtifact(tests).step);
 }

@@ -1,13 +1,15 @@
 # Zig Coding Standards
 
-These are initial contribution standards for a project at scaffold stage. They distinguish conventions visible in the current repository from recommendations for new code; the latter should not be mistaken for patterns already implemented throughout the engine.
+These are contribution standards for a project in early development. They distinguish conventions visible in the current repository from recommendations for new code; the latter should not be mistaken for patterns already implemented throughout the engine.
 
 ## Established in the current repository
 
-- Project source and build configuration are written in Zig.
-- `src/corex.zig` is the initial public module, and `src/main.zig` is the scaffold executable entry point.
-- `build.zig` defines `zig build`, `zig build run`, and `zig build test`.
-- The existing Zig files use lowercase snake_case for file names, declarations, and local identifiers.
+- Project source and build configuration are written in Zig (target: Zig 0.17.0).
+- `src/corex.zig` is the public module and re-exports implemented subsystems; `src/main.zig` is the `corex-engine` executable entry point.
+- Implemented startup-spine subsystems live under `src/core/` (CLI, manifest, paths, jobs, config, assets, splash, diagnostics, startup, version).
+- `build.zig` defines `zig build`, `zig build run`, and `zig build test`; `zig build run -- <args>` forwards arguments via `Run.addPassthruArgs`.
+- The Zig files use lowercase snake_case for file names, declarations, and local identifiers, and PascalCase for types.
+- Allocators are passed explicitly; owned resources expose a `deinit`. Error sets are explicit and, at the process boundary, map to the stable exit codes in `docs/launch-contract.md`.
 
 ## Recommended conventions for new code
 
