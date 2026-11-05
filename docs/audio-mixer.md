@@ -9,9 +9,10 @@ lives in `src/audio/` and is exposed as `corex.audio`.
 > with **no device dependency**, so it is deterministic and fully testable
 > headlessly. It consumes the `CXAW` artifacts produced by the WAV importer
 > ([asset-audio.md](asset-audio.md)). Spatialization and the scene bridge are
-> implemented one layer up ([audio-spatial.md](audio-spatial.md)). **OS playback
-> backends (ALSA/WASAPI/CoreAudio), effects/DSP, HRTF and streaming are
-> planned** — they are not described here as existing capabilities.
+> implemented one layer up ([audio-spatial.md](audio-spatial.md)), and insert
+> effects (biquads, compressor) beside it ([audio-effects.md](audio-effects.md)).
+> **OS playback backends (ALSA/WASAPI/CoreAudio), delay-based effects, HRTF and
+> streaming are planned** — they are not described here as existing capabilities.
 
 ## Overview
 
@@ -50,7 +51,12 @@ or allocates during rendering.
   there are no locks or atomics inside.
 - **One output pass.** Voices accumulate into the caller's buffer; master gain,
   non-finite sanitizing, clamping and peak metering happen in a single final
-  pass. There is no scratch buffer and no second traversal per voice.
+  pass. The only scratch in the whole mixer is the opt-in effect submix.
+- **Optional insert effects.** `effect_slots > 0` reserves insert slots per bus
+  plus a master chain. Only buses with an *active* chain are isolated into a
+  preallocated submix; everything else keeps writing straight to the output, so
+  an all-bypass configuration is bit-identical to the effect-free path. See
+  [audio-effects.md](audio-effects.md).
 - **Optional priority stealing.** With `steal_policy = .lowest_priority` a full
   pool recycles the least important voice instead of failing, and
   `terminationOf` still explains why an old handle died after its slot has been
@@ -224,6 +230,8 @@ var mixer = try A.Mixer.init(gpa, .{
     .clamp_output = true,
     .steal_policy = .none,  // or .lowest_priority
     .resample = .linear,    // or .sinc (band-limited)
+    .effect_slots = 0,      // inserts per bus + master; 0 disables effects
+    .block_frames = 256,    // internal block when effects are enabled
 });
 defer mixer.deinit();
 
@@ -265,7 +273,13 @@ mixer.stop(voice);
 Queries: `state(handle) ?State`, `isLive(handle) bool`,
 `positionFrames(handle) ?f64`, `liveVoices()`, `voiceCapacity()`,
 `busGain(bus) ?f32`, `isBusMuted(bus) ?bool`, `masterGain()`,
-`terminationOf(handle) ?Termination`, `stolenCount() u64`.
+`terminationOf(handle) ?Termination`, `stolenCount() u64`,
+`effectSlots() u8`, `busEffect(bus, slot) ?Effect`, `masterEffect(slot) ?Effect`.
+
+Inserts: `setBusEffect(bus, slot, effect)`, `clearBusEffects(bus)`,
+`setMasterEffect(slot, effect)`, `clearMasterEffects()`, `resetEffects()` — all
+`error.InvalidValue` on a bad index, a rate mismatch or a disabled chain. See
+[audio-effects.md](audio-effects.md).
 
 Errors: `InitError{ InvalidConfig, OutOfMemory }`,
 `PlayError{ InvalidClip, InvalidOptions, UnsupportedChannelLayout, NoVoiceAvailable }`,
@@ -274,6 +288,37 @@ length must be a whole number of output frames).
 
 Setters on a **dead handle are no-ops**, not errors — that is the point of the
 generational handle. Invalid *values* are always reported.
+
+## Insert effects
+
+Buses and the master accept an ordered chain of inserts. The signal flow is:
+
+```
+voices ─► bus chain (only if active) ─┐
+voices ─► direct (bus chain bypassed) ─┼─► sum ─► master chain ─► master gain ─► clamp/meter
+```
+
+```zig
+var mixer = try A.Mixer.init(gpa, .{ .effect_slots = 4 });   // opt-in
+try mixer.setBusEffect(1, 0, try A.Effect.biquad(48_000, .{ .kind = .low_pass, .cutoff_hz = 600 }));
+try mixer.setMasterEffect(0, try A.Effect.compressor(48_000, .{ .threshold_db = -6, .ratio = 2 }));
+```
+
+The guarantees that matter for the mixing contract:
+
+- With `effect_slots = 0` nothing is allocated and `render` is unchanged.
+- With slots reserved but every insert bypassed, the output is **bit-identical**
+  to the effect-free path: no bus is isolated, so the accumulation order per
+  sample is the same.
+- The internal `block_frames` chops the work, never the result — the DSP is
+  sequential, and a test compares block sizes 16 and 512 bit for bit.
+- An isolated bus is processed even when silent, so filter and compressor tails
+  ring out after the last voice finishes.
+- Master inserts run **before** the master gain and before metering, so a master
+  limiter sees the real sum and the reported peak is still honest.
+
+Full parameter reference, measured costs and limitations:
+[audio-effects.md](audio-effects.md).
 
 ## Gain staging, clamping and metering
 
@@ -373,6 +418,11 @@ it plays real imported fixtures end to end.
 - **Gain/metering**: voice × bus × master staging, phase inversion, bus mute, bus
   re-routing, summation, clamping, unclamped mode, peak and clipped counts,
   non-finite sanitizing.
+- **Insert routing**: an all-bypass chain is bit-identical to the effect-free
+  mixer; block sizes 16 and 512 agree bit for bit; an insert affects only its own
+  bus; master inserts affect the sum; tails ring out and `resetEffects` silences
+  them; a voice ending inside a block is counted once. The DSP itself is covered
+  in [audio-effects.md](audio-effects.md).
 - **Determinism and memory**: two mixers driven identically agree bit for bit over
   32 buffers; `checkAllAllocationFailures` on `init` + `play` + `render` with no
   leaks and no swallowed `OutOfMemory`, in both `.linear` and `.sinc` (the extra
@@ -413,8 +463,11 @@ Reading the table honestly:
   interpolation branch.
 - One load per sample on the copy path; two plus a lerp on linear; a normalized
   32–256 tap dot product on sinc, SIMD in the interior.
-- No allocation, no locks, no syscalls and no scratch buffer during `render` in
-  any mode. The sinc tables are built once in `init`.
+- No allocation, no locks and no syscalls during `render` in any mode. The sinc
+  tables and the effect submix are built once in `init`.
+- Insert effects add ~1% when reserved but bypassed, +11% for a biquad on one of
+  eight buses and +37% for a master compressor — see the measured table in
+  [audio-effects.md](audio-effects.md).
 - Voice state is a contiguous array walked in slot order, so the mix is
   cache-friendly and prefetchable.
 
@@ -427,7 +480,10 @@ Reading the table honestly:
   panning and Doppler live one layer up, in `corex.audio.spatial` /
   `AudioSystem` (see [audio-spatial.md](audio-spatial.md)), which feed this
   mixer's gain/pan/pitch. There is no HRTF or binaural rendering anywhere yet.
-- **No effects/DSP**: no filters, reverb, compression or per-bus inserts.
+- **Effects are filters and dynamics only**: biquads and a stereo-linked
+  compressor on per-bus and master chains ([audio-effects.md](audio-effects.md)).
+  No reverb, delay, chorus or convolution (they need delay lines), no lookahead
+  limiting, no oversampled saturation, no side-chain and no per-voice inserts.
 - **Resampling trade-offs are explicit.** `.linear` (the default) aliases when
   decimating. `.sinc` removes that, but its support is capped at 256 source
   samples, so beyond an 8:1 ratio the anti-aliasing is partial, and it costs
@@ -450,6 +506,7 @@ Reading the table honestly:
 
 ## Related
 
+- Insert effects and DSP: [audio-effects.md](audio-effects.md)
 - Spatial audio and scene integration: [audio-spatial.md](audio-spatial.md)
 - Audio import / `CXAW`: [asset-audio.md](asset-audio.md)
 - Import and cache: [asset-import.md](asset-import.md)

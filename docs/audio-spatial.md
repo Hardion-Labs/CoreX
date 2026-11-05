@@ -9,8 +9,9 @@ and is exposed as `corex.audio`.
 > extraction layer ([render-extraction.md](render-extraction.md)): it bridges the
 > ECS/scene to a device-independent subsystem with pure CPU work, so it is fully
 > testable headlessly. It drives the mixer ([audio-mixer.md](audio-mixer.md)) with
-> clips decoded from `CXAW` ([asset-audio.md](asset-audio.md)). **OS playback
-> backends, HRTF/binaural, occlusion/reverb and effects are planned** and are not
+> clips decoded from `CXAW` ([asset-audio.md](asset-audio.md)) and routed through
+> the bus insert chains ([audio-effects.md](audio-effects.md)). **OS playback
+> backends, HRTF/binaural and occlusion/reverb are planned** and are not
 > described here as existing capabilities.
 
 ## Overview
@@ -114,7 +115,7 @@ and **serializes like any component** (a test round-trips it through
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `clip` | 0 | Opaque handle into the caller's clip table |
-| `bus` | 0 | Mixer bus |
+| `bus` | 0 | Mixer bus (also selects its insert chain) |
 | `gain` | 1 | Linear gain, applied on top of the spatial gain |
 | `pitch` | 1 | Base rate; the Doppler multiplier is folded in |
 | `looping` | false | Whole-clip looping |
@@ -336,6 +337,7 @@ runs ~47× faster than real time.
 ## Related
 
 - Audio mixer: [audio-mixer.md](audio-mixer.md)
+- Bus and master insert effects: [audio-effects.md](audio-effects.md)
 - Audio import / `CXAW`: [asset-audio.md](asset-audio.md)
 - Render extraction (the same scene-bridge pattern): [render-extraction.md](render-extraction.md)
 - Scene transforms: [scene-transforms.md](scene-transforms.md)
