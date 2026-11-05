@@ -275,6 +275,37 @@ declared yet.
   111-193x real time. Delay and reverb were added on top (below); convolution,
   lookahead limiting, oversampled saturation, side-chain and per-voice inserts
   remain planned.
+- Oversampled saturation and true-peak limiting (`src/audio/effects.zig`:
+  `Saturator`/`SaturatorParams`, `Effect.saturator`, `LimiterParams.true_peak`,
+  `docs/audio-effects.md`). Both share one polyphase oversampling core built at
+  **comptime** from `resample.prototype` — the same Blackman-windowed sinc the
+  band-limited resampler uses, now exported so the two can never drift apart.
+  No table allocation, no init cost, coefficients in read-only memory.
+  Phase 0 of the interpolator is built as an exact delta (`sin(pi*k)` is only
+  ~1e-35 in float). The decimator uses an **odd** length so it is exactly
+  linear-phase with a whole-frame group delay; the even-length first attempt was
+  asymmetric by an eighth of a high-rate sample and a symmetry test caught it.
+  Histories mirror every write into a second copy of the buffer, so each dot
+  product runs over a contiguous, vectorizable slice instead of paying for
+  modular indexing. The saturator needs **no borrowed buffer at all** — 1120
+  bytes of inline state, independent of block size — and taps its dry path out of
+  the input history at exactly the 11-frame round-trip delay, so `mix < 1` never
+  comb-filters. Measured on a hard-driven 5 kHz tone: the far aliases (3 and
+  13 kHz) drop by more than 34 dB, while the 5th harmonic at 25 kHz sits one kHz
+  above the 24 kHz cutoff and is only partly suppressed (~8 dB) — no practical
+  filter separates those, and the test pins both halves of that claim. 4x
+  measures within a few percent of 2x at ~40% more cost, so **2x is the default**.
+  `true_peak` makes the limiter measure the reconstructed waveform at 4x as
+  ITU-R BS.1770 specifies; the audio is delayed by the interpolator's extra 5
+  frames so the emitted sample stays inside the detector window and the ceiling
+  guarantee is unchanged, including at zero lookahead. Off by default and
+  bit-identical when off. Cost: master saturator 2x +196%, true-peak adds ~a third
+  to the limiter, and a full drive chain still runs at 74x real time.
+- Fixed: `Mixer.validateEffect` returned early when an effect borrowed no buffer,
+  skipping the instance-identity check. The saturator is the first effect with an
+  instance but no buffer, so it could be inserted into two slots and have its
+  histories advanced twice per sample. Identity and buffer overlap are now
+  independent claims, and a regression test covers the bufferless case.
 - Lookahead brickwall limiter (`src/audio/effects.zig`: `Limiter`/`LimiterParams`,
   `Effect.limiter`, `docs/audio-effects.md`). The detector runs on the input while
   the audio is delayed by the same amount, so the gain is already down when a
@@ -341,7 +372,8 @@ declared yet.
   asset import/cache, world-space transforms, texture decoders, cache GC, render
   extraction, OBJ mesh import, scene prefabs, DEFLATE/zlib, PNG, asset change
   detection, WAV audio import, audio mixing, spatial audio, voice stealing,
-  band-limited resampling and insert DSP including delay/reverb/limiter (496 tests),
+  band-limited resampling and insert DSP including delay/reverb/limiter/saturator
+  (509 tests),
   including allocation-failure
   probes, cache corruption/truncation probes, a deep-hierarchy stress test, QOI
   encode/decode roundtrips, end-to-end texture-import-and-cache, OBJ-import-and-

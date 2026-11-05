@@ -17,8 +17,8 @@
 //! testable and loosely coupled.
 //!
 //! Beside the mixer, `effects` is pure DSP (RBJ biquad filters, a stereo-linked
-//! compressor, a feedback delay, a Freeverb-style reverb and a lookahead
-//! brickwall limiter) with no mixer dependency. The mixer owns the chains: `Config.effect_slots` reserves insert
+//! compressor, a feedback delay, a Freeverb-style reverb, a lookahead brickwall
+//! limiter and an oversampled saturator) with no mixer dependency. The mixer owns the chains: `Config.effect_slots` reserves insert
 //! slots per bus plus a master chain, and `render` stays allocation-free — buses
 //! with an active chain are mixed into a preallocated submix, processed, then
 //! summed. With `effect_slots = 0` (the default) none of that exists and the
@@ -77,7 +77,7 @@ pub const spatial = @import("audio/spatial.zig");
 pub const system = @import("audio/system.zig");
 /// Band-limited (windowed-sinc) resampling prototype and kernels.
 pub const resample = @import("audio/resample.zig");
-/// Insert DSP: biquads, compressor, feedback delay, reverb, limiter, chains.
+/// Insert DSP: biquads, compressor, delay, reverb, limiter, saturator, chains.
 pub const effects = @import("audio/effects.zig");
 
 pub const Mixer = mixer.Mixer;
@@ -105,6 +105,8 @@ pub const Reverb = effects.Reverb;
 pub const ReverbParams = effects.ReverbParams;
 pub const Limiter = effects.Limiter;
 pub const LimiterParams = effects.LimiterParams;
+pub const Saturator = effects.Saturator;
+pub const SaturatorParams = effects.SaturatorParams;
 
 pub const AudioSource = system.AudioSource;
 pub const AudioSystem = system.AudioSystem;
