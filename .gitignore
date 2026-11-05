@@ -2,6 +2,9 @@
 zig-out/
 .zig-cache-*
 
+# Asset import cache (derived data, reproducible from sources)
+.corex-cache/
+
 # Compiled objects, libraries, and executables
 *.o
 *.obj

@@ -57,6 +57,10 @@ versão própria, independente da versão da engine:
 - O manifesto `.corex` usa `format_version` (atualmente `1`).
 - Cenas `.scene` usam `format_version` próprio (atualmente `1`), independente do
   manifesto e da versão da engine ([scene-format.md](scene-format.md)).
+- O cache de importação de assets usa `format_version` próprio (atualmente `1`),
+  embutido em cada entrada; a chave de cache também incorpora a versão do
+  importer, de modo que incrementar qualquer uma delas invalida as entradas
+  afetadas ([asset-import.md](asset-import.md)).
 - Versões de formato desconhecidas são rejeitadas.
 - Mudanças incompatíveis de formato incrementam a versão do formato.
 

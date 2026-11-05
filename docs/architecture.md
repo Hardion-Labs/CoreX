@@ -40,8 +40,8 @@ selection, and installation management belong to the CoreXHub (separate repo).
 ## Module layout
 
 The public surface is concentrated in `src/corex.zig`. Implemented modules live
-under `src/core/` (startup spine), `src/ecs/` (entity-component-system) and
-`src/scene/` (scene documents):
+under `src/core/` (startup spine), `src/ecs/` (entity-component-system),
+`src/scene/` (scene documents) and `src/assets/` (import pipeline + cache):
 
 ```text
 src/
@@ -66,9 +66,14 @@ src/
 │   ├── world.zig         # Type-safe world + multi-component views     [implemented]
 │   └── schedule.zig      # Comptime stages + parallel system dispatch  [implemented]
 ├── scene.zig             # Scene public module; EngineScene schema
-└── scene/
-    ├── components.zig    # Built-in plain-data scene components        [implemented]
-    └── scene.zig         # Versioned scene document + ECS/hierarchy    [implemented]
+├── scene/
+│   ├── components.zig    # Built-in plain-data scene components        [implemented]
+│   └── scene.zig         # Versioned scene document + ECS/hierarchy    [implemented]
+├── assets.zig            # Asset public module; index + cache + importers + pipeline
+└── assets/
+    ├── cache.zig         # Content-addressed derived-data cache        [implemented]
+    ├── importer.zig      # Importer framework + raw/text/json          [implemented]
+    └── pipeline.zig      # Parallel import orchestration + report      [implemented]
 ```
 
 Planned subsystems will be added as sibling modules (e.g. `src/render/`,
@@ -181,22 +186,33 @@ entities, and allocation-failure paths are tested. Prefabs, scene streaming,
 world-space transform propagation, change tracking and multi-scene management
 are planned extensions.
 
-### Sistema de assets — implemented (indexing), planned (import/cache)
-`assets.indexDirectories` builds a kind/size index at startup. Importing,
-content-addressed caching, dependency tracking and hot-reload are planned
-extensions.
+### Sistema de assets — implemented (indexing + import/cache), planned (decoders)
+`core.assets.indexDirectories` builds a kind/size index at startup (unchanged).
+The asset subsystem (`corex.assets`, `src/assets/`) adds a content-addressed
+import cache, an importer framework (raw/text/json + a scene importer that reuses
+the scene system) and a parallel import pipeline over `std.Io`. Format-specific
+decoders (texture/audio/model/font), dependency tracking, cache GC and hot-reload
+are planned extensions. See [asset-import.md](asset-import.md).
 
-### Importação e cache — planned
-Asset import pipeline and a derived-data cache keyed by source content +
-importer version. Will integrate with the asset system and the job system.
+### Importação e cache — implemented
+`assets.pipeline` imports an indexed asset set into derived artifacts stored in a
+content-addressed cache keyed by source content hash + importer identity/version
++ options. Cache writes are atomic (temp + rename) and reads verify the payload
+hash (corrupt entries self-heal as misses). Imports run concurrently through an
+`Io.Group` (e.g. `JobSystem.io()`), with a `runSequential` fallback; per-asset
+failures are recorded in a report without aborting the batch. Binary assets use
+the `raw` (verbatim) importer until decoders exist. Startup/editor integration is
+a planned next step. See [asset-import.md](asset-import.md).
 
-### Serialização — implemented (scenes), planned (assets/export)
+### Serialização — implemented (scenes + import cache), planned (export)
 Scene (de)serialization is versioned (`format_version = 1`), strict and
 deterministic (entities sorted by stable ID, optional null fields omitted). It
 uses the standard-library JSON parser/stringifier with duplicate-field and
 unknown-field rejection, and enforces plain-data components at comptime so ECS
-copies cannot dangle. Asset/import-cache and export-template serialization are
-planned, aligned with the format-version policy in [versioning.md](versioning.md).
+copies cannot dangle. The import cache uses its own versioned on-disk format
+(binary header + JSON metadata + payload, `format_version = 1`) with hash
+verification. Export-template serialization is planned, aligned with the
+format-version policy in [versioning.md](versioning.md).
 
 ### VM Lua / Gameplay scripting — planned
 An embedded Lua VM and a gameplay scripting API. The example project ships a
@@ -211,9 +227,10 @@ as a C header under `include/corex/` before any module loads. See
 
 ### Sistema de jobs e carregamento assíncrono — implemented (foundation)
 `jobs.JobSystem` wraps `std.Io` concurrency with a configurable worker pool,
-`spawn` (future-based) and `Batch` (group-based). Used by the startup pipeline
-and by ECS system scheduling (`Schedule.run(js.io(), ...)`). Priorities,
-dependencies and a frame-budget scheduler are planned.
+`spawn` (future-based) and `Batch` (group-based). Used by the startup pipeline,
+by ECS system scheduling (`Schedule.run(js.io(), ...)`) and by the asset import
+pipeline (`assets.pipeline.run(gpa, js.io(), ...)`). Priorities, dependencies and
+a frame-budget scheduler are planned.
 
 ### Splash screen — implemented (contract + headless), planned (graphical)
 `splash.SplashScreen` is the interface; `HeadlessSplash` is the current
@@ -247,8 +264,10 @@ profiling, memory tracking, a metrics overlay and trace export are planned.
 
 The startup spine, the ECS (generational entities, sparse-set component pools,
 type-safe world, multi-component views and comptime system scheduling over the
-job system) and the scene system (versioned JSON scenes, stable IDs, hierarchy,
-ECS load/save) are implemented and tested, and the executable builds and runs on
+job system), the scene system (versioned JSON scenes, stable IDs, hierarchy,
+ECS load/save) and the asset import pipeline + content-addressed cache
+(raw/text/json/scene importers, atomic verified storage, parallel import over the
+job system) are implemented and tested, and the executable builds and runs on
 Zig 0.17.0. The remaining larger subsystems (renderers, GUI, editor, Lua, export,
 native modules) are in scope and either contract-defined or planned, as marked
 above.
