@@ -1,86 +1,86 @@
-# Transforms World-Space — CoreXEngine
+# World-Space Transforms — CoreXEngine
 
-Este documento descreve a propagação de transforms locais para o espaço de mundo
-(world-space) das cenas da CoreXEngine. A matemática vive em
-`src/scene/transform.zig` e é exposta como `corex.scene.transform` (com os tipos
-`corex.scene.Mat4`, `Vec3` e `Quat`). Os métodos de cena ficam em
-`src/scene/scene.zig` (`Scene.computeWorldTransforms` e `Scene.worldMatrix`).
+This document describes how CoreXEngine propagates local scene transforms into
+world space. The math lives in `src/scene/transform.zig` and is exposed as
+`corex.scene.transform` (with the types `corex.scene.Mat4`, `Vec3` and `Quat`).
+The scene methods live in `src/scene/scene.zig` (`Scene.computeWorldTransforms`
+and `Scene.worldMatrix`).
 
-> Estado: **implementado e testado**. O arquivo `.scene` continua armazenando
-> apenas o transform **local** autoral (TRS, `format_version = 1`); matrizes
-> world-space são **calculadas em runtime** e nunca serializadas. Isso preserva o
-> contrato do formato de cena (ver [scene-format.md](scene-format.md)).
+> Status: **implemented and tested**. The `.scene` file still stores only the
+> authored **local** transform (TRS, `format_version = 1`); world-space matrices
+> are **computed at runtime** and never serialized. This preserves the scene
+> format contract (see [scene-format.md](scene-format.md)).
 
-## Por que matrizes (e não TRS componente a componente)
+## Why matrices (and not component-wise TRS)
 
-Compor dois transforms combinando posição/rotação/escala componente a componente
-perde cisalhamento (shear) quando há **escala não uniforme sob rotação**. Por
-isso a propagação usa matrizes 4×4 completas:
+Composing two transforms by combining position/rotation/scale component-wise
+loses shear when there is **non-uniform scale under rotation**. That is why
+propagation uses full 4×4 matrices:
 
 ```
-world_filho = world_pai * local_filho
+child_world = parent_world * child_local
 ```
 
-onde `local_filho = T * R * S` (escala aplicada primeiro, depois rotação, depois
-translação). Multiplicação de matrizes preserva o shear corretamente em qualquer
-profundidade de hierarquia.
+where `child_local = T * R * S` (scale applied first, then rotation, then
+translation). Matrix multiplication preserves shear correctly at any hierarchy
+depth.
 
-## Convenções matemáticas
+## Math conventions
 
-- `Mat4 = [16]f32`, **column-major**: o elemento da linha `r`, coluna `c` é
-  `m[c*4 + r]`. Compatível com o layout esperado por APIs gráficas column-major.
-- `Vec3 = [3]f32`; `Quat = [4]f32` no formato `[x, y, z, w]`.
-- `transform.identity()` retorna a matriz identidade.
-- `transform.fromTransform(t)` constrói `M = T * R * S` a partir de um
-  `Transform` local. O quaternion é **normalizado** internamente; um quaternion
-  de comprimento zero é tratado como identidade.
-- `transform.multiply(a, b)` retorna `a * b`.
-- `transform.transformPoint(m, v)` aplica `m` a um ponto (translação incluída);
-  `transform.transformDirection(m, v)` aplica apenas a parte linear (sem
-  translação), útil para direções/normais.
-- Helpers de quaternion: `quatNormalize`, `quatMultiply`, `quatRotateVec3`,
+- `Mat4 = [16]f32`, **column-major**: the element at row `r`, column `c` is
+  `m[c*4 + r]`. Compatible with the layout expected by column-major graphics APIs.
+- `Vec3 = [3]f32`; `Quat = [4]f32` in `[x, y, z, w]` form.
+- `transform.identity()` returns the identity matrix.
+- `transform.fromTransform(t)` builds `M = T * R * S` from a local `Transform`.
+  The quaternion is **normalized** internally; a zero-length quaternion is
+  treated as identity.
+- `transform.multiply(a, b)` returns `a * b`.
+- `transform.transformPoint(m, v)` applies `m` to a point (translation included);
+  `transform.transformDirection(m, v)` applies only the linear part (no
+  translation), useful for directions/normals.
+- Quaternion helpers: `quatNormalize`, `quatMultiply`, `quatRotateVec3`,
   `quatFromAxisAngle`.
-- `transform.approxEqual(a, b, epsilon)` compara matrizes com tolerância absoluta
-  (útil em testes; não usar como igualdade exata em lógica de jogo).
+- `transform.approxEqual(a, b, epsilon)` compares matrices with an absolute
+  tolerance (useful in tests; do not use as exact equality in gameplay logic).
 
-## API da cena
+## Scene API
 
 ### `Scene.computeWorldTransforms(gpa) Error!WorldTransforms`
 
-Calcula as matrizes world-space de **todas** as entidades vivas em uma única
-passada **iterativa** O(n) (pais antes dos filhos). Não usa recursão, portanto
-hierarquias arbitrariamente profundas são seguras (sem risco de stack overflow).
-Entidades sem o componente `Transform` usam o transform local identidade.
-Requer que o schema da cena contenha `Transform` (caso contrário, erro de
-compilação). O chamador é dono do snapshot e deve chamar `deinit`.
+Computes the world-space matrices of **all** live entities in a single **iterative**
+O(n) pass (parents before children). It uses no recursion, so arbitrarily deep
+hierarchies are safe (no stack-overflow risk). Entities without the `Transform`
+component use the identity local transform. Requires the scene schema to contain
+`Transform` (otherwise a compile error). The caller owns the snapshot and must
+call `deinit`.
 
-Este é o caminho recomendado por frame: calcule uma vez após os transforms
-mudarem e consulte muitas entidades via `WorldTransforms.get`.
+This is the recommended per-frame path: compute once after transforms change and
+query many entities through `WorldTransforms.get`.
 
 ### `WorldTransforms` (snapshot)
 
-- `matrices: []Mat4` e `entities: []Entity` — arrays densos paralelos, ordenados
-  por **ID estável crescente** (determinismo).
-- `count() usize` — número de entidades no snapshot.
-- `get(entity) ?Mat4` — matriz world-space de um handle presente no snapshot, ou
-  `null` para um handle ausente.
-- `deinit()` — libera os arrays e o índice.
+- `matrices: []Mat4` and `entities: []Entity` — parallel dense arrays, ordered by
+  **ascending stable ID** (determinism).
+- `count() usize` — number of entities in the snapshot.
+- `get(entity) ?Mat4` — world-space matrix for a handle present in the snapshot,
+  or `null` for an absent handle.
+- `deinit()` — frees the arrays and the index.
 
-O snapshot é **congelado**: é válido até a hierarquia ou os transforms locais
-mudarem; recalcule para atualizar. Ele é **generation-safe**: um slot reciclado
-com nova geração não consegue ler a matriz da entidade anterior (o handle novo
-não está no snapshot). Um handle que estava vivo no momento do cálculo continua
-retornando a sua própria matriz congelada mesmo se a entidade for destruída
-depois — isso é dado da própria entidade, não de outra.
+The snapshot is **frozen**: it is valid until the hierarchy or the local
+transforms change; recompute to refresh. It is **generation-safe**: a recycled
+slot with a new generation cannot read the previous entity's matrix (the new
+handle is not in the snapshot). A handle that was alive at computation time keeps
+returning its own frozen matrix even if the entity is destroyed afterwards —
+that is the entity's own data, not another entity's.
 
 ### `Scene.worldMatrix(gpa, entity) Error!Mat4`
 
-Conveniência para uma única entidade: sobe a cadeia de pais até a raiz e compõe
-de cima para baixo. Aloca um buffer temporário de cadeia; para uso por frame
-sobre muitas entidades prefira `computeWorldTransforms`. Retorna
-`error.EntityNotAlive` para um handle morto. Requer `Transform` no schema.
+Convenience for a single entity: walks the parent chain up to the root and
+composes top-down. It allocates a temporary chain buffer; for per-frame use over
+many entities prefer `computeWorldTransforms`. Returns `error.EntityNotAlive` for
+a dead handle. Requires `Transform` in the schema.
 
-## Exemplo
+## Example
 
 ```zig
 const corex = @import("corex");
@@ -97,54 +97,57 @@ try scene.addComponent(root, corex.scene.Transform{
 const child = try scene.createEntity("Child", scene.idOf(root));
 try scene.addComponent(child, corex.scene.Transform{ .position = .{ 1, 0, 0 } });
 
-// Lote (recomendado por frame):
+// Batch (recommended per frame):
 var wt = try scene.computeWorldTransforms(gpa);
 defer wt.deinit();
 if (wt.get(child)) |world| {
-    const origem = corex.scene.transform.transformPoint(world, .{ 0, 0, 0 });
-    // origem == { 12, 0, 0 }  (root * child * origem)
+    const origin = corex.scene.transform.transformPoint(world, .{ 0, 0, 0 });
+    // origin == { 12, 0, 0 }  (root * child * origin)
 }
 
-// Unidade única:
+// Single entity:
 const m = try scene.worldMatrix(gpa, child);
 ```
 
-## Garantias e testes
+## Guarantees and tests
 
-- **Determinismo**: a ordem densa é por ID estável crescente; snapshots idênticos
-  para a mesma cena.
-- **Sem recursão**: avaliação topológica iterativa com pilha explícita no heap;
-  um teste de estresse com cadeia de 2000 níveis valida propagação correta sem
+- **Determinism**: the dense order is by ascending stable ID; identical snapshots
+  for the same scene.
+- **No recursion**: iterative topological evaluation with an explicit heap stack;
+  a stress test with a 2000-level chain validates correct propagation without
   stack overflow.
-- **Generation-safe**: handles reciclados não leem dados de entidades anteriores.
-- **Identidade para entidades sem Transform**: a entidade herda o world do pai.
-- **Referências de pai para frente**: pais definidos depois dos filhos no JSON
-  são resolvidos corretamente (resolução em duas passadas).
-- **Segurança de memória**: caminhos de falha de alocação são testados com
-  `checkAllAllocationFailures` (sem vazamentos). A inicialização do snapshot
-  registra a limpeza antes de qualquer alocação falível.
-- **Paridade**: `worldMatrix` (unidade) e `computeWorldTransforms` (lote)
-  produzem a mesma matriz para a mesma entidade.
+- **Generation-safe**: recycled handles never read data from previous entities.
+- **Identity for entities without Transform**: the entity inherits the parent's
+  world transform.
+- **Forward parent references**: parents defined after their children in the JSON
+  are resolved correctly (two-pass resolution).
+- **Memory safety**: allocation-failure paths are tested with
+  `checkAllAllocationFailures` (no leaks). Snapshot initialization registers
+  cleanup before any fallible allocation.
+- **Parity**: `worldMatrix` (single) and `computeWorldTransforms` (batch) produce
+  the same matrix for the same entity.
 
-## Desempenho e uso
+## Performance and usage
 
-- `computeWorldTransforms` é O(n) em tempo e usa memória temporária O(n)
-  (liberada antes do retorno), além dos arrays do snapshot. Faça uma vez por
-  frame (ou quando os transforms mudarem) e consulte via `get`.
-- `worldMatrix` é O(profundidade) e aloca um buffer de cadeia; adequado para
-  consultas pontuais, não para varrer a cena inteira por frame.
-- O snapshot não rastreia mudanças automaticamente: se a cena mudar, recalcule.
-  Rastreamento de mudanças (change tracking) é uma extensão futura.
+- `computeWorldTransforms` is O(n) in time and uses O(n) temporary memory (freed
+  before returning), in addition to the snapshot arrays. Run it once per frame
+  (or when transforms change) and query through `get`.
+- `worldMatrix` is O(depth) and allocates a chain buffer; suitable for one-off
+  queries, not for sweeping the whole scene every frame.
+- The snapshot does not track changes automatically: if the scene changes,
+  recompute. Change tracking is a future extension.
 
-## Limitações e próximos passos
+## Limitations and next steps
 
-- Não há cache incremental/dirty-tracking entre frames; cada cálculo é completo.
-- Não há suporte a múltiplas cenas ou streaming de transforms neste incremento.
-- O renderer/editor ainda consumirão estas matrizes quando forem implementados;
-  este incremento entrega apenas a matemática e a propagação no sistema de cenas.
+- There is no incremental/dirty-tracking cache between frames; each computation
+  is complete.
+- There is no support for multiple scenes or transform streaming in this
+  increment.
+- The renderer/editor will consume these matrices once implemented; this
+  increment delivers only the math and the propagation in the scene system.
 
-## Relacionados
+## Related
 
-- Formato de cena: [scene-format.md](scene-format.md)
-- Arquitetura: [architecture.md](architecture.md)
-- Versionamento: [versioning.md](versioning.md)
+- Scene format: [scene-format.md](scene-format.md)
+- Architecture: [architecture.md](architecture.md)
+- Versioning: [versioning.md](versioning.md)

@@ -1,15 +1,16 @@
-# Formato de Cena — arquivo `.scene`
+# Scene Format — the `.scene` file
 
-Cenas da CoreXEngine são documentos JSON UTF-8 versionados. Elas descrevem
-entidades, hierarquia e componentes armazenados no ECS. A engine **lê e valida**
-cenas; a criação de projetos continua fora do escopo da engine (ver
+CoreXEngine scenes are versioned UTF-8 JSON documents. They describe entities,
+hierarchy and components stored in the ECS. The engine **reads and validates**
+scenes; project creation remains out of the engine's scope (see
 [scope.md](scope.md)).
 
-> Estado: `format_version = 1` implementado para o schema padrão da engine
-> (`corex.scene.EngineScene`), que atualmente contém o componente `transform`.
-> Ferramentas podem definir schemas adicionais com `Scene(.{ Component(T, "nome") })`.
+> Status: `format_version = 1` implemented for the engine's default schema
+> (`corex.scene.EngineScene`), which currently contains the `transform`
+> component. Tools may define additional schemas with
+> `Scene(.{ Component(T, "name") })`.
 
-## Estrutura
+## Structure
 
 ```json
 {
@@ -39,89 +40,90 @@ cenas; a criação de projetos continua fora do escopo da engine (ver
 }
 ```
 
-## Campos da raiz
+## Root fields
 
-| Campo | Tipo | Obrigatório | Descrição |
+| Field | Type | Required | Description |
 |---|---|---|---|
-| `format_version` | inteiro | sim | Versão do formato de cena. Suportada: `1`. Versões desconhecidas são rejeitadas. |
-| `name` | string | sim | Nome de exibição da cena. Não vazio, até 128 bytes, sem caracteres de controle nem separadores de caminho. |
-| `entities` | array | não | Lista de entidades. Padrão: `[]` (cena vazia). |
+| `format_version` | integer | yes | Scene format version. Supported: `1`. Unknown versions are rejected. |
+| `name` | string | yes | Scene display name. Non-empty, up to 128 bytes, with no control characters or path separators. |
+| `entities` | array | no | Entity list. Default: `[]` (empty scene). |
 
-## Campos de entidade
+## Entity fields
 
-| Campo | Tipo | Obrigatório | Descrição |
+| Field | Type | Required | Description |
 |---|---|---|---|
-| `id` | inteiro > 0 | sim | Identificador estável da cena, único no documento. Nunca é reutilizado pela engine ao criar novas entidades em runtime. |
-| `name` | string | não | Nome de exibição. Mesmas regras do nome da cena. |
-| `parent` | inteiro > 0 | não | `id` da entidade pai. Deve existir, não pode ser a própria entidade e não pode formar ciclo. |
-| `components` | objeto | não | Componentes tipados. Padrão: `{}`. |
+| `id` | integer > 0 | yes | Stable scene identifier, unique within the document. Never reused by the engine when creating new entities at runtime. |
+| `name` | string | no | Display name. Same rules as the scene name. |
+| `parent` | integer > 0 | no | `id` of the parent entity. Must exist, cannot be the entity itself and cannot form a cycle. |
+| `components` | object | no | Typed components. Default: `{}`. |
 
-Campos desconhecidos e campos duplicados são rejeitados (JSON estrito).
+Unknown fields and duplicate fields are rejected (strict JSON).
 
-## Componente `transform`
+## The `transform` component
 
-Componente local da entidade em relação ao pai (ou à raiz da cena). Todos os
-campos são opcionais e usam os valores identidade quando ausentes:
+The entity's local component relative to its parent (or to the scene root). All
+fields are optional and use identity values when absent:
 
-| Campo | Tipo | Padrão | Descrição |
+| Field | Type | Default | Description |
 |---|---|---|---|
-| `position` | `[f32, f32, f32]` | `[0, 0, 0]` | Posição local. |
+| `position` | `[f32, f32, f32]` | `[0, 0, 0]` | Local position. |
 | `rotation` | `[f32, f32, f32, f32]` | `[0, 0, 0, 1]` | Quaternion `[x, y, z, w]`. |
-| `scale` | `[f32, f32, f32]` | `[1, 1, 1]` | Escala local. |
+| `scale` | `[f32, f32, f32]` | `[1, 1, 1]` | Local scale. |
 
-Valores não finitos (NaN/Infinity) são rejeitados. O formato armazena apenas o
-transform **local** autoral (TRS). A propagação para **world-space** é calculada
-em runtime por `Scene.computeWorldTransforms` / `Scene.worldMatrix` e **nunca** é
-serializada no arquivo `.scene` — manter o formato local evita redundância e
-preserva o contrato `format_version = 1`. Ver
-[scene-transforms.md](scene-transforms.md) para a matemática, a API e as garantias.
+Non-finite values (NaN/Infinity) are rejected. The format stores only the
+authored **local** transform (TRS). Propagation to **world space** is computed at
+runtime by `Scene.computeWorldTransforms` / `Scene.worldMatrix` and is **never**
+serialized into the `.scene` file — keeping the format local avoids redundancy
+and preserves the `format_version = 1` contract. See
+[scene-transforms.md](scene-transforms.md) for the math, the API and the
+guarantees.
 
-## Regras de validação
+## Validation rules
 
-- `format_version` deve ser `1`.
-- Nomes seguem a regra compartilhada de nomes de exibição (manifesto e cenas).
-- IDs de entidade devem ser únicos e maiores que zero.
-- Pais devem referenciar entidades existentes; auto-parentesco e ciclos são
-  rejeitados.
-- Componentes desconhecidos para o schema carregado são rejeitados.
-- O documento é limitado a 16 MiB e a 1.000.000 de entidades.
-- Caminhos de cena vindos do manifesto/CLI continuam relativos à raiz do
-  projeto, sem travessia (`..`), conforme [project-format.md](project-format.md).
+- `format_version` must be `1`.
+- Names follow the shared display-name rule (manifest and scenes).
+- Entity IDs must be unique and greater than zero.
+- Parents must reference existing entities; self-parenting and cycles are
+  rejected.
+- Components unknown to the loaded schema are rejected.
+- The document is limited to 16 MiB and 1,000,000 entities.
+- Scene paths coming from the manifest/CLI remain relative to the project root,
+  without traversal (`..`), as per [project-format.md](project-format.md).
 
-## Inicialização
+## Startup
 
-- `editor` e `runtime`: a cena inicial (manifesto ou `--scene`) é resolvida,
-  validada e carregada no ECS. Se nenhuma cena for indicada, uma cena vazia é
-  preparada. Falhas de cena produzem código de saída **6**.
-- `validate`: não carrega cena; valida manifesto, compatibilidade, configurações
-  e índice de assets. O contrato de inicialização permanece o mesmo
+- `editor` and `runtime`: the initial scene (manifest or `--scene`) is resolved,
+  validated and loaded into the ECS. If no scene is specified, an empty scene is
+  prepared. Scene failures produce exit code **6**.
+- `validate`: does not load a scene; validates the manifest, compatibility,
+  configuration and asset index. The launch contract remains the same
   ([launch-contract.md](launch-contract.md)).
 
-## API e propriedade
+## API and ownership
 
-`corex.scene.EngineScene` (ou `Scene(schema)`) é dono de sua arena, do mundo ECS
-e dos mapas de ID. Chame `deinit` exatamente uma vez. `parse`/`load` retornam uma
-cena owned; `serialize` retorna bytes owned. `save` escreve em caminho relativo
-ao projeto e cria diretórios pais; não é atômico contra crash (quem precisar de
-substituição atômica deve escrever um arquivo temporário e renomear).
+`corex.scene.EngineScene` (or `Scene(schema)`) owns its arena, its ECS world and
+its ID maps. Call `deinit` exactly once. `parse`/`load` return an owned scene;
+`serialize` returns owned bytes. `save` writes to a project-relative path and
+creates parent directories; it is not crash-atomic (callers needing atomic
+replacement should write a temporary file and rename it).
 
-Handles de entidade em runtime são handles geracionais do ECS; os IDs estáveis
-do arquivo ficam em um mapeamento separado. Use `createEntity`/`destroyEntity` da
-cena (não o mundo ECS bruto) para manter IDs e hierarquia consistentes. Destruir
-uma entidade reparenta seus filhos diretos para o pai dela (ou para a raiz).
+Runtime entity handles are generational ECS handles; the file's stable IDs live
+in a separate mapping. Use the scene's `createEntity`/`destroyEntity` (not the raw
+ECS world) to keep IDs and hierarchy consistent. Destroying an entity reparents
+its direct children to its parent (or to the root).
 
 ## Prefabs
 
-Arquivos `.prefab` usam a mesma forma deste documento, mas exigem **exatamente
-uma entidade raiz** (sem `parent`). Prefabs são subárvores reutilizáveis que
-podem ser capturadas de uma cena e instanciadas com remapeamento de IDs. Ver
+`.prefab` files use the same shape as this document, but require **exactly one
+root entity** (without `parent`). Prefabs are reusable subtrees that can be
+captured from a scene and instantiated with ID remapping. See
 [scene-prefabs.md](scene-prefabs.md).
 
-## Relacionados
+## Related
 
-- Arquitetura: [architecture.md](architecture.md)
-- Formato de projeto: [project-format.md](project-format.md)
-- Versionamento: [versioning.md](versioning.md)
-- Contrato de inicialização: [launch-contract.md](launch-contract.md)
-- Transforms world-space: [scene-transforms.md](scene-transforms.md)
+- Architecture: [architecture.md](architecture.md)
+- Project format: [project-format.md](project-format.md)
+- Versioning: [versioning.md](versioning.md)
+- Launch contract: [launch-contract.md](launch-contract.md)
+- World-space transforms: [scene-transforms.md](scene-transforms.md)
 - Prefabs: [scene-prefabs.md](scene-prefabs.md)

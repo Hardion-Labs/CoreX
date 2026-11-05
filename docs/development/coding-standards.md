@@ -10,6 +10,7 @@ These are contribution standards for a project in early development. They distin
 - `build.zig` defines `zig build`, `zig build run`, and `zig build test`; `zig build run -- <args>` forwards arguments via `Run.addPassthruArgs`.
 - The Zig files use lowercase snake_case for file names, declarations, and local identifiers, and PascalCase for types.
 - Allocators are passed explicitly; owned resources expose a `deinit`. Error sets are explicit and, at the process boundary, map to the stable exit codes in `docs/launch-contract.md`.
+- All source comments, doc comments, and project documentation are written in English. Identifiers and user-facing engine output (CLI help, log messages) are English as well.
 
 ## Recommended conventions for new code
 
@@ -51,6 +52,7 @@ The implemented subsystems establish explicit-allocator APIs, owned `deinit` cle
 ### Documentation and testing
 
 - Document public behavior, ownership, error conditions, and non-obvious invariants.
+- Write comments and documentation in English, including doc comments (`///`, `//!`) and Markdown under `docs/`. Keep technical terms, API names, and format identifiers exactly as they appear in the code.
 - Keep documentation accurate to the implementation and distinguish planned work from existing behavior.
 - Add tests for new behavior, important invariants, and error cases where applicable.
 - Run `zig build` and `zig build test` when relevant, and report exact commands and outcomes. Do not invent test coverage or results.
