@@ -30,6 +30,10 @@ declared yet.
   handles with safe slot recycling (`entity.zig`), sparse-set component storage
   with O(1) add/remove/get/has (`pool.zig`), and a comptime-typed world with
   type-safe component access and multi-component views (`world.zig`).
+- ECS system scheduling (`src/ecs/schedule.zig`, `docs/ecs-scheduling.md`):
+  comptime ordered stages, read/write access declarations with compile-time
+  conflict rejection, exclusive systems, concurrent dispatch through `std.Io` /
+  `JobSystem`, deterministic error propagation, and a `runSequential` fallback.
 - Scene system and versioned scene serialization (`src/scene/`, re-exported as
   `corex.scene`, `docs/scene-format.md`): strict JSON `format_version = 1`,
   stable entity IDs, parent hierarchy with cycle rejection, plain-data component
@@ -41,16 +45,17 @@ declared yet.
   `include/corex/native_module.h`); the loader is not implemented yet.
 - A minimal example project (`examples/hello-project/`) with a valid versioned
   initial scene.
-- Test suite covering the startup spine, ECS and scenes (114 tests), including
-  allocation-failure probes, validated in Debug, ReleaseSafe and ReleaseFast.
+- Test suite covering the startup spine, ECS, scheduling and scenes (128 tests),
+  including allocation-failure probes and job-system integration tests,
+  validated in Debug, ReleaseSafe and ReleaseFast.
 
 ### Changed
 
 - Renamed the executable to `corex-engine`.
 - README and architecture documentation now reflect the definitive scope and the
   per-subsystem implementation status.
-- The public module `src/corex.zig` re-exports the implemented core, ECS and scene
-  subsystems.
+- The public module `src/corex.zig` re-exports the implemented core, ECS
+  (including scheduling) and scene subsystems.
 - Startup `editor`/`runtime` now validates and loads the initial scene into the
   ECS (or prepares an empty scene). `validate` mode and the stable CLI/exit-code
   contract are unchanged; scene failures map to exit code 6.
@@ -75,6 +80,9 @@ declared yet.
 - ECS generational handles prevent use-after-free: a stale handle cannot access a
   recycled entity's components, and slots are retired before generation
   wraparound can alias a live entity.
+- ECS schedules reject conflicting read/write access in the same parallel stage
+  at compile time; exclusive systems are isolated, and parallel stages wait for
+  all systems before propagating errors.
 - Scene documents are strictly validated: unknown/duplicate fields, duplicate or
   zero entity IDs, missing parents, self-parenting, parent cycles, unknown
   components and non-finite transform values are rejected; scene paths stay
