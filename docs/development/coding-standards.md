@@ -6,7 +6,7 @@ These are contribution standards for a project in early development. They distin
 
 - Project source and build configuration are written in Zig (target: Zig 0.17.0).
 - `src/corex.zig` is the public module and re-exports implemented subsystems; `src/main.zig` is the `corex-engine` executable entry point.
-- Implemented subsystems live under `src/core/` (startup spine: CLI, manifest, paths, validation, jobs, config, assets, splash, diagnostics, startup, version), `src/ecs/` (entities, pools, world) and `src/scene/` (components, versioned scene documents).
+- Implemented subsystems live under `src/core/` (startup spine: CLI, manifest, paths, validation, jobs, config, assets, splash, diagnostics, startup, version), `src/ecs/` (entities, pools, world, scheduling) and `src/scene/` (components, versioned scene documents).
 - `build.zig` defines `zig build`, `zig build run`, and `zig build test`; `zig build run -- <args>` forwards arguments via `Run.addPassthruArgs`.
 - The Zig files use lowercase snake_case for file names, declarations, and local identifiers, and PascalCase for types.
 - Allocators are passed explicitly; owned resources expose a `deinit`. Error sets are explicit and, at the process boundary, map to the stable exit codes in `docs/launch-contract.md`.
