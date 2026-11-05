@@ -33,8 +33,9 @@ control, and maintainable code.
 > the job system, mark-and-sweep GC, change detection with incremental re-import),
 > the backend-independent render extraction
 > layer (camera math, frustum culling, sorted draw lists) and the
-> device-independent audio runtime (mixer with voices, buses, pan, pitch and
-> resampling, plus spatialization and the `AudioSource` scene bridge) are
+> device-independent audio runtime (mixer with voices, buses, pan, pitch,
+> linear/band-limited resampling and priority voice stealing, plus
+> spatialization and the `AudioSource` scene bridge) are
 > implemented and tested. The larger
 > subsystems (GPU renderer backends, GUI, editor, Lua, export, native modules) are
 > in scope and either contract-defined or planned. See
@@ -348,12 +349,16 @@ The design, math conventions and guarantees are documented in
 The audio subsystem (`corex.audio`) provides the **device-independent mixer** —
 the CPU foundation the OS playback backends will consume. It mixes a fixed pool
 of voices with gain, stereo pan (linear or equal-power), buses, master gain,
-pitch, looping and linear-interpolated resampling into an interleaved float32
-buffer. `render` takes no allocator: it cannot allocate, and it is deterministic
-(bit-identical output for the same call sequence). Voices are addressed by
-generational handles, so a stale handle is inert instead of aliasing a recycled
-voice. It has no device dependency, so it runs and is fully tested headlessly;
-ALSA/WASAPI/CoreAudio backends, 3D audio and effects are planned.
+pitch and looping into an interleaved float32 buffer. Resampling is linear by
+default or **band-limited windowed-sinc** on request (`.resample = .sinc`), which
+low-passes before decimating instead of aliasing. A full voice pool either fails
+or, with `.steal_policy = .lowest_priority`, recycles the least important voice —
+`priority` ranks sources and `terminationOf` explains why a handle died even after
+its slot was reused. `render` takes no allocator: it cannot allocate, and it is
+deterministic (bit-identical output for the same call sequence). Voices are
+addressed by generational handles, so a stale handle is inert instead of aliasing
+a recycled voice. It has no device dependency, so it runs and is fully tested
+headlessly; ALSA/WASAPI/CoreAudio backends and effects are planned.
 
 ```zig
 const corex = @import("corex");
@@ -367,7 +372,7 @@ const voice = try mixer.play(.{
     .channels = 2,
     .frames = frame_count,
     .samples = samples,
-}, .{ .gain = 0.8, .pan = -0.25, .looping = true, .bus = 1 });
+}, .{ .gain = 0.8, .pan = -0.25, .looping = true, .bus = 1, .priority = 200 });
 
 try mixer.setBusGain(1, 0.5); // music bus
 var buffer: [512 * 2]f32 = undefined;
@@ -455,7 +460,7 @@ CoreX/
 │   ├── render.zig              # Render public module (extraction layer)
 │   ├── render/                 # Camera, frustum culling, draw-list extraction
 │   ├── audio.zig               # Audio public module (mixing runtime)
-│   └── audio/                  # Clips, voice pool/mixer, spatialization, scene bridge
+│   └── audio/                  # Clips, mixer, spatialization, scene bridge, resampler
 ├── tools/                      # Reproducible test-vector generators
 ├── build.zig                   # Build configuration
 └── CHANGELOG.md, CONTRIBUTING.md, LICENSE, README.md, ...
@@ -488,6 +493,7 @@ Indicative; subject to change as technical decisions are validated.
 - [ ] Asset decoders (JPEG, compressed audio, other model formats), Adam7 PNG.
 - [x] Audio mixer (voices, buses, gain/pan, pitch, resampling, allocation-free render).
 - [x] Spatial audio (listener, attenuation models, Doppler) + `AudioSource` scene bridge.
+- [x] Voice stealing with priorities + band-limited (windowed-sinc) resampling.
 - [ ] Audio device backends (ALSA/WASAPI/CoreAudio), HRTF/occlusion, effects, streaming.
 - [ ] Hot-reload event watcher (inotify/FSEvents), dependency graph, startup/editor integration.
 - [x] Backend-independent render extraction (camera, frustum culling, sorted draw lists).

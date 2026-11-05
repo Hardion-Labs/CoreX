@@ -119,6 +119,7 @@ and **serializes like any component** (a test round-trips it through
 | `pitch` | 1 | Base rate; the Doppler multiplier is folded in |
 | `looping` | false | Whole-clip looping |
 | `playing` | false | Transport request (see below) |
+| `priority` | 128 | Importance for voice stealing, 0 least .. 255 most |
 | `spatial_blend` | 1 | 0 = 2D, 1 = fully 3D |
 | `attenuation` | inverse, 1..100, rolloff 1 | Distance model |
 | `doppler_factor` | 0 | Per-source Doppler strength |
@@ -142,6 +143,8 @@ ids to decoded `CXAW` buffers belongs to the asset layer, not to the component.
 - Changing `clip` while playing restarts the voice on the new clip.
 - Changes to `gain`, `pitch`, `bus` and `looping` are applied to the live voice
   every update; position/rotation changes are re-spatialized every update.
+- A voice whose slot was **stolen** is reported once in `Stats.stolen` and then
+  retried (see below).
 
 ## `AudioSystem`
 
@@ -168,7 +171,7 @@ const world = try scene.worldMatrix(gpa, camera_entity);
 const listener = A.Listener.fromMatrix(world);
 
 const stats = try system.update(&scene, listener, &clips);
-// stats.sources / .started / .updated / .stopped / .finished
+// stats.sources / .started / .updated / .stopped / .finished / .stolen
 // stats.culled / .unplayed / .invalid
 
 var buffer: [512 * 2]f32 = undefined;
@@ -206,13 +209,44 @@ source starts as soon as it becomes audible.
 | `updated` | Live voices refreshed |
 | `stopped` | Voices stopped (transport off, invalid source, entity/component gone) |
 | `finished` | Voices that reached their end since the previous update |
+| `stolen` | Voices whose slot was taken by a higher-or-equal-priority source |
 | `culled` | Sources not started because their gain was zero |
 | `unplayed` | Sources that could not start because the pool was full |
 | `invalid` | Invalid component or out-of-range clip handle |
 
 A full voice pool is **reported, not hidden**: `unplayed` counts the sources that
-could not start, and they start on a later update once a slot frees. There is no
-implicit voice stealing yet.
+could not start, and they start on a later update once a slot frees.
+
+### Voice pressure and priorities
+
+When the mixer is configured with `steal_policy = .lowest_priority` (see
+[audio-mixer.md](audio-mixer.md)), `priority` decides who keeps a slot:
+
+```zig
+var mixer = try A.Mixer.init(gpa, .{ .max_voices = 32, .steal_policy = .lowest_priority });
+// Music outranks ambience; a gunshot outranks both.
+try scene.addComponent(music,    AudioSource{ .playing = true, .looping = true, .priority = 220 });
+try scene.addComponent(ambience, AudioSource{ .playing = true, .looping = true, .priority = 40 });
+try scene.addComponent(shot,     AudioSource{ .playing = true, .priority = 180 });
+```
+
+- A source whose voice was stolen is counted **once** in `Stats.stolen`, attributed
+  to the right entity even though the slot has already been reused — the mixer
+  records the reason per generation, not per slot.
+- It is then **retried on every later update without stealing**
+  (`.allow_steal = false`). That is deliberate: a retry that could steal would
+  ping-pong forever with the voice that took its slot. While no slot is free the
+  attempt is counted in `unplayed`.
+- Retries run **after** the stop sweep, so a slot freed by a `playing = false`
+  later in the same update is used immediately. Resuming therefore does not
+  depend on ECS iteration order.
+- A retry resumes from the **last cursor the system observed**, so a looping
+  ambience comes back in roughly the right phase instead of restarting. The
+  cursor is at most one update stale, and it is discarded if `clip` changed while
+  the source was waiting.
+- Culling still applies: a stolen source that has become silent is not restarted.
+- With the default `steal_policy = .none`, `priority` is inert and a full pool
+  simply reports `unplayed`, exactly as before.
 
 ## Guarantees and tests
 
@@ -234,9 +268,15 @@ implicit voice stealing yet.
   looping propagation, Doppler from component velocity, entity destruction and
   component removal, invalid components and clip handles, pool exhaustion and
   recovery, `stopAll`/`deinit` releasing every voice.
+- **Voice pressure**: a higher-priority source steals the lowest-priority slot
+  and never the music; the steal is attributed to the right entity exactly once;
+  the retry cannot steal and is counted in `unplayed` while the pool is full; a
+  slot freed later in the same update resumes the source immediately; the resume
+  lands on the remembered cursor (frame 40 of a 256-frame clip, exactly); the
+  steal is not re-reported on later updates.
 - **Serialization**: `AudioSource` round-trips through `.scene` JSON (including
-  the attenuation enum), serialization is deterministic, and an invalid
-  component is rejected.
+  the attenuation enum and `priority`), serialization is deterministic, and an
+  invalid component is rejected.
 - **Memory**: `checkAllAllocationFailures` over three updates (start, refresh,
   stop) with no leaks and no swallowed `OutOfMemory`; a failed map insertion
   stops the voice it just started instead of leaking it.
@@ -281,7 +321,10 @@ runs ~47× faster than real time.
   scene.
 - **No automatic velocity**: Doppler needs explicit velocities; there is no
   finite-difference derivation from transform deltas.
-- **No voice stealing or priorities**: a full pool reports `unplayed`.
+- **Stealing is priority-only**: no distance/loudness scoring, no fade-out on
+  steal, and no virtual voice that keeps advancing while it waits. A resumed
+  source picks up at the last observed cursor, so an interruption is audible as a
+  gap, not as a smooth handover.
 - **No area/volume emitters**: sources are points; no cones or directional
   emitters yet.
 - **No pause per source**: `playing` is a boolean transport, so pausing a source
