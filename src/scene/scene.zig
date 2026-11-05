@@ -95,6 +95,10 @@ fn componentIsValid(comptime T: type, value: T) bool {
     return true;
 }
 
+fn lessU64(_: void, a: u64, b: u64) bool {
+    return a < b;
+}
+
 pub fn Scene(comptime schemas: anytype) type {
     comptime {
         // Reject duplicate component names early.
@@ -284,6 +288,119 @@ pub fn Scene(comptime schemas: anytype) type {
             const record = self.records.get(id) orelse return null;
             const pid = record.parent orelse return null;
             return self.entityById(pid);
+        }
+
+        /// Sorted stable IDs of all root entities (entities without a parent).
+        /// Caller owns the returned slice and frees it with `gpa`.
+        pub fn rootIds(self: *const Self, gpa: Allocator) Error![]u64 {
+            var ids: std.ArrayList(u64) = .empty;
+            errdefer ids.deinit(gpa);
+            var it = self.records.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.parent == null) try ids.append(gpa, entry.key_ptr.*);
+            }
+            std.mem.sort(u64, ids.items, {}, lessU64);
+            return ids.toOwnedSlice(gpa);
+        }
+
+        /// Result of cloning a subtree into a scene.
+        pub const Instance = struct {
+            root: ecs.Entity,
+            root_id: u64,
+            count: usize,
+        };
+
+        /// Clone the subtree rooted at `source.root_id` into `self`, attaching
+        /// the cloned root to `parent_id` (or as a root when null). New stable
+        /// IDs are allocated in ascending source-ID order, so the operation is
+        /// deterministic. Components are copied by value (plain data). On error
+        /// any entities created by this call are destroyed, leaving the target
+        /// scene unchanged except for monotonic ID advancement.
+        pub fn cloneSubtree(self: *Self, source: *Self, root_id: u64, parent_id: ?u64) Error!Instance {
+            const root_record = source.records.get(root_id) orelse return error.EntityNotFound;
+            if (!source.world.alive(root_record.entity)) return error.EntityNotFound;
+            const parent_entity = if (parent_id) |pid|
+                self.entityById(pid) orelse return error.InvalidParent
+            else
+                null;
+
+            // Build a children adjacency map for the source, then collect the
+            // subtree iteratively (no recursion, safe for deep hierarchies).
+            var children: std.AutoHashMap(u64, std.ArrayList(u64)) = .init(self.gpa);
+            defer {
+                var vit = children.valueIterator();
+                while (vit.next()) |list| list.deinit(self.gpa);
+                children.deinit();
+            }
+            var sit = source.records.iterator();
+            while (sit.next()) |entry| {
+                if (entry.value_ptr.parent) |p| {
+                    const gop = try children.getOrPut(p);
+                    if (!gop.found_existing) gop.value_ptr.* = .empty;
+                    try gop.value_ptr.append(self.gpa, entry.key_ptr.*);
+                }
+            }
+
+            var order: std.ArrayList(u64) = .empty;
+            defer order.deinit(self.gpa);
+            var stack: std.ArrayList(u64) = .empty;
+            defer stack.deinit(self.gpa);
+            try stack.append(self.gpa, root_id);
+            while (stack.items.len > 0) {
+                const id = stack.items[stack.items.len - 1];
+                stack.items.len -= 1;
+                try order.append(self.gpa, id);
+                if (children.getPtr(id)) |list| {
+                    for (list.items) |child_id| try stack.append(self.gpa, child_id);
+                }
+            }
+            std.mem.sort(u64, order.items, {}, lessU64);
+
+            var map: std.AutoHashMap(u64, ecs.Entity) = .init(self.gpa);
+            defer map.deinit();
+            var created: std.ArrayList(ecs.Entity) = .empty;
+            defer created.deinit(self.gpa);
+            try created.ensureTotalCapacity(self.gpa, order.items.len);
+            errdefer {
+                var i = created.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    self.destroyEntity(created.items[i]);
+                }
+            }
+
+            // First pass: create entities and copy components (parents wired later).
+            for (order.items) |sid| {
+                const rec = source.records.get(sid) orelse return error.EntityNotFound;
+                const entity = try self.createEntity(rec.name, null);
+                created.appendAssumeCapacity(entity);
+                try map.put(sid, entity);
+                inline for (schemas) |S| {
+                    if (source.world.get(S.component_type, rec.entity)) |ptr| {
+                        try self.addComponent(entity, ptr.*);
+                    }
+                }
+            }
+
+            // Second pass: remap parents inside the cloned subtree.
+            for (order.items) |sid| {
+                const entity = map.get(sid) orelse return error.EntityNotFound;
+                const rec = source.records.get(sid) orelse return error.EntityNotFound;
+                if (sid == root_id) {
+                    if (parent_entity) |p| try self.setParent(entity, p);
+                } else {
+                    const pid = rec.parent orelse return error.InvalidParent;
+                    const pe = map.get(pid) orelse return error.InvalidParent;
+                    try self.setParent(entity, pe);
+                }
+            }
+
+            const root_entity = map.get(root_id) orelse return error.EntityNotFound;
+            return .{
+                .root = root_entity,
+                .root_id = self.idOf(root_entity) orelse return error.EntityNotFound,
+                .count = order.items.len,
+            };
         }
 
         /// Set or clear an entity's parent. Rejects dead handles, missing

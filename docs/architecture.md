@@ -67,11 +67,12 @@ src/
 │   ├── schedule.zig      # Comptime stages + parallel system dispatch  [implemented]
 │   ├── graph.zig         # AutoSchedule: inferred dependency layers    [implemented]
 │   └── frame.zig         # FrameSchedule: budgets + system profiling   [implemented]
-├── scene.zig             # Scene public module; EngineScene schema
+├── scene.zig             # Scene public module; EngineScene/EnginePrefab schema
 ├── scene/
 │   ├── components.zig    # Built-in plain-data scene components        [implemented]
 │   ├── transform.zig     # Column-major Mat4 + quaternion math         [implemented]
-│   └── scene.zig         # Versioned scene document + ECS/hierarchy    [implemented]
+│   ├── scene.zig         # Versioned scene document + ECS/hierarchy    [implemented]
+│   └── prefab.zig        # Single-root reusable subtrees (.prefab)     [implemented]
 ├── assets.zig            # Asset public module; index + cache + importers + pipeline
 ├── assets/
 │   ├── cache.zig         # Content-addressed derived-data cache + GC   [implemented]
@@ -202,7 +203,7 @@ extensions. The world depends only on `entity.zig` and `pool.zig`; the scheduler
 depends only on the world and `std.Io`; `frame.zig` additionally reuses the
 diagnostics `Timer` (low coupling). Scenes and scripting build on these layers.
 
-### Sistema de cenas — implemented (format v1 + ECS load/save), planned (extensions)
+### Sistema de cenas — implemented (format v1 + ECS load/save + prefabs), planned (streaming)
 Scenes are versioned JSON documents (`docs/scene-format.md`) backed by the ECS.
 `scene.Scene(schema)` owns a typed ECS world, stable monotonic entity IDs and a
 parent hierarchy. It supports strict parse/serialize, file load/save,
@@ -224,8 +225,17 @@ entity by walking its parent chain. Matrices are column-major `Mat4` (`M = T*R*S
 `world_child = world_parent * local_child`); entities without a `Transform` use
 the identity local transform. Snapshots are generation-safe (a recycled slot's
 new handle cannot read the previous entity's matrix). The `.scene` format is
-unchanged — only local TRS values are serialized. Prefabs, scene streaming,
-change tracking and multi-scene management remain planned extensions.
+unchanged — only local TRS values are serialized.
+
+**Prefabs** are implemented (`src/scene/prefab.zig`, `docs/scene-prefabs.md`):
+a `.prefab` is a strict single-root scene document; `Prefab(schemas)` supports
+parse/load/save, capture from a live scene subtree (`fromScene`), and
+instantiation into any same-schema scene (`instantiate`). `Scene.cloneSubtree`
+clones entities/components by value, remaps stable IDs and parent links
+deterministically (ascending source-ID order), and rolls back created entities
+on error. Prefabs are classified as `AssetKind.prefab` and imported/cached by the
+engine registry (`prefab` importer v1). Scene streaming, change tracking and
+multi-scene management remain planned extensions.
 
 ### Sistema de assets — implemented (indexing + import/cache + texture/mesh decoders), planned (more decoders)
 `core.assets.indexDirectories` builds a kind/size index at startup (unchanged).
@@ -316,7 +326,7 @@ The startup spine, the ECS (generational entities, sparse-set component pools,
 type-safe world, multi-component views, comptime system scheduling over the job
 system, automatic dependency graphs, cooperative frame budgets and system
 profiling), the scene system (versioned JSON scenes, stable IDs, hierarchy, ECS
-load/save, world-space transforms), the asset import pipeline + content-addressed
+load/save, world-space transforms, reusable single-root prefabs), the asset import pipeline + content-addressed
 cache (raw/text/json/scene importers, BMP/TGA/QOI texture decoders, OBJ mesh
 importer, atomic verified storage, parallel import over the job system,
 mark-and-sweep GC) and the backend-independent render extraction layer (camera,
