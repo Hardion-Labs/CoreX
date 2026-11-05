@@ -197,10 +197,11 @@ declared yet.
   passthrough, mono→stereo duplication, stereo→mono and N→mono averaging;
   surround→stereo is rejected rather than guessed). `toPcm16` converts a mix for
   a device and round-trips every i16 value exactly. The mixing core is
-  monomorphized per (channel map, resampling) pair, with an interpolation-free
-  fast path at unit step. Consumes `CXAW` artifacts without importing the asset
-  layer, so both stay independently testable. No device backend, 3D audio,
-  effects, voice stealing or streaming yet (planned).
+  monomorphized per (channel map, resampling mode) pair, with an
+  interpolation-free fast path at unit step. Consumes `CXAW` artifacts without
+  importing the asset layer, so both stay independently testable. No device
+  backend, effects or streaming yet (planned); spatialization, voice stealing and
+  band-limited resampling were added on top (below).
 - Spatial audio and the scene audio bridge (`src/audio/spatial.zig`,
   `src/audio/system.zig`, re-exported as `corex.audio.spatial` /
   `corex.audio.system` with `Listener`/`Attenuation`/`Doppler`/`SpatialParams`/
@@ -219,8 +220,35 @@ declared yet.
   whose entity or component disappeared. It never writes to the scene, reports
   finished one-shots exactly once without restarting them, and reports pool
   exhaustion as `unplayed` instead of hiding it. The system borrows the mixer and
-  stops the voices it started on `deinit`. No HRTF, occlusion, reverb, voice
-  stealing or automatic velocity derivation yet (planned).
+  stops the voices it started on `deinit`. No HRTF, occlusion, reverb or
+  automatic velocity derivation yet (planned).
+- Voice stealing with priorities (`src/audio/mixer.zig`,
+  `StealPolicy`/`Termination`, `docs/audio-mixer.md`): an opt-in
+  `Config.steal_policy = .lowest_priority` recycles the least important voice
+  when the pool is full instead of failing. `PlayOptions.priority` (0..255,
+  default 128) ranks voices, ties break by oldest start, a voice of *higher*
+  priority is never taken, and `PlayOptions.allow_steal = false` opts a request
+  out. `terminationOf(handle)` reports `.stopped`/`.finished`/`.stolen` and keeps
+  working after the slot is reused, because the reason is recorded per generation
+  rather than per slot; `stolenCount()` totals the steals. The default `.none`
+  preserves the previous hard-limit behaviour bit for bit. `AudioSource.priority`
+  forwards the ranking through the scene bridge, a stolen source is reported once
+  in `Stats.stolen`, and it is retried **without stealing** after the stop sweep
+  — resuming from the last observed cursor — so two sources can never ping-pong
+  and resuming does not depend on ECS iteration order.
+- Band-limited resampling (`src/audio/resample.zig`, re-exported as
+  `corex.audio.resample` with `Quality`/`Sinc`/`Kernel`, `docs/audio-mixer.md`):
+  an opt-in `Config.resample = .sinc` replaces linear interpolation with a
+  32-tap Blackman-windowed sinc whose cutoff follows the decimation ratio, so it
+  low-passes **before** decimating instead of aliasing. The prototype is built
+  once in `init` as a flat table plus a contiguous polyphase bank (~33 KiB);
+  `render` stays allocation-free. Unity DC gain at every ratio and phase, support
+  capped at 256 source samples, edge clamp/loop wrap, SIMD interior loops,
+  contiguous bank rows at unity cutoff, and kernel reuse when the fractional
+  cursor repeats (which makes integer ratios cheap). Measured on 64 looping
+  stereo voices: 12× real time upsampling, 26× at 2:1, 4× for non-integer
+  decimation, versus 175–222× for `.linear` — the quality/cost trade-off is
+  documented, and `.linear` remains the default so existing output is unchanged.
 - Shared display-name validation (`src/core/validation.zig`) used by both the
   `.corex` manifest and scene documents.
 - Native Module ABI contract for C++ (`docs/native-module-api.md`,
@@ -231,7 +259,8 @@ declared yet.
   automatic dependency graphs, observers, frame budgets and profiling), scenes,
   asset import/cache, world-space transforms, texture decoders, cache GC, render
   extraction, OBJ mesh import, scene prefabs, DEFLATE/zlib, PNG, asset change
-  detection, WAV audio import, audio mixing and spatial audio (416 tests),
+  detection, WAV audio import, audio mixing, spatial audio, voice stealing and
+  band-limited resampling (440 tests),
   including allocation-failure
   probes, cache corruption/truncation probes, a deep-hierarchy stress test, QOI
   encode/decode roundtrips, end-to-end texture-import-and-cache, OBJ-import-and-

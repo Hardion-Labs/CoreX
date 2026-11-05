@@ -24,6 +24,15 @@
 //!   caller toggles `playing` off and on to replay. This keeps one-shots from
 //!   accidentally becoming loops and keeps scene documents byte-stable.
 //! - Setting `playing` false stops the voice and forgets the source.
+//!
+//! Voice pressure: when the mixer is configured with a steal policy,
+//! `AudioSource.priority` decides who keeps a slot. A source whose voice was
+//! stolen is reported once in `Stats.stolen` and then **retried without
+//! stealing** on every later update, so it resumes as soon as a slot is genuinely
+//! free instead of ping-ponging with the voice that took its place. Retries run
+//! after the stop sweep, so a slot freed in the same update is used immediately
+//! regardless of ECS iteration order, and they resume from the last cursor the
+//! system observed rather than restarting the clip.
 
 const std = @import("std");
 const spatial = @import("spatial.zig");
@@ -60,6 +69,9 @@ pub const AudioSource = struct {
     looping: bool = false,
     /// Transport request: true starts the voice, false stops it.
     playing: bool = false,
+    /// Importance for the mixer's voice stealing (0 least, 255 most). Only used
+    /// when the mixer was configured with a steal policy.
+    priority: u8 = 128,
     /// 0 = 2D (unity gain, center pan), 1 = fully spatialized.
     spatial_blend: f32 = 1.0,
     attenuation: Attenuation = .{},
@@ -125,6 +137,9 @@ pub const Stats = struct {
     stopped: usize = 0,
     /// Voices that reached their end since the previous update.
     finished: usize = 0,
+    /// Voices whose slot was taken by a higher-or-equal-priority source since
+    /// the previous update. They are retried without stealing on later updates.
+    stolen: usize = 0,
     /// Sources not started because their spatialized gain was zero.
     culled: usize = 0,
     /// Sources that could not start because the voice pool was full.
@@ -133,14 +148,29 @@ pub const Stats = struct {
     invalid: usize = 0,
 };
 
+/// What a tracked source is waiting for.
+const Status = enum {
+    /// The voice is live (or was, until the mixer released it).
+    live,
+    /// The clip reached its end: a tombstone, so a one-shot is not restarted
+    /// while `playing` remains true.
+    finished,
+    /// The slot was stolen: retried **without stealing** on later updates, so
+    /// the source resumes when a slot frees instead of ping-ponging with the
+    /// voice that took it.
+    stolen,
+};
+
 const Entry = struct {
+    entity: Entity,
     voice: VoiceHandle,
     clip: u32,
     /// Update tick that last saw this source; drives the stale-entry sweep.
     seen: u64,
-    /// The voice reached its end; kept as a tombstone so a one-shot is not
-    /// restarted while `playing` remains true.
-    finished: bool,
+    status: Status,
+    /// Last observed cursor, so a stolen voice resumes near where it was
+    /// interrupted instead of restarting the clip from frame 0.
+    resume_frame: u32 = 0,
 };
 
 pub const AudioSystem = struct {
@@ -241,21 +271,29 @@ pub const AudioSystem = struct {
             if (self.voices.getPtr(key)) |entry| {
                 entry.seen = self.tick;
                 if (!self.mixer.isLive(entry.voice)) {
-                    if (!entry.finished) {
-                        entry.finished = true;
-                        stats.finished += 1;
+                    if (entry.status == .live) {
+                        const reason = self.mixer.terminationOf(entry.voice) orelse .finished;
+                        if (reason == .stolen) {
+                            entry.status = .stolen;
+                            stats.stolen += 1;
+                        } else {
+                            entry.status = .finished;
+                            stats.finished += 1;
+                        }
                     }
+                    // Stolen sources are retried after the sweep, so a slot
+                    // freed later in this same update is still used.
                     continue;
                 }
                 if (entry.clip != source.clip) {
                     // Clip changed: restart on the new clip, keeping the source.
                     self.mixer.stop(entry.voice);
-                    const handle = self.startVoice(clips[source.clip], source, gain, result.pan, pitch) catch |err| {
+                    const handle = self.startVoice(clips[source.clip], source, gain, result.pan, pitch, true, 0) catch |err| {
                         _ = self.voices.remove(key);
                         countStartFailure(&stats, err);
                         continue;
                     };
-                    entry.* = .{ .voice = handle, .clip = source.clip, .seen = self.tick, .finished = false };
+                    entry.* = .{ .entity = entity, .voice = handle, .clip = source.clip, .seen = self.tick, .status = .live };
                     stats.started += 1;
                     continue;
                 }
@@ -276,6 +314,9 @@ pub const AudioSystem = struct {
                     stats.invalid += 1;
                     continue;
                 };
+                if (self.mixer.positionFrames(entry.voice)) |pos| {
+                    entry.resume_frame = @intFromFloat(@max(0, @floor(pos)));
+                }
                 stats.updated += 1;
                 continue;
             }
@@ -284,16 +325,17 @@ pub const AudioSystem = struct {
                 stats.culled += 1;
                 continue;
             }
-            const handle = self.startVoice(clips[source.clip], source, gain, result.pan, pitch) catch |err| {
+            const handle = self.startVoice(clips[source.clip], source, gain, result.pan, pitch, true, 0) catch |err| {
                 countStartFailure(&stats, err);
                 continue;
             };
             // If the map cannot grow, do not leak the voice we just started.
             self.voices.put(self.gpa, key, .{
+                .entity = entity,
                 .voice = handle,
                 .clip = source.clip,
                 .seen = self.tick,
-                .finished = false,
+                .status = .live,
             }) catch {
                 self.mixer.stop(handle);
                 return error.OutOfMemory;
@@ -311,16 +353,66 @@ pub const AudioSystem = struct {
             self.voices.removeByPtr(kv.key_ptr);
             stats.stopped += 1;
         }
+
+        // Retry stolen sources **after** the sweep and after every transport-off
+        // stop, so resuming does not depend on the ECS iteration order. Retries
+        // never steal (`allow_steal = false`), which is what prevents two
+        // equal-priority sources from stealing each other forever.
+        var retry = self.voices.valueIterator();
+        while (retry.next()) |entry| {
+            if (entry.status != .stolen) continue;
+            const source = scene.getComponent(AudioSource, entry.entity) orelse continue;
+            if (!source.playing or !source.isValid() or source.clip >= clips.len) continue;
+            const world = wt.get(entry.entity) orelse transform.identity();
+            const position: Vec3 = .{ world[12], world[13], world[14] };
+            const result = spatial.spatialize(listener, position, source.velocity, source.spatialParams(self.config));
+            const gain = source.gain * result.gain;
+            if (self.config.cull_silent and gain == 0) {
+                stats.culled += 1;
+                continue;
+            }
+            // Resume where the voice was interrupted, unless the clip handle
+            // changed while it was stolen -- then the old cursor is meaningless.
+            const resume_frame: u32 = if (entry.clip == source.clip)
+                @min(entry.resume_frame, clips[source.clip].frames -| 1)
+            else
+                0;
+            const handle = self.startVoice(clips[source.clip], source.*, gain, result.pan, source.pitch * result.pitch, false, resume_frame) catch |err| {
+                countStartFailure(&stats, err);
+                continue;
+            };
+            entry.* = .{
+                .entity = entry.entity,
+                .voice = handle,
+                .clip = source.clip,
+                .seen = self.tick,
+                .status = .live,
+                .resume_frame = resume_frame,
+            };
+            stats.started += 1;
+        }
         return stats;
     }
 
-    fn startVoice(self: *AudioSystem, clip: Clip, source: AudioSource, gain: f32, pan: f32, pitch: f32) mixer_mod.PlayError!VoiceHandle {
+    fn startVoice(
+        self: *AudioSystem,
+        clip: Clip,
+        source: AudioSource,
+        gain: f32,
+        pan: f32,
+        pitch: f32,
+        allow_steal: bool,
+        start_frame: u32,
+    ) mixer_mod.PlayError!VoiceHandle {
         return self.mixer.play(clip, .{
             .gain = gain,
             .pan = pan,
             .pitch = pitch,
             .looping = source.looping,
             .bus = source.bus,
+            .priority = source.priority,
+            .allow_steal = allow_steal,
+            .start_frame = start_frame,
         });
     }
 };
@@ -783,6 +875,7 @@ test "audio system: AudioSource serializes and parses as a scene component" {
         .pitch = 1.25,
         .looping = true,
         .playing = true,
+        .priority = 240,
         .spatial_blend = 0.75,
         .attenuation = .{ .model = .exponential, .min_distance = 2, .max_distance = 50, .rolloff = 1.5 },
         .doppler_factor = 0.5,
@@ -802,6 +895,7 @@ test "audio system: AudioSource serializes and parses as a scene component" {
     try testing.expectEqual(@as(f32, 0.5), src.gain);
     try testing.expectEqual(@as(f32, 1.25), src.pitch);
     try testing.expect(src.looping and src.playing);
+    try testing.expectEqual(@as(u8, 240), src.priority);
     try testing.expectEqual(@as(f32, 0.75), src.spatial_blend);
     try testing.expectEqual(Attenuation.Model.exponential, src.attenuation.model);
     try testing.expectEqual(@as(f32, 2), src.attenuation.min_distance);
@@ -868,4 +962,102 @@ test "audio system: two identical scenes produce identical audio" {
         _ = try mixer.render(&buffers[index]);
     }
     try testing.expectEqualSlices(f32, &buffers[0], &buffers[1]);
+}
+
+test "audio system: priorities drive stealing and a stolen source resumes into a free slot" {
+    const gpa = testing.allocator;
+    var mixer = try Mixer.init(gpa, .{
+        .channels = 2,
+        .sample_rate = 48000,
+        .max_voices = 2,
+        .pan_law = .linear,
+        .steal_policy = .lowest_priority,
+    });
+    defer mixer.deinit();
+    var scene = try TestScene.init(gpa, "audio");
+    defer scene.deinit();
+    var system = try AudioSystem.init(gpa, &mixer, .{});
+    defer system.deinit();
+
+    const ambience = try scene.createEntity("ambience", null);
+    try scene.addComponent(ambience, AudioSource{ .playing = true, .looping = true, .priority = 10, .spatial_blend = 0 });
+    const music = try scene.createEntity("music", null);
+    try scene.addComponent(music, AudioSource{ .playing = true, .looping = true, .priority = 200, .spatial_blend = 0 });
+    _ = try system.update(&scene, Listener{}, &test_clips);
+    const ambience_voice = system.voiceFor(ambience).?;
+    const music_voice = system.voiceFor(music).?;
+
+    // A gunshot outranks the ambience and takes its slot.
+    const shot = try scene.createEntity("shot", null);
+    try scene.addComponent(shot, AudioSource{ .playing = true, .looping = true, .priority = 250, .spatial_blend = 0 });
+    const steal_update = try system.update(&scene, Listener{}, &test_clips);
+    try testing.expectEqual(@as(usize, 1), steal_update.started);
+    try testing.expect(!mixer.isLive(ambience_voice));
+    try testing.expect(mixer.isLive(music_voice));
+    try testing.expectEqual(@as(u64, 1), mixer.stolenCount());
+
+    // The next update attributes the steal to the right entity and cannot
+    // resume it: every live voice outranks it, and retries never steal.
+    const after = try system.update(&scene, Listener{}, &test_clips);
+    try testing.expectEqual(@as(usize, 1), after.stolen);
+    try testing.expectEqual(@as(usize, 0), after.finished);
+    try testing.expectEqual(@as(usize, 1), after.unplayed);
+    try testing.expectEqual(@as(usize, 0), after.started);
+    try testing.expectEqual(@as(u64, 1), mixer.stolenCount());
+
+    // Freeing the music slot lets the ambience resume on its own.
+    scene.getComponent(AudioSource, music).?.playing = false;
+    const resumed = try system.update(&scene, Listener{}, &test_clips);
+    try testing.expectEqual(@as(usize, 1), resumed.stopped);
+    try testing.expectEqual(@as(usize, 1), resumed.started);
+    try testing.expectEqual(@as(usize, 0), resumed.unplayed);
+    try testing.expect(mixer.isLive(system.voiceFor(ambience).?));
+    try testing.expect(!system.voiceFor(ambience).?.eql(ambience_voice));
+
+    // The steal is reported once, not on every later update.
+    var out: [8]f32 = undefined;
+    _ = try mixer.render(&out);
+    const quiet = try system.update(&scene, Listener{}, &test_clips);
+    try testing.expectEqual(@as(usize, 0), quiet.stolen);
+    try testing.expectEqual(@as(usize, 2), quiet.updated);
+}
+
+test "audio system: a stolen source resumes near where it was interrupted" {
+    const gpa = testing.allocator;
+    var samples: [256]f32 = @splat(0.25);
+    const clips = [_]Clip{.{ .sample_rate = 48000, .channels = 1, .frames = samples.len, .samples = &samples }};
+
+    var mixer = try Mixer.init(gpa, .{
+        .channels = 1,
+        .sample_rate = 48000,
+        .max_voices = 1,
+        .steal_policy = .lowest_priority,
+    });
+    defer mixer.deinit();
+    var scene = try TestScene.init(gpa, "audio");
+    defer scene.deinit();
+    var system = try AudioSystem.init(gpa, &mixer, .{});
+    defer system.deinit();
+
+    const ambience = try scene.createEntity("ambience", null);
+    try scene.addComponent(ambience, AudioSource{ .playing = true, .looping = true, .priority = 10, .spatial_blend = 0 });
+    _ = try system.update(&scene, Listener{}, &clips);
+
+    // Advance the cursor, then let an update observe it.
+    var out: [40]f32 = undefined;
+    _ = try mixer.render(&out);
+    _ = try system.update(&scene, Listener{}, &clips);
+
+    const shot = try scene.createEntity("shot", null);
+    try scene.addComponent(shot, AudioSource{ .playing = true, .looping = true, .priority = 200, .spatial_blend = 0 });
+    _ = try system.update(&scene, Listener{}, &clips);
+    try testing.expectEqual(@as(u64, 1), mixer.stolenCount());
+
+    // Freeing the slot resumes the ambience at the remembered cursor, not at 0.
+    scene.getComponent(AudioSource, shot).?.playing = false;
+    const resumed = try system.update(&scene, Listener{}, &clips);
+    try testing.expectEqual(@as(usize, 1), resumed.stolen);
+    try testing.expectEqual(@as(usize, 1), resumed.started);
+    const pos = mixer.positionFrames(system.voiceFor(ambience).?).?;
+    try testing.expectApproxEqAbs(@as(f64, 40), pos, 1e-6);
 }
