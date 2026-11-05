@@ -33,6 +33,10 @@ Thumbs.db
 *.swp
 *.swo
 
+# Python bytecode from the test-vector generators
+__pycache__/
+*.pyc
+
 # Local environment and temporary files
 .env
 .env.*
