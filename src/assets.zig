@@ -41,6 +41,8 @@ pub const pipeline = @import("assets/pipeline.zig");
 pub const image = @import("assets/image.zig");
 /// Engine-ready `CXTX` texture artifact and texture importers.
 pub const texture = @import("assets/texture.zig");
+/// Engine-ready `CXMH` mesh artifact and the OBJ mesh importer.
+pub const mesh = @import("assets/mesh.zig");
 
 const scene_mod = @import("scene.zig");
 
@@ -59,6 +61,8 @@ pub const Options = pipeline.Options;
 pub const Status = pipeline.Status;
 pub const Image = image.Image;
 pub const Texture = texture.Texture;
+pub const Mesh = mesh.Mesh;
+pub const MeshView = mesh.MeshView;
 
 /// Scene importer: validate a `.scene` document with the scene system and
 /// re-serialize it canonically (deterministic, sorted by stable ID). Invalid
@@ -77,13 +81,14 @@ pub fn importScene(gpa: std.mem.Allocator, source: []const u8) ImportError![]u8 
 
 pub const scene_importer = Importer{ .id = "scene", .version = 1, .importFn = importScene };
 
-const engine_bindings = texture.bindings ++ [_]Registry.Binding{
+const engine_bindings = texture.bindings ++ mesh.bindings ++ [_]Registry.Binding{
     .{ .extensions = &[_][]const u8{ ".scene", ".corexscene" }, .importer = scene_importer },
 } ++ importer.builtin_bindings;
 
-/// The engine's default import registry: texture (BMP/TGA/QOI) + scene + JSON +
-/// text importers, with `raw` as the fallback for binary/unknown extensions
-/// (e.g. PNG/JPEG/audio/model, which have no decoder yet).
+/// The engine's default import registry: texture (BMP/TGA/QOI) + mesh (OBJ) +
+/// scene + JSON + text importers, with `raw` as the fallback for binary/unknown
+/// extensions (e.g. PNG/JPEG/audio and other model formats, which have no
+/// decoder yet).
 pub fn engineRegistry() Registry {
     return .{ .bindings = &engine_bindings, .fallback = importer.raw_importer };
 }
@@ -96,6 +101,7 @@ test {
     _ = pipeline;
     _ = image;
     _ = texture;
+    _ = mesh;
 }
 
 test "scene importer canonicalizes a valid scene" {
@@ -125,11 +131,14 @@ test "engine registry selects importers by extension" {
     try std.testing.expectEqualStrings("bmp", reg.select(".bmp").id);
     try std.testing.expectEqualStrings("tga", reg.select(".TGA").id);
     try std.testing.expectEqualStrings("qoi", reg.select(".qoi").id);
+    try std.testing.expectEqualStrings("obj", reg.select(".obj").id);
+    try std.testing.expectEqualStrings("obj", reg.select(".OBJ").id);
     try std.testing.expectEqualStrings("json", reg.select(".json").id);
     try std.testing.expectEqualStrings("text", reg.select(".lua").id);
     // Formats without a decoder yet still fall back to a verbatim raw copy.
     try std.testing.expectEqualStrings("raw", reg.select(".png").id);
     try std.testing.expectEqualStrings("raw", reg.select(".wav").id);
+    try std.testing.expectEqualStrings("raw", reg.select(".gltf").id);
 }
 
 test "pipeline imports a texture to a CXTX artifact and caches it" {
@@ -181,6 +190,68 @@ test "pipeline imports a texture to a CXTX artifact and caches it" {
     try std.testing.expectEqual(@as(u32, 2), tex.width);
     try std.testing.expectEqual(@as(u32, 2), tex.height);
     try std.testing.expectEqualSlices(u8, &pixels, tex.pixels);
+
+    // A second run is a cache hit (no re-import).
+    var report2 = try pipeline.runSequential(std.testing.allocator, io, root, idx, &store, .{
+        .registry = engineRegistry(),
+    });
+    defer report2.deinit();
+    try std.testing.expectEqual(@as(usize, 0), report2.imported);
+    try std.testing.expectEqual(@as(usize, 1), report2.cached);
+}
+
+test "pipeline imports an OBJ mesh to a CXMH artifact and caches it" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.createDirPath(io, "assets");
+    try tmp.dir.createDirPath(io, "cache");
+
+    const obj_src =
+        \\v 0 0 0
+        \\v 1 0 0
+        \\v 0 1 0
+        \\vn 0 0 1
+        \\vt 0 0
+        \\vt 1 0
+        \\vt 0 1
+        \\f 1/1/1 2/2/1 3/3/1
+    ;
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/tri.obj", .data = obj_src });
+
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buf);
+    const root_path = buf[0..n];
+
+    var idx = try indexDirectories(std.testing.allocator, io, root_path, &.{"assets"});
+    defer idx.deinit();
+    var root = try Io.Dir.openDirAbsolute(io, root_path, .{});
+    defer root.close(io);
+    var cache_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const cache_path = try std.fmt.bufPrint(&cache_buf, "{s}/cache", .{root_path});
+    var store = try Cache.open(io, cache_path);
+    defer store.deinit();
+
+    var report = try pipeline.runSequential(std.testing.allocator, io, root, idx, &store, .{
+        .registry = engineRegistry(),
+    });
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 1), report.imported);
+    try std.testing.expectEqualStrings("obj", report.entries[0].importer_id.?);
+    try std.testing.expectEqual(AssetKind.model, report.entries[0].kind);
+
+    // Read the cached artifact back and verify it is a valid CXMH mesh whose
+    // geometry matches the source triangle exactly.
+    const key = report.entries[0].key.?;
+    const artifact = (try store.get(std.testing.allocator, key)).?;
+    defer std.testing.allocator.free(artifact);
+    const view = try mesh.parse(artifact);
+    try std.testing.expectEqual(@as(u32, 3), view.vertex_count);
+    try std.testing.expectEqual(@as(u32, 3), view.index_count);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 0, 0 }, &view.bounds_min);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 1, 0 }, &view.bounds_max);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 0, 0 }, &view.vertexAt(1).position);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2 }, &.{ view.indexAt(0), view.indexAt(1), view.indexAt(2) });
 
     // A second run is a cache hit (no re-import).
     var report2 = try pipeline.runSequential(std.testing.allocator, io, root, idx, &store, .{
