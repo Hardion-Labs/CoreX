@@ -272,8 +272,38 @@ declared yet.
   metering, and isolated buses keep ringing their tails after the last voice
   finishes. Measured on 64 looping stereo voices: reserving slots costs ~1%,
   one bus biquad +11%, all eight buses +77%, a master compressor +37% — still
-  111-193x real time. No reverb/delay/convolution, lookahead limiting,
-  oversampled saturation, side-chain or per-voice inserts yet (planned).
+  111-193x real time. Delay and reverb were added on top (below); convolution,
+  lookahead limiting, oversampled saturation, side-chain and per-voice inserts
+  remain planned.
+- Delay-based insert effects (`src/audio/effects.zig`: `Delay`/`DelayParams`,
+  `Reverb`/`ReverbParams`, `Effect.delay`/`Effect.reverb`,
+  `docs/audio-effects.md`): a feedback delay with an optional one-pole low pass
+  in the feedback path, and a Freeverb-style reverb — eight parallel damped comb
+  filters into four series diffusion sections per channel, with a 23-sample stereo
+  spread so the tails decorrelate. The diffusion sections use Freeverb's form
+  (`H(z) = (z^-N - 1)/(1 - g*z^-N)`), whose DC null is deliberate: the combs have a
+  DC gain above 13x at maximum room size, and a flat-magnitude all pass would let
+  an impulse build a slow low-frequency rumble. Both the null and the bounded
+  shelving response are tested. Comb/diffusion lengths are the classic 44.1 kHz
+  tunings scaled to the running rate; comb feedback is capped at 0.98, which keeps
+  the network bounded even with damping disabled (asserted over a one-second
+  impulse response). Delay lines **flush on write**, so a long tail becomes exact
+  zeros instead of crawling through the denormal range for seconds.
+  The memory is **borrowed from the caller**, exactly like clip samples:
+  `requiredSamples` reports the size (108 KiB for a stereo reverb at 48 kHz),
+  `init` carves the lines out of the buffer, and the effect keeps a slice. The
+  mixer therefore allocates **nothing** for a reverb and `render` stays
+  allocation-free. `Effect.Kind` holds `*Delay`/`*Reverb` rather than inlining
+  752 bytes of line state into every insert slot, so `Effect` stays 48 bytes
+  instead of growing every slot on every bus.
+  New insert-time checks reject a layout mismatch, the same instance in two
+  slots, and buffers that overlap even partially — all silent-corruption cases
+  rather than crashes; replacing the holding slot is allowed and clearing a bus
+  releases the claim. Measured on 64 looping stereo voices at unity rate:
+  a 120 ms delay on one of eight buses +15%, on all eight +79%, a master reverb
+  +66%, and a full chain of eight delays + eight high passes + master reverb +
+  compressor still runs at 103x real time. No chorus/flanger, fractional delay
+  taps, convolution or reverb presets yet (planned).
 - Shared display-name validation (`src/core/validation.zig`) used by both the
   `.corex` manifest and scene documents.
 - Native Module ABI contract for C++ (`docs/native-module-api.md`,
@@ -285,7 +315,7 @@ declared yet.
   asset import/cache, world-space transforms, texture decoders, cache GC, render
   extraction, OBJ mesh import, scene prefabs, DEFLATE/zlib, PNG, asset change
   detection, WAV audio import, audio mixing, spatial audio, voice stealing,
-  band-limited resampling and insert DSP (467 tests),
+  band-limited resampling and insert DSP including delay/reverb (483 tests),
   including allocation-failure
   probes, cache corruption/truncation probes, a deep-hierarchy stress test, QOI
   encode/decode roundtrips, end-to-end texture-import-and-cache, OBJ-import-and-
