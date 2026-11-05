@@ -85,8 +85,35 @@ declared yet.
   (magic + version + dimensions + pixel format + pixels). Registered in the
   engine import registry for `.bmp`/`.tga`/`.qoi`; `.qoi` added to the texture
   index classification. All reads are bounds-checked and allocations bounded;
-  malformed/truncated sources are rejected. PNG/JPEG/audio/model/font remain
+  malformed/truncated sources are rejected. JPEG/audio/model/font remain
   `raw` imports until dedicated decoders exist.
+- DEFLATE/zlib decompression (`src/assets/inflate.zig`, re-exported as
+  `corex.assets.inflate`, `docs/asset-decoders.md`): complete RFC 1951 inflate
+  (stored, fixed-Huffman and dynamic-Huffman blocks, multi-block streams,
+  overlapping length/distance copies) plus the RFC 1950 zlib wrapper with
+  Adler-32 verification. Canonical Huffman codes are decoded through a flat
+  lookup table (O(1) per symbol) rebuilt in place per block; the 64-bit bit
+  reader refills whole bytes. Output is bounded by the caller's
+  `max_output_bytes` in both length and capacity (`error.OutputTooLarge`), and
+  over-subscribed/incomplete code spaces, illegal symbols, reserved block types
+  and back-references before the start of output are rejected.
+- PNG decoder (`src/assets/png.zig`, re-exported as `corex.assets.png`) and a
+  `png` importer (v1) registered for `.png` in the engine registry, producing the
+  existing `CXTX` artifact: all non-interlaced color types (grayscale, truecolor,
+  indexed, grayscale+alpha, truecolor+alpha) at every legal bit depth
+  (1/2/4/8/16), all five row filters, `tRNS` palette alpha and grayscale/RGB color
+  keys (compared at source depth), multiple consecutive IDAT chunks (single
+  chunks inflated without copying), ancillary chunks skipped and unknown
+  critical chunks rejected, with every chunk CRC-32 and the zlib Adler-32
+  verified. 16-bit samples keep their high byte and sub-byte grayscale is bit
+  replicated, because `CXTX` is RGBA8; Adam7 interlacing is rejected, not
+  approximated. Scanline inflation is bounded by the size implied by `IHDR`, and
+  images whose RGBA8 output would exceed `max_pixel_bytes` are rejected before
+  inflating. Pixel conversion is specialized at comptime per (depth, channels).
+- Reproducible decoder test vectors (`tools/gen_png_vectors.py`,
+  `src/assets/png_vectors.zig`): 24 valid PNGs with reference RGBA8 output plus
+  20 malformed PNGs and four DEFLATE/zlib streams, all generated with Python's
+  zlib so the tests compare against an independent encoder.
 - Asset cache garbage collection (`Cache.gc`, `Report.liveKeys`,
   `corex.assets.GcStats`): mark-and-sweep that deletes entries whose key is not in
   a caller-supplied live set (typically the keys of a full pipeline run) and
@@ -128,12 +155,14 @@ declared yet.
 - Test suite covering the startup spine, ECS, scheduling (manual stages,
   automatic dependency graphs, observers, frame budgets and profiling), scenes,
   asset import/cache, world-space transforms, texture decoders, cache GC, render
-  extraction, OBJ mesh import and scene prefabs (300 tests), including allocation-failure
+  extraction, OBJ mesh import, scene prefabs, DEFLATE/zlib and PNG (324 tests), including allocation-failure
   probes, cache corruption/truncation probes, a deep-hierarchy stress test, QOI
   encode/decode roundtrips, end-to-end texture-import-and-cache, OBJ-import-and-
   cache and import-then-GC tests, camera/frustum/culling and draw-list extraction
   tests, OBJ decode/artifact roundtrip and malformed-input tests, prefab
-  capture/instantiate/rollback and prefab-import-and-cache tests, and job-system
+  capture/instantiate/rollback and prefab-import-and-cache tests, PNG/inflate
+  reference-vector and rejection suites (including a 200 KiB multi-block stream
+  and truncation probes), and job-system
   integration tests (including parallel graph/frame profiling over `JobSystem`
   workers), validated in Debug, ReleaseSafe and ReleaseFast.
 
@@ -147,11 +176,12 @@ declared yet.
   scene (including transform math as `corex.scene.transform` and prefabs as
   `corex.scene.Prefab`/`EnginePrefab`,
   `Mat4`/`Vec3`/`Quat`), asset (import/cache with GC, image decoders and the
-  `CXTX` texture artifact as `corex.assets.image`/`corex.assets.texture`, the OBJ
+  `CXTX` texture artifact as `corex.assets.image`/`corex.assets.texture`, PNG
+  decoding as `corex.assets.png` and DEFLATE/zlib as `corex.assets.inflate`, the OBJ
   mesh importer and `CXMH` artifact as `corex.assets.mesh`,
   `Image`/`Texture`/`Mesh`/`MeshView`/`GcStats`) and render (backend-independent
   extraction as `corex.render`) subsystems.
-- The engine import registry now decodes `.bmp`/`.tga`/`.qoi` textures to `CXTX`
+- The engine import registry now decodes `.png`/`.bmp`/`.tga`/`.qoi` textures to `CXTX`
   and `.obj` meshes to `CXMH` artifacts instead of copying them verbatim; the cache
   key includes the importer identity/version, so this does not collide with
   previously cached `raw` entries.
