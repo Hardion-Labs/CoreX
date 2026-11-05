@@ -24,8 +24,10 @@ control, and maintainable code.
 > compatibility, jobs, configuration, asset indexing, splash contract,
 > diagnostics, and the project-open pipeline), the ECS (generational entities,
 > sparse-set component pools, type-safe world, multi-component views and comptime
-> system scheduling over the job system) and the scene system (versioned JSON
-> scenes, stable entity IDs, hierarchy, ECS load/save) are implemented and
+> system scheduling over the job system), the scene system (versioned JSON
+> scenes, stable entity IDs, hierarchy, ECS load/save) and the asset import
+> pipeline + content-addressed cache (raw/text/json/scene importers, atomic
+> verified storage, parallel import over the job system) are implemented and
 > tested. The larger subsystems (renderers, GUI, editor, Lua, export, native
 > modules) are in scope and either contract-defined or planned. See
 > [`docs/architecture.md`](docs/architecture.md) for the per-subsystem status.
@@ -170,6 +172,39 @@ defer allocator.free(bytes);
 The file format, validation rules and limits are documented in
 [`docs/scene-format.md`](docs/scene-format.md).
 
+## Assets
+
+The asset subsystem (`corex.assets`) indexes source assets and imports them into
+a content-addressed cache. The cache key derives from the source content hash +
+importer identity/version + options, so imports are incremental and reproducible:
+unchanged sources are reused, and bumping an importer version invalidates its
+entries. Writes are atomic and reads verify the payload hash (corrupt entries
+self-heal). Built-in importers cover raw binary, text (UTF-8 + line-ending
+normalization), JSON (strict validation + lossless minification) and scenes
+(validated and canonicalized via the scene system).
+
+```zig
+const corex = @import("corex");
+const A = corex.assets;
+
+var idx = try A.indexDirectories(gpa, io, project_root, &.{"assets"});
+defer idx.deinit();
+var cache = try A.Cache.open(io, cache_dir);
+defer cache.deinit();
+var root = try std.Io.Dir.openDirAbsolute(io, project_root, .{});
+defer root.close(io);
+
+var report = try A.pipeline.run(gpa, io, root, idx, &cache, .{
+    .registry = A.engineRegistry(),
+});
+defer report.deinit();
+// report.imported / report.cached / report.failed / report.total_output_bytes
+```
+
+`pipeline.run` imports concurrently over the job system; `runSequential` is a
+single-threaded fallback. The cache format, importer contract and limits are
+documented in [`docs/asset-import.md`](docs/asset-import.md).
+
 ## Project Structure
 
 ```text
@@ -179,6 +214,7 @@ CoreX/
 │   ├── scope.md                # Definitive project scope (Engine vs Hub)
 │   ├── architecture.md         # Subsystem map and implementation status
 │   ├── ecs-scheduling.md       # ECS system scheduling guide
+│   ├── asset-import.md         # Asset import pipeline + cache
 │   ├── launch-contract.md      # Stable startup contract (CLI, exit codes)
 │   ├── project-format.md       # .corex manifest format
 │   ├── scene-format.md         # Versioned .scene format
@@ -195,7 +231,9 @@ CoreX/
 │   ├── ecs.zig                 # ECS public module
 │   ├── ecs/                    # Entities, pools, world/views, scheduling
 │   ├── scene.zig               # Scene public module (EngineScene)
-│   └── scene/                  # Scene components + versioned documents
+│   ├── scene/                  # Scene components + versioned documents
+│   ├── assets.zig              # Asset public module (index + import + cache)
+│   └── assets/                 # Import cache, importers, parallel pipeline
 ├── build.zig                   # Build configuration
 └── CHANGELOG.md, CONTRIBUTING.md, LICENSE, README.md, ...
 ```
@@ -215,7 +253,8 @@ Indicative; subject to change as technical decisions are validated.
 - [ ] ECS scheduling extensions: dependency graph, frame budget, profiling.
 - [x] Scene system and versioned scene serialization (format v1, ECS load/save).
 - [ ] Scene extensions: prefabs, streaming, world-space transforms.
-- [ ] Asset import pipeline and cache.
+- [x] Asset import pipeline and content-addressed cache (raw/text/json/scene).
+- [ ] Asset decoders (texture/audio/model), cache GC, hot-reload, startup integration.
 - [ ] Renderer Low / Medium; Advanced contract.
 - [ ] GUI library and graphical editor.
 - [ ] Lua VM and gameplay scripting.
