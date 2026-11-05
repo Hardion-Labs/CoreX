@@ -19,6 +19,7 @@ pub const AssetKind = enum {
     model,
     script,
     scene,
+    prefab,
     shader,
     font,
     data,
@@ -32,6 +33,7 @@ pub const AssetKind = enum {
             .{ AssetKind.model, &[_][]const u8{ ".gltf", ".glb", ".obj", ".fbx", ".dae" } },
             .{ AssetKind.script, &[_][]const u8{".lua"} },
             .{ AssetKind.scene, &[_][]const u8{ ".scene", ".corexscene" } },
+            .{ AssetKind.prefab, &[_][]const u8{ ".prefab", ".corexprefab" } },
             .{ AssetKind.shader, &[_][]const u8{ ".glsl", ".vert", ".frag", ".hlsl", ".wgsl", ".comp", ".shader" } },
             .{ AssetKind.font, &[_][]const u8{ ".ttf", ".otf", ".woff", ".woff2" } },
             .{ AssetKind.data, &[_][]const u8{ ".json", ".xml", ".csv", ".txt", ".bin", ".dat" } },
@@ -153,6 +155,8 @@ test "AssetKind.fromExtension classifies common types" {
     try std.testing.expectEqual(AssetKind.audio, AssetKind.fromExtension(".ogg"));
     try std.testing.expectEqual(AssetKind.script, AssetKind.fromExtension(".lua"));
     try std.testing.expectEqual(AssetKind.scene, AssetKind.fromExtension(".scene"));
+    try std.testing.expectEqual(AssetKind.prefab, AssetKind.fromExtension(".prefab"));
+    try std.testing.expectEqual(AssetKind.prefab, AssetKind.fromExtension(".PREFAB"));
     try std.testing.expectEqual(AssetKind.model, AssetKind.fromExtension(".gltf"));
     try std.testing.expectEqual(AssetKind.unknown, AssetKind.fromExtension(".xyz"));
     try std.testing.expectEqual(AssetKind.unknown, AssetKind.fromExtension(""));

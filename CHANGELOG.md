@@ -51,11 +51,22 @@ declared yet.
   stable entity IDs, parent hierarchy with cycle rejection, plain-data component
   schemas, deterministic serialize/parse, file load/save, and ECS-backed startup
   scene loading. The default `EngineScene` schema ships a `Transform` component.
+- Scene prefabs (`src/scene/prefab.zig`, re-exported as `corex.scene.Prefab` /
+  `corex.scene.EnginePrefab`, `docs/scene-prefabs.md`): reusable single-root
+  `.prefab` documents (same strict `format_version = 1` shape as scenes),
+  parse/load/save, capture from a live scene subtree (`fromScene`), and
+  instantiation into any same-schema scene (`instantiate`). Backed by
+  `Scene.cloneSubtree`/`rootIds`: clones entities/components by value, remaps
+  stable IDs and parent links deterministically (ascending source-ID order),
+  iterative subtree collection for deep hierarchies, and rollback of created
+  entities on error. Added `AssetKind.prefab` and a `prefab` importer (v1) to the
+  engine registry, so prefabs are validated (single-root), canonicalized and
+  cached like other assets. Scene streaming remains planned.
 - Asset import pipeline and content-addressed cache (`src/assets/`, re-exported
   as `corex.assets`, `docs/asset-import.md`): incremental, reproducible imports
   keyed by source content hash + importer identity/version + options; atomic
   cache writes with hash-verified, self-healing reads; raw/text/json importers
-  plus a scene importer that reuses the scene system; concurrent import over
+  plus scene and prefab importers that reuse the scene system; concurrent import over
   `std.Io` / `JobSystem` with a `runSequential` fallback and a per-asset report.
   The startup asset index (`src/core/assets.zig`) is unchanged.
 - Scene world-space transform propagation (`src/scene/transform.zig`,
@@ -117,11 +128,12 @@ declared yet.
 - Test suite covering the startup spine, ECS, scheduling (manual stages,
   automatic dependency graphs, observers, frame budgets and profiling), scenes,
   asset import/cache, world-space transforms, texture decoders, cache GC, render
-  extraction and OBJ mesh import (290 tests), including allocation-failure
+  extraction, OBJ mesh import and scene prefabs (300 tests), including allocation-failure
   probes, cache corruption/truncation probes, a deep-hierarchy stress test, QOI
   encode/decode roundtrips, end-to-end texture-import-and-cache, OBJ-import-and-
   cache and import-then-GC tests, camera/frustum/culling and draw-list extraction
-  tests, OBJ decode/artifact roundtrip and malformed-input tests, and job-system
+  tests, OBJ decode/artifact roundtrip and malformed-input tests, prefab
+  capture/instantiate/rollback and prefab-import-and-cache tests, and job-system
   integration tests (including parallel graph/frame profiling over `JobSystem`
   workers), validated in Debug, ReleaseSafe and ReleaseFast.
 
@@ -132,7 +144,8 @@ declared yet.
   per-subsystem implementation status.
 - The public module `src/corex.zig` re-exports the implemented core, ECS
   (including scheduling, automatic dependency graphs and frame budgets/profiling),
-  scene (including transform math as `corex.scene.transform`,
+  scene (including transform math as `corex.scene.transform` and prefabs as
+  `corex.scene.Prefab`/`EnginePrefab`,
   `Mat4`/`Vec3`/`Quat`), asset (import/cache with GC, image decoders and the
   `CXTX` texture artifact as `corex.assets.image`/`corex.assets.texture`, the OBJ
   mesh importer and `CXMH` artifact as `corex.assets.mesh`,
