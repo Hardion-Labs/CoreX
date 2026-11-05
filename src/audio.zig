@@ -17,8 +17,8 @@
 //! testable and loosely coupled.
 //!
 //! Beside the mixer, `effects` is pure DSP (RBJ biquad filters, a stereo-linked
-//! compressor, a feedback delay and a Freeverb-style reverb) with no mixer
-//! dependency. The mixer owns the chains: `Config.effect_slots` reserves insert
+//! compressor, a feedback delay, a Freeverb-style reverb and a lookahead
+//! brickwall limiter) with no mixer dependency. The mixer owns the chains: `Config.effect_slots` reserves insert
 //! slots per bus plus a master chain, and `render` stays allocation-free — buses
 //! with an active chain are mixed into a preallocated submix, processed, then
 //! summed. With `effect_slots = 0` (the default) none of that exists and the
@@ -26,7 +26,8 @@
 //!
 //! The delay-based effects **borrow their memory from the caller**, like clips
 //! do: `Reverb.requiredSamples` says how much to allocate, `Reverb.init` carves
-//! the lines out of it, and `Effect.reverb(&instance)` inserts it. The mixer
+//! the lines out of it, and `Effect.reverb(&instance)` inserts it. The limiter
+//! follows the same contract and adds `latencyFrames()` for delay compensation. The mixer
 //! allocates nothing for them and rejects two slots claiming the same instance
 //! or overlapping buffers. See `docs/audio-effects.md`.
 //!
@@ -76,7 +77,7 @@ pub const spatial = @import("audio/spatial.zig");
 pub const system = @import("audio/system.zig");
 /// Band-limited (windowed-sinc) resampling prototype and kernels.
 pub const resample = @import("audio/resample.zig");
-/// Insert DSP: biquads, compressor, feedback delay, reverb, chains.
+/// Insert DSP: biquads, compressor, feedback delay, reverb, limiter, chains.
 pub const effects = @import("audio/effects.zig");
 
 pub const Mixer = mixer.Mixer;
@@ -102,6 +103,8 @@ pub const Delay = effects.Delay;
 pub const DelayParams = effects.DelayParams;
 pub const Reverb = effects.Reverb;
 pub const ReverbParams = effects.ReverbParams;
+pub const Limiter = effects.Limiter;
+pub const LimiterParams = effects.LimiterParams;
 
 pub const AudioSource = system.AudioSource;
 pub const AudioSystem = system.AudioSystem;

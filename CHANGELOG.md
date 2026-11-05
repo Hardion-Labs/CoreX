@@ -275,6 +275,32 @@ declared yet.
   111-193x real time. Delay and reverb were added on top (below); convolution,
   lookahead limiting, oversampled saturation, side-chain and per-voice inserts
   remain planned.
+- Lookahead brickwall limiter (`src/audio/effects.zig`: `Limiter`/`LimiterParams`,
+  `Effect.limiter`, `docs/audio-effects.md`). The detector runs on the input while
+  the audio is delayed by the same amount, so the gain is already down when a
+  transient reaches the output. The window maximum uses a **sliding-window
+  aggregation over two stacks**: each entry is two f32 (value plus the running
+  maximum below it), the window maximum is the larger of the two aggregates, and
+  entries move at most once, giving **O(1) amortized** — about two comparisons per
+  sample. That f32-only layout is deliberate: it lets the detector share the same
+  borrowed buffer as the delay lines, where a monotonic deque's integer expiry
+  stamps would need an alignment cast the borrowed-memory contract does not allow.
+  The gain is `min(target, recovery)`, so overshoot is impossible rather than
+  unlikely: the `min` also stops a *recovering* envelope from climbing past a
+  target that is still below unity between two peaks. The release state is the
+  **distance from unity**, not the gain — accumulating towards 1.0 with
+  `env*r + (1-r)` stalls ~7e-5 short in f32 because the increment falls under half
+  an ulp, which would leave the limiter attenuating by a hair forever; decaying
+  the distance keeps full relative precision and lands on **bit-exact unity**, so
+  a quiet mix passes through unchanged. Channels are peak-linked so limiting never
+  shifts the stereo image. `latencyFrames()` reports the added delay and
+  `gainReductionDb()` the current reduction. Memory follows the same borrowed
+  contract (3.8 KiB for 5 ms stereo at 48 kHz, 15 KiB for 20 ms) and the same
+  aliasing/overlap/layout checks. Measured cost is **flat in the lookahead**
+  (0 ms and 20 ms identical, ~+17% over baseline for a master insert), and four
+  full-scale voices that clip an unprotected mixer produce zero clipped samples
+  with the limiter engaged. Sample-peak only: true-peak detection needs
+  oversampling, and as an insert it runs before `master_gain` (planned).
 - Delay-based insert effects (`src/audio/effects.zig`: `Delay`/`DelayParams`,
   `Reverb`/`ReverbParams`, `Effect.delay`/`Effect.reverb`,
   `docs/audio-effects.md`): a feedback delay with an optional one-pole low pass
@@ -315,7 +341,7 @@ declared yet.
   asset import/cache, world-space transforms, texture decoders, cache GC, render
   extraction, OBJ mesh import, scene prefabs, DEFLATE/zlib, PNG, asset change
   detection, WAV audio import, audio mixing, spatial audio, voice stealing,
-  band-limited resampling and insert DSP including delay/reverb (483 tests),
+  band-limited resampling and insert DSP including delay/reverb/limiter (496 tests),
   including allocation-failure
   probes, cache corruption/truncation probes, a deep-hierarchy stress test, QOI
   encode/decode roundtrips, end-to-end texture-import-and-cache, OBJ-import-and-

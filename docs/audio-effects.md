@@ -5,10 +5,11 @@ This document describes CoreXEngine's insert effects: the pure DSP module in
 routes buses through it.
 
 > Status: **implemented and tested**. Biquad filters, a stereo-linked
-> compressor, a feedback delay and a Freeverb-style reverb, on per-bus and master
-> insert chains, allocation-free at render time. **Convolution, modulated delays
-> (chorus/flanger), lookahead limiting and oversampled saturation are planned** —
-> they are not described here as existing capabilities. The mixer itself is
+> compressor, a feedback delay, a Freeverb-style reverb and a lookahead brickwall
+> limiter, on per-bus and master insert chains, allocation-free at render time.
+> **Convolution, modulated delays (chorus/flanger), oversampled saturation and
+> side-chain input are planned** — they are not described here as existing
+> capabilities. The mixer itself is
 > documented in [audio-mixer.md](audio-mixer.md).
 
 ## Overview
@@ -232,6 +233,95 @@ feedback below 1 keeps it there, so it becomes an exact zero instead. The cost i
 one comparison per write, and it is what makes a long tail cheap rather than
 pathologically slow.
 
+## Lookahead brickwall limiter
+
+The compressor reacts *after* a transient, so a fast peak can overshoot before
+its envelope catches up. The limiter looks **ahead**: the detector runs on the
+input while the audio is delayed by the same amount, so the gain is already down
+by the time the peak reaches the output.
+
+| Parameter | Default | Range | Meaning |
+| --- | --- | --- | --- |
+| `ceiling_db` | -1.0 | `[-120, 0]` | Output ceiling; a limiter never adds gain |
+| `lookahead_ms` | 5.0 | `[0, 100]` | Look-ahead **and added latency**; 0 is allowed |
+| `release_ms` | 100.0 | `[0, 10000]` | One-pole recovery to unity; 0 is instant |
+
+```zig
+const params = A.LimiterParams{ .ceiling_db = -1, .lookahead_ms = 5, .release_ms = 80 };
+const memory = try gpa.alloc(f32, try A.Limiter.requiredSamples(48_000, 2, params)); // 3.8 KiB
+defer gpa.free(memory);
+var limiter = try A.Limiter.init(48_000, 2, params, memory);
+try mixer.setMasterEffect(0, A.Effect.limiter(&limiter));
+
+const latency = limiter.latencyFrames();      // 240 frames at 48 kHz
+const gr = limiter.gainReductionDb();         // 0 at unity, negative while limiting
+```
+
+### The window maximum in O(1)
+
+The detector needs the loudest sample in a window of `lookahead + 1` frames
+ending at the current input — that covers the sample being emitted and
+everything that will replace it. Recomputing it per sample would be O(window).
+
+Instead it uses a **sliding-window aggregation over two stacks** (a "SWAG"). Each
+entry stores two floats: the value, and the maximum of everything at or below it
+in that stack. The window maximum is the larger of the two stack aggregates.
+When the front stack empties, the back stack is transferred onto it, reversing
+the order and recomputing the aggregates; each entry moves at most once, so the
+cost is **O(1) amortized** — about two comparisons per sample.
+
+The two-floats-per-entry layout is not incidental. It means the whole structure
+lives in the **same borrowed `[]f32`** as the delay lines. A monotonic deque would
+need integer expiry stamps, and those cannot share an f32 buffer without an
+alignment cast that the borrowed-memory contract does not allow. The stacks grow
+towards each other in one region and their lengths always sum to at most the
+capacity, so they cannot collide; a test checks the structure against a naive
+O(n·window) scan over random, rising, falling and constant sequences at six
+window sizes.
+
+### Why overshoot is impossible, not just unlikely
+
+The gain is the lower of two things:
+
+```
+target = if (loudest > ceiling) ceiling / loudest else 1
+env    = min(target, recovery_towards_unity)
+```
+
+Because `loudest` covers the sample being emitted, `target` is always small
+enough for it. The `min` matters for the *other* direction: between two peaks the
+recovery climbs towards unity and would otherwise sail straight past a target
+that is still below 1, letting a sample through. A test drives exactly that case
+— a loud burst followed by a slightly quieter one, long enough for the recovery
+to cross the target — and asserts the ceiling holds.
+
+### Why the release state is a distance, not a gain
+
+Storing the gain and accumulating towards unity with `env*r + (1-r)` **stalls
+about 7e-5 below 1.0** in single precision: near 1.0 an f32 has only ~6e-8 of
+absolute resolution, so once `distance * (1-r)` drops under half an ulp the
+addition rounds away and the envelope never arrives. The limiter would then
+attenuate by a hair forever.
+
+So the authoritative state is `distance = 1 - gain`, which decays with full
+*relative* precision and is never reconstructed from the rounded gain. `1 -
+distance` rounds to exactly `1.0` once the distance is small enough, so the
+limiter returns to **bit-exact unity** — a quiet mix passes through unchanged.
+Both the stall and the exact-unity property are pinned by tests.
+
+### Placement
+
+The limiter is an ordinary insert, so on the master it runs **before**
+`master_gain` and the output clamp:
+
+```
+bus chains ─► sum ─► master inserts (limiter here) ─► master_gain ─► sanitize/clamp ─► out
+```
+
+A `master_gain` above 1 can therefore still push the signal past the ceiling.
+Keep it at or below 1, or lower the ceiling to match. `latencyFrames()` reports
+the delay so a caller can compensate; nothing does it automatically yet.
+
 ## Routing, order and tails
 
 - **Per bus:** slots run in index order, `0 → effect_slots - 1`. Order matters —
@@ -262,7 +352,7 @@ With `effect_slots > 0` the mixer reserves, once, at `init`:
 | Bus inserts | `max_buses × effect_slots × sizeof(Effect)` |
 | Master inserts | `effect_slots × sizeof(Effect)` |
 | Submix scratch | `max_buses × block_frames × channels × 4` bytes |
-| Delay / reverb memory | **zero** — the caller owns it (`requiredSamples`) |
+| Delay / reverb / limiter memory | **zero** — the caller owns it (`requiredSamples`) |
 
 The default `max_buses = 8`, `block_frames = 256`, stereo gives **16 KiB** of
 scratch. The scratch is reserved for every bus, not only the processed ones,
@@ -270,8 +360,9 @@ because an insert can be added at any time and `render` must never allocate.
 Lower `block_frames` to shrink it; the output does not change.
 
 Delay-based effects add nothing to that table: their memory is allocated by the
-caller. For reference, at 48 kHz a stereo reverb needs **108 KiB** and a 120 ms
-stereo delay needs **45 KiB**; both scale linearly with the sample rate.
+caller. For reference, at 48 kHz a stereo reverb needs **108 KiB**, a 120 ms
+stereo delay **45 KiB**, and a 5 ms stereo limiter just **3.8 KiB** (20 ms:
+15 KiB). All scale linearly with the sample rate.
 
 ## API
 
@@ -319,9 +410,9 @@ var room = try A.Reverb.init(48_000, 2, .{ .room_size = 0.8 }, memory);
 try mixer.setMasterEffect(0, A.Effect.reverb(&room));   // borrows &room + memory
 ```
 
-`Effect.delay(*Delay)` and `Effect.reverb(*Reverb)` are infallible — the instance
-already validated its parameters and buffer in `init`. Three extra rules are
-enforced by the setters:
+`Effect.delay(*Delay)`, `Effect.reverb(*Reverb)` and `Effect.limiter(*Limiter)`
+are infallible — the instance already validated its parameters and buffer in
+`init`. Three extra rules are enforced by the setters:
 
 | Rule | Why |
 | --- | --- |
@@ -375,6 +466,23 @@ A full reverb is 12 delay reads and 12 writes per sample per channel, so it cost
 about the same as a handful of biquads — the whole eight-bus chain above still
 runs at **103× real time**. Reverb on a bus is slightly cheaper than on the master
 because only that bus is isolated.
+
+The limiter, measured in a **separate session** (same 64 voices / 512 frames /
+48 kHz shape, but absolute microseconds are not comparable across sandbox runs —
+compare *within* a table, not between them):
+
+| Configuration | Time per render | Real-time factor | vs. baseline |
+| --- | --- | --- | --- |
+| No effects | **50.3 µs** | **212×** | — |
+| Master limiter, 0 ms lookahead | **58.7 µs** | **182×** | +17% |
+| Master limiter, 5 ms lookahead | **58.4 µs** | **183×** | +16% |
+| Master limiter, 20 ms lookahead | **58.7 µs** | **182×** | +17% |
+| Limiter on all 8 buses | **105.7 µs** | **101×** | +110% |
+| Master shelf + compressor + limiter, reverb on a bus | **104.8 µs** | **102×** | +108% |
+
+The cost is **flat in the lookahead**: 0 ms and 20 ms measure the same, which is
+the amortized bound showing up in practice — a longer window means more memory,
+not more work per sample. A master limiter costs about the same as a biquad.
 
 - Reserving slots and leaving them bypassed costs **about 1%**: the blocked path
   adds a per-block loop, not per-sample work, and no bus is isolated.
@@ -437,6 +545,22 @@ because only that bus is isolated.
   the shortest comb delay; the tail is bounded, finite and decaying; one second
   at `room_size = 1` with no damping stays bounded; identical impulses still
   produce decorrelated channels; reset silences every line; NaN/inf recover.
+- **Sliding maximum**: matches a naive O(n·window) scan over random, rising,
+  falling and constant sequences at window sizes 1, 2, 3, 7, 64 and 241, and the
+  two stacks never exceed the shared capacity.
+- **Limiter**: parameter and buffer-size validation; the exact `requiredSamples`
+  formula; **no sample ever exceeds the ceiling** across 27 combinations of
+  lookahead (0 / 0.1 / 5 ms), release (0 / 1 / 100 ms) and ceiling (0 / -1 /
+  -12 dB) driven by loud random audio with isolated 8× spikes; the recovering
+  envelope is clamped too; latency is exact and sub-ceiling audio is bit-exact;
+  release returns to **exactly** unity while zero release recovers on the next
+  sample; channels are linked so the stereo ratio and sign survive; reset clears
+  lines, detector and envelope; NaN/inf are treated as silence; a chain in one
+  pass equals the same chain in 134-sample chunks.
+- **Limiter in the mixer**: four full-scale voices clip the unprotected mixer and
+  produce **zero** clipped samples with a master limiter, whose peak stays at the
+  ceiling; a quiet mix passes at unity; the borrowed-memory rules apply to
+  limiter instances exactly as they do to delays and reverbs.
 - **Borrowed memory**: the same instance is rejected in another bus slot and on
   the master; a *different* instance over the same buffer is rejected; a
   partially overlapping buffer is rejected; replacing the holding slot is
@@ -446,8 +570,8 @@ because only that bus is isolated.
 - **Integration**: a delay insert echoes across 16-frame blocks with a 48-sample
   delay; `resetEffects` reaches through the borrowed pointer; a master reverb
   tails after the last voice finished and keeps tailing into the next render;
-  `checkAllAllocationFailures` proves the mixer allocates nothing for a reverb at
-  insert time or during render.
+  `checkAllAllocationFailures` proves the mixer allocates nothing for a reverb or
+  a limiter at insert time or during render.
 - **Determinism**: two identically driven mixers agree bit for bit over five
   buffers; a chain processed in one pass equals the same chain processed in
   64-sample chunks, and a delay+reverb chain in one pass equals the same chain in
@@ -464,9 +588,14 @@ because only that bus is isolated.
 - **Borrowed memory is the caller's responsibility**: the mixer rejects double
   claims, but it cannot know if you free the buffer while an insert still
   references it — the same contract as borrowed clip samples.
-- **No lookahead limiter**: the compressor reacts after the fact, so a fast
-  transient can overshoot before the envelope catches it. The output clamp is
-  still the last line of defence.
+- **The limiter is an insert, not the output stage**: it runs before
+  `master_gain` and the clamp, so a `master_gain` above 1 can still push the
+  result past the ceiling. Keep the gain at or below 1, or lower the ceiling to
+  match. It also adds latency (`latencyFrames()`), which nothing compensates for
+  automatically yet.
+- **No true-peak / inter-sample detection**: the limiter is sample-peak only, so
+  a reconstructed analogue waveform can still exceed the ceiling between samples.
+  True-peak limiting needs oversampling, which is not offered yet.
 - **No oversampling**: saturation/waveshaping would alias and is deliberately not
   offered yet.
 - **No side-chain input, no per-voice inserts**: effects are per bus and on the

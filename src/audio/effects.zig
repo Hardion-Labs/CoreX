@@ -11,8 +11,9 @@
 //!   constructors (`Effect.biquad`, `Effect.compressor`), which reject invalid
 //!   parameters. A constructed `Effect` is always valid, so `process` carries no
 //!   parameter checks and no transcendentals on the coefficient path.
-//! - **No allocation, ever.** Filter state is a fixed `[max_channels]` array, so
-//!   an effect is a value that can be stored in a preallocated slot array.
+//! - **No allocation, ever.** Inline filter state is a fixed `[max_channels]`
+//!   array; effects that need delay lines borrow a caller-owned buffer instead.
+//!   Either way an effect is a value in a preallocated slot array.
 //! - **Robust to bad input.** A non-finite input sample is treated as silence
 //!   instead of poisoning the filter state forever, and state below an inaudible
 //!   threshold is flushed to zero so silence does not leave denormals behind
@@ -24,20 +25,21 @@
 //!
 //! Implemented: RBJ biquad filters (low/high pass, band pass, notch, peaking,
 //! low/high shelf), a feed-forward stereo-linked compressor with a soft knee, a
-//! feedback delay with damping, and a Freeverb-style reverb (eight damped comb
-//! filters into four diffusion sections per channel; see `allpassStep`).
+//! feedback delay with damping, a Freeverb-style reverb (eight damped comb
+//! filters into four diffusion sections per channel; see `allpassStep`), and a
+//! lookahead brickwall limiter (see `Limiter` and `SlidingMax`).
 //!
 //! **Delay-based effects borrow their memory from the caller**, exactly like a
-//! `Clip` borrows its samples: `Delay.requiredSamples` / `Reverb.requiredSamples`
-//! say how much to allocate, `init` carves the lines out of that buffer, and the
-//! effect keeps a slice. Nothing here allocates, so a reverb costs no mixer
+//! `Clip` borrows its samples: `requiredSamples` on `Delay`, `Reverb` and
+//! `Limiter` says how much to allocate, `init` carves the lines out of that
+//! buffer, and the effect keeps a slice. Nothing here allocates, so a reverb costs no mixer
 //! memory and `render` stays allocation-free. The instance must outlive every
 //! slot that references it, and two slots must not share one instance or one
 //! buffer — the mixer rejects both (see `Effect.borrowedMemory` /
 //! `Effect.stateAddress`).
 //!
 //! Not implemented: convolution, chorus/flanger (modulated delay taps),
-//! lookahead limiting, oversampled saturation.
+//! oversampled saturation, side-chain input.
 
 const std = @import("std");
 
@@ -705,6 +707,263 @@ fn scaledLength(tuning: u32, scale: f64) usize {
     return @max(1, @as(usize, @intFromFloat(scaled)));
 }
 
+// --- lookahead limiter -----------------------------------------------------
+
+/// Longest lookahead the limiter accepts, in milliseconds. It bounds the borrowed
+/// buffer and the latency a caller can accidentally ask for.
+pub const max_lookahead_ms: f32 = 100;
+
+/// Brickwall ceiling range. A limiter attenuates; it never makes anything louder,
+/// so the ceiling is at most 0 dBFS. The floor keeps `ceiling / peak` well away
+/// from the denormal range.
+pub const min_ceiling_db: f32 = -120;
+
+pub const LimiterParams = struct {
+    /// Output ceiling in dBFS, in `[-120, 0]`.
+    ceiling_db: f32 = -1.0,
+    /// How far ahead the detector looks. **This is also the added latency**, in
+    /// frames `ceil(lookahead_ms * rate / 1000)`. 0 is allowed and gives a
+    /// zero-latency limiter that reacts within the same sample.
+    lookahead_ms: f32 = 5.0,
+    /// One-pole recovery towards unity after the peak leaves the window.
+    /// 0 means instant recovery.
+    release_ms: f32 = 100.0,
+};
+
+/// Sliding-window maximum in O(1) amortized, built from two stacks that each
+/// carry a running aggregate (a "sliding window aggregation", or SWAG).
+///
+/// Every entry is **two f32**: the value, and the maximum of everything at or
+/// below it in that stack. The window maximum is then the larger of the two
+/// stack aggregates. That f32-only layout is the point: the structure shares the
+/// same borrowed `[]f32` as the delay lines. A monotonic deque would need integer
+/// expiry stamps, which cannot live in an f32 buffer without an alignment cast.
+///
+/// The window is fixed, so there is exactly one push and at most one pop per
+/// sample. The stacks grow towards each other inside one region of `capacity`
+/// entries and their lengths always sum to at most `capacity`, so they can never
+/// collide. Transferring the back stack to the front reverses the order and
+/// recomputes the aggregates; each entry is moved at most once, which is where
+/// the amortized bound comes from.
+const SlidingMax = struct {
+    /// `capacity` entries of `[value, aggregate]`.
+    slots: []f32,
+    capacity: usize,
+    front_len: usize = 0,
+    back_len: usize = 0,
+
+    fn init(storage: []f32, capacity: usize) SlidingMax {
+        std.debug.assert(capacity >= 1);
+        std.debug.assert(storage.len >= capacity * 2);
+        return .{ .slots = storage[0 .. capacity * 2], .capacity = capacity };
+    }
+
+    inline fn frontAggregate(self: *const SlidingMax) f32 {
+        return if (self.front_len == 0) 0 else self.slots[(self.front_len - 1) * 2 + 1];
+    }
+
+    inline fn backAggregate(self: *const SlidingMax) f32 {
+        return if (self.back_len == 0) 0 else self.slots[(self.capacity - self.back_len) * 2 + 1];
+    }
+
+    inline fn len(self: *const SlidingMax) usize {
+        return self.front_len + self.back_len;
+    }
+
+    inline fn max(self: *const SlidingMax) f32 {
+        return @max(self.frontAggregate(), self.backAggregate());
+    }
+
+    fn push(self: *SlidingMax, value: f32) void {
+        std.debug.assert(self.len() < self.capacity);
+        const entry = self.capacity - self.back_len - 1;
+        const aggregate = @max(value, self.backAggregate());
+        self.slots[entry * 2] = value;
+        self.slots[entry * 2 + 1] = aggregate;
+        self.back_len += 1;
+    }
+
+    fn pop(self: *SlidingMax) void {
+        if (self.front_len == 0) {
+            while (self.back_len > 0) {
+                // Read before writing: when the region is full these are the
+                // same slot, and the value must survive the move.
+                const value = self.slots[(self.capacity - self.back_len) * 2];
+                self.back_len -= 1;
+                const aggregate = @max(value, self.frontAggregate());
+                self.slots[self.front_len * 2] = value;
+                self.slots[self.front_len * 2 + 1] = aggregate;
+                self.front_len += 1;
+            }
+        }
+        std.debug.assert(self.front_len > 0);
+        self.front_len -= 1;
+    }
+
+    fn clear(self: *SlidingMax) void {
+        self.front_len = 0;
+        self.back_len = 0;
+    }
+};
+
+/// Lookahead brickwall limiter.
+///
+/// The detector runs on the **input** while the audio is delayed by the same
+/// amount, so by the time a transient reaches the output the gain has already
+/// been pulled down. The detector keeps the maximum over a window of
+/// `lookahead + 1` samples ending at the current input, which covers the sample
+/// being emitted and everything that will replace it before the next one.
+///
+/// The envelope takes the lower of the target and a one-pole recovery towards
+/// unity: instant attack, gradual release, and never above what the window
+/// actually needs. That last clamp is what makes overshoot impossible rather
+/// than merely unlikely — a release-only envelope can climb back above the
+/// target between two peaks and let a sample through.
+///
+/// The recovery state is the *distance* from unity, not the gain, so it reaches
+/// exactly 1.0 instead of stalling a few 1e-5 short (see `Limiter.distance`).
+pub const Limiter = struct {
+    sample_rate: u32,
+    channels: usize,
+    lines: [max_channels]Line,
+    detector: SlidingMax,
+    delay_frames: usize,
+    window: usize,
+    ceiling: f32,
+    release_coeff: f32,
+    /// Last gain actually applied. A meter, never fed back into the recurrence.
+    envelope: f32 = 1,
+    /// `1 - gain`, the authoritative release state. Keeping the *distance* rather
+    /// than the gain is what lets recovery reach exactly unity: near 1.0 an f32
+    /// gain has only ~6e-8 of absolute resolution, so a per-frame increment of
+    /// `distance * (1 - r)` vanishes into rounding and the envelope stalls
+    /// ~7e-5 short of unity. The distance decays with full relative precision
+    /// instead, and is never reconstructed from the rounded gain.
+    distance: f32 = 0,
+    memory: []f32,
+
+    /// Number of f32 samples the caller must provide: the audio delay lines plus
+    /// the detector's two-stack region.
+    pub fn requiredSamples(sample_rate: u32, channels: usize, params: LimiterParams) Error!usize {
+        const frames = try lookaheadFrames(sample_rate, params.lookahead_ms);
+        try validateChannels(channels);
+        try validateLimiter(params);
+        return frames * channels + (frames + 1) * 2;
+    }
+
+    pub fn init(sample_rate: u32, channels: usize, params: LimiterParams, buffer: []f32) Error!Limiter {
+        const frames = try lookaheadFrames(sample_rate, params.lookahead_ms);
+        try validateChannels(channels);
+        try validateLimiter(params);
+        const window = frames + 1;
+        const need = frames * channels + window * 2;
+        if (buffer.len < need) return error.InvalidValue;
+
+        var lines: [max_channels]Line = @splat(.{ .data = buffer[0..0] });
+        for (0..channels) |c| lines[c] = .{ .data = buffer[c * frames ..][0..frames] };
+        @memset(buffer[0..need], 0);
+
+        const rate: f64 = @floatFromInt(sample_rate);
+        const coeff: f32 = if (params.release_ms > 0)
+            @floatCast(@exp(-1.0 / (@as(f64, params.release_ms) * 0.001 * rate)))
+        else
+            0;
+        return .{
+            .sample_rate = sample_rate,
+            .channels = channels,
+            .lines = lines,
+            .detector = SlidingMax.init(buffer[frames * channels ..][0 .. window * 2], window),
+            .delay_frames = frames,
+            .window = window,
+            .ceiling = @floatCast(std.math.pow(f64, 10.0, @as(f64, params.ceiling_db) / 20.0)),
+            .release_coeff = coeff,
+            .memory = buffer[0..need],
+        };
+    }
+
+    pub fn process(self: *Limiter, buffer: []f32, channels: usize) void {
+        std.debug.assert(channels == self.channels);
+        const ceiling = self.ceiling;
+        const r = self.release_coeff;
+        const delayed_path = self.delay_frames != 0;
+        var distance = self.distance;
+        // Seed from the current meter so an empty block leaves it alone.
+        var env: f32 = self.envelope;
+        var i: usize = 0;
+        while (i < buffer.len) : (i += channels) {
+            // One detector across all channels: linking the peak is what keeps
+            // limiting from pulling the stereo image towards the quieter side.
+            var x: [max_channels]f32 = @splat(0);
+            var peak: f32 = 0;
+            for (0..channels) |c| {
+                x[c] = finite(buffer[i + c]);
+                peak = @max(peak, @abs(x[c]));
+            }
+
+            if (self.detector.len() == self.window) self.detector.pop();
+            self.detector.push(peak);
+
+            const loudest = self.detector.max();
+            const target: f32 = if (loudest > ceiling) ceiling / loudest else 1;
+            distance = flushSmall(distance * r);
+            const recovered = 1.0 - distance;
+            if (target < recovered) {
+                // Instant attack. Snapping the state to the target keeps the
+                // release starting from where the gain actually is.
+                distance = 1.0 - target;
+                env = target;
+            } else {
+                // Gradual release, and `env <= target` holds in both branches:
+                // that is what makes overshoot impossible rather than unlikely.
+                env = recovered;
+            }
+
+            for (0..channels) |c| {
+                const line = &self.lines[c];
+                const out = if (delayed_path) line.read() else x[c];
+                if (delayed_path) line.write(x[c]);
+                buffer[i + c] = out * env;
+            }
+        }
+        self.distance = distance;
+        self.envelope = env;
+    }
+
+    /// Silence the delay lines and the detector and restore unity gain, keeping
+    /// the settings.
+    pub fn reset(self: *Limiter) void {
+        @memset(self.memory, 0);
+        for (&self.lines) |*line| line.index = 0;
+        self.detector.clear();
+        self.envelope = 1;
+        self.distance = 0;
+    }
+
+    /// Latency this instance adds, in frames per channel. Report it to anything
+    /// that needs to stay aligned with the limited signal.
+    pub fn latencyFrames(self: *const Limiter) usize {
+        return self.delay_frames;
+    }
+
+    /// Current gain reduction in dB (0 when unity, negative while limiting).
+    /// Floored at -240 dB so a fully muted envelope still returns a finite value.
+    pub fn gainReductionDb(self: *const Limiter) f32 {
+        return @floatCast(20.0 * @log10(@as(f64, @max(self.envelope, 1e-12))));
+    }
+};
+
+fn validateLimiter(params: LimiterParams) Error!void {
+    if (!std.math.isFinite(params.ceiling_db) or params.ceiling_db > 0 or params.ceiling_db < min_ceiling_db) return error.InvalidValue;
+    if (!std.math.isFinite(params.release_ms) or params.release_ms < 0 or params.release_ms > 10_000) return error.InvalidValue;
+}
+
+fn lookaheadFrames(sample_rate: u32, lookahead_ms: f32) Error!usize {
+    if (sample_rate == 0) return error.InvalidValue;
+    if (!std.math.isFinite(lookahead_ms) or lookahead_ms < 0 or lookahead_ms > max_lookahead_ms) return error.InvalidValue;
+    const frames = @ceil(@as(f64, lookahead_ms) * @as(f64, @floatFromInt(sample_rate)) / 1000.0);
+    return @intFromFloat(frames);
+}
+
 // --- effect + chain --------------------------------------------------------
 
 /// One insert slot. The `sample_rate` it was designed for travels with it, so a
@@ -723,6 +982,7 @@ pub const Effect = struct {
         /// state, and inlining that would bloat every insert slot on every bus.
         delay: *Delay,
         reverb: *Reverb,
+        limiter: *Limiter,
     };
 
     /// Identity. `process` returns immediately, and a chain of these is bit-exact.
@@ -754,12 +1014,19 @@ pub const Effect = struct {
         return .{ .sample_rate = instance.sample_rate, .kind = .{ .reverb = instance } };
     }
 
+    /// Wrap an initialized `Limiter`. Same ownership rules as `delay`. As a
+    /// master insert it runs **before** `master_gain` and the output clamp.
+    pub fn limiter(instance: *Limiter) Effect {
+        return .{ .sample_rate = instance.sample_rate, .kind = .{ .limiter = instance } };
+    }
+
     /// Layout this effect was built for, or 0 when it adapts to any layout.
     /// Delay lines are allocated per channel, so they cannot be reinterpreted.
     pub fn channelCount(self: Effect) u16 {
         return switch (self.kind) {
             .delay => |instance| @intCast(instance.channels),
             .reverb => |instance| @intCast(instance.channels),
+            .limiter => |instance| @intCast(instance.channels),
             else => 0,
         };
     }
@@ -770,6 +1037,7 @@ pub const Effect = struct {
         return switch (self.kind) {
             .delay => |instance| instance.memory,
             .reverb => |instance| instance.memory,
+            .limiter => |instance| instance.memory,
             else => null,
         };
     }
@@ -780,6 +1048,7 @@ pub const Effect = struct {
         return switch (self.kind) {
             .delay => |instance| @intFromPtr(instance),
             .reverb => |instance| @intFromPtr(instance),
+            .limiter => |instance| @intFromPtr(instance),
             else => null,
         };
     }
@@ -793,6 +1062,7 @@ pub const Effect = struct {
             .compressor => |*comp| comp.process(buffer, channels),
             .delay => |instance| instance.process(buffer, channels),
             .reverb => |instance| instance.process(buffer, channels),
+            .limiter => |instance| instance.process(buffer, channels),
         }
     }
 
@@ -805,6 +1075,7 @@ pub const Effect = struct {
             .compressor => |*comp| comp.reset(),
             .delay => |instance| instance.reset(),
             .reverb => |instance| instance.reset(),
+            .limiter => |instance| instance.reset(),
         }
     }
 };
@@ -1628,4 +1899,332 @@ test "effects: borrowed instances expose their memory and identity" {
     slot.process(memory[0..2], 2);
     slot.reset();
     for (reverb.memory) |v| try testing.expectEqual(@as(f32, 0), v);
+}
+
+test "effects: the sliding maximum matches a naive scan" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const random = prng.random();
+    const count = 1500;
+    const values = try gpa.alloc(f32, count);
+    defer gpa.free(values);
+
+    // Random, monotone up, monotone down and constant: the last three are the
+    // shapes that stress the two-stack transfer in opposite directions.
+    const patterns = [_]usize{ 0, 1, 2, 3 };
+    const windows = [_]usize{ 1, 2, 3, 7, 64, 241 };
+    for (windows) |window| {
+        const storage = try gpa.alloc(f32, window * 2);
+        defer gpa.free(storage);
+        for (patterns) |pattern| {
+            for (values, 0..) |*v, i| {
+                const t: f32 = @floatFromInt(i);
+                v.* = switch (pattern) {
+                    0 => random.float(f32),
+                    1 => t,
+                    2 => @floatFromInt(count - i),
+                    else => 0.5,
+                };
+            }
+            var sw = SlidingMax.init(storage, window);
+            for (values, 0..) |v, i| {
+                if (sw.len() == window) sw.pop();
+                sw.push(v);
+                const start = if (i + 1 >= window) i + 1 - window else 0;
+                var expect: f32 = 0;
+                for (values[start .. i + 1]) |u| expect = @max(expect, u);
+                try testing.expectEqual(expect, sw.max());
+                try testing.expectEqual(i + 1 - start, sw.len());
+                // The two stacks share one region and must never overlap.
+                try testing.expect(sw.len() <= window);
+            }
+            sw.clear();
+            try testing.expectEqual(@as(usize, 0), sw.len());
+            try testing.expectEqual(@as(f32, 0), sw.max());
+        }
+    }
+}
+
+test "effects: limiter parameters and buffer size are validated" {
+    const gpa = testing.allocator;
+    const rate = 48000;
+    // 5 ms at 48 kHz is 240 frames: 240 stereo frames plus a 241-entry detector.
+    const params = LimiterParams{};
+    try testing.expectEqual(@as(usize, 240), try lookaheadFrames(rate, params.lookahead_ms));
+    try testing.expectEqual(@as(usize, 240 * 2 + 241 * 2), try Limiter.requiredSamples(rate, 2, params));
+    try testing.expectEqual(@as(usize, 240 + 241 * 2), try Limiter.requiredSamples(rate, 1, params));
+    // Zero lookahead still needs the one-entry detector.
+    try testing.expectEqual(@as(usize, 2), try Limiter.requiredSamples(rate, 1, .{ .lookahead_ms = 0 }));
+    try testing.expectEqual(@as(usize, 1), try lookaheadFrames(rate, 0.001));
+
+    try testing.expectError(error.InvalidValue, Limiter.requiredSamples(0, 1, params));
+    try testing.expectError(error.InvalidValue, Limiter.requiredSamples(rate, 0, params));
+    try testing.expectError(error.InvalidValue, Limiter.requiredSamples(rate, 3, params));
+    try testing.expectError(error.InvalidValue, Limiter.requiredSamples(rate, 1, .{ .ceiling_db = 0.5 }));
+    try testing.expectError(error.InvalidValue, Limiter.requiredSamples(rate, 1, .{ .ceiling_db = -121 }));
+    try testing.expectError(error.InvalidValue, Limiter.requiredSamples(rate, 1, .{ .ceiling_db = std.math.nan(f32) }));
+    try testing.expectError(error.InvalidValue, Limiter.requiredSamples(rate, 1, .{ .lookahead_ms = -1 }));
+    try testing.expectError(error.InvalidValue, Limiter.requiredSamples(rate, 1, .{ .lookahead_ms = max_lookahead_ms + 1 }));
+    try testing.expectError(error.InvalidValue, Limiter.requiredSamples(rate, 1, .{ .release_ms = -1 }));
+    try testing.expectError(error.InvalidValue, Limiter.requiredSamples(rate, 1, .{ .release_ms = 10_001 }));
+
+    const buf = try gpa.alloc(f32, try Limiter.requiredSamples(rate, 1, params));
+    defer gpa.free(buf);
+    try testing.expectError(error.InvalidValue, Limiter.init(rate, 1, params, buf[0 .. buf.len - 1]));
+    const limited = try Limiter.init(rate, 1, params, buf);
+    try testing.expectEqual(@as(usize, 240), limited.latencyFrames());
+    try testing.expectEqual(@as(f32, 0), limited.gainReductionDb());
+    // The ceiling is the linear form of ceiling_db.
+    try testing.expectApproxEqAbs(@as(f32, 0.8912509), limited.ceiling, 1e-6);
+}
+
+test "effects: the limiter never lets a sample past its ceiling" {
+    const gpa = testing.allocator;
+    const rate = 48000;
+    var prng = std.Random.DefaultPrng.init(0xc0ffee);
+    const random = prng.random();
+
+    // Every combination that could break the guarantee: with and without
+    // lookahead, fast and slow release, mono and stereo, several ceilings.
+    const lookaheads = [_]f32{ 0, 0.1, 5 };
+    const releases = [_]f32{ 0, 1, 100 };
+    const ceilings = [_]f32{ 0, -1, -12 };
+    for (lookaheads) |lookahead| {
+        for (releases) |release| {
+            for (ceilings) |ceiling_db| {
+                const params = LimiterParams{ .ceiling_db = ceiling_db, .lookahead_ms = lookahead, .release_ms = release };
+                const memory = try gpa.alloc(f32, try Limiter.requiredSamples(rate, 2, params));
+                defer gpa.free(memory);
+                var limiter = try Limiter.init(rate, 2, params, memory);
+                const ceiling = limiter.ceiling;
+
+                const frames = 4096;
+                const signal = try gpa.alloc(f32, frames * 2);
+                defer gpa.free(signal);
+                for (signal, 0..) |*v, i| {
+                    // Loud random audio, well over full scale, with isolated
+                    // full-scale spikes and silences mixed in.
+                    var value = (random.float(f32) * 2.0 - 1.0) * 4.0;
+                    if (i % 257 == 0) value = 8.0;
+                    if (i % 1024 < 64) value = 0;
+                    v.* = value;
+                }
+                limiter.process(signal, 2);
+                for (signal) |v| {
+                    try testing.expect(std.math.isFinite(v));
+                    // Float rounding in ceiling/peak and the multiply can land
+                    // an ulp above; anything beyond that is a real overshoot.
+                    try testing.expect(@abs(v) <= ceiling * (1.0 + 1e-6));
+                }
+            }
+        }
+    }
+}
+
+test "effects: the limiter clamps a recovering envelope, not just a falling one" {
+    const gpa = testing.allocator;
+    const rate = 48000;
+    // A release-only envelope climbs back towards unity and would sail past the
+    // target while the signal is still loud. This is the case the final min()
+    // exists for: quiet enough to raise the target, loud enough to still need
+    // reduction, for long enough that the recovery crosses it.
+    const params = LimiterParams{ .ceiling_db = -1, .lookahead_ms = 1, .release_ms = 20 };
+    const memory = try gpa.alloc(f32, try Limiter.requiredSamples(rate, 1, params));
+    defer gpa.free(memory);
+    var limiter = try Limiter.init(rate, 1, params, memory);
+    const ceiling = limiter.ceiling;
+
+    const frames = 12000;
+    const signal = try gpa.alloc(f32, frames);
+    defer gpa.free(signal);
+    for (signal, 0..) |*v, i| v.* = if (i < 1000) 1.0 else 0.95;
+    limiter.process(signal, 1);
+
+    var reached_ceiling = false;
+    for (signal[2000..]) |v| {
+        try testing.expect(@abs(v) <= ceiling * (1.0 + 1e-6));
+        if (@abs(v) > ceiling * 0.999) reached_ceiling = true;
+    }
+    // It really is limiting there, not just attenuating everything.
+    try testing.expect(reached_ceiling);
+}
+
+test "effects: limiter latency is exact and quiet audio is untouched" {
+    const gpa = testing.allocator;
+    const rate = 48000;
+    const params = LimiterParams{ .lookahead_ms = 1, .release_ms = 50 };
+    const memory = try gpa.alloc(f32, try Limiter.requiredSamples(rate, 1, params));
+    defer gpa.free(memory);
+    var limiter = try Limiter.init(rate, 1, params, memory);
+    const latency = limiter.latencyFrames();
+    try testing.expectEqual(@as(usize, 48), latency);
+
+    // Everything below the ceiling passes at unity, delayed by exactly latency.
+    const frames = 512;
+    const signal = try gpa.alloc(f32, frames);
+    defer gpa.free(signal);
+    const original = try gpa.alloc(f32, frames);
+    defer gpa.free(original);
+    for (signal, 0..) |*v, i| {
+        const value: f32 = 0.25 * @sin(@as(f32, @floatFromInt(i)) * 0.1);
+        v.* = value;
+        original[i] = value;
+    }
+    limiter.process(signal, 1);
+    for (signal[0..latency]) |v| try testing.expectEqual(@as(f32, 0), v);
+    try testing.expectEqualSlices(f32, original[0 .. frames - latency], signal[latency..]);
+    try testing.expectEqual(@as(f32, 0), limiter.gainReductionDb());
+
+    // A single over-scale impulse emerges at exactly `latency`, at the ceiling.
+    limiter.reset();
+    @memset(signal, 0);
+    signal[0] = 4.0;
+    limiter.process(signal, 1);
+    try testing.expectEqual(@as(f32, 0), signal[0]);
+    try testing.expectApproxEqAbs(limiter.ceiling, signal[latency], 1e-6);
+    for (signal[1..latency]) |v| try testing.expectEqual(@as(f32, 0), v);
+    try testing.expect(limiter.gainReductionDb() < 0);
+}
+
+test "effects: limiter release recovers, and zero release recovers immediately" {
+    const gpa = testing.allocator;
+    const rate = 48000;
+    const params = LimiterParams{ .lookahead_ms = 0, .release_ms = 50 };
+    const memory = try gpa.alloc(f32, try Limiter.requiredSamples(rate, 1, params));
+    defer gpa.free(memory);
+    var slow = try Limiter.init(rate, 1, params, memory);
+
+    const fast_mem = try gpa.alloc(f32, try Limiter.requiredSamples(rate, 1, .{ .lookahead_ms = 0, .release_ms = 0 }));
+    defer gpa.free(fast_mem);
+    var fast = try Limiter.init(rate, 1, .{ .lookahead_ms = 0, .release_ms = 0 }, fast_mem);
+
+    // One second is 20 time constants of a 50 ms release, so the envelope has
+    // provably settled by the end; 6000 frames would only be 2.5 of them.
+    const frames = 48000;
+    const a = try gpa.alloc(f32, frames);
+    defer gpa.free(a);
+    const b = try gpa.alloc(f32, frames);
+    defer gpa.free(b);
+    for (a, 0..) |*v, i| {
+        // A loud burst, then a quiet tail that needs no reduction at all.
+        const value: f32 = if (i < 100) 2.0 else 0.1;
+        v.* = value;
+        b[i] = value;
+    }
+    slow.process(a, 1);
+    fast.process(b, 1);
+
+    // Zero lookahead means zero latency: the burst is limited in place.
+    try testing.expectApproxEqAbs(slow.ceiling, a[0], 1e-6);
+    // Instant release: the very next sample is already back at unity.
+    try testing.expectEqual(@as(f32, 0.1), b[100]);
+    // Slow release: still reduced right after the burst, and back to *exactly*
+    // unity by the end. Storing the gain instead of the distance to unity stalls
+    // ~7e-5 short of 1.0 in f32, which would leave the limiter permanently
+    // attenuating by a hair; this pins the fix.
+    try testing.expect(a[100] < 0.1);
+    try testing.expectEqual(@as(f32, 0.1), a[frames - 1]);
+    try testing.expectEqual(@as(f32, 1), slow.envelope);
+    // The residual distance is ~1e-9, far below half an ulp of 1.0, so the gain
+    // is already exactly unity even though the state has not flushed to zero.
+    try testing.expect(slow.distance < 1e-8);
+    try testing.expectEqual(@as(f32, 0), slow.gainReductionDb());
+}
+
+test "effects: limiter links channels so the stereo image is preserved" {
+    const gpa = testing.allocator;
+    const rate = 48000;
+    const params = LimiterParams{ .lookahead_ms = 0, .release_ms = 0 };
+    const memory = try gpa.alloc(f32, try Limiter.requiredSamples(rate, 2, params));
+    defer gpa.free(memory);
+    var limiter = try Limiter.init(rate, 2, params, memory);
+
+    // Left is hot, right is quiet. Both must be scaled by the same gain, so the
+    // ratio between them survives.
+    var signal = [_]f32{ 4.0, 1.0, -4.0, -1.0, 2.0, 0.5 };
+    limiter.process(&signal, 2);
+    for (0..3) |i| {
+        const l = signal[i * 2];
+        const r = signal[i * 2 + 1];
+        try testing.expectApproxEqAbs(limiter.ceiling, @abs(l), 1e-6);
+        try testing.expectApproxEqAbs(@abs(l) / 4.0, @abs(r), 1e-6);
+        try testing.expect(std.math.sign(l) == std.math.sign(r));
+    }
+}
+
+test "effects: limiter reset, non-finite input and block-size independence" {
+    const gpa = testing.allocator;
+    const rate = 48000;
+    const params = LimiterParams{ .lookahead_ms = 2, .release_ms = 30 };
+    const mem_a = try gpa.alloc(f32, try Limiter.requiredSamples(rate, 2, params));
+    defer gpa.free(mem_a);
+    const mem_b = try gpa.alloc(f32, mem_a.len);
+    defer gpa.free(mem_b);
+    var a = try Limiter.init(rate, 2, params, mem_a);
+    var b = try Limiter.init(rate, 2, params, mem_b);
+
+    const frames = 3000;
+    const buf_a = try gpa.alloc(f32, frames * 2);
+    defer gpa.free(buf_a);
+    const buf_b = try gpa.alloc(f32, frames * 2);
+    defer gpa.free(buf_b);
+    for (buf_a, 0..) |*v, i| {
+        const value: f32 = if (i == 0) std.math.nan(f32) else if (i == 1) std.math.inf(f32) else 1.5 * @sin(@as(f32, @floatFromInt(i)) * 0.07);
+        v.* = value;
+        buf_b[i] = value;
+    }
+    a.process(buf_a, 2);
+    var offset: usize = 0;
+    while (offset < buf_b.len) : (offset += 134) {
+        const n = @min(134, buf_b.len - offset);
+        b.process(buf_b[offset..][0..n], 2);
+    }
+    try testing.expectEqualSlices(f32, buf_a, buf_b);
+    for (buf_a) |v| try testing.expect(std.math.isFinite(v));
+
+    // An empty block is a no-op, including for the meter.
+    const before_env = a.envelope;
+    const before_distance = a.distance;
+    a.process(buf_a[0..0], 2);
+    try testing.expectEqual(before_env, a.envelope);
+    try testing.expectEqual(before_distance, a.distance);
+
+    // Reset restores unity gain and clears both the lines and the detector.
+    a.reset();
+    try testing.expectEqual(@as(f32, 1), a.envelope);
+    try testing.expectEqual(@as(usize, 0), a.detector.len());
+    for (a.memory) |v| try testing.expectEqual(@as(f32, 0), v);
+    @memset(buf_a, 0);
+    a.process(buf_a, 2);
+    for (buf_a) |v| try testing.expectEqual(@as(f32, 0), v);
+
+    // The poisoned samples were treated as silence, so the impulse that follows
+    // still comes through at the right time.
+    a.reset();
+    @memset(buf_a, 0);
+    buf_a[0] = std.math.nan(f32);
+    buf_a[2] = std.math.inf(f32);
+    buf_a[4] = 0.5;
+    a.process(buf_a, 2);
+    for (buf_a) |v| try testing.expect(std.math.isFinite(v));
+    try testing.expectEqual(@as(f32, 0.5), buf_a[a.latencyFrames() * 2 + 4]);
+}
+
+test "effects: a limiter insert exposes its borrowed memory" {
+    const gpa = testing.allocator;
+    const rate = 48000;
+    const memory = try gpa.alloc(f32, try Limiter.requiredSamples(rate, 2, .{}));
+    defer gpa.free(memory);
+    var limiter = try Limiter.init(rate, 2, .{}, memory);
+    const effect = Effect.limiter(&limiter);
+    try testing.expectEqual(@as(u16, 2), effect.channelCount());
+    try testing.expectEqual(@as(usize, @intFromPtr(&limiter)), effect.stateAddress().?);
+    try testing.expectEqual(memory.len, effect.borrowedMemory().?.len);
+
+    var slot = effect;
+    var signal = [_]f32{ 2.0, 2.0, 0.1, 0.1 };
+    slot.process(&signal, 2);
+    try testing.expect(limiter.gainReductionDb() < 0);
+    slot.reset();
+    try testing.expectEqual(@as(f32, 0), limiter.gainReductionDb());
 }
