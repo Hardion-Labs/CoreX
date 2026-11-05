@@ -249,6 +249,31 @@ declared yet.
   stereo voices: 12× real time upsampling, 26× at 2:1, 4× for non-integer
   decimation, versus 175–222× for `.linear` — the quality/cost trade-off is
   documented, and `.linear` remains the default so existing output is unchanged.
+- Insert effects for buses and the master (`src/audio/effects.zig`, re-exported
+  as `corex.audio.effects` with `Effect`/`Chain`/`Biquad`/`BiquadKind`/
+  `BiquadParams`/`Coefficients`/`Compressor`/`CompressorParams`,
+  `docs/audio-effects.md`): a pure DSP module importing only `std`. RBJ biquad
+  filters (low/high pass, constant-peak band pass, notch, peaking, low/high
+  shelf) computed in double precision, processed in transposed direct form II,
+  and checked with a Jury stability test at construction; plus a feed-forward
+  stereo-linked peak compressor with a soft knee, separate attack/release
+  one-poles and a below-threshold fast path that skips the detector entirely.
+  Constructors validate every parameter, so the per-sample loop carries no
+  parameter checks; non-finite input is silenced instead of poisoning recursive
+  state, and state below ~1e-15 is flushed so silence does no denormal work.
+  The mixer gains `Config.effect_slots` (0 = disabled, the default) and
+  `Config.block_frames`, `setBusEffect`/`busEffect`/`clearBusEffects`,
+  `setMasterEffect`/`masterEffect`/`clearMasterEffects`, `resetEffects` and
+  `effectSlots`. Only buses with an *active* chain are isolated into a
+  preallocated submix and summed back, so an all-bypass configuration is
+  **bit-identical** to the effect-free path and `render` remains allocation-free;
+  the block size does not change the output. Inserts are rejected when built for
+  a different sample rate. Master inserts run before the master gain and before
+  metering, and isolated buses keep ringing their tails after the last voice
+  finishes. Measured on 64 looping stereo voices: reserving slots costs ~1%,
+  one bus biquad +11%, all eight buses +77%, a master compressor +37% — still
+  111-193x real time. No reverb/delay/convolution, lookahead limiting,
+  oversampled saturation, side-chain or per-voice inserts yet (planned).
 - Shared display-name validation (`src/core/validation.zig`) used by both the
   `.corex` manifest and scene documents.
 - Native Module ABI contract for C++ (`docs/native-module-api.md`,
@@ -259,8 +284,8 @@ declared yet.
   automatic dependency graphs, observers, frame budgets and profiling), scenes,
   asset import/cache, world-space transforms, texture decoders, cache GC, render
   extraction, OBJ mesh import, scene prefabs, DEFLATE/zlib, PNG, asset change
-  detection, WAV audio import, audio mixing, spatial audio, voice stealing and
-  band-limited resampling (440 tests),
+  detection, WAV audio import, audio mixing, spatial audio, voice stealing,
+  band-limited resampling and insert DSP (467 tests),
   including allocation-failure
   probes, cache corruption/truncation probes, a deep-hierarchy stress test, QOI
   encode/decode roundtrips, end-to-end texture-import-and-cache, OBJ-import-and-

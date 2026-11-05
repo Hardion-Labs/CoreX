@@ -4,7 +4,8 @@
 //! dependency, so it is fully testable headlessly and deterministic. It mixes
 //! borrowed float32 clips into an interleaved output buffer with gain, pan,
 //! buses, pitch, looping and resampling (linear by default, band-limited
-//! windowed-sinc on request). When the voice pool is full, an optional
+//! windowed-sinc on request), with optional insert effects per bus and on the
+//! master. When the voice pool is full, an optional
 //! priority-based steal policy recycles the least important voice. The OS audio
 //! backends (ALSA/WASAPI/CoreAudio) are **planned**; this layer defines the
 //! contract they will consume — `render` fills a buffer, `toPcm16` converts it to
@@ -14,6 +15,14 @@
 //! `corex.assets.audio.parse` maps to `corex.audio.Clip` field by field. The
 //! mixer itself does not import the asset layer, so the two stay independently
 //! testable and loosely coupled.
+//!
+//! Beside the mixer, `effects` is pure DSP (RBJ biquad filters and a
+//! stereo-linked compressor) with no mixer dependency. The mixer owns the
+//! chains: `Config.effect_slots` reserves insert slots per bus plus a master
+//! chain, and `render` stays allocation-free — buses with an active chain are
+//! mixed into a preallocated submix, processed, then summed. With
+//! `effect_slots = 0` (the default) none of that exists and the output is
+//! bit-identical to the effect-free path. See `docs/audio-effects.md`.
 //!
 //! Two layers sit on top of the mixer:
 //! - `spatial` is pure math (listener basis, distance attenuation, azimuth pan,
@@ -46,8 +55,8 @@
 //! ```
 //!
 //! See `docs/audio-mixer.md` for the mixing contract, channel/pan rules,
-//! guarantees and limitations, and `docs/audio-spatial.md` for the spatial layer
-//! and the scene bridge.
+//! guarantees and limitations, `docs/audio-effects.md` for the insert DSP, and
+//! `docs/audio-spatial.md` for the spatial layer and the scene bridge.
 
 const std = @import("std");
 
@@ -61,6 +70,8 @@ pub const spatial = @import("audio/spatial.zig");
 pub const system = @import("audio/system.zig");
 /// Band-limited (windowed-sinc) resampling prototype and kernels.
 pub const resample = @import("audio/resample.zig");
+/// Insert DSP: biquad filters, compressor, effects and chains.
+pub const effects = @import("audio/effects.zig");
 
 pub const Mixer = mixer.Mixer;
 pub const VoiceHandle = mixer.VoiceHandle;
@@ -71,6 +82,16 @@ pub const RenderStats = mixer.RenderStats;
 pub const StealPolicy = mixer.StealPolicy;
 pub const Termination = mixer.Termination;
 pub const Resample = mixer.Resample;
+
+pub const Effect = effects.Effect;
+pub const EffectChain = effects.Chain;
+pub const Biquad = effects.Biquad;
+pub const BiquadKind = effects.BiquadKind;
+pub const BiquadParams = effects.BiquadParams;
+pub const Coefficients = effects.Coefficients;
+pub const Compressor = effects.Compressor;
+pub const CompressorParams = effects.CompressorParams;
+pub const biquadCoefficients = effects.biquadCoefficients;
 
 pub const AudioSource = system.AudioSource;
 pub const AudioSystem = system.AudioSystem;
@@ -103,4 +124,5 @@ test {
     _ = spatial;
     _ = system;
     _ = resample;
+    _ = effects;
 }
