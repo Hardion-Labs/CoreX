@@ -8,9 +8,10 @@ lives in `src/audio/` and is exposed as `corex.audio`.
 > extraction layer ([render-extraction.md](render-extraction.md)): pure CPU work
 > with **no device dependency**, so it is deterministic and fully testable
 > headlessly. It consumes the `CXAW` artifacts produced by the WAV importer
-> ([asset-audio.md](asset-audio.md)). **OS playback backends (ALSA/WASAPI/
-> CoreAudio), 3D spatialization, effects/DSP and streaming are planned** — they
-> are not described here as existing capabilities.
+> ([asset-audio.md](asset-audio.md)). Spatialization and the scene bridge are
+> implemented one layer up ([audio-spatial.md](audio-spatial.md)). **OS playback
+> backends (ALSA/WASAPI/CoreAudio), effects/DSP, HRTF and streaming are
+> planned** — they are not described here as existing capabilities.
 
 ## Overview
 
@@ -50,6 +51,10 @@ or allocates during rendering.
 - **One output pass.** Voices accumulate into the caller's buffer; master gain,
   non-finite sanitizing, clamping and peak metering happen in a single final
   pass. There is no scratch buffer and no second traversal per voice.
+- **Optional priority stealing.** With `steal_policy = .lowest_priority` a full
+  pool recycles the least important voice instead of failing, and
+  `terminationOf` still explains why an old handle died after its slot has been
+  reused. The default `.none` keeps the pool a hard limit.
 
 ## Channel mapping
 
@@ -84,9 +89,45 @@ in loudness at the center. Linear is exact at the endpoints and cheaper.
 
 - The source cursor is a **float64** frame position; the step is
   `(clip.sample_rate / output_sample_rate) * pitch`.
-- Sample rate conversion is **linear interpolation** between the two neighbouring
-  source frames. It is cheap and allocation-free, but it is not band-limited:
-  large downsampling ratios can alias. A polyphase/sinc resampler is future work.
+- Two qualities are selectable with `Config.resample`:
+
+  | Quality | Filter | Cost | Aliasing when decimating |
+  | --- | --- | --- | --- |
+  | `.linear` (default) | two-point interpolation | 2 loads + 1 lerp per sample | **yes** — it is not a low-pass |
+  | `.sinc` | Blackman-windowed sinc, 32 taps | one ~33 KiB table at `init`, 32–256 MACs per sample | **no**, up to the support cap |
+
+### Band-limited mode (`.sinc`)
+
+`src/audio/resample.zig` implements the windowed-sinc alternative. It is opt-in
+because it costs an order of magnitude more than linear interpolation; the
+default stays `.linear` so existing behaviour and bit-exactness are unchanged.
+
+- **Prototype.** `sinc(x) · blackman(x / 16)` over `x ∈ [-16, 16]`, sampled once
+  into two views of the same filter: a flat table (`32 × 128 + 1` floats) for
+  arbitrary cutoffs, and a **polyphase bank** (`129 × 32` floats) whose rows are
+  whole coefficient sets at unity cutoff. Both are built in `Mixer.init` and
+  freed in `deinit`; `render` still takes no allocator.
+- **Cutoff follows the ratio.** For a step `s` the cutoff scales by
+  `min(1, 1/s)` and the support stretches by the same factor, so the signal is
+  low-passed **before** it is decimated. That is what removes the aliasing.
+- **Support cap.** The support is capped at **256 source samples** per output
+  sample to bound the cost. Beyond a 8:1 ratio the anti-aliasing is therefore
+  partial — a documented limit, not a silent one.
+- **Unity DC gain.** Coefficients are normalized to sum to 1 at every ratio and
+  phase, so the filter never drifts the loudness of a signal.
+- **Fast paths.** At unity cutoff (upsampling, or unit step with a fractional
+  cursor) a kernel is one contiguous **bank row pair** interpolated between
+  phases — vectorizable, no gather. The interior read loop is SIMD
+  (4 taps/step mono, 8 floats/step stereo); only clip edges take the guarded
+  scalar path. Because the weights depend only on the fractional cursor and the
+  step, an **exactly repeated fraction reuses the kernel** and just relocates its
+  start index, which makes integer ratios (48→24 kHz, 96→48 kHz) nearly free.
+- **Edges.** Reads outside the clip clamp to the edge sample, or wrap when the
+  voice loops, so looping stays continuous through the boundary.
+- **Measured effect.** A 16 kHz tone at 48 kHz resampled to 24 kHz (Nyquist
+  12 kHz) keeps **> 0.8** of its amplitude with `.linear` — the alias — and
+  **< 0.2** with `.sinc`. A 1 kHz tone through the same 2:1 decimation is
+  preserved within 5e-3. Both are tests, not claims.
 - `pitch` must be **greater than zero** (zero and negative values are rejected —
   there is no "stopped" or reverse playback through pitch) and is clamped to
   `[min_pitch = 0.01, max_pitch = 100]`.
@@ -103,19 +144,70 @@ in loudness at the center. Linear is exact at the endpoints and cheaper.
 ## Voice lifecycle
 
 ```
-play ──► playing ⇄ paused ──► (end of clip, non-looping) ──► slot recycled
+play ──► playing ⇄ paused ──► (end of clip, non-looping) ──► slot recycled  (.finished)
                     │
-                    └── stop ─────────────────────────────► slot recycled
+                    ├── stop ─────────────────────────────► slot recycled  (.stopped)
+                    │
+                    └── stolen by a new play ─────────────► slot recycled  (.stolen)
 ```
 
 - A voice that reaches its end is recycled **after** its last samples are mixed,
   so the tail of the buffer is correct and the rest is silence.
   `RenderStats.voices_finished` counts them.
-- The pool is a **hard limit**: `play` returns `error.NoVoiceAvailable` when it is
-  full. There is no implicit voice stealing (a planned addition).
+- The pool is a **hard limit by default**: `play` returns
+  `error.NoVoiceAvailable` when it is full. Enable `steal_policy` to recycle a
+  voice instead (next section).
 - A **muted bus** silences its voices but does not stop them: they keep advancing
   and still finish, which is what a mute control should do.
 - `stopAll` releases every voice and keeps bus/master settings.
+
+## Voice stealing and priorities
+
+A fixed pool will eventually fill up. What happens then is a policy, not an
+accident:
+
+```zig
+var mixer = try A.Mixer.init(gpa, .{ .max_voices = 32, .steal_policy = .lowest_priority });
+
+const music    = try mixer.play(track, .{ .looping = true, .priority = 220 });
+const ambience = try mixer.play(rain,  .{ .looping = true, .priority = 40 });
+// Pool full: the gunshot takes the ambience's slot, not the music's.
+const shot     = try mixer.play(gun,   .{ .priority = 180 });
+
+mixer.isLive(ambience);                      // false
+mixer.terminationOf(ambience);               // .stolen
+mixer.terminationOf(music);                  // null (still live)
+mixer.stolenCount();                         // 1
+```
+
+Rules, in order:
+
+1. **Only equal-or-lower priority can be taken.** A voice whose priority is
+   *higher* than the request is never a candidate; if every live voice outranks
+   the request, `play` fails with `NoVoiceAvailable` rather than interrupting
+   something more important.
+2. **Lowest priority first**, so the least important sound is the one that dies.
+3. **Ties break by age** — the smallest start sequence number wins, i.e. the
+   oldest voice among equals. The scan is ascending by slot, so the choice is
+   fully deterministic for a given call sequence.
+4. **Opt out per request** with `.allow_steal = false`: the request then only
+   takes a genuinely free slot. This is what a retry should use, so two sources
+   cannot steal each other forever.
+5. **Paused voices are candidates too.** Pausing holds a slot; it does not
+   protect it.
+
+`terminationOf(handle)` answers *why* a handle is dead — `.stopped`, `.finished`
+or `.stolen` — and keeps working **after the slot has been reused**, because the
+reason is recorded against the generation that died, not against the slot. Each
+slot keeps only its most recent termination: once a newer occupancy of the same
+slot ends, the older handle returns `null` instead of a wrong reason. Unknown or
+forged handles always return `null`.
+
+The scene bridge uses exactly this: `AudioSource.priority` is forwarded to the
+mixer, a stolen source is reported once in `Stats.stolen`, and it is retried with
+`.allow_steal = false` until a slot is genuinely free — resuming from the last
+cursor it observed rather than restarting the clip (see
+[audio-spatial.md](audio-spatial.md)).
 
 ## API
 
@@ -130,6 +222,8 @@ var mixer = try A.Mixer.init(gpa, .{
     .pan_law = .equal_power,
     .master_gain = 1.0,
     .clamp_output = true,
+    .steal_policy = .none,  // or .lowest_priority
+    .resample = .linear,    // or .sinc (band-limited)
 });
 defer mixer.deinit();
 
@@ -138,7 +232,12 @@ const voice = try mixer.play(.{
     .channels = view.channels,
     .frames = view.frames,
     .samples = samples,     // borrowed; must outlive the voice
-}, .{ .gain = 0.8, .pan = -0.25, .pitch = 1.0, .looping = true, .bus = 1, .start_frame = 0, .paused = false });
+}, .{
+    .gain = 0.8, .pan = -0.25, .pitch = 1.0, .looping = true, .bus = 1,
+    .start_frame = 0, .paused = false,
+    .priority = 200,        // 0 least .. 255 most important (default 128)
+    .allow_steal = true,    // may this request take someone else's slot?
+});
 
 try mixer.setGain(voice, 0.5);   // error.InvalidValue on non-finite input
 try mixer.setPan(voice, 0.25);   // clamped to [-1, 1]
@@ -165,7 +264,8 @@ mixer.stop(voice);
 
 Queries: `state(handle) ?State`, `isLive(handle) bool`,
 `positionFrames(handle) ?f64`, `liveVoices()`, `voiceCapacity()`,
-`busGain(bus) ?f32`, `isBusMuted(bus) ?bool`, `masterGain()`.
+`busGain(bus) ?f32`, `isBusMuted(bus) ?bool`, `masterGain()`,
+`terminationOf(handle) ?Termination`, `stolenCount() u64`.
 
 Errors: `InitError{ InvalidConfig, OutOfMemory }`,
 `PlayError{ InvalidClip, InvalidOptions, UnsupportedChannelLayout, NoVoiceAvailable }`,
@@ -244,6 +344,23 @@ it plays real imported fixtures end to end.
 - **Resampling**: 2:1 downsampling lands on whole source frames; 1:2 upsampling
   produces exact midpoints; stereo and 6-channel sources are interpolated on
   every channel; the last frame of a non-looping clip is held, not wrapped.
+- **Band-limited resampling**: the prototype is symmetric with zero endpoints
+  and a zero crossing at ±1; the polyphase bank agrees with the flat table; DC
+  gain is unity at seven ratios and 50 phases each; an upsampled sine matches the
+  analytic signal within 2e-3; a 16 kHz tone decimated 2:1 is attenuated below
+  0.2 while linear keeps > 0.8; a 1 kHz tone survives the same decimation within
+  5e-3; support grows with the ratio and saturates at the cap; edges clamp,
+  looping wraps, a one-frame clip is constant under both; interleaved channels
+  are filtered independently; kernels depend only on the fraction so `start` can
+  be relocated; the unit-rate path stays **bit-exact** against `.linear`; an
+  integer step reuses the kernel across four loop wraps; rendering is
+  deterministic and allocation-free.
+- **Stealing**: the default policy refuses a full pool and never steals; the
+  lowest-priority voice is taken and its slot reused; a request below every live
+  voice fails; `.allow_steal = false` fails even when a victim exists; ties break
+  by age, deterministically, including a paused victim; `terminationOf`
+  distinguishes stop/finish/steal, survives slot reuse, and returns `null` for
+  unknown handles and for records a newer occupancy has overwritten.
 - **Pitch**: step scaling, mid-flight pitch changes continuing from the cursor,
   clamping into the documented band, rejection of zero/negative pitch.
 - **Looping**: wrap-around interpolation across the boundary, steps larger than
@@ -258,7 +375,8 @@ it plays real imported fixtures end to end.
   non-finite sanitizing.
 - **Determinism and memory**: two mixers driven identically agree bit for bit over
   32 buffers; `checkAllAllocationFailures` on `init` + `play` + `render` with no
-  leaks and no swallowed `OutOfMemory`; the leak-checked test allocator covers
+  leaks and no swallowed `OutOfMemory`, in both `.linear` and `.sinc` (the extra
+  table allocations unwind cleanly); the leak-checked test allocator covers
   every other test.
 - **Integration**: WAV → `CXAW` → `Clip` → mixer, mono and stereo bit-exact,
   half-rate resampling, and a PCM16 bounce within one LSB.
@@ -268,19 +386,35 @@ it plays real imported fixtures end to end.
 
 ## Performance
 
-Measured on this machine, `ReleaseFast`, best of 400 renders, **64 looping stereo
-voices** into a 512-frame stereo buffer at 48 kHz (10.7 ms of audio per render):
+Measured on this machine, `ReleaseFast`, best of 300 renders, **64 looping stereo
+voices** into a 512-frame stereo buffer (10.7 ms of audio per render). This is a
+stress case: every voice resamples on every sample.
 
-| Source rate | Path | Time per render | Real-time factor |
+| Output / clip rate | Ratio | `.linear` | `.sinc` |
 | --- | --- | --- | --- |
-| 44,100 Hz | linear resampling | **68.8 µs** | **155×** |
-| 48,000 Hz | interpolation-free | **32.6 µs** | **328×** |
+| 48,000 / 48,000 Hz | 1:1 (copy path) | **25 µs** (423×) | same path |
+| 48,000 / 44,100 Hz | upsampling | **58 µs** (185×) | **864 µs** (12×) |
+| 24,000 / 48,000 Hz | 2:1 decimation | **58 µs** (185×) | **411 µs** (26×) |
+| 48,000 / 96,000 Hz | 2:1 decimation | — | **419 µs** (25×) |
+| 44,100 / 48,000 Hz | 1.088:1 decimation | **61 µs** (175×) | **2,511 µs** (4×) |
 
-- The mixing core is monomorphized per **(channel map, resampling)** pair, so the
-  per-sample work has no layout branch and no interpolation branch. The
-  unit-step specialization is ~2.1× faster than the general path.
-- One load per sample on the fast path; two plus a lerp when resampling.
-- No allocation, no locks, no syscalls and no scratch buffer during `render`.
+Reading the table honestly:
+
+- `.sinc` costs **7× to 40× linear** depending on the ratio. It is opt-in for
+  exactly that reason. At 64 simultaneous resampled voices the worst case uses
+  about a quarter of one core; at a more typical 8–16 voices it is a few percent.
+- **Integer ratios are the cheap case** (26×): the fractional cursor never
+  changes, so the kernel is built once per voice per render and only relocated.
+  Non-integer decimation is the expensive case (4×): the stretched filter needs a
+  fresh 64-tap kernel every frame, and that construction — not the dot product —
+  dominates. Upsampling sits in between (12×) thanks to the contiguous bank rows.
+- The mixing core is monomorphized per **(channel map, mode)** pair — `copy`,
+  `linear` or `sinc` — so the per-sample work has no layout branch and no
+  interpolation branch.
+- One load per sample on the copy path; two plus a lerp on linear; a normalized
+  32–256 tap dot product on sinc, SIMD in the interior.
+- No allocation, no locks, no syscalls and no scratch buffer during `render` in
+  any mode. The sinc tables are built once in `init`.
 - Voice state is a contiguous array walked in slot order, so the mix is
   cache-friendly and prefetchable.
 
@@ -294,9 +428,16 @@ voices** into a 512-frame stereo buffer at 48 kHz (10.7 ms of audio per render):
   `AudioSystem` (see [audio-spatial.md](audio-spatial.md)), which feed this
   mixer's gain/pan/pitch. There is no HRTF or binaural rendering anywhere yet.
 - **No effects/DSP**: no filters, reverb, compression or per-bus inserts.
-- **Linear resampling only** — no band-limited (polyphase/sinc) conversion, so
-  large downsampling ratios can alias.
-- **No voice stealing**: a full pool returns `NoVoiceAvailable`.
+- **Resampling trade-offs are explicit.** `.linear` (the default) aliases when
+  decimating. `.sinc` removes that, but its support is capped at 256 source
+  samples, so beyond an 8:1 ratio the anti-aliasing is partial, and it costs
+  7–40× linear (see Performance). There is no asynchronous/offline high-quality
+  converter and no per-voice quality selection — quality is per mixer.
+- **Stealing is priority-only.** There is no loudness-based or distance-based
+  victim scoring, no fade-out on steal (the slot is taken immediately, which can
+  click), and no "virtual voice" that keeps advancing silently while it waits.
+  The scene bridge resumes a stolen source from the last cursor it observed, so
+  the gap is at most one update plus the time spent waiting for a free slot.
 - **No streaming**: a clip must be fully resident in memory (the `CXAW` decoder
   has the same limitation).
 - **No loop points**: `smpl`/`cue ` markers are not carried by `CXAW` yet, so

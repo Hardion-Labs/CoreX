@@ -3,7 +3,9 @@
 //! This is the audio counterpart of `corex.render`: pure CPU work with no device
 //! dependency, so it is fully testable headlessly and deterministic. It mixes
 //! borrowed float32 clips into an interleaved output buffer with gain, pan,
-//! buses, pitch, looping and linear-interpolated resampling. The OS audio
+//! buses, pitch, looping and resampling (linear by default, band-limited
+//! windowed-sinc on request). When the voice pool is full, an optional
+//! priority-based steal policy recycles the least important voice. The OS audio
 //! backends (ALSA/WASAPI/CoreAudio) are **planned**; this layer defines the
 //! contract they will consume — `render` fills a buffer, `toPcm16` converts it to
 //! the format most devices accept.
@@ -57,6 +59,8 @@ pub const mixer = @import("audio/mixer.zig");
 pub const spatial = @import("audio/spatial.zig");
 /// Scene-driven audio: the `AudioSource` component and the voice reconciler.
 pub const system = @import("audio/system.zig");
+/// Band-limited (windowed-sinc) resampling prototype and kernels.
+pub const resample = @import("audio/resample.zig");
 
 pub const Mixer = mixer.Mixer;
 pub const VoiceHandle = mixer.VoiceHandle;
@@ -64,6 +68,9 @@ pub const State = mixer.State;
 pub const Config = mixer.Config;
 pub const PlayOptions = mixer.PlayOptions;
 pub const RenderStats = mixer.RenderStats;
+pub const StealPolicy = mixer.StealPolicy;
+pub const Termination = mixer.Termination;
+pub const Resample = mixer.Resample;
 
 pub const AudioSource = system.AudioSource;
 pub const AudioSystem = system.AudioSystem;
@@ -95,4 +102,5 @@ test {
     _ = mixer;
     _ = spatial;
     _ = system;
+    _ = resample;
 }
