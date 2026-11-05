@@ -10,7 +10,7 @@ contract is unchanged.
 > [asset-decoders.md](asset-decoders.md) — an **OBJ mesh** decoder produces a
 > `CXMH` artifact — see [mesh-import.md](mesh-import.md) — and a **WAV audio**
 > decoder produces a `CXAW` artifact (interleaved f32) — see
-> [asset-audio.md](asset-audio.md). Other binary formats (JPEG, compressed audio,
+> [asset-audio.md](asset-audio.md). Other binary formats (compressed audio,
 > other models such as glTF/FBX/DAE, fonts) still have no decoder and use the
 > `raw` importer (verbatim copy) until decoders are registered. This is documented
 > below and is not described as an existing capability.
@@ -229,7 +229,7 @@ Guarantees and behavior:
 - Texture decoders exist for **PNG, BMP, TGA and QOI** (see
   [asset-decoders.md](asset-decoders.md)), a mesh decoder for **OBJ** (see
   [mesh-import.md](mesh-import.md)) and an audio decoder for **uncompressed WAV**
-  (see [asset-audio.md](asset-audio.md)). JPEG, compressed audio
+  (see [asset-audio.md](asset-audio.md)). Compressed audio
   (ADPCM/µ-law/Ogg/MP3/FLAC/Opus), other model formats (glTF/FBX/DAE) and fonts
   still have no decoder and use the `raw` importer (verbatim copy); they will be
   registered as dedicated importers once they exist. Compressed WAV codecs are

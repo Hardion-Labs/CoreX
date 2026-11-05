@@ -248,11 +248,11 @@ reclaims orphan entries when sources change or are removed. Built-in importers
 cover raw binary, text (UTF-8 + line-ending
 normalization), JSON (strict validation + lossless minification) and scenes
 (validated and canonicalized via the scene system). Texture sources in **PNG,
-BMP, TGA and QOI** are decoded to RGBA8 and stored as a self-describing `CXTX`
+JPEG, BMP, TGA and QOI** are decoded to RGBA8 and stored as a self-describing `CXTX`
 artifact, and **OBJ** meshes are decoded to indexed triangle meshes stored as a
 `CXMH` artifact, and **WAV** audio (uncompressed PCM 8/16/24/32-bit and IEEE
 float32) is decoded to interleaved float32 stored as a `CXAW` artifact; other
-binary formats (JPEG, compressed audio, glTF/FBX) still import as `raw` until
+binary formats (compressed audio, glTF/FBX) still import as `raw` until
 decoders exist.
 
 PNG support covers every color type and bit depth (1/2/4/8/16), all five row
@@ -263,6 +263,14 @@ bounded by the caller, so a decompression bomb cannot exceed the size declared b
 the image header. 16-bit samples are reduced to their high byte (the artifact is
 RGBA8). Interlaced files decode to exactly the same pixels as their
 non-interlaced equivalent.
+
+JPEG support covers sequential Huffman frames (`SOF0`/`SOF1`) at 8-bit precision,
+grayscale and YCbCr, every common subsampling (4:4:4, 4:4:0, 4:2:2, 4:2:0, 4:1:1),
+restart markers and optimized Huffman tables. Colour conversion and chroma
+upsampling reproduce libjpeg exactly; only the inverse DCT differs, because JPEG
+does not normatively specify it, so output matches a libjpeg decode to within 3
+levels per channel over the reference corpus. Progressive, arithmetic-coded,
+lossless, 12-bit and CMYK files are rejected rather than approximated.
 
 ```zig
 const corex = @import("corex");
@@ -527,7 +535,8 @@ Indicative; subject to change as technical decisions are validated.
 - [x] Asset change detection + incremental import (hot-reload foundation).
 - [x] Mesh decoder (OBJ → indexed triangle mesh, `CXMH` artifact).
 - [x] Audio decoder (WAV/PCM + IEEE float32 → interleaved f32 `CXAW` artifact).
-- [ ] Asset decoders (JPEG, compressed audio, other model formats).
+- [x] JPEG decoder (sequential Huffman, grayscale/YCbCr, all common subsamplings).
+- [ ] Asset decoders (progressive JPEG, compressed audio, other model formats).
 - [x] Audio mixer (voices, buses, gain/pan, pitch, resampling, allocation-free render).
 - [x] Spatial audio (listener, attenuation models, Doppler) + `AudioSource` scene bridge.
 - [x] Voice stealing with priorities + band-limited (windowed-sinc) resampling.
