@@ -6,7 +6,7 @@ These are contribution standards for a project in early development. They distin
 
 - Project source and build configuration are written in Zig (target: Zig 0.17.0).
 - `src/corex.zig` is the public module and re-exports implemented subsystems; `src/main.zig` is the `corex-engine` executable entry point.
-- Implemented startup-spine subsystems live under `src/core/` (CLI, manifest, paths, jobs, config, assets, splash, diagnostics, startup, version).
+- Implemented subsystems live under `src/core/` (startup spine: CLI, manifest, paths, validation, jobs, config, assets, splash, diagnostics, startup, version), `src/ecs/` (entities, pools, world) and `src/scene/` (components, versioned scene documents).
 - `build.zig` defines `zig build`, `zig build run`, and `zig build test`; `zig build run -- <args>` forwards arguments via `Run.addPassthruArgs`.
 - The Zig files use lowercase snake_case for file names, declarations, and local identifiers, and PascalCase for types.
 - Allocators are passed explicitly; owned resources expose a `deinit`. Error sets are explicit and, at the process boundary, map to the stable exit codes in `docs/launch-contract.md`.
@@ -38,7 +38,7 @@ These are contribution standards for a project in early development. They distin
 - Avoid global mutable state; where it is necessary, document initialization, lifetime, and synchronization expectations.
 - Do not introduce allocations in hot paths without a clear need and justification.
 
-The current scaffold does not yet establish allocator APIs or specialized memory-management patterns. New code should not imply that such policies already exist.
+The implemented subsystems establish explicit-allocator APIs, owned `deinit` cleanup, generational ECS handles and plain-data scene components. New code should follow these patterns where they fit and should not imply that planned subsystems already establish additional policies.
 
 ### Safety and performance
 

@@ -22,6 +22,7 @@ const config = @import("config.zig");
 const assets = @import("assets.zig");
 const splash_mod = @import("splash.zig");
 const diagnostics = @import("diagnostics.zig");
+const scene_mod = @import("../scene.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -64,9 +65,13 @@ pub const StartupResult = struct {
     config: config.ProjectConfig,
     asset_index: assets.AssetIndex,
     scene: ?SceneRequest,
+    /// Loaded initial scene for `editor`/`runtime`. Null in `validate` mode.
+    /// When no initial scene is requested, this is an empty scene.
+    scene_data: ?scene_mod.EngineScene,
     mode: cli.Mode,
 
     pub fn deinit(self: *StartupResult) void {
+        if (self.scene_data) |*s| s.deinit();
         self.manifest.deinit();
         self.asset_index.deinit();
         self.* = undefined;
@@ -164,11 +169,27 @@ pub fn run(
     splash.setProgress("configuration loaded and assets indexed", 0.7);
     log.info("indexed {d} assets ({d} bytes)", .{ index.count(), index.totalBytes() });
 
-    // Step 6: prepare the initial scene.
-    var scene: ?SceneRequest = null;
+    // Step 6: prepare and load the initial scene.
+    var scene_data: ?scene_mod.EngineScene = null;
+    errdefer {
+        if (scene_data) |*s| s.deinit();
+    }
+    var scene_req: ?SceneRequest = null;
     if (opts.mode != .validate) {
         splash.setProgress("preparing initial scene", 0.8);
-        scene = try prepareScene(io, project_root, man.initial_scene, opts.scene_override);
+        scene_req = try prepareScene(io, project_root, man.initial_scene, opts.scene_override);
+        if (scene_req) |req| {
+            var dir = Io.Dir.openDirAbsolute(io, project_root, .{}) catch return error.PreparationFailed;
+            defer dir.close(io);
+            scene_data = scene_mod.EngineScene.load(gpa, io, dir, req.path) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                log.warn("failed to load scene \"{s}\": {s}", .{ req.path, @errorName(err) });
+                return error.PreparationFailed;
+            };
+            log.info("scene \"{s}\" loaded ({d} entities)", .{ scene_data.?.name, scene_data.?.count() });
+        } else {
+            scene_data = scene_mod.EngineScene.init(gpa, "empty") catch return error.OutOfMemory;
+        }
         profiler.record("scene", stage_timer.elapsedNanoseconds());
         stage_timer.restart();
     }
@@ -187,7 +208,8 @@ pub fn run(
         .manifest = man,
         .config = cfg,
         .asset_index = index,
-        .scene = scene,
+        .scene = scene_req,
+        .scene_data = scene_data,
         .mode = opts.mode,
     };
 }
@@ -268,6 +290,10 @@ const minimal_manifest =
     \\{ "format_version": 1, "name": "TestGame", "engine_version": "0.1.0" }
 ;
 
+const empty_scene =
+    \\{ "format_version": 1, "name": "main", "entities": [] }
+;
+
 test "startup: validate mode succeeds on a minimal project" {
     var proj = try TestProject.init();
     defer proj.deinit();
@@ -283,6 +309,7 @@ test "startup: validate mode succeeds on a minimal project" {
 
     try std.testing.expectEqualStrings("TestGame", result.manifest.name);
     try std.testing.expect(result.scene == null);
+    try std.testing.expect(result.scene_data == null);
     try std.testing.expect(!splash.is_open);
 }
 
@@ -292,7 +319,7 @@ test "startup: editor mode prepares scene and indexes assets" {
     try proj.write("Game.corex",
         \\{ "format_version": 1, "name": "TestGame", "engine_version": "0.1.0", "initial_scene": "scenes/main.scene" }
     );
-    try proj.write("scenes/main.scene", "{}");
+    try proj.write("scenes/main.scene", empty_scene);
     try proj.write("assets/tex/hero.png", "png");
     try proj.write("settings.json", "{ \"window_width\": 800 }");
 
@@ -307,6 +334,8 @@ test "startup: editor mode prepares scene and indexes assets" {
     try std.testing.expectEqual(@as(u32, 800), result.config.window_width);
     try std.testing.expectEqual(@as(usize, 1), result.asset_index.countByKind(.texture));
     try std.testing.expectEqualStrings("scenes/main.scene", result.scene.?.path);
+    try std.testing.expect(result.scene_data != null);
+    try std.testing.expectEqual(@as(usize, 0), result.scene_data.?.count());
     try std.testing.expect(!splash.is_open);
 }
 
@@ -362,7 +391,7 @@ test "startup: scene override is used" {
     var proj = try TestProject.init();
     defer proj.deinit();
     try proj.write("Game.corex", minimal_manifest);
-    try proj.write("scenes/other.scene", "{}");
+    try proj.write("scenes/other.scene", empty_scene);
     var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
     const mpath = try proj.manifestPath(&path_buf);
     const opts = cli.LaunchOptions{ .mode = .editor, .project_path = mpath, .scene_override = "scenes/other.scene" };
@@ -370,6 +399,67 @@ test "startup: scene override is used" {
     var result = try run(std.testing.allocator, std.testing.io, opts, splash.interface());
     defer result.deinit();
     try std.testing.expectEqualStrings("scenes/other.scene", result.scene.?.path);
+}
+
+test "startup: editor without initial scene prepares an empty scene" {
+    var proj = try TestProject.init();
+    defer proj.deinit();
+    try proj.write("Game.corex", minimal_manifest);
+
+    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const mpath = try proj.manifestPath(&path_buf);
+    const opts = cli.LaunchOptions{ .mode = .editor, .project_path = mpath, .headless = true };
+    var splash = splash_mod.HeadlessSplash{};
+    var result = try run(std.testing.allocator, std.testing.io, opts, splash.interface());
+    defer result.deinit();
+
+    try std.testing.expect(result.scene == null);
+    try std.testing.expect(result.scene_data != null);
+    try std.testing.expectEqual(@as(usize, 0), result.scene_data.?.count());
+}
+
+test "startup: invalid scene content -> PreparationFailed" {
+    var proj = try TestProject.init();
+    defer proj.deinit();
+    try proj.write("Game.corex",
+        \\{ "format_version": 1, "name": "TestGame", "engine_version": "0.1.0", "initial_scene": "scenes/bad.scene" }
+    );
+    try proj.write("scenes/bad.scene", "{ not valid json");
+
+    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const mpath = try proj.manifestPath(&path_buf);
+    const opts = cli.LaunchOptions{ .mode = .editor, .project_path = mpath };
+    var splash = splash_mod.HeadlessSplash{};
+    try std.testing.expectError(error.PreparationFailed, run(std.testing.allocator, std.testing.io, opts, splash.interface()));
+    try std.testing.expect(!splash.is_open);
+}
+
+test "startup: editor loads scene entities and components" {
+    var proj = try TestProject.init();
+    defer proj.deinit();
+    try proj.write("Game.corex",
+        \\{ "format_version": 1, "name": "TestGame", "engine_version": "0.1.0", "initial_scene": "scenes/main.scene" }
+    );
+    try proj.write("scenes/main.scene",
+        \\{ "format_version": 1, "name": "main", "entities": [
+        \\  { "id": 1, "name": "Root", "components": { "transform": { "position": [1, 2, 3] } } },
+        \\  { "id": 2, "name": "Child", "parent": 1 }
+        \\] }
+    );
+
+    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const mpath = try proj.manifestPath(&path_buf);
+    const opts = cli.LaunchOptions{ .mode = .runtime, .project_path = mpath, .headless = true };
+    var splash = splash_mod.HeadlessSplash{};
+    var result = try run(std.testing.allocator, std.testing.io, opts, splash.interface());
+    defer result.deinit();
+
+    var s = &result.scene_data.?;
+    try std.testing.expectEqual(@as(usize, 2), s.count());
+    const root = s.entityById(1).?;
+    const child = s.entityById(2).?;
+    try std.testing.expect(s.parent(child).?.eql(root));
+    try std.testing.expectEqual(@as(f32, 1), s.getComponent(scene_mod.Transform, root).?.position[0]);
 }
 
 test "exitCode mapping is stable" {

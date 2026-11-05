@@ -1,4 +1,29 @@
 {
+  "format_version": 1,
   "name": "main",
-  "entities": []
+  "entities": [
+    {
+      "id": 1,
+      "name": "Root",
+      "components": {
+        "transform": {
+          "position": [0, 0, 0],
+          "rotation": [0, 0, 0, 1],
+          "scale": [1, 1, 1]
+        }
+      }
+    },
+    {
+      "id": 2,
+      "name": "Child",
+      "parent": 1,
+      "components": {
+        "transform": {
+          "position": [0, 1, 0],
+          "rotation": [0, 0, 0, 1],
+          "scale": [1, 1, 1]
+        }
+      }
+    }
+  ]
 }
