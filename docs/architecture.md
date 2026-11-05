@@ -122,17 +122,17 @@ Lifecycle, CLI, logging, configuration, versioning, diagnostics and the startup
 pipeline are implemented. Memory policies beyond explicit allocators are still
 to be formalized.
 
-### Runtime independente — planned
+### Independent runtime — planned
 A standalone runtime that loads and runs an exported project without the
 editor. The `runtime` launch mode currently prepares the session headless; the
 loop, subsystems and player are planned.
 
-### Editor gráfico próprio — planned
+### First-party graphical editor — planned
 The graphical editor. The startup pipeline already opens an editor *session*
 (headless). Panels, inspectors, scene view, asset browser and the editor loop
 are planned on top of the GUI library.
 
-### Biblioteca GUI própria — planned
+### First-party GUI library — planned
 The engine's own GUI toolkit (widgets, layout, input, rendering integration) used
 by the editor and the graphical splash. No third-party GUI dependency is planned.
 
@@ -203,7 +203,7 @@ extensions. The world depends only on `entity.zig` and `pool.zig`; the scheduler
 depends only on the world and `std.Io`; `frame.zig` additionally reuses the
 diagnostics `Timer` (low coupling). Scenes and scripting build on these layers.
 
-### Sistema de cenas — implemented (format v1 + ECS load/save + prefabs), planned (streaming)
+### Scene system — implemented (format v1 + ECS load/save + prefabs), planned (streaming)
 Scenes are versioned JSON documents (`docs/scene-format.md`) backed by the ECS.
 `scene.Scene(schema)` owns a typed ECS world, stable monotonic entity IDs and a
 parent hierarchy. It supports strict parse/serialize, file load/save,
@@ -237,7 +237,7 @@ on error. Prefabs are classified as `AssetKind.prefab` and imported/cached by th
 engine registry (`prefab` importer v1). Scene streaming, change tracking and
 multi-scene management remain planned extensions.
 
-### Sistema de assets — implemented (indexing + import/cache + texture/mesh decoders), planned (more decoders)
+### Asset system — implemented (indexing + import/cache + texture/mesh decoders), planned (more decoders)
 `core.assets.indexDirectories` builds a kind/size index at startup (unchanged).
 The asset subsystem (`corex.assets`, `src/assets/`) adds a content-addressed
 import cache, an importer framework (raw/text/json + a scene importer that reuses
@@ -252,7 +252,7 @@ dependency tracking, temp-file cleanup and hot-reload are planned extensions. Se
 [asset-import.md](asset-import.md), [asset-decoders.md](asset-decoders.md) and
 [mesh-import.md](mesh-import.md).
 
-### Importação e cache — implemented
+### Import and cache — implemented
 `assets.pipeline` imports an indexed asset set into derived artifacts stored in a
 content-addressed cache keyed by source content hash + importer identity/version
 + options. Cache writes are atomic (temp + rename) and reads verify the payload
@@ -262,7 +262,7 @@ failures are recorded in a report without aborting the batch. Binary assets use
 the `raw` (verbatim) importer until decoders exist. Startup/editor integration is
 a planned next step. See [asset-import.md](asset-import.md).
 
-### Serialização — implemented (scenes + import cache), planned (export)
+### Serialization — implemented (scenes + import cache), planned (export)
 Scene (de)serialization is versioned (`format_version = 1`), strict and
 deterministic (entities sorted by stable ID, optional null fields omitted). It
 uses the standard-library JSON parser/stringifier with duplicate-field and
@@ -272,18 +272,18 @@ copies cannot dangle. The import cache uses its own versioned on-disk format
 verification. Export-template serialization is planned, aligned with the
 format-version policy in [versioning.md](versioning.md).
 
-### VM Lua / Gameplay scripting — planned
+### Lua VM / gameplay scripting — planned
 An embedded Lua VM and a gameplay scripting API. The example project ships a
 placeholder `scripts/main.lua`. The VM choice (Lua version, allocator, sandbox)
 will be documented before integration.
 
-### Native Module API para C++ — contract defined
+### Native Module API for C++ — contract defined
 A stable C ABI lets C++ modules extend the engine without coupling to Zig
 internals. The contract (entry points, versioning, lifetime) will be published
 as a C header under `include/corex/` before any module loads. See
 [native-module-api.md](native-module-api.md).
 
-### Sistema de jobs e carregamento assíncrono — implemented (foundation)
+### Job system and asynchronous loading — implemented (foundation)
 `jobs.JobSystem` wraps `std.Io` concurrency with a configurable worker pool,
 `spawn` (future-based) and `Batch` (group-based). Used by the startup pipeline,
 by ECS system scheduling (`Schedule.run(js.io(), ...)`) and by the asset import
@@ -295,16 +295,16 @@ a frame-budget scheduler are planned.
 implementation. A graphical splash will implement the same interface on the GUI
 library.
 
-### Sistema de versionamento da engine — implemented
+### Engine versioning system — implemented
 `version.zig` exposes the engine version and the project compatibility policy.
 The engine never installs or selects versions (that is the Hub's role).
 
-### Sistema de exportação / Export Templates — planned (engine side)
+### Export system / Export Templates — planned (engine side)
 The engine defines the export pipeline, the packaged runtime format and the
 Export Template *format/consumption*. Acquisition, installation and management
 of templates belong to the Hub. See [scope.md](scope.md).
 
-### Ferramentas de diagnóstico e profiling — implemented (foundation + ECS frame profiling)
+### Diagnostics and profiling tools — implemented (foundation + ECS frame profiling)
 `diagnostics.Timer` and `diagnostics.Profiler` measure startup stages. ECS
 system/frame profiling is implemented via `frame.FrameSchedule`/`FrameProfiler`
 (allocation-free per-system runs/errors/timings). Engine-wide memory tracking, a

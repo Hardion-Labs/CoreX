@@ -1,86 +1,87 @@
-# Importação de Assets e Cache — CoreXEngine
+# Asset Import and Cache — CoreXEngine
 
-Este documento descreve o pipeline de importação de assets e o cache
-endereçado por conteúdo da CoreXEngine. O código vive em `src/assets/` e é
-exposto publicamente como `corex.assets`. O índice de assets (etapa de startup)
-permanece em `src/core/assets.zig` e não teve seu contrato alterado.
+This document describes CoreXEngine's asset import pipeline and content-addressed
+cache. The code lives in `src/assets/` and is exposed publicly as `corex.assets`.
+The asset index (a startup stage) remains in `src/core/assets.zig` and its
+contract is unchanged.
 
-> Estado: **implementado e testado**. Decodificadores de **textura** para
-> **BMP, TGA e QOI** existem e produzem um artefato `CXTX` (RGBA8) — ver
-> [asset-decoders.md](asset-decoders.md) — e um decodificador de **malha OBJ**
-> produz um artefato `CXMH` — ver [mesh-import.md](mesh-import.md). Demais
-> formatos binários (PNG, JPEG, áudio, outros modelos como glTF/FBX/DAE, fonte)
-> ainda não têm decodificador e usam o importer `raw` (cópia verbatim) até que
-> decodificadores sejam registrados. Isso está documentado abaixo e não é
-> descrito como capacidade existente.
+> Status: **implemented and tested**. **Texture** decoders for **BMP, TGA and
+> QOI** exist and produce a `CXTX` artifact (RGBA8) — see
+> [asset-decoders.md](asset-decoders.md) — and an **OBJ mesh** decoder produces a
+> `CXMH` artifact — see [mesh-import.md](mesh-import.md). Other binary formats
+> (PNG, JPEG, audio, other models such as glTF/FBX/DAE, fonts) still have no
+> decoder and use the `raw` importer (verbatim copy) until decoders are
+> registered. This is documented below and is not described as an existing
+> capability.
 
-## Visão geral
+## Overview
 
-O pipeline transforma assets de origem em artefatos derivados prontos para a
-engine e os armazena em um cache incremental e reprodutível:
+The pipeline turns source assets into engine-ready derived artifacts and stores
+them in an incremental, reproducible cache:
 
-1. O índice de assets (`AssetIndex`) lista os arquivos de origem (caminho,
-   tamanho, tipo).
-2. Para cada asset, o pipeline lê a origem, seleciona um **importer** pela
-   extensão e calcula uma **chave de cache** a partir do hash do conteúdo +
-   identidade/versão do importer + opções.
-3. Se a chave já existe no cache e é íntegra, o artefato é reutilizado
-   (**cache hit**, sem reimportar). Caso contrário, o importer roda e o
-   resultado é gravado de forma atômica (**import**).
-4. Um **relatório** (`Report`) registra o resultado por asset e os totais.
+1. The asset index (`AssetIndex`) lists the source files (path, size, kind).
+2. For each asset, the pipeline reads the source, selects an **importer** by
+   extension and computes a **cache key** from the content hash + importer
+   identity/version + options.
+3. If the key already exists in the cache and is intact, the artifact is reused
+   (**cache hit**, no re-import). Otherwise the importer runs and the result is
+   written atomically (**import**).
+4. A **report** (`Report`) records the per-asset result and the totals.
 
-Como a chave depende do conteúdo da origem e da versão do importer, o cache é
-automaticamente invalidado quando a origem muda ou quando o importer é
-atualizado — sem necessidade de um índice separado ou de timestamps.
+Because the key depends on the source content and the importer version, the cache
+is invalidated automatically when the source changes or the importer is updated —
+with no need for a separate index or timestamps.
 
 ## Importers
 
-Um `Importer` é uma identidade estável (`id` + `version`) mais uma função pura
-`bytes de origem -> bytes derivados`. A versão participa da chave de cache;
-alterar o comportamento de um importer e incrementar sua versão invalida as
-entradas afetadas.
+An `Importer` is a stable identity (`id` + `version`) plus a pure function
+`source bytes -> derived bytes`. The version participates in the cache key;
+changing an importer's behavior and bumping its version invalidates the affected
+entries.
 
-Importers embutidos (`corex.assets.importer`):
+Built-in importers (`corex.assets.importer`):
 
-| ID     | Versão | Comportamento                                                        |
-|--------|--------|----------------------------------------------------------------------|
-| `raw`  | 1      | Cópia verbatim para assets binários/opacos (sem decodificação).        |
-| `text` | 1      | Valida UTF-8, remove BOM e normaliza CRLF/CR para LF.                  |
-| `json` | 1      | Valida JSON estrito (rejeita campos duplicados) e reminifica sem perdas. |
+| ID     | Version | Behavior                                                              |
+|--------|---------|-----------------------------------------------------------------------|
+| `raw`  | 1       | Verbatim copy for binary/opaque assets (no decoding).                  |
+| `text` | 1       | Validates UTF-8, strips the BOM and normalizes CRLF/CR to LF.           |
+| `json` | 1       | Validates strict JSON (rejects duplicate fields) and re-minifies losslessly. |
 
-O importer de cenas (`corex.assets.scene_importer`, ID `scene`) reutiliza o
-sistema de cenas: valida o documento `.scene` (hierarquia, componentes,
-transforms) e o re-serializa de forma canônica e determinística. Cenas inválidas
-são rejeitadas em tempo de importação.
+The scene importer (`corex.assets.scene_importer`, ID `scene`) reuses the scene
+system: it validates the `.scene` document (hierarchy, components, transforms)
+and re-serializes it canonically and deterministically. Invalid scenes are
+rejected at import time.
 
-Importers de textura (`corex.assets.texture`, IDs `bmp`/`tga`/`qoi`, versão 1)
-decodificam a imagem para RGBA8 e a serializam no artefato `CXTX`. Ver
-[asset-decoders.md](asset-decoders.md) para formatos suportados, layout do
-artefato e limitações.
+Texture importers (`corex.assets.texture`, IDs `bmp`/`tga`/`qoi`, version 1)
+decode the image to RGBA8 and serialize it into the `CXTX` artifact. See
+[asset-decoders.md](asset-decoders.md) for supported formats, the artifact layout
+and limitations.
 
-Contrato de um importer:
+Importer contract:
 
 ```zig
 pub const ImportError = error{ InvalidAsset, OutOfMemory };
 // fn (gpa: Allocator, source: []const u8) ImportError![]u8
 ```
 
-- Os bytes retornados são alocados com o allocator recebido; o caller libera.
-- O importer não deve reter `source`.
-- `InvalidAsset` indica origem inválida para aquele importer; o pipeline marca o
-  asset como `failed` e continua o lote.
+- The returned bytes are allocated with the passed allocator; the caller frees
+  them.
+- The importer must not retain `source`.
+- `InvalidAsset` means the source is invalid for that importer; the pipeline marks
+  the asset as `failed` and continues the batch.
 
-### Registro de importers
+### Importer registry
 
-`Registry` mapeia extensões (com ponto, case-insensitive) para importers, com um
-fallback para extensões não casadas:
+`Registry` maps extensions (including the dot, case-insensitive) to importers,
+with a fallback for unmatched extensions:
 
-- `importer.defaultRegistry()`: JSON + texto, fallback `raw`.
-- `assets.engineRegistry()`: texturas (BMP/TGA/QOI) + malhas (OBJ) + cenas +
-  prefabs (`.prefab`) + JSON + texto, fallback `raw` (registro padrão da engine).
+- `importer.defaultRegistry()`: JSON + text, `raw` fallback.
+- `assets.engineRegistry()`: textures (BMP/TGA/QOI) + meshes (OBJ) + scenes +
+  prefabs (`.prefab`/`.corexprefab`) + JSON + text, `raw` fallback (the engine's
+  default registry).
 
-Camadas superiores podem estender o registro (por exemplo, decodificadores de
-áudio ou outros formatos de modelo) sem alterar o pipeline:
+Higher layers can extend the registry (for example, audio decoders or other model
+formats) without changing the pipeline:
 
 ```zig
 const reg = corex.assets.Registry{
@@ -89,31 +90,31 @@ const reg = corex.assets.Registry{
 };
 ```
 
-## Cache endereçado por conteúdo
+## Content-addressed cache
 
-`corex.assets.Cache` armazena um arquivo autodescritivo por chave, nomeado pelo
-digest hexadecimal minúsculo (BLAKE3-256). Layout de cada arquivo:
+`corex.assets.Cache` stores one self-describing file per key, named by the
+lowercase hexadecimal digest (BLAKE3-256). Layout of each file:
 
 ```text
 magic "CXAC" (4 bytes) | format_version u32 LE | meta_len u32 LE | meta JSON | payload
 ```
 
-O objeto JSON de metadados registra: chave, caminho de origem, hash da origem,
-importer e versão, hash e tamanho do artefato, e o tipo do asset.
+The metadata JSON object records: key, source path, source hash, importer and
+version, artifact hash and size, and the asset kind.
 
-Garantias:
+Guarantees:
 
-- **Escrita atômica**: grava em arquivo temporário e faz `rename`. Um crash não
-  deixa entrada parcial visível.
-- **Verificação de integridade**: na leitura, o hash e o tamanho do payload são
-  recalculados e comparados aos metadados. Entrada corrompida/truncada é tratada
-  como *miss* e reimportada (auto-recuperação).
-- **Invalidação por versão**: `format_version` do cache e a versão do importer
-  participam da chave; incrementá-los invalida as entradas afetadas.
-- **Concorrência segura**: contador atômico de arquivos temporários + `rename`
-  atômico permitem gravações paralelas, inclusive de chaves idênticas.
+- **Atomic write**: writes to a temporary file and `rename`s it. A crash never
+  leaves a partially visible entry.
+- **Integrity verification**: on read, the payload hash and size are recomputed
+  and compared against the metadata. A corrupt/truncated entry is treated as a
+  *miss* and re-imported (self-healing).
+- **Version invalidation**: the cache `format_version` and the importer version
+  participate in the key; bumping them invalidates the affected entries.
+- **Concurrency-safe**: an atomic temporary-file counter + atomic `rename` allow
+  parallel writes, including of identical keys.
 
-API principal:
+Main API:
 
 ```zig
 var cache = try corex.assets.Cache.open(io, cache_dir);
@@ -121,15 +122,15 @@ defer cache.deinit();
 
 const key = corex.assets.cache.deriveKey(source_hash, "text", 1, options_hash);
 try cache.put(gpa, key, info, payload, tmp_suffix);
-const bytes = try cache.get(gpa, key); // ?[]u8; null em miss/corrupção
+const bytes = try cache.get(gpa, key); // ?[]u8; null on miss/corruption
 ```
 
-`get` retorna bytes de propriedade do caller (liberar com o mesmo allocator).
-`has` verifica sem reter o payload; `remove` apaga uma entrada.
+`get` returns bytes owned by the caller (free them with the same allocator).
+`has` checks without retaining the payload; `remove` deletes an entry.
 
 ## Pipeline
 
-`corex.assets.pipeline` orquestra a importação de um `AssetIndex`:
+`corex.assets.pipeline` orchestrates the import of an `AssetIndex`:
 
 ```zig
 var report = try corex.assets.pipeline.run(gpa, io, project_root, index, &cache, .{
@@ -138,36 +139,36 @@ var report = try corex.assets.pipeline.run(gpa, io, project_root, index, &cache,
 defer report.deinit();
 ```
 
-- `run(...)` importa assets concorrentemente via `Io.Group` (por exemplo
-  `JobSystem.io()`). Requer um allocator thread-safe.
-- `runSequential(...)` importa um a um, sem paralelismo, para contextos
-  single-thread ou allocators não thread-safe.
-- Cada task escreve apenas seu próprio slot do relatório; os totais são
-  calculados após a conclusão do grupo.
-- Uma falha por asset é registrada (`status = .failed`, `error_name`) e não
-  aborta o restante do lote.
+- `run(...)` imports assets concurrently through an `Io.Group` (for example
+  `JobSystem.io()`). It requires a thread-safe allocator.
+- `runSequential(...)` imports one at a time, without parallelism, for
+  single-threaded contexts or non-thread-safe allocators.
+- Each task writes only its own report slot; totals are computed after the group
+  completes.
+- A per-asset failure is recorded (`status = .failed`, `error_name`) and does not
+  abort the rest of the batch.
 
-Opções (`Options`):
+Options (`Options`):
 
-| Campo              | Padrão              | Efeito                                        |
+| Field              | Default             | Effect                                        |
 |--------------------|---------------------|-----------------------------------------------|
-| `force`            | `false`             | Ignora cache hits e reimporta tudo.            |
-| `registry`         | `defaultRegistry()` | Registro de importers por extensão.            |
-| `max_source_bytes` | 64 MiB              | Limite de leitura por arquivo de origem.       |
-| `options_salt`     | `""`                | Bytes extras dobrados na chave de cache.       |
+| `force`            | `false`             | Ignores cache hits and re-imports everything.  |
+| `registry`         | `defaultRegistry()` | Extension-to-importer registry.                |
+| `max_source_bytes` | 64 MiB              | Read limit per source file.                    |
+| `options_salt`     | `""`                | Extra bytes folded into the cache key.         |
 
-O relatório (`Report`) contém uma entrada por asset na ordem do índice, com
-`status` (`imported`, `cached`, `failed`), `importer_id`, `key`, `output_size` e
-`error_name`, além dos totais (`imported`, `cached`, `failed`,
-`total_output_bytes`). `Report.liveKeys(gpa)` coleta as chaves de todos os assets
-importados/cacheados com sucesso — o conjunto `live` para a coleta de lixo.
+The report (`Report`) contains one entry per asset in index order, with `status`
+(`imported`, `cached`, `failed`), `importer_id`, `key`, `output_size` and
+`error_name`, plus the totals (`imported`, `cached`, `failed`,
+`total_output_bytes`). `Report.liveKeys(gpa)` collects the keys of every
+successfully imported/cached asset — the `live` set for garbage collection.
 
-## Coleta de lixo (GC)
+## Garbage collection (GC)
 
-`Cache.gc(gpa, live)` faz uma varredura **mark-and-sweep**: apaga toda entrada
-cuja chave **não** está em `live` e mantém o restante. É o complemento do ciclo
-import → cache: quando uma origem muda, é removida ou um importer é
-versionado, a entrada antiga vira órfã e o GC a reclaima.
+`Cache.gc(gpa, live)` performs a **mark-and-sweep** pass: it deletes every entry
+whose key is **not** in `live` and keeps the rest. It is the complement of the
+import → cache cycle: when a source changes, is removed, or an importer is
+versioned, the old entry becomes an orphan and GC reclaims it.
 
 ```zig
 var report = try corex.assets.pipeline.run(gpa, io, root, idx, &cache, .{
@@ -175,66 +176,64 @@ var report = try corex.assets.pipeline.run(gpa, io, root, idx, &cache, .{
 });
 defer report.deinit();
 
-const live = try report.liveKeys(gpa); // chaves válidas do índice atual
+const live = try report.liveKeys(gpa); // valid keys of the current index
 defer gpa.free(live);
 
 const stats = try cache.gc(gpa, live);
 // stats.scanned / .kept / .removed / .bytes_freed
 ```
 
-Garantias e comportamento:
+Guarantees and behavior:
 
-- `live` deve ser o conjunto **completo** de chaves a reter — tipicamente de uma
-  execução do pipeline sobre o índice inteiro. Entradas fora desse conjunto são
-  removidas; o GC não "adivinha" o que ainda é referenciado.
-- Entradas são identificadas estritamente pelo nome de arquivo (64 dígitos
-  hexadecimais minúsculos). Arquivos temporários (`.tmp.N`) e arquivos estranhos
-  **não** são tocados.
-- Complexidade O(entradas + live), com um hash set para pertinência; a iteração
-  de diretório usa buffer fixo. `bytes_freed` soma o tamanho em disco das
-  entradas removidas.
-- É uma operação de **manutenção**: execute quando não houver `put` concorrente
-  em andamento (não faz parte do caminho de importação por frame). É idempotente:
-  uma segunda varredura com o mesmo `live` nada remove.
-- Assets que falharam na importação não contribuem com chave; seu artefato antigo
-  (se existir) é tratado como órfão e removido, o que é correto pois a origem
-  atual é inválida.
+- `live` must be the **complete** set of keys to retain — typically from a pipeline
+  run over the whole index. Entries outside that set are removed; GC does not
+  "guess" what is still referenced.
+- Entries are identified strictly by filename (64 lowercase hexadecimal digits).
+  Temporary files (`.tmp.N`) and foreign files are **not** touched.
+- Complexity O(entries + live), with a hash set for membership; directory
+  iteration uses a fixed buffer. `bytes_freed` sums the on-disk size of the removed
+  entries.
+- It is a **maintenance** operation: run it when no concurrent `put` is in progress
+  (it is not part of the per-frame import path). It is idempotent: a second sweep
+  with the same `live` removes nothing.
+- Assets that failed to import contribute no key; their old artifact (if any) is
+  treated as an orphan and removed, which is correct because the current source is
+  invalid.
 
-## Limitações
+## Limitations
 
-- Decodificadores de textura existem para **BMP, TGA e QOI** (ver
-  [asset-decoders.md](asset-decoders.md)) e de malha para **OBJ** (ver
-  [mesh-import.md](mesh-import.md)). PNG, JPEG, áudio, outros formatos de modelo
-  (glTF/FBX/DAE) e fonte ainda não têm decodificador e usam o importer `raw`
-  (cópia verbatim); serão registrados como importers específicos quando existirem.
-- O importer `json` preserva a ordem de chaves da origem (minifica, não ordena
-  chaves); a determinismo é por conteúdo de origem, o que é suficiente para o
-  cache endereçado por conteúdo.
-- O pipeline ainda não está ligado ao startup/editor; é uma API pública
-  independente. A integração com o startup e o hot-reload são próximos passos.
-- A coleta de lixo (GC) de entradas órfãs do cache está **implementada**
-  (`Cache.gc`, ver acima). Ainda não há rastreamento de dependências entre assets
-  nem limpeza de arquivos temporários deixados por escritas interrompidas
-  (crash); ambos são extensões planejadas.
-- `run` paralelo exige allocator thread-safe; caso contrário use
-  `runSequential`.
+- Texture decoders exist for **BMP, TGA and QOI** (see
+  [asset-decoders.md](asset-decoders.md)) and a mesh decoder for **OBJ** (see
+  [mesh-import.md](mesh-import.md)). PNG, JPEG, audio, other model formats
+  (glTF/FBX/DAE) and fonts still have no decoder and use the `raw` importer
+  (verbatim copy); they will be registered as dedicated importers once they exist.
+- The `json` importer preserves the source key order (it minifies, it does not sort
+  keys); determinism is by source content, which is sufficient for a
+  content-addressed cache.
+- The pipeline is not wired into startup/editor yet; it is an independent public
+  API. Startup integration and hot-reload are next steps.
+- Garbage collection (GC) of orphan cache entries is **implemented** (`Cache.gc`,
+  see above). There is no dependency tracking between assets yet, nor cleanup of
+  temporary files left behind by interrupted writes (crash); both are planned
+  extensions.
+- Parallel `run` requires a thread-safe allocator; otherwise use `runSequential`.
 
-## Segurança de memória
+## Memory safety
 
-- Allocators explícitos em todas as APIs que alocam; propriedade documentada.
-- Leituras limitadas (`max_source_bytes`, `max_cache_file_bytes`) para evitar
-  consumo ilimitado de memória.
-- Escrita atômica + verificação de hash evitam confiar em artefatos parciais ou
-  corrompidos.
-- Caminhos de origem vêm do índice (relativos ao projeto); o pipeline lê
-  relativos ao diretório raiz do projeto.
-- Testes incluem sondas de falha de alocação (`checkAllAllocationFailures`) nos
-  importers e testes de corrupção/truncamento no cache.
+- Explicit allocators in every allocating API; ownership documented.
+- Bounded reads (`max_source_bytes`, `max_cache_file_bytes`) to avoid unbounded
+  memory consumption.
+- Atomic writes + hash verification avoid trusting partial or corrupt artifacts.
+- Source paths come from the index (project-relative); the pipeline reads them
+  relative to the project root directory.
+- Tests include allocation-failure probes (`checkAllAllocationFailures`) on the
+  importers and corruption/truncation tests on the cache.
 
-## Links relacionados
+## Related links
 
-- [architecture.md](architecture.md) — mapa de subsistemas e estado.
-- [asset-decoders.md](asset-decoders.md) — decodificadores de textura e artefato CXTX.
-- [scene-format.md](scene-format.md) — formato de cena validado pelo importer.
-- [versioning.md](versioning.md) — política de versionamento de formatos.
-- [launch-contract.md](launch-contract.md) — contrato de startup (inalterado).
+- [architecture.md](architecture.md) — subsystem map and status.
+- [asset-decoders.md](asset-decoders.md) — texture decoders and the CXTX artifact.
+- [mesh-import.md](mesh-import.md) — OBJ mesh importer and the CXMH artifact.
+- [scene-format.md](scene-format.md) — scene format validated by the importer.
+- [versioning.md](versioning.md) — format versioning policy.
+- [launch-contract.md](launch-contract.md) — startup contract (unchanged).

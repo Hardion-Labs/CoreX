@@ -21,7 +21,7 @@ pub fn validateDisplayName(name: []const u8) NameError!void {
 test "validateDisplayName accepts ordinary names" {
     try validateDisplayName("MyGame");
     try validateDisplayName("Main Scene");
-    try validateDisplayName("Cena-1");
+    try validateDisplayName("Scene-1");
 }
 
 test "validateDisplayName rejects empty, long, control and separator names" {

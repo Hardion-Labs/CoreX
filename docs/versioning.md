@@ -1,78 +1,80 @@
-# Versionamento e Compatibilidade — CoreXEngine
+# Versioning and Compatibility — CoreXEngine
 
-## Versão da engine
+## Engine version
 
-A CoreXEngine usa [Semantic Versioning 2.0.0](https://semver.org/lang/pt-BR/):
+CoreXEngine uses [Semantic Versioning 2.0.0](https://semver.org/):
 `MAJOR.MINOR.PATCH[-PRE][+BUILD]`.
 
-A versão atual da engine é exposta por `corex.version` e impressa por
-`corex-engine --version`. A versão alvo do compilador é **Zig 0.17.0**, exposta
-por `corex.zig_version`.
+The current engine version is exposed by `corex.version` and printed by
+`corex-engine --version`. The target compiler version is **Zig 0.17.0**, exposed
+by `corex.zig_version`.
 
-Durante o desenvolvimento inicial a engine usa versões `0.x.y` (ex.:
-`0.1.0-dev`). O sufixo `-dev` marca builds de desenvolvimento.
+During early development the engine uses `0.x.y` versions (e.g. `0.1.0-dev`).
+The `-dev` suffix marks development builds.
 
-## Política de compatibilidade de projetos
+## Project compatibility policy
 
-Um projeto declara a versão da engine para a qual foi criado no campo
-`engine_version` do manifesto `.corex`. A engine verifica compatibilidade antes
-de carregar o projeto:
+A project declares the engine version it was created for in the `engine_version`
+field of the `.corex` manifest. The engine checks compatibility before loading
+the project:
 
-- **MAJOR diferente** → incompatível. Mudanças de MAJOR quebram compatibilidade.
-- **MAJOR == 0** (fase inicial): `MINOR` deve ser **igual**. Em `0.x`, cada
-  incremento de MINOR pode quebrar compatibilidade; por isso exige-se igualdade.
-- **MAJOR >= 1**: `MINOR` do projeto deve ser **menor ou igual** ao da engine
-  (compatibilidade retroativa dentro do mesmo MAJOR). Um projeto que exige um
-  MINOR mais novo que o da engine é incompatível.
-- `PATCH`, `PRE` e `BUILD` não afetam a compatibilidade. São registrados para
-  diagnóstico.
+- **Different MAJOR** → incompatible. MAJOR changes break compatibility.
+- **MAJOR == 0** (early phase): `MINOR` must be **equal**. In `0.x`, every MINOR
+  increment may break compatibility, so equality is required.
+- **MAJOR >= 1**: the project's `MINOR` must be **less than or equal to** the
+  engine's (backward compatibility within the same MAJOR). A project requiring a
+  newer MINOR than the engine's is incompatible.
+- `PATCH`, `PRE` and `BUILD` do not affect compatibility. They are recorded for
+  diagnostics.
 
-Resultado da verificação:
+Check outcome:
 
-- Compatível → a inicialização prossegue.
-- Incompatível → a engine rejeita o projeto com código de saída **4** e uma
-  mensagem indicando as versões envolvidas.
+- Compatible → startup proceeds.
+- Incompatible → the engine rejects the project with exit code **4** and a
+  message stating the versions involved.
 
-A engine **não** instala, baixa, seleciona nem troca de versão silenciosamente.
-A seleção de versão é responsabilidade exclusiva do CoreXHub. Se o projeto for
-incompatível, cabe ao usuário (ou ao Hub) iniciar a versão correta da engine.
+The engine does **not** install, download, select or switch versions silently.
+Version selection is exclusively CoreXHub's responsibility. If the project is
+incompatible, it is up to the user (or the Hub) to launch the correct engine
+version.
 
-## Versão selecionada pelo Hub (`--engine-version`)
+## Version selected by the Hub (`--engine-version`)
 
-Quando iniciada pelo Hub, a engine pode receber `--engine-version <semver>` com a
-versão que o Hub selecionou. Esse valor é **informativo**:
+When launched by the Hub, the engine may receive `--engine-version <semver>` with
+the version the Hub selected. That value is **informational**:
 
-- A engine registra a versão recebida.
-- Se divergir da versão real do binário em execução, a engine emite um aviso.
-- A engine não toma nenhuma ação de instalação/seleção com base nesse valor.
+- The engine records the received version.
+- If it differs from the actual version of the running binary, the engine emits a
+  warning.
+- The engine takes no installation/selection action based on that value.
 
-Isso mantém a fronteira clara: o Hub decide qual versão iniciar; a engine apenas
-reporta qual versão é.
+This keeps the boundary clear: the Hub decides which version to launch; the
+engine only reports which version it is.
 
-## Versionamento de formato
+## Format versioning
 
-Formatos de arquivo (manifesto `.corex`, cenas, assets, export templates) têm
-versão própria, independente da versão da engine:
+File formats (the `.corex` manifest, scenes, assets, export templates) have their
+own version, independent of the engine version:
 
-- O manifesto `.corex` usa `format_version` (atualmente `1`).
-- Cenas `.scene` usam `format_version` próprio (atualmente `1`), independente do
-  manifesto e da versão da engine ([scene-format.md](scene-format.md)).
-- O cache de importação de assets usa `format_version` próprio (atualmente `1`),
-  embutido em cada entrada; a chave de cache também incorpora a versão do
-  importer, de modo que incrementar qualquer uma delas invalida as entradas
-  afetadas ([asset-import.md](asset-import.md)).
-- Versões de formato desconhecidas são rejeitadas.
-- Mudanças incompatíveis de formato incrementam a versão do formato.
+- The `.corex` manifest uses `format_version` (currently `1`).
+- `.scene` scenes use their own `format_version` (currently `1`), independent of
+  the manifest and of the engine version ([scene-format.md](scene-format.md)).
+- The asset import cache uses its own `format_version` (currently `1`), embedded
+  in every entry; the cache key also incorporates the importer version, so
+  bumping either one invalidates the affected entries
+  ([asset-import.md](asset-import.md)).
+- Unknown format versions are rejected.
+- Incompatible format changes bump the format version.
 
-## Contratos estáveis
+## Stable contracts
 
-Fazem parte do contrato estável de integração:
+The following are part of the stable integration contract:
 
-- Os argumentos de linha de comando e seus significados ([launch-contract.md](launch-contract.md)).
-- Os códigos de saída ([launch-contract.md](launch-contract.md)).
-- O formato do manifesto `.corex` e sua `format_version` ([project-format.md](project-format.md)).
-- O formato de cena `.scene` e sua `format_version` ([scene-format.md](scene-format.md)).
-- A política de compatibilidade deste documento.
+- Command-line arguments and their meanings ([launch-contract.md](launch-contract.md)).
+- Exit codes ([launch-contract.md](launch-contract.md)).
+- The `.corex` manifest format and its `format_version` ([project-format.md](project-format.md)).
+- The `.scene` scene format and its `format_version` ([scene-format.md](scene-format.md)).
+- The compatibility policy in this document.
 
-Mudanças nesses contratos exigem incremento de versão apropriado e nota no
+Changes to these contracts require an appropriate version bump and a note in the
 [CHANGELOG](../CHANGELOG.md).

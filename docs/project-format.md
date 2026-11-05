@@ -1,13 +1,13 @@
-# Formato de Projeto — arquivo `.corex`
+# Project Format — the `.corex` file
 
-O arquivo `.corex` é o **ponto de entrada** de um projeto CoreXEngine. É um
-documento JSON UTF-8 que descreve o projeto e aponta para seus recursos. A engine
-o recebe via `--project` e o valida antes de carregar qualquer conteúdo.
+The `.corex` file is the **entry point** of a CoreXEngine project. It is a UTF-8
+JSON document that describes the project and points at its resources. The engine
+receives it via `--project` and validates it before loading any content.
 
-A engine **não cria** arquivos `.corex`. A criação de projetos é responsabilidade
-do CoreXHub (ou de ferramenta externa). A engine apenas lê e valida.
+The engine does **not create** `.corex` files. Project creation is CoreXHub's
+responsibility (or an external tool's). The engine only reads and validates.
 
-## Estrutura
+## Structure
 
 ```json
 {
@@ -21,46 +21,44 @@ do CoreXHub (ou de ferramenta externa). A engine apenas lê e valida.
 }
 ```
 
-## Campos
+## Fields
 
-| Campo | Tipo | Obrigatório | Descrição |
+| Field | Type | Required | Description |
 |---|---|---|---|
-| `format_version` | inteiro | sim | Versão do formato do manifesto. Atualmente suportada: `1`. |
-| `name` | string | sim | Nome de exibição do projeto. Não vazio, sem separadores de caminho nem caracteres de controle. |
-| `id` | string | não | Identificador estável do projeto (ex.: UUID). Atribuído por quem cria o projeto (Hub). A engine não o gera. |
-| `engine_version` | string (semver) | sim | Versão da engine para a qual o projeto foi criado. Usada na verificação de compatibilidade. |
-| `initial_scene` | string | não | Cena inicial, relativa à raiz do projeto. Padrão: nenhuma (o editor/runtime prepara uma cena vazia). Nos modos `editor`/`runtime` o arquivo deve ser uma cena válida ([scene-format.md](scene-format.md)); `validate` não carrega a cena. |
-| `asset_directories` | array de string | não | Diretórios de assets, relativos à raiz. Padrão: `["assets"]`. |
-| `script_directories` | array de string | não | Diretórios de scripts, relativos à raiz. Padrão: `["scripts"]`. |
+| `format_version` | integer | yes | Manifest format version. Currently supported: `1`. |
+| `name` | string | yes | Project display name. Non-empty, with no path separators or control characters. |
+| `id` | string | no | Stable project identifier (e.g. a UUID). Assigned by whoever creates the project (the Hub). The engine does not generate it. |
+| `engine_version` | string (semver) | yes | Engine version the project was created for. Used in the compatibility check. |
+| `initial_scene` | string | no | Initial scene, relative to the project root. Default: none (the editor/runtime prepares an empty scene). In `editor`/`runtime` modes the file must be a valid scene ([scene-format.md](scene-format.md)); `validate` does not load the scene. |
+| `asset_directories` | array of string | no | Asset directories, relative to the root. Default: `["assets"]`. |
+| `script_directories` | array of string | no | Script directories, relative to the root. Default: `["scripts"]`. |
 
-Campos desconhecidos são rejeitados na validação estrita para evitar erros
-silenciosos de digitação. Versões futuras do formato poderão adicionar campos;
-isso sempre incrementa `format_version`.
+Unknown fields are rejected by strict validation to avoid silent typos. Future
+format versions may add fields; that always bumps `format_version`.
 
-## Regras de caminho
+## Path rules
 
-Todos os caminhos dentro do manifesto (`initial_scene`, `asset_directories`,
-`script_directories`) devem ser:
+Every path inside the manifest (`initial_scene`, `asset_directories`,
+`script_directories`) must be:
 
-- **Relativos** à raiz do projeto (o diretório que contém o `.corex`).
-- Livres de travessia (`..` não é permitido em nenhum componente).
-- Livres de caminhos absolutos.
-- Não vazios.
+- **Relative** to the project root (the directory containing the `.corex`).
+- Free of traversal (`..` is not allowed in any component).
+- Free of absolute paths.
+- Non-empty.
 
-Essas regras existem para que um projeto não possa referenciar arquivos fora da
-sua própria raiz. A engine rejeita o manifesto (código de saída 3) se qualquer
-caminho violar essas regras.
+These rules exist so a project cannot reference files outside its own root. The
+engine rejects the manifest (exit code 3) if any path violates them.
 
-A raiz do projeto é o diretório que contém o arquivo `.corex`. Por exemplo, para
-`/path/MyGame/MyGame.corex`, a raiz é `/path/MyGame`.
+The project root is the directory containing the `.corex` file. For example, for
+`/path/MyGame/MyGame.corex`, the root is `/path/MyGame`.
 
-## Compatibilidade de versão
+## Version compatibility
 
-O campo `engine_version` é comparado com a versão da engine em execução usando a
-política de [versioning.md](versioning.md). Projetos incompatíveis são rejeitados
-com código de saída 4. A engine não tenta instalar nem selecionar outra versão.
+The `engine_version` field is compared against the running engine version using
+the policy in [versioning.md](versioning.md). Incompatible projects are rejected
+with exit code 4. The engine does not try to install or select another version.
 
-## Exemplo mínimo
+## Minimal example
 
 ```json
 {
@@ -70,11 +68,11 @@ com código de saída 4. A engine não tenta instalar nem selecionar outra vers�
 }
 ```
 
-Com o manifesto mínimo, a engine usa `asset_directories = ["assets"]`,
-`script_directories = ["scripts"]` e nenhuma cena inicial explícita.
+With the minimal manifest, the engine uses `asset_directories = ["assets"]`,
+`script_directories = ["scripts"]` and no explicit initial scene.
 
-## Estabilidade
+## Stability
 
-`format_version = 1` é o contrato atual. Mudanças incompatíveis no formato
-incrementam `format_version`. A engine suporta apenas as versões de formato que
-declara explicitamente; versões desconhecidas são rejeitadas.
+`format_version = 1` is the current contract. Incompatible format changes bump
+`format_version`. The engine only supports the format versions it explicitly
+declares; unknown versions are rejected.
