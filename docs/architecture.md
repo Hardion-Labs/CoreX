@@ -59,12 +59,14 @@ src/
 │   ├── splash.zig        # Splash screen contract + headless impl      [implemented]
 │   ├── diagnostics.zig   # Timers + stage profiling                    [implemented]
 │   └── startup.zig       # The 7-step startup pipeline                 [implemented]
-├── ecs.zig               # ECS public module; re-exports entity/pool/world/schedule
+├── ecs.zig               # ECS public module; re-exports entity/pool/world/schedule/graph/frame
 ├── ecs/
 │   ├── entity.zig        # Generational entity handles + lifecycle     [implemented]
 │   ├── pool.zig          # Sparse-set component storage                [implemented]
 │   ├── world.zig         # Type-safe world + multi-component views     [implemented]
-│   └── schedule.zig      # Comptime stages + parallel system dispatch  [implemented]
+│   ├── schedule.zig      # Comptime stages + parallel system dispatch  [implemented]
+│   ├── graph.zig         # AutoSchedule: inferred dependency layers    [implemented]
+│   └── frame.zig         # FrameSchedule: budgets + system profiling   [implemented]
 ├── scene.zig             # Scene public module; EngineScene schema
 ├── scene/
 │   ├── components.zig    # Built-in plain-data scene components        [implemented]
@@ -153,7 +155,7 @@ CPU work with no GPU dependency, so it is fully tested headlessly and is the
 contract the Low/Medium/Advanced GPU backends will consume. The GPU backends
 themselves remain planned.
 
-### ECS — implemented (storage + queries + scheduling), planned (extensions)
+### ECS — implemented (storage + queries + scheduling + graph/frame budgets), planned (extensions)
 A data-oriented ECS in `src/ecs/`, re-exported as `corex.ecs`:
 
 - **`Entity`** — a generational handle (`index: u32`, `generation: u32`, packed
@@ -179,15 +181,26 @@ A data-oriented ECS in `src/ecs/`, re-exported as `corex.ecs`:
   Systems declare read/write component access; the scheduler rejects conflicting
   systems in the same stage at comptime and dispatches non-conflicting systems
   concurrently through `std.Io` (e.g. `JobSystem.io()`). Exclusive systems occupy
-  a stage alone. `runSequential` provides a no-Io fallback. See
-  [ecs-scheduling.md](ecs-scheduling.md).
+  a stage alone. `runSequential` provides a no-Io fallback. Optional observer
+  hooks (`runObserved`/`runSequentialObserved`) support profiling without changing
+  the plain run contracts. See [ecs-scheduling.md](ecs-scheduling.md).
+- **`graph.AutoSchedule`** — infers a deterministic comptime dependency graph
+  from read/write/exclusive access: conflicting systems get declaration-order
+  edges, non-conflicting systems share parallel layers, exclusive systems become
+  barriers. Layer assignment is a comptime longest-path pass; runtime dispatch
+  reuses the shared `runLayer` helper with no graph allocation.
+- **`frame.FrameSchedule`** — wraps an `AutoSchedule` and adds allocation-free
+  per-system profiling (`FrameProfiler`: runs/errors/monotonic timings) and
+  cooperative frame budgets (`runBudgeted` + `FrameCursor`), stopping between
+  systems and resuming across calls. Budgeted execution is sequential and never
+  preempts a running system.
 
-Storage, queries and scheduling are implemented and tested (including under
-`ReleaseSafe` and `ReleaseFast`). Automatic dependency-graph scheduling, frame
-budgeting, change detection and relation/graph components are planned
+Storage, queries, scheduling, automatic dependency graphs, frame budgets and
+system profiling are implemented and tested (including under `ReleaseSafe` and
+`ReleaseFast`). Change detection and relation/graph components remain planned
 extensions. The world depends only on `entity.zig` and `pool.zig`; the scheduler
-depends only on the world and `std.Io` (low coupling). Scenes and scripting build
-on these layers.
+depends only on the world and `std.Io`; `frame.zig` additionally reuses the
+diagnostics `Timer` (low coupling). Scenes and scripting build on these layers.
 
 ### Sistema de cenas — implemented (format v1 + ECS load/save), planned (extensions)
 Scenes are versioned JSON documents (`docs/scene-format.md`) backed by the ECS.
@@ -281,9 +294,11 @@ The engine defines the export pipeline, the packaged runtime format and the
 Export Template *format/consumption*. Acquisition, installation and management
 of templates belong to the Hub. See [scope.md](scope.md).
 
-### Ferramentas de diagnóstico e profiling — implemented (foundation)
-`diagnostics.Timer` and `diagnostics.Profiler` measure startup stages. Frame
-profiling, memory tracking, a metrics overlay and trace export are planned.
+### Ferramentas de diagnóstico e profiling — implemented (foundation + ECS frame profiling)
+`diagnostics.Timer` and `diagnostics.Profiler` measure startup stages. ECS
+system/frame profiling is implemented via `frame.FrameSchedule`/`FrameProfiler`
+(allocation-free per-system runs/errors/timings). Engine-wide memory tracking, a
+metrics overlay and trace export are planned.
 
 ## API guidelines
 
@@ -298,11 +313,14 @@ profiling, memory tracking, a metrics overlay and trace export are planned.
 ## Current status
 
 The startup spine, the ECS (generational entities, sparse-set component pools,
-type-safe world, multi-component views and comptime system scheduling over the
-job system), the scene system (versioned JSON scenes, stable IDs, hierarchy,
-ECS load/save) and the asset import pipeline + content-addressed cache
-(raw/text/json/scene importers, atomic verified storage, parallel import over the
-job system) are implemented and tested, and the executable builds and runs on
-Zig 0.17.0. The remaining larger subsystems (renderers, GUI, editor, Lua, export,
-native modules) are in scope and either contract-defined or planned, as marked
-above.
+type-safe world, multi-component views, comptime system scheduling over the job
+system, automatic dependency graphs, cooperative frame budgets and system
+profiling), the scene system (versioned JSON scenes, stable IDs, hierarchy, ECS
+load/save, world-space transforms), the asset import pipeline + content-addressed
+cache (raw/text/json/scene importers, BMP/TGA/QOI texture decoders, OBJ mesh
+importer, atomic verified storage, parallel import over the job system,
+mark-and-sweep GC) and the backend-independent render extraction layer (camera,
+frustum culling, sorted draw lists) are implemented and tested, and the executable
+builds and runs on Zig 0.17.0. The remaining larger subsystems (GPU renderer
+backends, GUI, editor, Lua, export, native modules) are in scope and either
+contract-defined or planned, as marked above.
