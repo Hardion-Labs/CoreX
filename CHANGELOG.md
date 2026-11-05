@@ -84,6 +84,18 @@ declared yet.
   Advanced GPU backends will consume; the backends themselves remain planned.
   Also adds reusable `Vec3` helpers (`dot`/`sub`/`add`/`scale`/`length`/`normalize`,
   public `cross`) to the scene transform math.
+- OBJ mesh importer + engine-ready `CXMH` mesh artifact (`src/assets/mesh.zig`,
+  re-exported as `corex.assets.mesh`, `docs/mesh-import.md`): decodes the
+  Wavefront OBJ geometry subset (`v`/`vn`/`vt`/`f`, fan triangulation, negative
+  indices, per-corner `v`/`v/vt`/`v//vn`/`v/vt/vn` forms) into an indexed triangle
+  mesh with interleaved position/normal/UV vertices (`p3n3t2`, 32-byte stride),
+  vertex deduplication, flat per-face normals when absent, and computed bounds.
+  `serialize`/`parse` produce a self-describing little-endian `CXMH` container;
+  `parse` is zero-copy, alignment-safe and validates index range + float finiteness
+  in one linear pass. Registered in `engineRegistry()` (`.obj` → `obj` importer
+  v1, `AssetKind.model`), so the pipeline imports/caches/GCs meshes like any asset.
+  Bounded by `max_vertices`/`max_indices`; feeds the render extraction layer
+  (`Renderable.bounds`/mesh handles). glTF/FBX/DAE remain `raw` (planned).
 - Shared display-name validation (`src/core/validation.zig`) used by both the
   `.corex` manifest and scene documents.
 - Native Module ABI contract for C++ (`docs/native-module-api.md`,
@@ -91,11 +103,12 @@ declared yet.
 - A minimal example project (`examples/hello-project/`) with a valid versioned
   initial scene.
 - Test suite covering the startup spine, ECS, scheduling, scenes, asset
-  import/cache, world-space transforms, texture decoders, cache GC and render
-  extraction (251 tests), including allocation-failure probes, cache
-  corruption/truncation probes, a deep-hierarchy stress test, QOI encode/decode
-  roundtrips, end-to-end texture-import-and-cache and import-then-GC tests,
-  camera/frustum/culling and draw-list extraction tests, and job-system
+  import/cache, world-space transforms, texture decoders, cache GC, render
+  extraction and OBJ mesh import (267 tests), including allocation-failure
+  probes, cache corruption/truncation probes, a deep-hierarchy stress test, QOI
+  encode/decode roundtrips, end-to-end texture-import-and-cache, OBJ-import-and-
+  cache and import-then-GC tests, camera/frustum/culling and draw-list extraction
+  tests, OBJ decode/artifact roundtrip and malformed-input tests, and job-system
   integration tests, validated in Debug, ReleaseSafe and ReleaseFast.
 
 ### Changed
@@ -106,12 +119,14 @@ declared yet.
 - The public module `src/corex.zig` re-exports the implemented core, ECS
   (including scheduling), scene (including transform math as `corex.scene.transform`,
   `Mat4`/`Vec3`/`Quat`), asset (import/cache with GC, image decoders and the
-  `CXTX` texture artifact as `corex.assets.image`/`corex.assets.texture`,
-  `Image`/`Texture`/`GcStats`) and render (backend-independent extraction as
-  `corex.render`) subsystems.
+  `CXTX` texture artifact as `corex.assets.image`/`corex.assets.texture`, the OBJ
+  mesh importer and `CXMH` artifact as `corex.assets.mesh`,
+  `Image`/`Texture`/`Mesh`/`MeshView`/`GcStats`) and render (backend-independent
+  extraction as `corex.render`) subsystems.
 - The engine import registry now decodes `.bmp`/`.tga`/`.qoi` textures to `CXTX`
-  artifacts instead of copying them verbatim; the cache key includes the importer
-  identity/version, so this does not collide with previously cached `raw` entries.
+  and `.obj` meshes to `CXMH` artifacts instead of copying them verbatim; the cache
+  key includes the importer identity/version, so this does not collide with
+  previously cached `raw` entries.
 - Startup `editor`/`runtime` now validates and loads the initial scene into the
   ECS (or prepares an empty scene). `validate` mode and the stable CLI/exit-code
   contract are unchanged; scene failures map to exit code 6.

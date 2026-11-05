@@ -7,10 +7,12 @@ permanece em `src/core/assets.zig` e não teve seu contrato alterado.
 
 > Estado: **implementado e testado**. Decodificadores de **textura** para
 > **BMP, TGA e QOI** existem e produzem um artefato `CXTX` (RGBA8) — ver
-> [asset-decoders.md](asset-decoders.md). Demais formatos binários (PNG, JPEG,
-> áudio, modelo, fonte) ainda não têm decodificador e usam o importer `raw`
-> (cópia verbatim) até que decodificadores sejam registrados. Isso está
-> documentado abaixo e não é descrito como capacidade existente.
+> [asset-decoders.md](asset-decoders.md) — e um decodificador de **malha OBJ**
+> produz um artefato `CXMH` — ver [mesh-import.md](mesh-import.md). Demais
+> formatos binários (PNG, JPEG, áudio, outros modelos como glTF/FBX/DAE, fonte)
+> ainda não têm decodificador e usam o importer `raw` (cópia verbatim) até que
+> decodificadores sejam registrados. Isso está documentado abaixo e não é
+> descrito como capacidade existente.
 
 ## Visão geral
 
@@ -74,11 +76,11 @@ pub const ImportError = error{ InvalidAsset, OutOfMemory };
 fallback para extensões não casadas:
 
 - `importer.defaultRegistry()`: JSON + texto, fallback `raw`.
-- `assets.engineRegistry()`: texturas (BMP/TGA/QOI) + cenas + JSON + texto,
-  fallback `raw` (registro padrão da engine).
+- `assets.engineRegistry()`: texturas (BMP/TGA/QOI) + malhas (OBJ) + cenas +
+  JSON + texto, fallback `raw` (registro padrão da engine).
 
 Camadas superiores podem estender o registro (por exemplo, decodificadores de
-textura/áudio/modelo) sem alterar o pipeline:
+áudio ou outros formatos de modelo) sem alterar o pipeline:
 
 ```zig
 const reg = corex.assets.Registry{
@@ -201,9 +203,10 @@ Garantias e comportamento:
 ## Limitações
 
 - Decodificadores de textura existem para **BMP, TGA e QOI** (ver
-  [asset-decoders.md](asset-decoders.md)). PNG, JPEG, áudio, modelo e fonte ainda
-  não têm decodificador e usam o importer `raw` (cópia verbatim); serão
-  registrados como importers específicos quando existirem.
+  [asset-decoders.md](asset-decoders.md)) e de malha para **OBJ** (ver
+  [mesh-import.md](mesh-import.md)). PNG, JPEG, áudio, outros formatos de modelo
+  (glTF/FBX/DAE) e fonte ainda não têm decodificador e usam o importer `raw`
+  (cópia verbatim); serão registrados como importers específicos quando existirem.
 - O importer `json` preserva a ordem de chaves da origem (minifica, não ordena
   chaves); a determinismo é por conteúdo de origem, o que é suficiente para o
   cache endereçado por conteúdo.
