@@ -11,8 +11,9 @@ lives in `src/audio/` and is exposed as `corex.audio`.
 > ([asset-audio.md](asset-audio.md)). Spatialization and the scene bridge are
 > implemented one layer up ([audio-spatial.md](audio-spatial.md)), and insert
 > effects (biquads, compressor) beside it ([audio-effects.md](audio-effects.md)).
-> **OS playback backends (ALSA/WASAPI/CoreAudio), delay-based effects, HRTF and
-> streaming are planned** — they are not described here as existing capabilities.
+> **OS playback backends (ALSA/WASAPI/CoreAudio), modulated/convolved effects,
+> HRTF and streaming are planned** — they are not described here as existing
+> capabilities.
 
 ## Overview
 
@@ -302,6 +303,12 @@ voices ─► direct (bus chain bypassed) ─┼─► sum ─► master chain �
 var mixer = try A.Mixer.init(gpa, .{ .effect_slots = 4 });   // opt-in
 try mixer.setBusEffect(1, 0, try A.Effect.biquad(48_000, .{ .kind = .low_pass, .cutoff_hz = 600 }));
 try mixer.setMasterEffect(0, try A.Effect.compressor(48_000, .{ .threshold_db = -6, .ratio = 2 }));
+
+// Delay-based inserts borrow caller memory; the mixer allocates nothing for them.
+const memory = try gpa.alloc(f32, try A.Reverb.requiredSamples(48_000, 2));
+defer gpa.free(memory);
+var room = try A.Reverb.init(48_000, 2, .{ .room_size = 0.8 }, memory);
+try mixer.setMasterEffect(1, A.Effect.reverb(&room));
 ```
 
 The guarantees that matter for the mixing contract:
@@ -421,8 +428,13 @@ it plays real imported fixtures end to end.
 - **Insert routing**: an all-bypass chain is bit-identical to the effect-free
   mixer; block sizes 16 and 512 agree bit for bit; an insert affects only its own
   bus; master inserts affect the sum; tails ring out and `resetEffects` silences
-  them; a voice ending inside a block is counted once. The DSP itself is covered
-  in [audio-effects.md](audio-effects.md).
+  them; a voice ending inside a block is counted once.
+- **Borrowed effect memory**: a delay/reverb instance cannot be inserted twice,
+  two instances cannot share or partially overlap a buffer, the layout must match
+  the output, replacing the holding slot is allowed, and clearing releases the
+  claim. A delay echoes correctly across block boundaries and a master reverb
+  tails into a render with no voices at all. The DSP itself is covered in
+  [audio-effects.md](audio-effects.md).
 - **Determinism and memory**: two mixers driven identically agree bit for bit over
   32 buffers; `checkAllAllocationFailures` on `init` + `play` + `render` with no
   leaks and no swallowed `OutOfMemory`, in both `.linear` and `.sinc` (the extra
@@ -466,7 +478,9 @@ Reading the table honestly:
 - No allocation, no locks and no syscalls during `render` in any mode. The sinc
   tables and the effect submix are built once in `init`.
 - Insert effects add ~1% when reserved but bypassed, +11% for a biquad on one of
-  eight buses and +37% for a master compressor — see the measured table in
+  eight buses and +37% for a master compressor. A master reverb adds ~66% over an
+  unity-rate baseline, and a full eight-bus chain with delays, filters, reverb and
+  compression still runs at 103× real time — see the measured tables in
   [audio-effects.md](audio-effects.md).
 - Voice state is a contiguous array walked in slot order, so the mix is
   cache-friendly and prefetchable.
@@ -480,10 +494,13 @@ Reading the table honestly:
   panning and Doppler live one layer up, in `corex.audio.spatial` /
   `AudioSystem` (see [audio-spatial.md](audio-spatial.md)), which feed this
   mixer's gain/pan/pitch. There is no HRTF or binaural rendering anywhere yet.
-- **Effects are filters and dynamics only**: biquads and a stereo-linked
-  compressor on per-bus and master chains ([audio-effects.md](audio-effects.md)).
-  No reverb, delay, chorus or convolution (they need delay lines), no lookahead
-  limiting, no oversampled saturation, no side-chain and no per-voice inserts.
+- **Effects**: biquads, a stereo-linked compressor, a feedback delay and a
+  Freeverb-style reverb on per-bus and master chains
+  ([audio-effects.md](audio-effects.md)). No chorus/flanger, convolution,
+  lookahead limiting, oversampled saturation, side-chain or per-voice inserts.
+  Delay-based effects borrow their memory from the caller, so they add **no mixer
+  allocation**; the mixer rejects two slots claiming the same instance or
+  overlapping buffers.
 - **Resampling trade-offs are explicit.** `.linear` (the default) aliases when
   decimating. `.sinc` removes that, but its support is capped at 256 source
   samples, so beyond an 8:1 ratio the anti-aliasing is partial, and it costs

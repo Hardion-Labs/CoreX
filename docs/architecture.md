@@ -98,7 +98,7 @@ src/
     ├── spatial.zig       # Listener, attenuation, pan, Doppler math    [implemented]
     ├── system.zig        # AudioSource component + scene reconciler    [implemented]
     ├── resample.zig      # Windowed-sinc prototype + polyphase bank    [implemented]
-    └── effects.zig       # Biquads, compressor, insert chains          [implemented]
+    └── effects.zig       # Biquads, compressor, delay, reverb, chains  [implemented]
 ```
 
 Planned subsystems will be added as sibling modules (e.g. `src/render/`,
@@ -177,10 +177,13 @@ pitch, looping and resampling — linear by default, band-limited windowed-sinc 
 request — mixed into an interleaved float32 buffer by an **allocation-free**
 `render`. A full voice pool either fails (default) or recycles the
 lowest-priority voice, with per-generation termination reasons. Opt-in insert
-chains (`src/audio/effects.zig`, `docs/audio-effects.md`) add RBJ biquad filters
-and a stereo-linked compressor per bus and on the master; only buses with an
-active chain are isolated into a preallocated submix, so an all-bypass
-configuration stays bit-identical and allocation-free. Channel mapping, clamping,
+chains (`src/audio/effects.zig`, `docs/audio-effects.md`) add RBJ biquad filters,
+a stereo-linked compressor, a feedback delay and a Freeverb-style reverb per bus
+and on the master; only buses with an active chain are isolated into a
+preallocated submix, so an all-bypass configuration stays bit-identical and
+allocation-free. Delay-based effects borrow their memory from the caller (like
+clips), so they add no mixer allocation, and the mixer rejects two slots claiming
+the same instance or overlapping buffers. Channel mapping, clamping,
 non-finite sanitizing and peak metering are explicit and documented; `toPcm16`
 converts the mix for a device. It consumes `CXAW` artifacts without importing the
 asset layer, so both stay independently testable. Pure CPU work with no device
@@ -195,7 +198,7 @@ It mirrors the render extraction bridge and never writes to the scene, forwards
 `AudioSource.priority` to the mixer's steal policy, and resumes a stolen source
 from its last observed cursor without stealing on its behalf. A source reaches
 the insert effects through its `bus`. The backends themselves,
-HRTF/occlusion/reverb, delay-based effects and streaming remain planned.
+HRTF/occlusion, modulated/convolved effects and streaming remain planned.
 
 ### ECS — implemented (storage + queries + scheduling + graph/frame budgets), planned (extensions)
 A data-oriented ECS in `src/ecs/`, re-exported as `corex.ecs`:
@@ -385,8 +388,9 @@ mark-and-sweep GC, change detection with incremental re-import), the
 backend-independent render extraction layer (camera,
 frustum culling, sorted draw lists) and the device-independent audio runtime
 (mixer with voices/buses/pan/pitch, linear and band-limited resampling, priority
-voice stealing, biquad/compressor insert chains, plus spatialization and the
-`AudioSource` scene bridge) are implemented and tested, and the executable builds
+voice stealing, biquad/compressor/delay/reverb insert chains, plus spatialization
+and the `AudioSource` scene bridge) are implemented and tested, and the executable
+builds
 and runs on Zig 0.17.0. The remaining larger subsystems (GPU renderer
 backends, GUI, editor, Lua, export, native modules) are in scope and either
 contract-defined or planned, as marked above.
