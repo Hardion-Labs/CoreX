@@ -2308,15 +2308,19 @@ test "mixer: delay-based inserts need no mixer allocation" {
     const memory = try gpa.alloc(f32, try effects.Reverb.requiredSamples(48000, 1));
     defer gpa.free(memory);
     var reverb = try effects.Reverb.init(48000, 1, .{}, memory);
+    const lim_mem = try gpa.alloc(f32, try effects.Limiter.requiredSamples(48000, 1, .{}));
+    defer gpa.free(lim_mem);
+    var limiter = try effects.Limiter.init(48000, 1, .{}, lim_mem);
 
-    // The reverb and its memory live outside the probe: the mixer must not
+    // The instances and their memory live outside the probe: the mixer must not
     // allocate anything for them, at insert time or during render.
     try testing.checkAllAllocationFailures(gpa, struct {
-        fn f(alloc: Allocator, instance: *effects.Reverb) !void {
+        fn f(alloc: Allocator, instance: *effects.Reverb, peak: *effects.Limiter) !void {
             const samples = [_]f32{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8 };
             var mixer = try Mixer.init(alloc, .{ .channels = 1, .effect_slots = 2, .block_frames = 4 });
             defer mixer.deinit();
             try mixer.setMasterEffect(0, Effect.reverb(instance));
+            try mixer.setMasterEffect(1, Effect.limiter(peak));
             try mixer.setBusEffect(0, 0, try Effect.biquad(48000, .{ .cutoff_hz = 4000 }));
             _ = try mixer.play(monoClip(&samples, 48000), .{ .looping = true });
             var out: [32]f32 = undefined;
@@ -2324,5 +2328,76 @@ test "mixer: delay-based inserts need no mixer allocation" {
             mixer.resetEffects();
             _ = try mixer.render(&out);
         }
-    }.f, .{&reverb});
+    }.f, .{ &reverb, &limiter });
+}
+
+test "mixer: a master limiter removes clipping without touching quiet mixes" {
+    const gpa = testing.allocator;
+    const params = effects.LimiterParams{ .ceiling_db = -1, .lookahead_ms = 2, .release_ms = 60 };
+    const memory = try gpa.alloc(f32, try effects.Limiter.requiredSamples(48000, 1, params));
+    defer gpa.free(memory);
+    var limiter = try effects.Limiter.init(48000, 1, params, memory);
+
+    var plain = try Mixer.init(gpa, .{ .channels = 1 });
+    defer plain.deinit();
+    var limited = try Mixer.init(gpa, .{ .channels = 1, .effect_slots = 1, .block_frames = 128 });
+    defer limited.deinit();
+    try limited.setMasterEffect(0, Effect.limiter(&limiter));
+
+    // Four full-scale voices sum to 4.0: the unprotected mixer clips hard.
+    const samples = try sineClip(gpa, 4800, 48000, 1000);
+    defer gpa.free(samples);
+    const tone = monoClip(samples, 48000);
+    for (0..4) |_| {
+        _ = try plain.play(tone, .{ .looping = true });
+        _ = try limited.play(tone, .{ .looping = true });
+    }
+
+    var raw: [2048]f32 = undefined;
+    var safe: [2048]f32 = undefined;
+    const raw_stats = try plain.render(&raw);
+    const safe_stats = try limited.render(&safe);
+    try testing.expect(raw_stats.clipped_samples > 0);
+    try testing.expectEqual(@as(usize, 0), safe_stats.clipped_samples);
+    try testing.expect(safe_stats.peak <= limiter.ceiling * (1.0 + 1e-6));
+    try testing.expect(limiter.gainReductionDb() < -6);
+
+    // A quiet mix is passed through at unity, delayed by exactly the lookahead.
+    plain.stopAll();
+    limited.stopAll();
+    limiter.reset();
+    _ = try limited.play(tone, .{ .looping = true, .gain = 0.1 });
+    _ = try limited.render(&safe);
+    try testing.expectEqual(@as(f32, 0), limiter.gainReductionDb());
+    try testing.expectEqual(@as(usize, 0), safe_stats.clipped_samples);
+}
+
+test "mixer: a limiter insert obeys the borrowed-memory rules" {
+    const gpa = testing.allocator;
+    var mixer = try Mixer.init(gpa, .{ .channels = 1, .max_buses = 2, .effect_slots = 2 });
+    defer mixer.deinit();
+    const params = effects.LimiterParams{ .lookahead_ms = 1 };
+    const need = try effects.Limiter.requiredSamples(48000, 1, params);
+    const memory = try gpa.alloc(f32, need + 8);
+    defer gpa.free(memory);
+    var limiter = try effects.Limiter.init(48000, 1, params, memory[0..need]);
+
+    try mixer.setMasterEffect(0, Effect.limiter(&limiter));
+    try testing.expectError(error.InvalidValue, mixer.setBusEffect(0, 0, Effect.limiter(&limiter)));
+    try testing.expectError(error.InvalidValue, mixer.setMasterEffect(1, Effect.limiter(&limiter)));
+    var overlapping = try effects.Limiter.init(48000, 1, params, memory[1 .. need + 1]);
+    try testing.expectError(error.InvalidValue, mixer.setBusEffect(1, 0, Effect.limiter(&overlapping)));
+
+    // A stereo limiter cannot run on a mono mixer.
+    const stereo_mem = try gpa.alloc(f32, try effects.Limiter.requiredSamples(48000, 2, params));
+    defer gpa.free(stereo_mem);
+    var stereo = try effects.Limiter.init(48000, 2, params, stereo_mem);
+    try testing.expectError(error.InvalidValue, mixer.setBusEffect(0, 0, Effect.limiter(&stereo)));
+
+    // Clearing the master releases the claim.
+    mixer.clearMasterEffects();
+    try mixer.setBusEffect(0, 0, Effect.limiter(&limiter));
+    mixer.resetEffects();
+    try testing.expectEqual(@as(f32, 1), limiter.envelope);
+    for (memory[0..need]) |v| try testing.expectEqual(@as(f32, 0), v);
 }

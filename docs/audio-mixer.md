@@ -309,6 +309,13 @@ const memory = try gpa.alloc(f32, try A.Reverb.requiredSamples(48_000, 2));
 defer gpa.free(memory);
 var room = try A.Reverb.init(48_000, 2, .{ .room_size = 0.8 }, memory);
 try mixer.setMasterEffect(1, A.Effect.reverb(&room));
+
+// A brickwall ceiling on the master. It runs before master_gain and the clamp,
+// so keep master_gain <= 1 and compensate latencyFrames() if you need alignment.
+const lim_mem = try gpa.alloc(f32, try A.Limiter.requiredSamples(48_000, 2, .{}));
+defer gpa.free(lim_mem);
+var limiter = try A.Limiter.init(48_000, 2, .{ .ceiling_db = -1 }, lim_mem);
+try mixer.setMasterEffect(2, A.Effect.limiter(&limiter));
 ```
 
 The guarantees that matter for the mixing contract:
@@ -429,7 +436,10 @@ it plays real imported fixtures end to end.
   mixer; block sizes 16 and 512 agree bit for bit; an insert affects only its own
   bus; master inserts affect the sum; tails ring out and `resetEffects` silences
   them; a voice ending inside a block is counted once.
-- **Borrowed effect memory**: a delay/reverb instance cannot be inserted twice,
+- **Limiter**: four full-scale voices clip an unprotected mixer; with a master
+  limiter `clipped_samples` is **zero** and the peak sits at the ceiling, while a
+  quiet mix still passes at unity gain.
+- **Borrowed effect memory**: a delay/reverb/limiter instance cannot be inserted twice,
   two instances cannot share or partially overlap a buffer, the layout must match
   the output, replacing the holding slot is allowed, and clearing releases the
   claim. A delay echoes correctly across block boundaries and a master reverb
@@ -480,8 +490,10 @@ Reading the table honestly:
 - Insert effects add ~1% when reserved but bypassed, +11% for a biquad on one of
   eight buses and +37% for a master compressor. A master reverb adds ~66% over an
   unity-rate baseline, and a full eight-bus chain with delays, filters, reverb and
-  compression still runs at 103× real time — see the measured tables in
-  [audio-effects.md](audio-effects.md).
+  compression still runs at 103× real time. A master limiter adds ~17%, **flat in
+  the lookahead length** (0 ms and 20 ms cost the same). See the measured tables
+  in [audio-effects.md](audio-effects.md), and compare within a table rather than
+  across them.
 - Voice state is a contiguous array walked in slot order, so the mix is
   cache-friendly and prefetchable.
 
@@ -494,10 +506,10 @@ Reading the table honestly:
   panning and Doppler live one layer up, in `corex.audio.spatial` /
   `AudioSystem` (see [audio-spatial.md](audio-spatial.md)), which feed this
   mixer's gain/pan/pitch. There is no HRTF or binaural rendering anywhere yet.
-- **Effects**: biquads, a stereo-linked compressor, a feedback delay and a
-  Freeverb-style reverb on per-bus and master chains
-  ([audio-effects.md](audio-effects.md)). No chorus/flanger, convolution,
-  lookahead limiting, oversampled saturation, side-chain or per-voice inserts.
+- **Effects**: biquads, a stereo-linked compressor, a feedback delay, a
+  Freeverb-style reverb and a lookahead brickwall limiter on per-bus and master
+  chains ([audio-effects.md](audio-effects.md)). No chorus/flanger, convolution,
+  oversampled saturation, side-chain or per-voice inserts.
   Delay-based effects borrow their memory from the caller, so they add **no mixer
   allocation**; the mixer rejects two slots claiming the same instance or
   overlapping buffers.
