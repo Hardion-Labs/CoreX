@@ -546,10 +546,15 @@ pub const Mixer = struct {
         if (effect.kind != .bypass and effect.sample_rate != self.sample_rate) return error.InvalidValue;
         const layout = effect.channelCount();
         if (layout != 0 and layout != self.channels) return error.InvalidValue;
-        const memory = effect.borrowedMemory() orelse return;
-        const address = effect.stateAddress().?;
-        const start = @intFromPtr(memory.ptr);
-        const end = start + memory.len * @sizeOf(f32);
+        // Identity and buffer are independent claims. An effect can borrow an
+        // instance with no buffer at all (the saturator keeps its state inline),
+        // and it must still be rejected in a second slot: sharing it would
+        // advance its histories twice per sample.
+        const address = effect.stateAddress();
+        const memory = effect.borrowedMemory();
+        if (address == null and memory == null) return;
+        const start = if (memory) |m| @intFromPtr(m.ptr) else 0;
+        const end = if (memory) |m| @intFromPtr(m.ptr) + m.len * @sizeOf(f32) else 0;
 
         for (0..self.buses.len) |b| {
             for (0..self.effect_slots) |k| {
@@ -566,14 +571,19 @@ pub const Mixer = struct {
     /// True when `other` is the same borrowed instance or its memory overlaps
     /// the range being inserted. Either would make two slots fight over one
     /// set of cursors, which is silent corruption rather than a crash.
-    fn claims(other: Effect, address: usize, start: usize, end: usize) bool {
-        if (other.stateAddress()) |existing| {
-            if (existing == address) return true;
+    fn claims(other: Effect, address: ?usize, start: usize, end: usize) bool {
+        if (address) |wanted| {
+            if (other.stateAddress()) |existing| {
+                if (existing == wanted) return true;
+            }
         }
-        if (other.borrowedMemory()) |memory| {
-            const other_start = @intFromPtr(memory.ptr);
-            const other_end = other_start + memory.len * @sizeOf(f32);
-            if (start < other_end and other_start < end) return true;
+        // An empty range cannot overlap anything.
+        if (end > start) {
+            if (other.borrowedMemory()) |memory| {
+                const other_start = @intFromPtr(memory.ptr);
+                const other_end = other_start + memory.len * @sizeOf(f32);
+                if (start < other_end and other_start < end) return true;
+            }
         }
         return false;
     }
@@ -2311,16 +2321,18 @@ test "mixer: delay-based inserts need no mixer allocation" {
     const lim_mem = try gpa.alloc(f32, try effects.Limiter.requiredSamples(48000, 1, .{}));
     defer gpa.free(lim_mem);
     var limiter = try effects.Limiter.init(48000, 1, .{}, lim_mem);
+    var saturator = try effects.Saturator.init(48000, 1, .{ .oversample = 4 });
 
     // The instances and their memory live outside the probe: the mixer must not
     // allocate anything for them, at insert time or during render.
     try testing.checkAllAllocationFailures(gpa, struct {
-        fn f(alloc: Allocator, instance: *effects.Reverb, peak: *effects.Limiter) !void {
+        fn f(alloc: Allocator, instance: *effects.Reverb, peak: *effects.Limiter, drive: *effects.Saturator) !void {
             const samples = [_]f32{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8 };
-            var mixer = try Mixer.init(alloc, .{ .channels = 1, .effect_slots = 2, .block_frames = 4 });
+            var mixer = try Mixer.init(alloc, .{ .channels = 1, .effect_slots = 3, .block_frames = 4 });
             defer mixer.deinit();
             try mixer.setMasterEffect(0, Effect.reverb(instance));
             try mixer.setMasterEffect(1, Effect.limiter(peak));
+            try mixer.setMasterEffect(2, Effect.saturator(drive));
             try mixer.setBusEffect(0, 0, try Effect.biquad(48000, .{ .cutoff_hz = 4000 }));
             _ = try mixer.play(monoClip(&samples, 48000), .{ .looping = true });
             var out: [32]f32 = undefined;
@@ -2328,7 +2340,7 @@ test "mixer: delay-based inserts need no mixer allocation" {
             mixer.resetEffects();
             _ = try mixer.render(&out);
         }
-    }.f, .{ &reverb, &limiter });
+    }.f, .{ &reverb, &limiter, &saturator });
 }
 
 test "mixer: a master limiter removes clipping without touching quiet mixes" {
@@ -2400,4 +2412,59 @@ test "mixer: a limiter insert obeys the borrowed-memory rules" {
     mixer.resetEffects();
     try testing.expectEqual(@as(f32, 1), limiter.envelope);
     for (memory[0..need]) |v| try testing.expectEqual(@as(f32, 0), v);
+}
+
+test "mixer: saturation then limiting shapes a hot bus without clipping" {
+    const gpa = testing.allocator;
+    var saturator = try effects.Saturator.init(48000, 1, .{ .drive = 8, .oversample = 4 });
+    const params = effects.LimiterParams{ .ceiling_db = -1, .lookahead_ms = 2, .true_peak = true };
+    const memory = try gpa.alloc(f32, try effects.Limiter.requiredSamples(48000, 1, params));
+    defer gpa.free(memory);
+    var limiter = try effects.Limiter.init(48000, 1, params, memory);
+
+    var mixer = try Mixer.init(gpa, .{ .channels = 1, .effect_slots = 2, .block_frames = 128 });
+    defer mixer.deinit();
+    try mixer.setMasterEffect(0, Effect.saturator(&saturator));
+    try mixer.setMasterEffect(1, Effect.limiter(&limiter));
+
+    const samples = try sineClip(gpa, 4800, 48000, 1000);
+    defer gpa.free(samples);
+    const tone = monoClip(samples, 48000);
+    for (0..4) |_| _ = try mixer.play(tone, .{ .looping = true });
+
+    var out: [2048]f32 = undefined;
+    const stats = try mixer.render(&out);
+    try testing.expectEqual(@as(usize, 0), stats.clipped_samples);
+    try testing.expect(stats.peak <= limiter.ceiling * (1.0 + 1e-6));
+    // The chain really ran: the saturator added latency and the limiter pulled
+    // the summed level down.
+    try testing.expectEqual(effects.oversample_latency, saturator.latencyFrames());
+    // tanh already bounds the sum near 1, so the limiter only has to trim the
+    // last dB down to its ceiling -- it is the saturator doing the heavy work.
+    try testing.expect(limiter.gainReductionDb() < -0.5);
+    for (out) |v| try testing.expect(std.math.isFinite(v));
+}
+
+test "mixer: a saturator instance cannot be inserted twice" {
+    const gpa = testing.allocator;
+    var mixer = try Mixer.init(gpa, .{ .channels = 1, .max_buses = 2, .effect_slots = 2 });
+    defer mixer.deinit();
+    var saturator = try effects.Saturator.init(48000, 1, .{ .oversample = 2 });
+    try mixer.setBusEffect(0, 0, Effect.saturator(&saturator));
+    // It borrows no buffer, but sharing the instance would still double-advance
+    // its histories, so the identity check has to catch it on its own.
+    try testing.expectError(error.InvalidValue, mixer.setBusEffect(1, 0, Effect.saturator(&saturator)));
+    try testing.expectError(error.InvalidValue, mixer.setMasterEffect(0, Effect.saturator(&saturator)));
+
+    // A distinct instance over no shared memory is fine.
+    var other = try effects.Saturator.init(48000, 1, .{ .oversample = 2 });
+    try mixer.setBusEffect(1, 0, Effect.saturator(&other));
+    // Layout still has to match.
+    var stereo = try effects.Saturator.init(48000, 2, .{});
+    try testing.expectError(error.InvalidValue, mixer.setMasterEffect(0, Effect.saturator(&stereo)));
+
+    try mixer.clearBusEffects(0);
+    try mixer.setMasterEffect(0, Effect.saturator(&saturator));
+    mixer.resetEffects();
+    for (&saturator.in_hist) |h| for (h.data) |v| try testing.expectEqual(@as(f32, 0), v);
 }

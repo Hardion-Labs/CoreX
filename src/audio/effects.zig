@@ -1,8 +1,9 @@
 //! Audio DSP: insert effects for bus and master chains.
 //!
-//! This module is **pure signal processing**. It imports only `std`: it knows
-//! nothing about voices, buses, the mixer, scenes or assets, so a filter can be
-//! tested against its analytic transfer function on its own. The mixer owns the
+//! This module is **pure signal processing**. It imports only `std` and the
+//! sibling `resample` module (also pure DSP, for the shared filter prototype):
+//! it knows nothing about voices, buses, the mixer, scenes or assets, so a filter
+//! can be tested against its analytic transfer function on its own. The mixer owns the
 //! chains and calls `Chain.process` on an interleaved buffer; nothing here
 //! allocates, and every effect keeps its state inline.
 //!
@@ -26,8 +27,9 @@
 //! Implemented: RBJ biquad filters (low/high pass, band pass, notch, peaking,
 //! low/high shelf), a feed-forward stereo-linked compressor with a soft knee, a
 //! feedback delay with damping, a Freeverb-style reverb (eight damped comb
-//! filters into four diffusion sections per channel; see `allpassStep`), and a
-//! lookahead brickwall limiter (see `Limiter` and `SlidingMax`).
+//! filters into four diffusion sections per channel; see `allpassStep`), a
+//! lookahead brickwall limiter with optional true-peak detection (see `Limiter`
+//! and `SlidingMax`), and an oversampled waveshaping saturator.
 //!
 //! **Delay-based effects borrow their memory from the caller**, exactly like a
 //! `Clip` borrows its samples: `requiredSamples` on `Delay`, `Reverb` and
@@ -39,9 +41,12 @@
 //! `Effect.stateAddress`).
 //!
 //! Not implemented: convolution, chorus/flanger (modulated delay taps),
-//! oversampled saturation, side-chain input.
+//! side-chain input.
 
 const std = @import("std");
+/// Sibling pure-DSP module. Only its filter prototype is used, so the
+/// oversampling kernels and the resampler's polyphase bank can never drift apart.
+const resample = @import("resample.zig");
 
 /// Channel layouts an effect can process. Matches the mixer's output contract
 /// (mono or stereo) and keeps the state inline and allocation-free.
@@ -707,6 +712,252 @@ fn scaledLength(tuning: u32, scale: f64) usize {
     return @max(1, @as(usize, @intFromFloat(scaled)));
 }
 
+// --- oversampling ----------------------------------------------------------
+
+/// Taps per polyphase branch. At 4x this is the 48-tap filter ITU-R BS.1770
+/// specifies for true-peak measurement, which is why the limiter uses it too.
+pub const oversample_taps: usize = 12;
+/// Highest supported factor. 1 means "process at the base rate".
+pub const max_oversample: usize = 4;
+
+/// Round-trip latency of the oversampled path, in base-rate frames. It falls out
+/// of the two causal shifts (interpolation needs `taps/2 - 1` future samples,
+/// decimation the rest) and is independent of the factor.
+pub const oversample_latency: usize = oversample_taps - 1;
+/// Where the dry tap sits in the input history: the sample delayed by exactly
+/// `oversample_latency`, so a dry/wet mix stays phase-aligned.
+const dry_tap: usize = oversample_taps - 1 - oversample_latency;
+/// How far ahead the interpolator must look, in base frames.
+const interp_delay: usize = oversample_taps / 2 - 1;
+
+/// Up kernels indexed `[phase][tap]`, oldest tap first. Phase 0 is exactly a
+/// delta, so it reproduces the input sample and costs nothing to reason about.
+fn buildUpKernel(comptime factor: usize) [factor][oversample_taps]f32 {
+    @setEvalBranchQuota(100_000);
+    const h: f64 = @floatFromInt(oversample_taps / 2);
+    var out: [factor][oversample_taps]f32 = undefined;
+    for (0..factor) |p| {
+        if (p == 0) {
+            // Phase 0 is a delta mathematically; `sin(pi*k)` is only ~1e-35 in
+            // floating point, so build it exactly rather than nearly.
+            for (&out[p]) |*v| v.* = 0;
+            out[p][oversample_taps / 2] = 1;
+            continue;
+        }
+        const frac = @as(f64, @floatFromInt(p)) / @as(f64, @floatFromInt(factor));
+        var sum: f64 = 0;
+        for (0..oversample_taps) |i| {
+            const v = resample.prototype(h - @as(f64, @floatFromInt(i)) + frac, h);
+            out[p][i] = @floatCast(v);
+            sum += v;
+        }
+        // Normalize per phase so a constant signal stays exactly constant.
+        for (0..oversample_taps) |i| out[p][i] = @floatCast(@as(f64, out[p][i]) / sum);
+    }
+    return out;
+}
+
+/// Decimation kernel, oldest tap first, normalized to unity DC gain.
+///
+/// The length is **odd** (`factor * taps + 1`) on purpose. An even-length kernel
+/// is symmetric about a half-sample, which at an even decimation factor is a
+/// fractional delay at the base rate; an odd one is symmetric about a real tap,
+/// so the filter is exactly linear-phase and its group delay is a whole number
+/// of base frames. The two end taps land where the window is zero.
+fn buildDownKernel(comptime factor: usize) [factor * oversample_taps + 1]f32 {
+    @setEvalBranchQuota(100_000);
+    const h: f64 = @floatFromInt(oversample_taps / 2);
+    const f: f64 = @floatFromInt(factor);
+    const n = factor * oversample_taps + 1;
+    var out: [n]f32 = undefined;
+    var sum: f64 = 0;
+    for (0..n) |j| {
+        const v = resample.prototype(h - @as(f64, @floatFromInt(j)) / f, h) / f;
+        out[j] = @floatCast(v);
+        sum += v;
+    }
+    for (&out) |*v| v.* = @floatCast(@as(f64, v.*) / sum);
+    return out;
+}
+
+const up_kernel_2 = buildUpKernel(2);
+const up_kernel_4 = buildUpKernel(4);
+const down_kernel_2 = buildDownKernel(2);
+const down_kernel_4 = buildDownKernel(4);
+/// High-rate history length: enough for the longest decimator plus the `F - 1`
+/// samples it reads back from the newest, so every factor uses the same array.
+const hi_history_len: usize = max_oversample * (oversample_taps + 1);
+
+/// Fixed-length history whose live window is always **contiguous**: every write
+/// is mirrored into a second copy of the buffer, so the dot products run over a
+/// plain slice with no modular indexing in the inner loop. Two stores per sample
+/// buy a vectorizable inner loop, which is the whole point at these tap counts.
+fn History(comptime n: usize) type {
+    return struct {
+        data: [2 * n]f32 = @splat(0),
+        pos: usize = 0,
+
+        const Self = @This();
+
+        inline fn push(self: *Self, value: f32) void {
+            self.data[self.pos] = value;
+            self.data[self.pos + n] = value;
+            self.pos += 1;
+            if (self.pos == n) self.pos = 0;
+        }
+
+        /// The last `n` values, oldest first. Valid until the next push.
+        inline fn window(self: *const Self) *const [n]f32 {
+            return self.data[self.pos..][0..n];
+        }
+
+        inline fn clear(self: *Self) void {
+            self.data = @splat(0);
+            self.pos = 0;
+        }
+    };
+}
+
+inline fn dot(comptime n: usize, kernel: *const [n]f32, values: *const [n]f32) f32 {
+    var acc: f32 = 0;
+    for (kernel, values) |h, v| acc += h * v;
+    return acc;
+}
+
+/// Soft clipper. `tanh` is odd, monotonic and bounded by 1, so the shaped signal
+/// cannot run away however hard it is driven.
+inline fn shape(x: f32, drive: f32) f32 {
+    return std.math.tanh(drive * x);
+}
+
+pub const SaturatorParams = struct {
+    /// Gain into the shaper. 1 is gentle, 10 is heavy; the output stays bounded
+    /// by 1 either way.
+    drive: f32 = 1.0,
+    /// 0 is bit-exact dry, 1 is fully shaped.
+    mix: f32 = 1.0,
+    /// 1, 2 or 4. Above 1 the shaper runs at the higher rate, so the harmonics it
+    /// creates above the base Nyquist are filtered out instead of folding back.
+    ///
+    /// The default is 2, not 4: with this filter length the decimator's stopband
+    /// is the limiting factor, so 4x measures within a few percent of 2x on a
+    /// hard-driven tone while costing ~40% more. Reach for 4 when the drive is
+    /// extreme enough to put real energy above twice the base Nyquist.
+    oversample: usize = 2,
+};
+
+/// Waveshaping saturator with optional 2x/4x oversampling.
+///
+/// A nonlinearity generates harmonics far above the input bandwidth. At the base
+/// rate those fold back as inharmonic aliasing, which is the characteristic
+/// "digital" harshness of naive distortion. Running the shaper at 2x or 4x and
+/// filtering on the way back down moves the fold-back point above the audible
+/// band.
+///
+/// All state is fixed-size and inline, so this effect needs **no borrowed
+/// buffer** at all — only the instance itself, which the caller owns. Memory is
+/// independent of the block size.
+pub const Saturator = struct {
+    sample_rate: u32,
+    channels: usize,
+    factor: usize,
+    up: []const [oversample_taps]f32,
+    down: []const f32,
+    drive: f32,
+    wet: f32,
+    dry: f32,
+    in_hist: [max_channels]History(oversample_taps),
+    hi_hist: [max_channels]History(hi_history_len),
+
+    pub fn init(sample_rate: u32, channels: usize, params: SaturatorParams) Error!Saturator {
+        if (sample_rate == 0) return error.InvalidValue;
+        try validateChannels(channels);
+        if (!std.math.isFinite(params.drive) or params.drive < 0.01 or params.drive > 100) return error.InvalidValue;
+        if (!std.math.isFinite(params.mix) or params.mix < 0 or params.mix > 1) return error.InvalidValue;
+        const factor = params.oversample;
+        if (factor != 1 and factor != 2 and factor != 4) return error.InvalidValue;
+        return .{
+            .sample_rate = sample_rate,
+            .channels = channels,
+            .factor = factor,
+            .up = switch (factor) {
+                2 => &up_kernel_2,
+                4 => &up_kernel_4,
+                else => &.{},
+            },
+            .down = switch (factor) {
+                2 => &down_kernel_2,
+                4 => &down_kernel_4,
+                else => &.{},
+            },
+            .drive = params.drive,
+            .wet = params.mix,
+            .dry = 1.0 - params.mix,
+            .in_hist = @splat(.{}),
+            .hi_hist = @splat(.{}),
+        };
+    }
+
+    pub fn process(self: *Saturator, buffer: []f32, channels: usize) void {
+        std.debug.assert(channels == self.channels);
+        const drive = self.drive;
+        const wet = self.wet;
+        const dry = self.dry;
+
+        if (self.factor == 1) {
+            // No oversampling, no latency, no filtering.
+            for (buffer) |*v| {
+                const x = finite(v.*);
+                v.* = x * dry + shape(x, drive) * wet;
+            }
+            return;
+        }
+
+        const frames = buffer.len / channels;
+        var i: usize = 0;
+        var n: usize = 0;
+        while (n < frames) : (n += 1) {
+            for (0..channels) |c| {
+                const x = finite(buffer[i + c]);
+                const in_hist = &self.in_hist[c];
+                in_hist.push(x);
+                const window = in_hist.window();
+
+                // Interpolate, shape at the high rate, keep the shaped samples.
+                const hi = &self.hi_hist[c];
+                for (self.up) |*kernel| hi.push(shape(dot(oversample_taps, kernel, window), drive));
+
+                // Decimate back down, filtering out everything the shaper put
+                // above the base Nyquist. The kernel is symmetric, so it pairs
+                // directly with the oldest-first window; it ends `factor - 1`
+                // samples before the newest, which is what makes the group
+                // delay a whole number of base frames.
+                const hw = hi.window();
+                const start = hi_history_len - self.factor * (oversample_taps + 1);
+                const span = hw[start..][0..self.down.len];
+                var acc: f32 = 0;
+                for (self.down, span) |h, v| acc += h * v;
+
+                // The dry path is tapped from the same history at exactly the
+                // round-trip delay, so mixing never comb-filters.
+                buffer[i + c] = window[dry_tap] * dry + acc * wet;
+            }
+            i += channels;
+        }
+    }
+
+    /// Latency added by the oversampled path, in frames per channel. Zero when
+    /// `oversample == 1`.
+    pub fn latencyFrames(self: *const Saturator) usize {
+        return if (self.factor == 1) 0 else oversample_latency;
+    }
+
+    pub fn reset(self: *Saturator) void {
+        for (&self.in_hist) |*h| h.clear();
+        for (&self.hi_hist) |*h| h.clear();
+    }
+};
+
 // --- lookahead limiter -----------------------------------------------------
 
 /// Longest lookahead the limiter accepts, in milliseconds. It bounds the borrowed
@@ -728,6 +979,13 @@ pub const LimiterParams = struct {
     /// One-pole recovery towards unity after the peak leaves the window.
     /// 0 means instant recovery.
     release_ms: f32 = 100.0,
+    /// Detect **inter-sample** peaks by measuring the 4x oversampled waveform,
+    /// as ITU-R BS.1770 does. A sample-peak limiter can let the reconstructed
+    /// analogue signal exceed the ceiling between samples; this closes that gap
+    /// at the cost of the interpolator's MACs and `interp_delay` extra frames of
+    /// latency (reported by `latencyFrames`). Off by default, so existing
+    /// instances are bit-identical.
+    true_peak: bool = false,
 };
 
 /// Sliding-window maximum in O(1) amortized, built from two stacks that each
@@ -827,6 +1085,10 @@ pub const Limiter = struct {
     channels: usize,
     lines: [max_channels]Line,
     detector: SlidingMax,
+    true_peak: bool,
+    /// Per-channel interpolation history for true-peak detection. Inline and
+    /// fixed-size, so enabling the option needs no extra borrowed memory.
+    interp: [max_channels]History(oversample_taps),
     delay_frames: usize,
     window: usize,
     ceiling: f32,
@@ -845,17 +1107,23 @@ pub const Limiter = struct {
     /// Number of f32 samples the caller must provide: the audio delay lines plus
     /// the detector's two-stack region.
     pub fn requiredSamples(sample_rate: u32, channels: usize, params: LimiterParams) Error!usize {
-        const frames = try lookaheadFrames(sample_rate, params.lookahead_ms);
+        const look = try lookaheadFrames(sample_rate, params.lookahead_ms);
         try validateChannels(channels);
         try validateLimiter(params);
-        return frames * channels + (frames + 1) * 2;
+        const delay = look + truePeakDelay(params.true_peak);
+        return delay * channels + (look + 1) * 2;
     }
 
     pub fn init(sample_rate: u32, channels: usize, params: LimiterParams, buffer: []f32) Error!Limiter {
-        const frames = try lookaheadFrames(sample_rate, params.lookahead_ms);
+        const look = try lookaheadFrames(sample_rate, params.lookahead_ms);
         try validateChannels(channels);
         try validateLimiter(params);
-        const window = frames + 1;
+        // The detector reports the peak of the sample `interp_delay` frames back,
+        // because interpolation needs future samples. Delaying the audio by the
+        // same extra amount keeps the emitted sample inside the detector window,
+        // so the ceiling guarantee is unchanged.
+        const frames = look + truePeakDelay(params.true_peak);
+        const window = look + 1;
         const need = frames * channels + window * 2;
         if (buffer.len < need) return error.InvalidValue;
 
@@ -873,6 +1141,8 @@ pub const Limiter = struct {
             .channels = channels,
             .lines = lines,
             .detector = SlidingMax.init(buffer[frames * channels ..][0 .. window * 2], window),
+            .true_peak = params.true_peak,
+            .interp = @splat(.{}),
             .delay_frames = frames,
             .window = window,
             .ceiling = @floatCast(std.math.pow(f64, 10.0, @as(f64, params.ceiling_db) / 20.0)),
@@ -898,6 +1168,18 @@ pub const Limiter = struct {
             for (0..channels) |c| {
                 x[c] = finite(buffer[i + c]);
                 peak = @max(peak, @abs(x[c]));
+            }
+            if (self.true_peak) {
+                // Measure the waveform the DAC will actually reconstruct, not
+                // just the samples. Phase 0 is a delta, so this also covers the
+                // base-rate peak of the sample being reported.
+                for (0..channels) |c| {
+                    self.interp[c].push(x[c]);
+                    const w = self.interp[c].window();
+                    for (&up_kernel_4) |*kernel| {
+                        peak = @max(peak, @abs(dot(oversample_taps, kernel, w)));
+                    }
+                }
             }
 
             if (self.detector.len() == self.window) self.detector.pop();
@@ -935,6 +1217,7 @@ pub const Limiter = struct {
         @memset(self.memory, 0);
         for (&self.lines) |*line| line.index = 0;
         self.detector.clear();
+        for (&self.interp) |*h| h.clear();
         self.envelope = 1;
         self.distance = 0;
     }
@@ -951,6 +1234,12 @@ pub const Limiter = struct {
         return @floatCast(20.0 * @log10(@as(f64, @max(self.envelope, 1e-12))));
     }
 };
+
+/// Extra audio delay the true-peak detector needs so the sample it reports is
+/// the one being emitted.
+inline fn truePeakDelay(enabled: bool) usize {
+    return if (enabled) interp_delay else 0;
+}
 
 fn validateLimiter(params: LimiterParams) Error!void {
     if (!std.math.isFinite(params.ceiling_db) or params.ceiling_db > 0 or params.ceiling_db < min_ceiling_db) return error.InvalidValue;
@@ -983,6 +1272,7 @@ pub const Effect = struct {
         delay: *Delay,
         reverb: *Reverb,
         limiter: *Limiter,
+        saturator: *Saturator,
     };
 
     /// Identity. `process` returns immediately, and a chain of these is bit-exact.
@@ -1020,6 +1310,12 @@ pub const Effect = struct {
         return .{ .sample_rate = instance.sample_rate, .kind = .{ .limiter = instance } };
     }
 
+    /// Wrap an initialized `Saturator`. The instance is borrowed like the others,
+    /// but it owns all its state inline, so there is no buffer to keep alive.
+    pub fn saturator(instance: *Saturator) Effect {
+        return .{ .sample_rate = instance.sample_rate, .kind = .{ .saturator = instance } };
+    }
+
     /// Layout this effect was built for, or 0 when it adapts to any layout.
     /// Delay lines are allocated per channel, so they cannot be reinterpreted.
     pub fn channelCount(self: Effect) u16 {
@@ -1027,6 +1323,7 @@ pub const Effect = struct {
             .delay => |instance| @intCast(instance.channels),
             .reverb => |instance| @intCast(instance.channels),
             .limiter => |instance| @intCast(instance.channels),
+            .saturator => |instance| @intCast(instance.channels),
             else => 0,
         };
     }
@@ -1049,6 +1346,7 @@ pub const Effect = struct {
             .delay => |instance| @intFromPtr(instance),
             .reverb => |instance| @intFromPtr(instance),
             .limiter => |instance| @intFromPtr(instance),
+            .saturator => |instance| @intFromPtr(instance),
             else => null,
         };
     }
@@ -1063,6 +1361,7 @@ pub const Effect = struct {
             .delay => |instance| instance.process(buffer, channels),
             .reverb => |instance| instance.process(buffer, channels),
             .limiter => |instance| instance.process(buffer, channels),
+            .saturator => |instance| instance.process(buffer, channels),
         }
     }
 
@@ -1076,6 +1375,7 @@ pub const Effect = struct {
             .delay => |instance| instance.reset(),
             .reverb => |instance| instance.reset(),
             .limiter => |instance| instance.reset(),
+            .saturator => |instance| instance.reset(),
         }
     }
 };
@@ -2227,4 +2527,334 @@ test "effects: a limiter insert exposes its borrowed memory" {
     try testing.expect(limiter.gainReductionDb() < 0);
     slot.reset();
     try testing.expectEqual(@as(f32, 0), limiter.gainReductionDb());
+}
+
+/// Amplitude of one frequency in a signal, by direct correlation. The caller
+/// picks a whole number of cycles so the estimate is not window-biased.
+fn magnitudeAt(signal: []const f32, rate: u32, freq: f64) f64 {
+    var re: f64 = 0;
+    var im: f64 = 0;
+    const w = 2.0 * std.math.pi * freq / @as(f64, @floatFromInt(rate));
+    for (signal, 0..) |v, i| {
+        const t = w * @as(f64, @floatFromInt(i));
+        re += @as(f64, v) * @cos(t);
+        im += @as(f64, v) * @sin(t);
+    }
+    const n: f64 = @floatFromInt(signal.len);
+    return 2.0 * @sqrt(re * re + im * im) / n;
+}
+
+test "effects: the mirrored history window is oldest-first and stays in bounds" {
+    const n = 12;
+    var hist = History(n){};
+    var reference: [n]f32 = @splat(0);
+    var i: usize = 0;
+    while (i < 500) : (i += 1) {
+        const value: f32 = @floatFromInt(i);
+        hist.push(value);
+        std.mem.copyBackwards(f32, reference[1..], reference[0 .. n - 1]);
+        reference[0] = value;
+        // reference is newest-first; the window must be the reverse.
+        const w = hist.window();
+        for (0..n) |k| try testing.expectEqual(reference[n - 1 - k], w[k]);
+        try testing.expect(hist.pos < n);
+    }
+    hist.clear();
+    for (hist.window()) |v| try testing.expectEqual(@as(f32, 0), v);
+}
+
+test "effects: oversampling kernels have unity DC gain and an identity phase" {
+    inline for (.{ 2, 4 }) |factor| {
+        const up = comptime buildUpKernel(factor);
+        for (up) |phase| {
+            var sum: f64 = 0;
+            for (phase) |h| sum += h;
+            try testing.expectApproxEqAbs(@as(f64, 1), sum, 1e-6);
+        }
+        // Phase 0 reproduces the input sample exactly: a delta at taps/2.
+        for (up[0], 0..) |h, i| {
+            if (i == oversample_taps / 2) {
+                try testing.expectEqual(@as(f32, 1), h);
+            } else {
+                try testing.expectEqual(@as(f32, 0), h);
+            }
+        }
+        const down = comptime buildDownKernel(factor);
+        var sum: f64 = 0;
+        for (down) |h| sum += h;
+        try testing.expectApproxEqAbs(@as(f64, 1), sum, 1e-6);
+        // The decimator is symmetric, so it is linear-phase.
+        for (0..down.len / 2) |i| {
+            try testing.expectApproxEqAbs(down[i], down[down.len - 1 - i], 1e-6);
+        }
+    }
+}
+
+test "effects: saturator parameters are validated" {
+    const rate = 48000;
+    try testing.expectError(error.InvalidValue, Saturator.init(0, 1, .{}));
+    try testing.expectError(error.InvalidValue, Saturator.init(rate, 0, .{}));
+    try testing.expectError(error.InvalidValue, Saturator.init(rate, 3, .{}));
+    try testing.expectError(error.InvalidValue, Saturator.init(rate, 1, .{ .drive = 0 }));
+    try testing.expectError(error.InvalidValue, Saturator.init(rate, 1, .{ .drive = 101 }));
+    try testing.expectError(error.InvalidValue, Saturator.init(rate, 1, .{ .drive = std.math.nan(f32) }));
+    try testing.expectError(error.InvalidValue, Saturator.init(rate, 1, .{ .mix = -0.1 }));
+    try testing.expectError(error.InvalidValue, Saturator.init(rate, 1, .{ .mix = 1.1 }));
+    try testing.expectError(error.InvalidValue, Saturator.init(rate, 1, .{ .oversample = 3 }));
+    try testing.expectError(error.InvalidValue, Saturator.init(rate, 1, .{ .oversample = 8 }));
+
+    const plain = try Saturator.init(rate, 1, .{ .oversample = 1 });
+    try testing.expectEqual(@as(usize, 0), plain.latencyFrames());
+    // Latency comes from the filter, not the factor.
+    inline for (.{ 2, 4 }) |f| {
+        const sat = try Saturator.init(rate, 1, .{ .oversample = f });
+        try testing.expectEqual(oversample_latency, sat.latencyFrames());
+    }
+}
+
+test "effects: a constant input survives the oversampled round trip" {
+    const rate = 48000;
+    // Both kernels are DC-normalized, so a constant must come out as exactly
+    // shape(constant) once the pipeline has filled. This checks the whole
+    // up/shape/down chain end to end, including the tap alignment.
+    inline for (.{ 1, 2, 4 }) |f| {
+        var sat = try Saturator.init(rate, 1, .{ .drive = 3, .oversample = f });
+        const frames = 256;
+        var buf: [frames]f32 = @splat(0.4);
+        sat.process(&buf, 1);
+        const want = std.math.tanh(@as(f32, 3.0) * 0.4);
+        for (buf[sat.latencyFrames() + oversample_taps ..]) |v| {
+            try testing.expectApproxEqAbs(want, v, 2e-3);
+        }
+    }
+}
+
+test "effects: a dry saturator is bit-exact at exactly its latency" {
+    const rate = 48000;
+    inline for (.{ 1, 2, 4 }) |f| {
+        var sat = try Saturator.init(rate, 1, .{ .drive = 8, .mix = 0, .oversample = f });
+        const frames = 200;
+        var buf: [frames]f32 = undefined;
+        var original: [frames]f32 = undefined;
+        for (&buf, 0..) |*v, i| {
+            const value: f32 = 0.3 * @sin(@as(f32, @floatFromInt(i)) * 0.21);
+            v.* = value;
+            original[i] = value;
+        }
+        sat.process(&buf, 1);
+        const latency = sat.latencyFrames();
+        for (buf[0..latency]) |v| try testing.expectEqual(@as(f32, 0), v);
+        try testing.expectEqualSlices(f32, original[0 .. frames - latency], buf[latency..]);
+    }
+}
+
+test "effects: oversampling removes the aliasing of hard saturation" {
+    const gpa = testing.allocator;
+    const rate = 48000;
+    // 5 kHz at 48 kHz: one second is a whole number of cycles for the tone and
+    // for every alias measured below, so the correlation is unbiased.
+    const frames = 48000;
+    const source = try gpa.alloc(f32, frames);
+    defer gpa.free(source);
+    for (source, 0..) |*v, i| {
+        v.* = @floatCast(0.9 * @sin(2.0 * std.math.pi * 5000.0 * @as(f64, @floatFromInt(i)) / 48000.0));
+    }
+    const a = try gpa.alloc(f32, frames);
+    defer gpa.free(a);
+    const b = try gpa.alloc(f32, frames);
+    defer gpa.free(b);
+
+    var naive = try Saturator.init(rate, 1, .{ .drive = 12, .oversample = 1 });
+    var over = try Saturator.init(rate, 1, .{ .drive = 12, .oversample = 4 });
+    @memcpy(a, source);
+    @memcpy(b, source);
+    naive.process(a, 1);
+    over.process(b, 1);
+
+    // tanh is odd, so it makes odd harmonics. At the base rate the 7th (35 kHz)
+    // and 9th (45 kHz) fold back to 13 and 3 kHz -- neither is a harmonic of the
+    // 5 kHz tone, so both are pure aliasing, and both sit well inside the
+    // decimator's stopband.
+    var naive_far: f64 = 0;
+    var over_far: f64 = 0;
+    for ([_]f64{ 3000, 13000 }) |freq| {
+        naive_far += magnitudeAt(a[1000..], rate, freq);
+        over_far += magnitudeAt(b[1000..], rate, freq);
+    }
+    // The wanted signal is still there in both.
+    try testing.expect(magnitudeAt(a[1000..], rate, 5000) > 0.5);
+    try testing.expect(magnitudeAt(b[1000..], rate, 5000) > 0.5);
+    try testing.expect(naive_far > 0.1);
+    try testing.expect(over_far < naive_far * 0.02); // > 34 dB down
+
+    // The 5th harmonic lands at 25 kHz, one kHz above the 24 kHz decimation
+    // cutoff, so it folds to 23 kHz. No practical filter removes a component
+    // that close to the cutoff without also cutting the audible band, so this
+    // one is only partly suppressed. Pinning it keeps the claim honest: the win
+    // is on the far aliases, not on harmonics sitting on Nyquist.
+    const naive_near = magnitudeAt(a[1000..], rate, 23000);
+    const over_near = magnitudeAt(b[1000..], rate, 23000);
+    try testing.expect(naive_near > 0.1);
+    try testing.expect(over_near < naive_near * 0.75);
+    try testing.expect(over_near > naive_near * 0.1);
+}
+
+test "effects: saturator output is bounded, resets, and survives bad input" {
+    const gpa = testing.allocator;
+    const rate = 48000;
+    var sat = try Saturator.init(rate, 2, .{ .drive = 50, .oversample = 4 });
+    const frames = 2000;
+    const buf = try gpa.alloc(f32, frames * 2);
+    defer gpa.free(buf);
+    var prng = std.Random.DefaultPrng.init(0x5a7);
+    const random = prng.random();
+    for (buf, 0..) |*v, i| {
+        v.* = if (i == 0) std.math.nan(f32) else if (i == 1) std.math.inf(f32) else (random.float(f32) * 2 - 1) * 20;
+    }
+    sat.process(buf, 2);
+    for (buf) |v| {
+        try testing.expect(std.math.isFinite(v));
+        // |tanh| < 1 and the decimator's absolute tap sum is a little over 1.
+        try testing.expect(@abs(v) < 1.5);
+    }
+    sat.reset();
+    @memset(buf, 0);
+    sat.process(buf, 2);
+    for (buf) |v| try testing.expectEqual(@as(f32, 0), v);
+}
+
+test "effects: saturator channels are independent and block-size invariant" {
+    const gpa = testing.allocator;
+    const rate = 48000;
+    var a = try Saturator.init(rate, 2, .{ .drive = 6, .oversample = 4 });
+    var b = try Saturator.init(rate, 2, .{ .drive = 6, .oversample = 4 });
+    const frames = 1500;
+    const buf_a = try gpa.alloc(f32, frames * 2);
+    defer gpa.free(buf_a);
+    const buf_b = try gpa.alloc(f32, frames * 2);
+    defer gpa.free(buf_b);
+    for (0..frames) |i| {
+        const t: f32 = @floatFromInt(i);
+        const left = 0.8 * @sin(t * 0.13);
+        buf_a[i * 2] = left;
+        buf_a[i * 2 + 1] = 0; // right silent: it must stay silent
+        buf_b[i * 2] = left;
+        buf_b[i * 2 + 1] = 0;
+    }
+    a.process(buf_a, 2);
+    var offset: usize = 0;
+    while (offset < buf_b.len) : (offset += 118) {
+        const n = @min(118, buf_b.len - offset);
+        b.process(buf_b[offset..][0..n], 2);
+    }
+    try testing.expectEqualSlices(f32, buf_a, buf_b);
+    for (0..frames) |i| try testing.expectEqual(@as(f32, 0), buf_a[i * 2 + 1]);
+}
+
+test "effects: true-peak detection catches inter-sample overs" {
+    const gpa = testing.allocator;
+    const rate = 48000;
+    // A quarter-rate sine at 45 degrees lands every sample on +/-0.7071 while the
+    // waveform it describes peaks at 1.0. A sample-peak limiter sees nothing
+    // wrong; the reconstructed signal is 3 dB over.
+    const frames = 4096;
+    const source = try gpa.alloc(f32, frames);
+    defer gpa.free(source);
+    for (source, 0..) |*v, i| {
+        const t = 2.0 * std.math.pi * 12000.0 * @as(f64, @floatFromInt(i)) / 48000.0 + std.math.pi / 4.0;
+        v.* = @floatCast(@sin(t));
+    }
+    var sample_peak: f32 = 0;
+    for (source) |v| sample_peak = @max(sample_peak, @abs(v));
+    try testing.expectApproxEqAbs(@as(f32, 0.7071068), sample_peak, 1e-5);
+
+    const ceiling_db = -2.0; // ~0.794, above the samples but below the real peak
+    const a = try gpa.alloc(f32, frames);
+    defer gpa.free(a);
+    const b = try gpa.alloc(f32, frames);
+    defer gpa.free(b);
+
+    const sample_params = LimiterParams{ .ceiling_db = ceiling_db, .lookahead_ms = 2, .release_ms = 20 };
+    const true_params = LimiterParams{ .ceiling_db = ceiling_db, .lookahead_ms = 2, .release_ms = 20, .true_peak = true };
+    const mem_a = try gpa.alloc(f32, try Limiter.requiredSamples(rate, 1, sample_params));
+    defer gpa.free(mem_a);
+    const mem_b = try gpa.alloc(f32, try Limiter.requiredSamples(rate, 1, true_params));
+    defer gpa.free(mem_b);
+    var sample_lim = try Limiter.init(rate, 1, sample_params, mem_a);
+    var true_lim = try Limiter.init(rate, 1, true_params, mem_b);
+
+    // True-peak mode reports the extra interpolation delay it adds.
+    try testing.expectEqual(sample_lim.latencyFrames() + interp_delay, true_lim.latencyFrames());
+
+    @memcpy(a, source);
+    @memcpy(b, source);
+    sample_lim.process(a, 1);
+    true_lim.process(b, 1);
+
+    // The sample-peak limiter passes the tone untouched...
+    try testing.expectEqual(@as(f32, 0), sample_lim.gainReductionDb());
+    // ...while the true-peak one pulls it down to keep the real peak in range.
+    try testing.expect(true_lim.gainReductionDb() < -1.5);
+    var peak_a: f32 = 0;
+    var peak_b: f32 = 0;
+    for (a[512..]) |v| peak_a = @max(peak_a, @abs(v));
+    for (b[512..]) |v| peak_b = @max(peak_b, @abs(v));
+    try testing.expectApproxEqAbs(sample_peak, peak_a, 1e-4);
+    try testing.expect(peak_b < peak_a * 0.9);
+    // The source's true peak is 1.0, so the gain it settles on is exactly the
+    // ceiling -- referenced to the inter-sample peak, not to the samples.
+    try testing.expectApproxEqAbs(true_lim.ceiling, peak_b / peak_a, 0.05);
+}
+
+test "effects: true-peak mode still guarantees its ceiling and defaults off" {
+    const gpa = testing.allocator;
+    const rate = 48000;
+    var prng = std.Random.DefaultPrng.init(0x7ae4);
+    const random = prng.random();
+    const frames = 3000;
+    const buf = try gpa.alloc(f32, frames * 2);
+    defer gpa.free(buf);
+
+    // Zero lookahead is the tightest case: the detector window is one entry, so
+    // the extra delay is exactly what keeps the emitted sample covered.
+    for ([_]f32{ 0, 0.5, 5 }) |lookahead| {
+        const params = LimiterParams{ .ceiling_db = -3, .lookahead_ms = lookahead, .release_ms = 10, .true_peak = true };
+        const mem = try gpa.alloc(f32, try Limiter.requiredSamples(rate, 2, params));
+        defer gpa.free(mem);
+        var lim = try Limiter.init(rate, 2, params, mem);
+        for (buf, 0..) |*v, i| {
+            v.* = if (i % 512 == 0) 6.0 else (random.float(f32) * 2 - 1) * 3;
+        }
+        lim.process(buf, 2);
+        for (buf) |v| {
+            try testing.expect(std.math.isFinite(v));
+            try testing.expect(@abs(v) <= lim.ceiling * (1.0 + 1e-6));
+        }
+        lim.reset();
+        for (&lim.interp) |h| for (h.data) |v| try testing.expectEqual(@as(f32, 0), v);
+    }
+
+    // With the flag off, output is bit-identical to a limiter built the old way.
+    const off = LimiterParams{ .ceiling_db = -1, .lookahead_ms = 1 };
+    const mem = try gpa.alloc(f32, try Limiter.requiredSamples(rate, 1, off));
+    defer gpa.free(mem);
+    var lim = try Limiter.init(rate, 1, off, mem);
+    try testing.expectEqual(@as(usize, 48), lim.latencyFrames());
+    try testing.expect(!lim.true_peak);
+}
+
+test "effects: a saturator insert borrows only its instance" {
+    const rate = 48000;
+    var sat = try Saturator.init(rate, 2, .{ .oversample = 2 });
+    const effect = Effect.saturator(&sat);
+    try testing.expectEqual(@as(u16, 2), effect.channelCount());
+    try testing.expectEqual(@as(usize, @intFromPtr(&sat)), effect.stateAddress().?);
+    // No buffer to keep alive: all state is inline.
+    try testing.expectEqual(@as(?[]const f32, null), effect.borrowedMemory());
+
+    var slot = effect;
+    var signal = [_]f32{ 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5 };
+    slot.process(&signal, 2);
+    slot.reset();
+    for (&sat.in_hist) |h| for (h.data) |v| try testing.expectEqual(@as(f32, 0), v);
 }
