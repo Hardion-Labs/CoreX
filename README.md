@@ -29,7 +29,7 @@ control, and maintainable code.
 > propagation, reusable single-root prefabs) and the asset import
 > pipeline + content-addressed cache (raw/text/json/scene importers, PNG/BMP/TGA/QOI
 > texture decoders over a dependency-free DEFLATE/zlib inflater, OBJ mesh decoder,
-> WAV audio decoder, atomic verified storage, parallel import over
+> WAV and FLAC audio decoders, atomic verified storage, parallel import over
 > the job system, mark-and-sweep GC, change detection with incremental re-import),
 > the backend-independent render extraction
 > layer (camera math, frustum culling, sorted draw lists) and the
@@ -250,10 +250,10 @@ normalization), JSON (strict validation + lossless minification) and scenes
 (validated and canonicalized via the scene system). Texture sources in **PNG,
 JPEG, BMP, TGA and QOI** are decoded to RGBA8 and stored as a self-describing `CXTX`
 artifact, and **OBJ** meshes are decoded to indexed triangle meshes stored as a
-`CXMH` artifact, and **WAV** audio (uncompressed PCM 8/16/24/32-bit and IEEE
-float32) is decoded to interleaved float32 stored as a `CXAW` artifact; other
-binary formats (compressed audio, glTF/FBX) still import as `raw` until
-decoders exist.
+`CXMH` artifact, and **WAV** (uncompressed PCM 8/16/24/32-bit and IEEE float32)
+and **FLAC** audio are decoded to interleaved float32 stored as a `CXAW` artifact;
+other binary formats (lossy compressed audio, glTF/FBX) still import as `raw`
+until decoders exist.
 
 PNG support covers every color type and bit depth (1/2/4/8/16), all five row
 filters, palette and color-key transparency, multi-chunk IDAT and Adam7
@@ -324,7 +324,17 @@ decoders and `CXTX` artifact are documented in
 [`docs/asset-decoders.md`](docs/asset-decoders.md); the OBJ mesh importer and
 `CXMH` artifact are documented in [`docs/mesh-import.md`](docs/mesh-import.md); the
 WAV audio importer and `CXAW` artifact are documented in
-[`docs/asset-audio.md`](docs/asset-audio.md).
+[`docs/asset-audio.md`](docs/asset-audio.md), and the FLAC decoder that produces
+the same artifact in [`docs/asset-flac.md`](docs/asset-flac.md).
+
+FLAC support covers the whole baseline format: `CONSTANT`/`VERBATIM`/`FIXED`/`LPC`
+subframes, orders up to 32, both Rice residual methods with escaped partitions,
+1..8 channels plus left/side, right/side and mid/side decorrelation, sample sizes
+from 4 to 32 bits, fixed and variable block sizes, and CRC-8/CRC-16 verification.
+Because FLAC is lossless, the corpus is checked **bit-exactly** against libFLAC —
+there is no tolerance. Paths libFLAC's encoder never chooses (mid/side, Rice
+method 1, high LPC and partition orders, the odd bit depths) are covered by
+hand-built frames that libFLAC itself decodes back before they are committed.
 
 ## Render
 
@@ -477,6 +487,7 @@ CoreX/
 │   ├── asset-decoders.md       # Image decoders (PNG/BMP/TGA/QOI) + CXTX artifact
 │   ├── mesh-import.md          # OBJ mesh importer + CXMH artifact
 │   ├── asset-audio.md          # WAV audio importer + CXAW artifact
+│   ├── asset-flac.md           # FLAC decoder + the same CXAW artifact
 │   ├── launch-contract.md      # Stable startup contract (CLI, exit codes)
 │   ├── project-format.md       # .corex manifest format
 │   ├── scene-format.md         # Versioned .scene format
@@ -536,7 +547,8 @@ Indicative; subject to change as technical decisions are validated.
 - [x] Mesh decoder (OBJ → indexed triangle mesh, `CXMH` artifact).
 - [x] Audio decoder (WAV/PCM + IEEE float32 → interleaved f32 `CXAW` artifact).
 - [x] JPEG decoder (sequential Huffman, grayscale/YCbCr, all common subsamplings).
-- [ ] Asset decoders (progressive JPEG, compressed audio, other model formats).
+- [x] FLAC decoder (lossless, bit-exact against libFLAC, same `CXAW` artifact).
+- [ ] Asset decoders (progressive JPEG, lossy compressed audio, other model formats).
 - [x] Audio mixer (voices, buses, gain/pan, pitch, resampling, allocation-free render).
 - [x] Spatial audio (listener, attenuation models, Doppler) + `AudioSource` scene bridge.
 - [x] Voice stealing with priorities + band-limited (windowed-sinc) resampling.

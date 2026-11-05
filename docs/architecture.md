@@ -84,6 +84,7 @@ src/
 │   ├── texture.zig       # CXTX texture artifact + texture importers   [implemented]
 │   ├── mesh.zig          # OBJ decoder + CXMH mesh artifact/importer   [implemented]
 │   ├── audio.zig         # WAV decoder + CXAW audio artifact/importer  [implemented]
+│   ├── flac.zig          # FLAC decoder, same Audio/CXAW artifact      [implemented]
 │   ├── changes.zig       # Change detection + hot-reload baseline      [implemented]
 │   └── pipeline.zig      # Parallel import orchestration + report      [implemented]
 ├── render.zig            # Render public module; backend-independent extraction
@@ -294,7 +295,10 @@ self-describing `CXTX` artifact (`src/assets/image.zig`, `src/assets/png.zig`,
 subset to an indexed triangle mesh and serializes a `CXMH` artifact
 (`src/assets/mesh.zig`), and a **WAV audio importer** that decodes the
 uncompressed RIFF/WAVE subset (PCM 8/16/24/32-bit, IEEE float32, extensible) to
-interleaved float32 and serializes a `CXAW` artifact (`src/assets/audio.zig`).
+interleaved float32 and serializes a `CXAW` artifact (`src/assets/audio.zig`), and
+a **FLAC importer** that decodes the lossless baseline format into the same
+`Audio`/`CXAW` artifact (`src/assets/flac.zig`, importing `audio.zig` one way only
+so the registry composes both binding lists without an import cycle).
 A mark-and-sweep **cache GC** (`Cache.gc` + `Report.liveKeys`) reclaims orphan
 entries. **Change detection** (`src/assets/changes.zig`) compares a path-sorted
 snapshot against the current index using a size/mtime fingerprint confirmed by
@@ -384,7 +388,8 @@ profiling), the scene system (versioned JSON scenes, stable IDs, hierarchy, ECS
 load/save, world-space transforms, reusable single-root prefabs), the asset import pipeline + content-addressed
 cache (raw/text/json/scene importers, PNG/BMP/TGA/QOI texture decoders over a
 dependency-free DEFLATE/zlib inflater, OBJ mesh
-importer, WAV audio importer, atomic verified storage, parallel import over the job system,
+importer, WAV and FLAC audio importers, atomic verified storage, parallel import
+over the job system,
 mark-and-sweep GC, change detection with incremental re-import), the
 backend-independent render extraction layer (camera,
 frustum culling, sorted draw lists) and the device-independent audio runtime

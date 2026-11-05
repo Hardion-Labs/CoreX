@@ -10,7 +10,8 @@ contract is unchanged.
 > [asset-decoders.md](asset-decoders.md) — an **OBJ mesh** decoder produces a
 > `CXMH` artifact — see [mesh-import.md](mesh-import.md) — and a **WAV audio**
 > decoder produces a `CXAW` artifact (interleaved f32) — see
-> [asset-audio.md](asset-audio.md). Other binary formats (compressed audio,
+> [asset-audio.md](asset-audio.md) and [asset-flac.md](asset-flac.md). Other
+> binary formats (lossy compressed audio,
 > other models such as glTF/FBX/DAE, fonts) still have no decoder and use the
 > `raw` importer (verbatim copy) until decoders are registered. This is documented
 > below and is not described as an existing capability.
@@ -65,6 +66,12 @@ uncompressed RIFF/WAVE subset (PCM 8/16/24/32-bit and IEEE float32, including
 `CXAW` artifact. Compressed codecs are rejected rather than approximated. See
 [asset-audio.md](asset-audio.md) for the supported subset, normalization rules,
 the artifact layout and limitations.
+
+The FLAC importer (`corex.assets.flac`, ID `flac`, version 1) decodes bare FLAC
+into the same interleaved float32 `Audio` and the same `CXAW` artifact, so the
+cache and the mixer cannot tell the two containers apart. FLAC is lossless, so
+its tests compare **bit-exactly** against libFLAC. See
+[asset-flac.md](asset-flac.md).
 
 Importer contract:
 
@@ -226,11 +233,12 @@ Guarantees and behavior:
 
 ## Limitations
 
-- Texture decoders exist for **PNG, BMP, TGA and QOI** (see
+- Texture decoders exist for **PNG, JPEG, BMP, TGA and QOI** (see
   [asset-decoders.md](asset-decoders.md)), a mesh decoder for **OBJ** (see
-  [mesh-import.md](mesh-import.md)) and an audio decoder for **uncompressed WAV**
-  (see [asset-audio.md](asset-audio.md)). Compressed audio
-  (ADPCM/µ-law/Ogg/MP3/FLAC/Opus), other model formats (glTF/FBX/DAE) and fonts
+  [mesh-import.md](mesh-import.md)) and audio decoders for **uncompressed WAV**
+  and **FLAC** (see [asset-audio.md](asset-audio.md) and
+  [asset-flac.md](asset-flac.md)). Lossy and other compressed audio
+  (ADPCM/µ-law/Ogg/MP3/Opus), other model formats (glTF/FBX/DAE) and fonts
   still have no decoder and use the `raw` importer (verbatim copy); they will be
   registered as dedicated importers once they exist. Compressed WAV codecs are
   rejected rather than approximated. PNG covers the full format range including
@@ -270,6 +278,7 @@ Guarantees and behavior:
   DEFLATE/zlib inflater and the CXTX artifact.
 - [mesh-import.md](mesh-import.md) — OBJ mesh importer and the CXMH artifact.
 - [asset-audio.md](asset-audio.md) — WAV audio importer and the CXAW artifact.
+- [asset-flac.md](asset-flac.md) — FLAC decoder producing the same CXAW artifact.
 - [scene-format.md](scene-format.md) — scene format validated by the importer.
 - [versioning.md](versioning.md) — format versioning policy.
 - [launch-contract.md](launch-contract.md) — startup contract (unchanged).
