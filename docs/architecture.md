@@ -41,7 +41,8 @@ selection, and installation management belong to the CoreXHub (separate repo).
 
 The public surface is concentrated in `src/corex.zig`. Implemented modules live
 under `src/core/` (startup spine), `src/ecs/` (entity-component-system),
-`src/scene/` (scene documents) and `src/assets/` (import pipeline + cache):
+`src/scene/` (scene documents), `src/assets/` (import pipeline + cache),
+`src/render/` (draw-list extraction) and `src/audio/` (playback mixing):
 
 ```text
 src/
@@ -86,10 +87,14 @@ src/
 │   ├── changes.zig       # Change detection + hot-reload baseline      [implemented]
 │   └── pipeline.zig      # Parallel import orchestration + report      [implemented]
 ├── render.zig            # Render public module; backend-independent extraction
-└── render/
-    ├── camera.zig        # View/projection math (right-handed)         [implemented]
-    ├── culling.zig       # Frustum + AABB/sphere classification        [implemented]
-    └── draw.zig          # Renderable + draw-list extraction + sorting [implemented]
+├── render/
+│   ├── camera.zig        # View/projection math (right-handed)         [implemented]
+│   ├── culling.zig       # Frustum + AABB/sphere classification        [implemented]
+│   └── draw.zig          # Renderable + draw-list extraction + sorting [implemented]
+├── audio.zig             # Audio public module; device-independent mixing
+└── audio/
+    ├── clip.zig          # Clip descriptor, channel maps, pan, PCM16   [implemented]
+    └── mixer.zig         # Voice pool, buses, allocation-free render   [implemented]
 ```
 
 Planned subsystems will be added as sibling modules (e.g. `src/render/`,
@@ -159,6 +164,19 @@ transform snapshot, culls each `Renderable`'s world AABB, and emits a sorted
 CPU work with no GPU dependency, so it is fully tested headlessly and is the
 contract the Low/Medium/Advanced GPU backends will consume. The GPU backends
 themselves remain planned.
+
+### Audio runtime — mixing implemented; device backends planned
+The device-independent playback layer is implemented (`src/audio/`, re-exported
+as `corex.audio`, `docs/audio-mixer.md`): a fixed-capacity voice pool with
+generational handles, buses and master gain, stereo pan (linear or equal-power),
+pitch, looping and linear-interpolated resampling, mixed into an interleaved
+float32 buffer by an **allocation-free** `render`. Channel mapping, clamping,
+non-finite sanitizing and peak metering are explicit and documented; `toPcm16`
+converts the mix for a device. It consumes `CXAW` artifacts without importing the
+asset layer, so both stay independently testable. Pure CPU work with no device
+dependency — the contract the OS backends (ALSA/WASAPI/CoreAudio) will consume.
+The backends themselves, 3D spatialization, effects/DSP, voice stealing and
+streaming remain planned.
 
 ### ECS — implemented (storage + queries + scheduling + graph/frame budgets), planned (extensions)
 A data-oriented ECS in `src/ecs/`, re-exported as `corex.ecs`:
@@ -344,9 +362,10 @@ load/save, world-space transforms, reusable single-root prefabs), the asset impo
 cache (raw/text/json/scene importers, PNG/BMP/TGA/QOI texture decoders over a
 dependency-free DEFLATE/zlib inflater, OBJ mesh
 importer, WAV audio importer, atomic verified storage, parallel import over the job system,
-mark-and-sweep GC, change detection with incremental re-import) and the
+mark-and-sweep GC, change detection with incremental re-import), the
 backend-independent render extraction layer (camera,
-frustum culling, sorted draw lists) are implemented and tested, and the executable
-builds and runs on Zig 0.17.0. The remaining larger subsystems (GPU renderer
+frustum culling, sorted draw lists) and the device-independent audio mixer
+(voices, buses, pan, pitch, resampling, allocation-free render) are implemented
+and tested, and the executable builds and runs on Zig 0.17.0. The remaining larger subsystems (GPU renderer
 backends, GUI, editor, Lua, export, native modules) are in scope and either
 contract-defined or planned, as marked above.
