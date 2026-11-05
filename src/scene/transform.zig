@@ -111,6 +111,42 @@ pub fn approxEqual(a: Mat4, b: Mat4, epsilon: f32) bool {
     return true;
 }
 
+// --- Vec3 helpers ----------------------------------------------------------
+
+/// Dot product `a · b`.
+pub fn dot(a: Vec3, b: Vec3) f32 {
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+/// Component-wise difference `a - b`.
+pub fn sub(a: Vec3, b: Vec3) Vec3 {
+    return .{ a[0] - b[0], a[1] - b[1], a[2] - b[2] };
+}
+
+/// Component-wise sum `a + b`.
+pub fn add(a: Vec3, b: Vec3) Vec3 {
+    return .{ a[0] + b[0], a[1] + b[1], a[2] + b[2] };
+}
+
+/// Scale a vector by a scalar.
+pub fn scale(v: Vec3, s: f32) Vec3 {
+    return .{ v[0] * s, v[1] * s, v[2] * s };
+}
+
+/// Euclidean length of a vector.
+pub fn length(v: Vec3) f32 {
+    return @sqrt(dot(v, v));
+}
+
+/// Unit-length vector; a near-zero vector becomes zero (callers that need a
+/// direction must guard against the degenerate case).
+pub fn normalize(v: Vec3) Vec3 {
+    const len = length(v);
+    if (len < 1e-8) return .{ 0, 0, 0 };
+    const inv = 1.0 / len;
+    return .{ v[0] * inv, v[1] * inv, v[2] * inv };
+}
+
 // --- quaternion helpers ----------------------------------------------------
 
 /// Normalize a quaternion; a near-zero quaternion becomes identity.
@@ -158,7 +194,8 @@ pub fn quatFromAxisAngle(axis: Vec3, angle: f32) Quat {
     return .{ axis[0] * inv * s, axis[1] * inv * s, axis[2] * inv * s, @cos(half) };
 }
 
-fn cross(a: Vec3, b: Vec3) Vec3 {
+/// Cross product `a × b` (right-handed).
+pub fn cross(a: Vec3, b: Vec3) Vec3 {
     return .{
         a[1] * b[2] - a[2] * b[1],
         a[2] * b[0] - a[0] * b[2],
@@ -285,4 +322,27 @@ test "fromTransform normalizes a non-unit quaternion" {
     const a = fromTransform(.{ .rotation = q });
     const b = fromTransform(.{ .rotation = scaled });
     try testing.expect(approxEqual(a, b, eps));
+}
+
+test "vec3: dot, sub, add, scale and length" {
+    try testing.expectEqual(@as(f32, 32), dot(.{ 1, 2, 3 }, .{ 4, 5, 6 }));
+    try expectVec3(.{ -3, -3, -3 }, sub(.{ 1, 2, 3 }, .{ 4, 5, 6 }));
+    try expectVec3(.{ 5, 7, 9 }, add(.{ 1, 2, 3 }, .{ 4, 5, 6 }));
+    try expectVec3(.{ 2, 4, 6 }, scale(.{ 1, 2, 3 }, 2));
+    try testing.expectApproxEqAbs(@as(f32, 5), length(.{ 3, 4, 0 }), eps);
+}
+
+test "vec3: normalize yields unit length and handles zero" {
+    const n = normalize(.{ 3, 4, 0 });
+    try testing.expectApproxEqAbs(@as(f32, 1), length(n), eps);
+    try expectVec3(.{ 0, 0, 0 }, normalize(.{ 0, 0, 0 }));
+}
+
+test "vec3: cross is right-handed and orthogonal" {
+    try expectVec3(.{ 0, 0, 1 }, cross(.{ 1, 0, 0 }, .{ 0, 1, 0 }));
+    const a = Vec3{ 1, 2, 3 };
+    const b = Vec3{ 4, 5, 6 };
+    const c = cross(a, b);
+    try testing.expectApproxEqAbs(@as(f32, 0), dot(a, c), eps);
+    try testing.expectApproxEqAbs(@as(f32, 0), dot(b, c), eps);
 }

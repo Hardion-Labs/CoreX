@@ -39,6 +39,10 @@ pub const scene = @import("scene.zig");
 /// the parallel import pipeline.
 pub const assets = @import("assets.zig");
 
+/// Render subsystem: backend-independent camera math, frustum culling and
+/// draw-list extraction (the CPU foundation the GPU tiers will consume).
+pub const render = @import("render.zig");
+
 // Pull every submodule's tests into the test build.
 test {
     std.testing.refAllDecls(@This());
