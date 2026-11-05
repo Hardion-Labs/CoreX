@@ -1,8 +1,8 @@
 //! Engine-ready texture artifact (`CXTX`) and texture importers.
 //!
-//! The importers decode a source image (BMP/TGA/QOI, see `image.zig`) to RGBA8
-//! and serialize it into a self-describing `CXTX` container that the renderer
-//! can upload directly without re-parsing the source format. The container is
+//! The importers decode a source image (BMP/TGA/QOI in `image.zig`, PNG in
+//! `png.zig`) to RGBA8 and serialize it into a self-describing `CXTX` container
+//! that the renderer can upload directly without re-parsing the source format. The container is
 //! the derived artifact stored in the content-addressed cache; its identity is
 //! the importer `id` + `version`, so changing the layout and bumping the version
 //! invalidates affected cache entries automatically.
@@ -21,6 +21,7 @@
 
 const std = @import("std");
 const image = @import("image.zig");
+const png = @import("png.zig");
 const importer = @import("importer.zig");
 
 const Allocator = std.mem.Allocator;
@@ -121,12 +122,19 @@ pub fn importQoi(gpa: Allocator, source: []const u8) ImportError![]u8 {
     return importImage(gpa, source, image.decodeQoi);
 }
 
+/// Decode a PNG (see `png.zig`) and serialize it to a `CXTX` artifact.
+pub fn importPng(gpa: Allocator, source: []const u8) ImportError![]u8 {
+    return importImage(gpa, source, png.decode);
+}
+
 pub const bmp_importer = Importer{ .id = "bmp", .version = 1, .importFn = importBmp };
 pub const tga_importer = Importer{ .id = "tga", .version = 1, .importFn = importTga };
 pub const qoi_importer = Importer{ .id = "qoi", .version = 1, .importFn = importQoi };
+pub const png_importer = Importer{ .id = "png", .version = 1, .importFn = importPng };
 
 /// Extension bindings for the engine registry (prepended by `assets.zig`).
 pub const bindings = [_]importer.Registry.Binding{
+    .{ .extensions = &[_][]const u8{".png"}, .importer = png_importer },
     .{ .extensions = &[_][]const u8{".bmp"}, .importer = bmp_importer },
     .{ .extensions = &[_][]const u8{".tga"}, .importer = tga_importer },
     .{ .extensions = &[_][]const u8{".qoi"}, .importer = qoi_importer },
@@ -227,6 +235,7 @@ test "texture: importers reject invalid sources" {
     try testing.expectError(error.InvalidAsset, importBmp(testing.allocator, "not a bmp"));
     try testing.expectError(error.InvalidAsset, importTga(testing.allocator, "no"));
     try testing.expectError(error.InvalidAsset, importQoi(testing.allocator, "nope"));
+    try testing.expectError(error.InvalidAsset, importPng(testing.allocator, "not a png"));
 }
 
 test "texture: bindings select the right importer by extension" {
@@ -234,7 +243,9 @@ test "texture: bindings select the right importer by extension" {
     try testing.expectEqualStrings("bmp", reg.select(".bmp").id);
     try testing.expectEqualStrings("tga", reg.select(".TGA").id);
     try testing.expectEqualStrings("qoi", reg.select(".qoi").id);
-    try testing.expectEqualStrings("raw", reg.select(".png").id);
+    try testing.expectEqualStrings("png", reg.select(".png").id);
+    try testing.expectEqualStrings("png", reg.select(".PNG").id);
+    try testing.expectEqualStrings("raw", reg.select(".jpg").id);
 }
 
 test "texture: serialize and import survive allocation failure" {
@@ -246,4 +257,39 @@ test "texture: serialize and import survive allocation failure" {
             alloc.free(bytes);
         }
     }.f, .{});
+}
+
+test "texture: importPng produces a CXTX artifact with the reference pixels" {
+    const gpa = testing.allocator;
+    const vectors = @import("png_vectors.zig");
+    for (vectors.valid) |vector| {
+        const source = try gpa.alloc(u8, vector.png_hex.len / 2);
+        defer gpa.free(source);
+        _ = try std.fmt.hexToBytes(source, vector.png_hex);
+        const expected = try gpa.alloc(u8, vector.rgba_hex.len / 2);
+        defer gpa.free(expected);
+        _ = try std.fmt.hexToBytes(expected, vector.rgba_hex);
+
+        const bytes = try importPng(gpa, source);
+        defer gpa.free(bytes);
+        const tex = try parse(bytes);
+        try testing.expectEqual(vector.width, tex.width);
+        try testing.expectEqual(vector.height, tex.height);
+        try testing.expectEqual(PixelFormat.rgba8, tex.pixel_format);
+        try testing.expectEqualSlices(u8, expected, tex.pixels);
+    }
+}
+
+test "texture: importPng survives allocation failure" {
+    const gpa = testing.allocator;
+    const vectors = @import("png_vectors.zig");
+    const source = try gpa.alloc(u8, vectors.valid[0].png_hex.len / 2);
+    defer gpa.free(source);
+    _ = try std.fmt.hexToBytes(source, vectors.valid[0].png_hex);
+    try testing.checkAllAllocationFailures(gpa, struct {
+        fn f(alloc: Allocator, bytes_in: []const u8) !void {
+            const bytes = try importPng(alloc, bytes_in);
+            alloc.free(bytes);
+        }
+    }.f, .{source});
 }

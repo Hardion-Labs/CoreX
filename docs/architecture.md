@@ -78,6 +78,8 @@ src/
 │   ├── cache.zig         # Content-addressed derived-data cache + GC   [implemented]
 │   ├── importer.zig      # Importer framework + raw/text/json          [implemented]
 │   ├── image.zig         # BMP/TGA/QOI decoders -> RGBA8               [implemented]
+│   ├── inflate.zig       # DEFLATE/zlib inflate (PNG foundation)       [implemented]
+│   ├── png.zig           # PNG decoder -> RGBA8 (all filters)          [implemented]
 │   ├── texture.zig       # CXTX texture artifact + texture importers   [implemented]
 │   ├── mesh.zig          # OBJ decoder + CXMH mesh artifact/importer   [implemented]
 │   └── pipeline.zig      # Parallel import orchestration + report      [implemented]
@@ -237,18 +239,21 @@ on error. Prefabs are classified as `AssetKind.prefab` and imported/cached by th
 engine registry (`prefab` importer v1). Scene streaming, change tracking and
 multi-scene management remain planned extensions.
 
-### Asset system — implemented (indexing + import/cache + texture/mesh decoders), planned (more decoders)
+### Asset system — implemented (indexing + import/cache + PNG/BMP/TGA/QOI + OBJ decoders), planned (more decoders)
 `core.assets.indexDirectories` builds a kind/size index at startup (unchanged).
 The asset subsystem (`corex.assets`, `src/assets/`) adds a content-addressed
 import cache, an importer framework (raw/text/json + a scene importer that reuses
 the scene system), a parallel import pipeline over `std.Io`, dependency-free
-**texture decoders** (BMP/TGA/QOI) that normalize to RGBA8 and serialize a
-self-describing `CXTX` artifact (`src/assets/image.zig`, `src/assets/texture.zig`),
-and an **OBJ mesh importer** that decodes the geometry subset to an indexed
-triangle mesh and serializes a `CXMH` artifact (`src/assets/mesh.zig`).
+**texture decoders** (PNG/BMP/TGA/QOI) that normalize to RGBA8 and serialize a
+self-describing `CXTX` artifact (`src/assets/image.zig`, `src/assets/png.zig`,
+`src/assets/texture.zig`), backed by a dependency-free **DEFLATE/zlib inflater**
+(`src/assets/inflate.zig`), and an **OBJ mesh importer** that decodes the geometry
+subset to an indexed triangle mesh and serializes a `CXMH` artifact
+(`src/assets/mesh.zig`).
 A mark-and-sweep **cache GC** (`Cache.gc` + `Report.liveKeys`) reclaims orphan
-entries. PNG/JPEG/audio/font and other model-format (glTF/FBX/DAE) decoders,
-dependency tracking, temp-file cleanup and hot-reload are planned extensions. See
+entries. JPEG/audio/font and other model-format (glTF/FBX/DAE) decoders,
+Adam7-interlaced PNG, dependency tracking, temp-file cleanup and hot-reload are
+planned extensions. See
 [asset-import.md](asset-import.md), [asset-decoders.md](asset-decoders.md) and
 [mesh-import.md](mesh-import.md).
 
@@ -327,7 +332,8 @@ type-safe world, multi-component views, comptime system scheduling over the job
 system, automatic dependency graphs, cooperative frame budgets and system
 profiling), the scene system (versioned JSON scenes, stable IDs, hierarchy, ECS
 load/save, world-space transforms, reusable single-root prefabs), the asset import pipeline + content-addressed
-cache (raw/text/json/scene importers, BMP/TGA/QOI texture decoders, OBJ mesh
+cache (raw/text/json/scene importers, PNG/BMP/TGA/QOI texture decoders over a
+dependency-free DEFLATE/zlib inflater, OBJ mesh
 importer, atomic verified storage, parallel import over the job system,
 mark-and-sweep GC) and the backend-independent render extraction layer (camera,
 frustum culling, sorted draw lists) are implemented and tested, and the executable
