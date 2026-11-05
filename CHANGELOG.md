@@ -85,7 +85,7 @@ declared yet.
   (magic + version + dimensions + pixel format + pixels). Registered in the
   engine import registry for `.bmp`/`.tga`/`.qoi`; `.qoi` added to the texture
   index classification. All reads are bounds-checked and allocations bounded;
-  malformed/truncated sources are rejected. JPEG/audio/model/font remain
+  malformed/truncated sources are rejected. Audio/model/font remain
   `raw` imports until dedicated decoders exist.
 - DEFLATE/zlib decompression (`src/assets/inflate.zig`, re-exported as
   `corex.assets.inflate`, `docs/asset-decoders.md`): complete RFC 1951 inflate
@@ -133,6 +133,37 @@ declared yet.
   that leave passes empty, odd dimensions, per-pass filter rotation, and an
   illegal filter byte in a later pass. Two rejection vectors are deliberately
   stricter than libpng (exact inflated size, interlace method 2).
+- JPEG decoder (`src/assets/jpeg.zig`, re-exported as `corex.assets.jpeg`) and a
+  `jpeg` importer (v1) bound to `.jpg`/`.jpeg`, producing the existing `CXTX`
+  artifact. Previously those extensions were classified as textures but fell back
+  to a verbatim `raw` copy. Supports sequential DCT with Huffman coding
+  (`SOF0`/`SOF1`), 8-bit samples, grayscale and YCbCr, any legal sampling factors
+  in 1..4 (4:4:4, 4:4:0, 4:2:2, 4:2:0, 4:1:1), 8/16-bit quantization tables,
+  arbitrary Huffman tables and restart markers with predictor and bit-buffer
+  reset. Progressive, hierarchical, lossless, arithmetic-coded, 12-bit and
+  4-component CMYK/YCCK frames are rejected, never partially decoded. Colour
+  conversion uses libjpeg's exact fixed-point constants and chroma upsampling
+  reproduces libjpeg's fancy triangle filters (including the above/below row
+  selection, the +8/+7 rounding asymmetry and the two-sample replication
+  fallback), so the only divergence from libjpeg is the inverse DCT, which JPEG
+  does not normatively specify: measured worst channel 3 levels and worst mean
+  0.199 over the corpus. The bit reader un-stuffs `0xFF00`, skips fill bytes and
+  stops at markers without consuming them; a scan that runs out of bytes is
+  rejected rather than grey-filled. The IDCT skips all-zero coefficient rows and
+  fills DC-only blocks with the 2D gain of 1/8. Component planes are bounded by
+  `max_plane_bytes` with overflow-checked arithmetic before any allocation, and
+  conversion uses one `3 * width` scratch allocation with no per-pixel ratio
+  dispatch. Measured 30.6 ms (4:4:4) and 20.5 ms (4:2:0) for 1024x1024 in
+  ReleaseFast.
+- JPEG test corpus (`tools/gen_jpeg_vectors.py`, `src/assets/jpeg_vectors.zig`):
+  36 vectors encoded by libjpeg with libjpeg's own decode as the reference, 19
+  malformed files and 7 valid-but-unsupported ones. The `progressive` vector is a
+  genuinely valid progressive JPEG that the generator confirms libjpeg reads, so
+  the rejection is proven to be a real format case. Focused unit tests pin the
+  paths Pillow cannot emit (4:4:0 upsampling), the rounding biases, the
+  replication fallback, odd widths, the DC gain, byte un-stuffing, marker stops,
+  sign extension, Huffman over-subscription and colour clamping, plus
+  allocation-failure probes over the decoder and the importer.
 - Asset change detection (`src/assets/changes.zig`, re-exported as
   `corex.assets.changes` with `Snapshot`/`ChangeSet`/`ChangeKind`,
   `docs/asset-change-detection.md`): a path-sorted snapshot of every indexed
@@ -392,7 +423,7 @@ declared yet.
   extraction, OBJ mesh import, scene prefabs, DEFLATE/zlib, PNG, asset change
   detection, WAV audio import, audio mixing, spatial audio, voice stealing,
   band-limited resampling, insert DSP including delay/reverb/limiter/saturator
-  and Adam7 interlaced PNG (516 tests),
+  Adam7 interlaced PNG and sequential JPEG (535 tests),
   including allocation-failure
   probes, cache corruption/truncation probes, a deep-hierarchy stress test, QOI
   encode/decode roundtrips, end-to-end texture-import-and-cache, OBJ-import-and-

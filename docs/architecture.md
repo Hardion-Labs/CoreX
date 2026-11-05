@@ -300,7 +300,7 @@ entries. **Change detection** (`src/assets/changes.zig`) compares a path-sorted
 snapshot against the current index using a size/mtime fingerprint confirmed by
 BLAKE3, reports added/modified/removed, and derives the complete live key set for
 GC; `pipeline.Options.only` then re-imports just what changed.
-JPEG/compressed-audio/font and other model-format (glTF/FBX/DAE) decoders, an OS
+Progressive-JPEG/compressed-audio/font and other model-format (glTF/FBX/DAE) decoders, an OS
 audio device backend, dependency tracking, temp-file cleanup and hot-reload are
 planned extensions. See [asset-import.md](asset-import.md),
 [asset-decoders.md](asset-decoders.md), [mesh-import.md](mesh-import.md) and
