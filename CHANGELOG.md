@@ -160,6 +160,15 @@ declared yet.
   contract are unchanged; scene failures map to exit code 6.
 - The example project's initial scene was migrated from an unversioned placeholder
   to the documented `format_version = 1` scene format.
+- All project documentation is now written in English. The remaining
+  Portuguese pages (`scope`, `versioning`, `project-format`, `launch-contract`,
+  `scene-format`, `scene-transforms`, `scene-prefabs`, `asset-import`,
+  `asset-decoders`, `mesh-import`, `render-extraction`) were translated, along with
+  the Portuguese section headings in `docs/architecture.md`. Technical content,
+  tables, code samples, relative links, and the implemented/planned status of every
+  subsystem are preserved; no contract, format version, or behavior changed. The
+  English-only convention is now recorded in `CONTRIBUTING.md` and
+  `docs/development/coding-standards.md`.
 
 ### Fixed
 

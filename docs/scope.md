@@ -1,109 +1,109 @@
-# CoreXEngine — Escopo Definitivo
+# CoreXEngine — Definitive Scope
 
-Este documento registra o escopo definitivo do projeto mantido neste repositório.
-Ele é a referência de fronteira entre a **CoreXEngine** e o **CoreXHub**.
+This document records the definitive scope of the project maintained in this
+repository. It is the boundary reference between **CoreXEngine** and **CoreXHub**.
 
-## Identidade do projeto
+## Project identity
 
-O projeto deste repositório é exclusivamente a **CoreXEngine**: uma engine de jogos
-modular escrita em Zig 0.17.0, com runtime independente, editor gráfico próprio e
-ferramentas de produção de conteúdo.
+The project in this repository is exclusively **CoreXEngine**: a modular game
+engine written in Zig 0.17.0, with an independent runtime, its own graphical
+editor and content-production tools.
 
-O **CoreXHub** é um produto independente, mantido em outro repositório. Nada do
-CoreXHub é implementado, incorporado ou duplicado aqui.
+**CoreXHub** is an independent product, maintained in a separate repository.
+Nothing from CoreXHub is implemented, embedded or duplicated here.
 
-## Fora do escopo — CoreXHub
+## Out of scope — CoreXHub
 
-As responsabilidades abaixo pertencem ao CoreXHub e **não** devem ser
-implementadas na CoreXEngine:
+The responsibilities below belong to CoreXHub and must **not** be implemented in
+CoreXEngine:
 
-- Criar projetos.
-- Registrar projetos.
-- Gerenciar projetos recentes.
-- Instalar versões da engine.
-- Selecionar versões da engine.
-- Gerenciar instalações.
-- Gerenciar Export Templates (instalação/aquisição).
-- Iniciar a CoreXEngine com o projeto selecionado (o Hub é quem inicia; a engine
-  apenas aceita ser iniciada).
+- Creating projects.
+- Registering projects.
+- Managing recent projects.
+- Installing engine versions.
+- Selecting engine versions.
+- Managing installations.
+- Managing Export Templates (installation/acquisition).
+- Launching CoreXEngine with the selected project (the Hub is the launcher; the
+  engine only accepts being launched).
 
-## Dentro do escopo — CoreXEngine
+## In scope — CoreXEngine
 
-A CoreXEngine implementa:
+CoreXEngine implements:
 
-- Engine Core em Zig 0.17.0.
-- Runtime independente.
-- Editor gráfico próprio.
-- Biblioteca GUI própria.
+- Engine Core in Zig 0.17.0.
+- Independent runtime.
+- Its own graphical editor.
+- Its own GUI library.
 - Renderer Low.
 - Renderer Medium.
-- Contratos para Renderer Advanced.
+- Contracts for Renderer Advanced.
 - ECS.
-- Sistema de cenas.
-- Sistema de assets.
-- Importação e cache.
-- Serialização.
-- VM Lua.
+- Scene system.
+- Asset system.
+- Import and cache.
+- Serialization.
+- Lua VM.
 - Gameplay scripting.
-- Native Module API para C++.
-- Sistema de jobs e carregamento assíncrono.
+- Native Module API for C++.
+- Job system and asynchronous loading.
 - Splash screen.
-- Sistema de versionamento da engine.
-- Sistema de exportação.
-- Export Templates (formato/empacotamento consumidos pela engine).
-- Ferramentas de diagnóstico e profiling.
+- Engine versioning system.
+- Export system.
+- Export Templates (format/packaging consumed by the engine).
+- Diagnostics and profiling tools.
 
-> Observação sobre Export Templates: a **aquisição, instalação e gestão** de
-> templates pertencem ao Hub. A engine define o **formato**, o **empacotamento**
-> e o **consumo** dos templates durante a exportação.
+> Note on Export Templates: **acquisition, installation and management** of
+> templates belong to the Hub. The engine defines the **format**, the
+> **packaging** and the **consumption** of templates during export.
 
-## Integração com o CoreXHub
+## Integration with CoreXHub
 
-A integração ocorre exclusivamente por:
+Integration happens exclusively through:
 
-1. Argumentos de inicialização documentados.
-2. Formatos de arquivo documentados (`.corex`, cenas, assets, templates).
-3. Contratos estáveis (CLI, manifesto, códigos de saída, versão).
+1. Documented launch arguments.
+2. Documented file formats (`.corex`, scenes, assets, templates).
+3. Stable contracts (CLI, manifest, exit codes, version).
 
-A engine disponibiliza uma interface de inicialização documentada em
-[launch-contract.md](launch-contract.md). O Hub pode iniciar a engine passando:
+The engine exposes a launch interface documented in
+[launch-contract.md](launch-contract.md). The Hub may launch the engine passing:
 
-- Caminho absoluto do projeto (arquivo `.corex`).
-- Versão da engine selecionada (informativa; a engine não instala/seleciona versões).
-- Argumentos adicionais documentados.
+- The absolute project path (the `.corex` file).
+- The selected engine version (informational; the engine does not install/select
+  versions).
+- Additional documented arguments.
 
-Exemplo:
+Example:
 
 ```sh
 corex-engine --project "/path/MyGame/MyGame.corex" --hub-launch
 ```
 
-O editor também aceita inicialização direta pela linha de comando, sem o Hub.
-**A engine nunca depende do Hub para executar.**
+The editor also accepts direct command-line launch, without the Hub.
+**The engine never depends on the Hub to run.**
 
-## Regras de arquitetura
+## Architectural rules
 
-- Não criar Project Manager interno.
-- Não criar catálogo de projetos.
-- Não implementar criação de projetos na engine.
-- Não instalar ou selecionar versões silenciosamente.
-- Não acoplar a engine ao CoreXHub.
+- Do not create an internal Project Manager.
+- Do not create a project catalog.
+- Do not implement project creation in the engine.
+- Do not install or select versions silently.
+- Do not couple the engine to CoreXHub.
 
-O arquivo `.corex` é o ponto de entrada do projeto. Ao receber um projeto, a
-engine executa a sequência de inicialização definida em
-[launch-contract.md](launch-contract.md):
+The `.corex` file is the project entry point. On receiving a project, the engine
+runs the startup sequence defined in [launch-contract.md](launch-contract.md):
 
-1. Inicializar serviços essenciais.
-2. Abrir splash screen.
-3. Validar manifesto e compatibilidade.
-4. Carregar configurações em workers.
-5. Indexar assets.
-6. Preparar a cena inicial.
-7. Abrir o editor gráfico.
+1. Initialize essential services.
+2. Open the splash screen.
+3. Validate the manifest and compatibility.
+4. Load configuration in workers.
+5. Index assets.
+6. Prepare the initial scene.
+7. Open the graphical editor.
 
-## Estado de implementação
+## Implementation status
 
-Este documento define o escopo alvo. O estado real de cada subsistema é
-registrado em [architecture.md](architecture.md) e no [CHANGELOG](../CHANGELOG.md).
-Funcionalidades ainda não implementadas são marcadas como planejadas e não devem
-ser descritas como existentes.
+This document defines the target scope. The actual status of each subsystem is
+recorded in [architecture.md](architecture.md) and in the
+[CHANGELOG](../CHANGELOG.md). Features that are not implemented yet are marked as
+planned and must not be described as existing.

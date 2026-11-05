@@ -1,21 +1,21 @@
-# Prefabs de Cena — CoreXEngine
+# Scene Prefabs — CoreXEngine
 
-Prefabs são subárvores de entidades reutilizáveis e versionadas. Eles permitem
-capturar um trecho de uma cena (por exemplo, um inimigo com filhos e
-componentes) e instanciá-lo várias vezes em outras cenas, com IDs estáveis
-remapeados e hierarquia/componentes copiados por valor.
+Prefabs are reusable, versioned entity subtrees. They let you capture a piece of a
+scene (for example, an enemy with children and components) and instantiate it
+several times in other scenes, with stable IDs remapped and hierarchy/components
+copied by value.
 
-> Estado: **implementado e testado**. Prefabs reutilizam o formato de cena
-> (`format_version = 1`) e o ECS; não duplicam serialização nem armazenamento.
-> Streaming de cena, change tracking e gerenciamento de múltiplas cenas continuam
-> planejados.
+> Status: **implemented and tested**. Prefabs reuse the scene format
+> (`format_version = 1`) and the ECS; they do not duplicate serialization or
+> storage. Scene streaming, change tracking and multi-scene management remain
+> planned.
 
-## Formato `.prefab`
+## The `.prefab` format
 
-Um arquivo `.prefab` (ou `.corexprefab`) é um documento JSON estrito com a mesma
-forma de um `.scene` (ver [scene-format.md](scene-format.md)), mas com **exatamente
-uma entidade raiz** (uma entidade sem `parent`). Documentos com zero ou múltiplas
-raízes são rejeitados com `error.InvalidPrefab`.
+A `.prefab` (or `.corexprefab`) file is a strict JSON document with the same shape
+as a `.scene` (see [scene-format.md](scene-format.md)), but with **exactly one root
+entity** (an entity without `parent`). Documents with zero or multiple roots are
+rejected with `error.InvalidPrefab`.
 
 ```json
 {
@@ -32,54 +32,53 @@ raízes são rejeitados com `error.InvalidPrefab`.
 }
 ```
 
-As mesmas regras de validação de cena se aplicam: campos desconhecidos/duplicados
-rejeitados, IDs únicos > 0, pais existentes, sem ciclos, componentes plain-data e
-nomes válidos. O schema padrão da engine é `corex.scene.EnginePrefab` (apenas
-`transform`); ferramentas podem usar `Prefab(.{ Component(T, "nome"), ... })`.
+The same scene validation rules apply: unknown/duplicate fields rejected, unique
+IDs > 0, existing parents, no cycles, plain-data components and valid names. The
+engine's default schema is `corex.scene.EnginePrefab` (only `transform`); tools may
+use `Prefab(.{ Component(T, "name"), ... })`.
 
 ## API
 
-`corex.scene.Prefab(schemas)` (e `corex.scene.prefab`):
+`corex.scene.Prefab(schemas)` (and `corex.scene.prefab`):
 
-- `parse(gpa, bytes) !Prefab` — lê um documento prefab estrito.
-- `load(gpa, io, dir, path) !Prefab` — carrega relativo ao projeto (caminho seguro).
-- `fromScene(gpa, source, root_entity, opt_name) !Prefab` — captura a subárvore
-  enraizada em `root_entity` de uma cena viva. A cena de origem não é alterada; o
-  pai original da raiz capturada é descartado.
-- `instantiate(target, parent_id) !ecs.Entity` — instancia no `target` (mesmo
-  schema), anexando a raiz clonada a `parent_id` (ou como raiz se `null`). Retorna
-  o handle da nova raiz.
-- `serialize(gpa) ![]u8` / `save(io, dir, path)` — serialização determinística
-  (mesmo layout de cena, entidades em ordem crescente de ID).
+- `parse(gpa, bytes) !Prefab` — reads a strict prefab document.
+- `load(gpa, io, dir, path) !Prefab` — loads relative to the project (safe path).
+- `fromScene(gpa, source, root_entity, opt_name) !Prefab` — captures the subtree
+  rooted at `root_entity` from a live scene. The source scene is unchanged; the
+  captured root's original parent is dropped.
+- `instantiate(target, parent_id) !ecs.Entity` — instantiates into `target` (same
+  schema), attaching the cloned root to `parent_id` (or as a root when `null`).
+  Returns the new root handle.
+- `serialize(gpa) ![]u8` / `save(io, dir, path)` — deterministic serialization (same
+  layout as a scene, entities in ascending ID order).
 - `deinit`, `count`, `root`, `name`, `root_id`.
 
-A base é `Scene.cloneSubtree(source, root_id, parent_id)`, que também está
-disponível diretamente em qualquer `Scene(schemas)` para composição de cenas.
+The foundation is `Scene.cloneSubtree(source, root_id, parent_id)`, which is also
+available directly on any `Scene(schemas)` for scene composition.
 
-## Garantias
+## Guarantees
 
-- **Remapeamento de IDs**: a instanciação aloca novos IDs estáveis no target em
-  ordem crescente de ID da origem, então é determinística e nunca colide com IDs
-  existentes. Links de `parent` dentro da subárvore são remapeados; a raiz clonada
-  é anexada ao `parent_id` solicitado.
-- **Cópia por valor**: componentes são plain-data e copiados por valor; instâncias
-  múltiplas são independentes (mutar uma não afeta outra nem o prefab).
-- **Atomicidade em erro**: se qualquer etapa falhar (por exemplo, componente
-  inválido ou falha de alocação), as entidades criadas pela chamada são
-  destruídas e o target permanece inalterado, exceto pelo avanço monotônico de
-  IDs (IDs nunca são reutilizados).
-- **Hierarquia profunda**: a coleta da subárvore é iterativa (sem recursão),
-  segura para hierarquias arbitrariamente profundas.
-- **Segurança de memória**: allocators explícitos, propriedade documentada,
-  sondas `checkAllAllocationFailures` e teste de rollback em falha de componente.
+- **ID remapping**: instantiation allocates new stable IDs in the target in
+  ascending source-ID order, so it is deterministic and never collides with
+  existing IDs. `parent` links inside the subtree are remapped; the cloned root is
+  attached to the requested `parent_id`.
+- **Copy by value**: components are plain data and copied by value; multiple
+  instances are independent (mutating one does not affect another or the prefab).
+- **Atomicity on error**: if any step fails (for example, an invalid component or an
+  allocation failure), the entities created by the call are destroyed and the target
+  remains unchanged, except for monotonic ID advancement (IDs are never reused).
+- **Deep hierarchies**: subtree collection is iterative (no recursion), safe for
+  arbitrarily deep hierarchies.
+- **Memory safety**: explicit allocators, documented ownership,
+  `checkAllAllocationFailures` probes and a rollback test on component failure.
 
-## Integração com assets
+## Asset integration
 
-`AssetKind.prefab` classifica `.prefab`/`.corexprefab`. O `engineRegistry()`
-inclui o importer `prefab` (id `prefab`, versão 1), que valida o documento
-(single-root) e o re-serializa canonicamente antes de armazenar no cache
-endereçado por conteúdo. Prefabs participam do pipeline/cache/GC como qualquer
-outro asset.
+`AssetKind.prefab` classifies `.prefab`/`.corexprefab`. `engineRegistry()` includes
+the `prefab` importer (id `prefab`, version 1), which validates the document
+(single-root) and re-serializes it canonically before storing it in the
+content-addressed cache. Prefabs participate in the pipeline/cache/GC like any
+other asset.
 
 ```zig
 const corex = @import("corex");
@@ -90,7 +89,7 @@ var report = try A.pipeline.run(gpa, io, root, idx, &cache, .{
 // report.entries[i].importer_id == "prefab", kind == .prefab
 ```
 
-## Exemplo
+## Example
 
 ```zig
 const corex = @import("corex");
@@ -105,26 +104,26 @@ const anchor = try level.createEntity("Anchor", null);
 
 const a = try prefab.instantiate(&level, level.idOf(anchor));
 const b = try prefab.instantiate(&level, level.idOf(anchor));
-// a e b são raízes independentes, cada uma com sua subárvore clonada.
+// a and b are independent roots, each with its own cloned subtree.
 
-// Capturar um prefab a partir de uma cena viva:
+// Capture a prefab from a live scene:
 var captured = try S.EnginePrefab.fromScene(gpa, &level, a, "captured");
 defer captured.deinit();
 const bytes = try captured.serialize(gpa);
 defer gpa.free(bytes);
 ```
 
-## Limitações e próximos passos
+## Limitations and next steps
 
-- Prefabs não têm overrides por instância nem variantes aninhadas (prefab dentro
-  de prefab com edição); a instanciação é uma cópia por valor completa.
-- Não há referências cruzadas entre entidades via componentes (componentes são
-  plain-data; IDs de entidade em componentes não são remapeados automaticamente).
-- Streaming de cena, change tracking e multi-scene management continuam planejados.
+- Prefabs have no per-instance overrides and no nested variants (a prefab inside a
+  prefab with editing); instantiation is a full copy by value.
+- There are no cross-entity references through components (components are plain
+  data; entity IDs stored in components are not remapped automatically).
+- Scene streaming, change tracking and multi-scene management remain planned.
 
-## Relacionados
+## Related
 
-- Formato de cena: [scene-format.md](scene-format.md)
-- Transforms world-space: [scene-transforms.md](scene-transforms.md)
-- Importação e cache: [asset-import.md](asset-import.md)
-- Arquitetura: [architecture.md](architecture.md)
+- Scene format: [scene-format.md](scene-format.md)
+- World-space transforms: [scene-transforms.md](scene-transforms.md)
+- Import and cache: [asset-import.md](asset-import.md)
+- Architecture: [architecture.md](architecture.md)

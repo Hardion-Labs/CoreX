@@ -1,90 +1,88 @@
-# Extração de Render Backend-Independente — CoreXEngine
+# Backend-Independent Render Extraction — CoreXEngine
 
-Este documento descreve a camada de extração de render da CoreXEngine: a
-fundação **independente de backend** (CPU) que todas as tiers de renderer
-(Low/Medium/Advanced) consumirão. O código vive em `src/render/` e é exposto como
-`corex.render`.
+This document describes CoreXEngine's render extraction layer: the
+**backend-independent** (CPU) foundation every renderer tier (Low/Medium/Advanced)
+will consume. The code lives in `src/render/` and is exposed as `corex.render`.
 
-> Estado: **camada de extração implementada e testada**. Os backends GPU
-> Low/Medium e o contrato Advanced ainda são planejados; nenhum backend GPU foi
-> escolhido. Esta camada não tem dependência de GPU, então roda e é totalmente
-> testada headless. Ela consome os transforms world-space
-> ([scene-transforms.md](scene-transforms.md)) e, no futuro, os artefatos de
-> textura `CXTX` ([asset-decoders.md](asset-decoders.md)).
+> Status: **extraction layer implemented and tested**. The Low/Medium GPU backends
+> and the Advanced contract are still planned; no GPU backend has been chosen.
+> This layer has no GPU dependency, so it runs and is fully tested headlessly. It
+> consumes world-space transforms ([scene-transforms.md](scene-transforms.md))
+> and, in the future, `CXTX` texture artifacts
+> ([asset-decoders.md](asset-decoders.md)).
 
-## Visão geral
+## Overview
 
-A extração transforma uma cena + câmera em uma **draw list** pronta para o
-backend GPU:
+Extraction turns a scene + camera into a **draw list** ready for the GPU backend:
 
 ```
-cena (Transform + Renderable) ──► world transforms (snapshot O(n))
-                               ──► AABB world por renderable
+scene (Transform + Renderable) ──► world transforms (O(n) snapshot)
+                               ──► world AABB per renderable
                                ──► frustum culling
-                               ──► DrawCommands ordenados ──► backend GPU
+                               ──► sorted DrawCommands ──► GPU backend
 ```
 
-É trabalho puramente de CPU, reutilizando o snapshot de world transforms da cena
-e a iteração de views do ECS — baixo acoplamento e cache-friendly.
+It is pure CPU work, reusing the scene's world-transform snapshot and the ECS view
+iteration — low coupling and cache-friendly.
 
-## Convenções matemáticas
+## Math conventions
 
-- Matrizes `Mat4` **column-major** (`m[c*4+r]`), as mesmas de
-  [scene-transforms.md](scene-transforms.md).
-- Sistema **right-handed**; a câmera olha para **-Z**.
-- Clip space estilo OpenGL: NDC com `z ∈ [-1, 1]` (near → -1, far → +1).
-- `clip = projection * view * world` (vetor-coluna).
+- **Column-major** `Mat4` matrices (`m[c*4+r]`, the same as
+  [scene-transforms.md](scene-transforms.md)).
+- **Right-handed** system; the camera looks down **-Z**.
+- OpenGL-style clip space: NDC with `z ∈ [-1, 1]` (near → -1, far → +1).
+- `clip = projection * view * world` (column vector).
 
-## Câmera (`corex.render.camera`)
+## Camera (`corex.render.camera`)
 
-- `perspective(fov_y, aspect, near, far)` — projeção perspectiva (fov vertical em
-  radianos; `near < far`, ambos positivos).
-- `orthographic(left, right, bottom, top, near, far)` — projeção ortográfica.
-- `lookAt(eye, target, up)` — matriz de view; `eye == target` (caso degenerado)
-  retorna identidade.
-- `Camera` — combina `view`, `projection`, `view_projection` (= `projection *
-  view`) e `position` (olho, usado para ordenação por profundidade).
-  `Camera.perspectiveLookAt(...)` é um construtor de conveniência.
+- `perspective(fov_y, aspect, near, far)` — perspective projection (vertical fov in
+  radians; `near < far`, both positive).
+- `orthographic(left, right, bottom, top, near, far)` — orthographic projection.
+- `lookAt(eye, target, up)` — view matrix; `eye == target` (the degenerate case)
+  returns identity.
+- `Camera` — combines `view`, `projection`, `view_projection` (= `projection *
+  view`) and `position` (the eye, used for depth sorting).
+  `Camera.perspectiveLookAt(...)` is a convenience constructor.
 
 ## Culling (`corex.render.culling`)
 
-- `Aabb { center, extents }` — caixa alinhada por centro + semi-extensões;
+- `Aabb { center, extents }` — an aligned box by center + half-extents;
   `fromMinMax`, `min`, `max`.
 - `Sphere { center, radius }`.
-- `Plane { normal, d }` — inside quando `dot(normal, p) + d >= 0`; normalizada
-  para que `distanceToPoint` seja uma distância euclidiana com sinal.
-- `Frustum.fromMat4(view_projection)` — extrai os 6 planos normalizados
+- `Plane { normal, d }` — inside when `dot(normal, p) + d >= 0`; normalized so
+  `distanceToPoint` is a signed Euclidean distance.
+- `Frustum.fromMat4(view_projection)` — extracts the 6 normalized planes
   (Gribb–Hartmann): left/right/bottom/top/near/far.
 - `Classification { outside, intersecting, inside }`.
-- `Frustum.classifyAabb` / `classifySphere` — teste conservador: `outside` só
-  quando totalmente fora de algum plano (seguro para descartar).
-- `transformAabb(m, b)` — transforma uma AABB local em world de forma
-  conservadora (método de Arvo): transforma o centro e escala as extensões pelos
-  valores absolutos da parte linear; envolve a caixa sob rotação e escala não
-  uniforme.
+- `Frustum.classifyAabb` / `classifySphere` — a conservative test: `outside` only
+  when fully outside some plane (safe to discard).
+- `transformAabb(m, b)` — conservatively transforms a local AABB into world space
+  (Arvo's method): transforms the center and scales the extents by the absolute
+  values of the linear part; it bounds the box under rotation and non-uniform
+  scale.
 
 ## Draw list (`corex.render.draw`)
 
-- `Renderable { mesh, material, bounds }` — componente de cena **plain-data**
-  (handles opacos + AABB local). Adicione ao schema com
-  `Component(Renderable, "renderable")`; serializa como qualquer componente.
-  `isValid` rejeita bounds não finitos ou extensões negativas.
-- `DrawCommand { entity, mesh, material, world, bounds, depth }` — um draw call
-  visível, auto-contido (carrega a matriz world e os bounds world), então a draw
-  list sobrevive ao snapshot transitório de transforms.
+- `Renderable { mesh, material, bounds }` — a **plain-data** scene component
+  (opaque handles + a local AABB). Add it to a schema with
+  `Component(Renderable, "renderable")`; it serializes like any component.
+  `isValid` rejects non-finite bounds or negative extents.
+- `DrawCommand { entity, mesh, material, world, bounds, depth }` — one visible draw
+  call, self-contained (it carries the world matrix and world bounds), so the draw
+  list outlives the transient transform snapshot.
 - `SortMode`:
-  - `front_to_back` — mais perto primeiro (bom para opacos / early-z).
-  - `back_to_front` — mais longe primeiro (necessário para alpha blending).
-  - `by_material` — agrupa por material, depois mesh (minimiza trocas de estado).
-  Empates são desfeitos pelo `entity.key()` para **determinismo**.
-- `RenderFrame { commands, culled }` — draw list ordenada + diagnóstico de
-  culling; o caller é dono e chama `deinit`.
-- `extractDrawList(scene, cam, mode, gpa)` — genérica sobre qualquer
-  `*Scene(schema)` com `Transform` + `Renderable`. Calcula o snapshot de world
-  transforms uma vez, faz o culling da AABB world de cada renderable e ordena os
-  sobreviventes. Falha apenas por alocação (a cena já é válida).
+  - `front_to_back` — nearest first (good for opaque geometry / early-z).
+  - `back_to_front` — farthest first (required for alpha blending).
+  - `by_material` — groups by material, then mesh (minimizes state changes).
+  Ties are broken by `entity.key()` for **determinism**.
+- `RenderFrame { commands, culled }` — a sorted draw list plus culling diagnostics;
+  the caller owns it and calls `deinit`.
+- `extractDrawList(scene, cam, mode, gpa)` — generic over any `*Scene(schema)` with
+  `Transform` + `Renderable`. Computes the world-transform snapshot once, culls each
+  renderable's world AABB and sorts the survivors. Fails only on allocation (the
+  scene is already valid).
 
-## Exemplo
+## Example
 
 ```zig
 const corex = @import("corex");
@@ -107,48 +105,47 @@ const cam = R.Camera.perspectiveLookAt(
 );
 var frame = try R.extractDrawList(&scene, cam, .front_to_back, gpa);
 defer frame.deinit();
-// frame.commands[i].world / .mesh / .material prontos para o backend GPU.
+// frame.commands[i].world / .mesh / .material are ready for the GPU backend.
 ```
 
-## Garantias e testes
+## Guarantees and tests
 
-- **Matemática da câmera**: near/far mapeiam para NDC -1/+1; `lookAt` coloca o
-  olho na origem e objetos à frente têm view-z negativo; caso degenerado retorna
-  identidade.
-- **Frustum**: matriz identidade produz o cubo NDC `[-1,1]^3`; uma câmera
-  perspectiva real descarta o que está atrás, ao lado e além do far.
-- **Classificação**: inside/intersecting/outside para AABB e esfera;
-  `transformAabb` envolve os 8 cantos sob rotação (verificado explicitamente).
-- **Extração**: cena vazia → frame vazio; objeto off-screen é descartado
-  (`culled`); entidade sem `Renderable` não desenha; a matriz world reflete a
-  hierarquia; ordenação front/back e por material corretas; **determinismo** para
-  cenas idênticas; bounds escalados ainda descartam corretamente.
-- **Segurança de memória**: sonda `checkAllAllocationFailures` na extração sem
-  vazamentos; allocators explícitos; propriedade documentada.
+- **Camera math**: near/far map to NDC -1/+1; `lookAt` puts the eye at the origin
+  and objects in front have negative view-z; the degenerate case returns identity.
+- **Frustum**: the identity matrix yields the NDC cube `[-1,1]^3`; a real
+  perspective camera discards what is behind, to the side and beyond the far plane.
+- **Classification**: inside/intersecting/outside for AABBs and spheres;
+  `transformAabb` bounds all 8 corners under rotation (explicitly verified).
+- **Extraction**: an empty scene → an empty frame; an off-screen object is
+  discarded (`culled`); an entity without `Renderable` is not drawn; the world matrix
+  reflects the hierarchy; front/back and by-material sorting are correct;
+  **determinism** for identical scenes; scaled bounds still cull correctly.
+- **Memory safety**: a `checkAllAllocationFailures` probe on extraction with no
+  leaks; explicit allocators; ownership documented.
 
-## Desempenho
+## Performance
 
-- Reutiliza o snapshot O(n) de world transforms (uma passada por frame).
-- Culling por AABB é O(1) por renderable (6 planos); só os visíveis viram
-  `DrawCommand`.
-- Ordenação com `std.mem.sort` e ordenação total (empate por `entity.key()`),
-  logo o resultado é determinístico independente da estabilidade do sort.
-- `DrawCommand` é plain-data e auto-contido, cache-friendly para o backend.
+- Reuses the O(n) world-transform snapshot (one pass per frame).
+- AABB culling is O(1) per renderable (6 planes); only visible ones become
+  `DrawCommand`s.
+- Sorting uses `std.mem.sort` with a total order (ties broken by `entity.key()`), so
+  the result is deterministic regardless of sort stability.
+- `DrawCommand` is plain data and self-contained, cache-friendly for the backend.
 
-## Limitações e próximos passos
+## Limitations and next steps
 
-- Não há backend GPU ainda (Low/Medium/Advanced planejados); esta camada só
-  produz a draw list, não rasteriza.
-- Sem LOD, occlusion culling, instancing ou batching automático; `by_material`
-  apenas ordena para reduzir trocas de estado.
-- `Renderable` usa handles opacos de mesh/material; a resolução para recursos GPU
-  e a ligação com o cache de assets são trabalho do backend futuro.
-- Sem transparência por objeto além da ordenação `back_to_front`; materiais
-  transparentes/opacos ainda não são separados em sublistas.
+- There is no GPU backend yet (Low/Medium/Advanced are planned); this layer only
+  produces the draw list, it does not rasterize.
+- No LOD, occlusion culling, instancing or automatic batching; `by_material` only
+  sorts to reduce state changes.
+- `Renderable` uses opaque mesh/material handles; resolving them to GPU resources
+  and binding them to the asset cache is work for the future backend.
+- No per-object transparency beyond `back_to_front` sorting; transparent/opaque
+  materials are not yet split into sublists.
 
-## Relacionados
+## Related
 
-- Transforms world-space: [scene-transforms.md](scene-transforms.md)
-- Decodificadores de textura / CXTX: [asset-decoders.md](asset-decoders.md)
-- Arquitetura: [architecture.md](architecture.md)
-- Versionamento: [versioning.md](versioning.md)
+- World-space transforms: [scene-transforms.md](scene-transforms.md)
+- Texture decoders / CXTX: [asset-decoders.md](asset-decoders.md)
+- Architecture: [architecture.md](architecture.md)
+- Versioning: [versioning.md](versioning.md)
