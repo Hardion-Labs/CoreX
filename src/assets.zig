@@ -1,8 +1,9 @@
 //! CoreXEngine asset subsystem.
 //!
 //! Unifies asset indexing (`core/assets.zig`), the content-addressed import
-//! cache (`assets/cache.zig`), the importer framework (`assets/importer.zig`)
-//! and the import pipeline (`assets/pipeline.zig`). It also registers the
+//! cache (`assets/cache.zig`), the importer framework (`assets/importer.zig`),
+//! the import pipeline (`assets/pipeline.zig`) and change detection
+//! (`assets/changes.zig`, the hot-reload foundation). It also registers the
 //! engine's scene importer, which reuses the scene system to validate and
 //! canonicalize `.scene` documents at import time.
 //!
@@ -37,6 +38,8 @@ pub const cache = @import("assets/cache.zig");
 pub const importer = @import("assets/importer.zig");
 /// Import orchestration over the job system.
 pub const pipeline = @import("assets/pipeline.zig");
+/// Change detection (added/modified/removed) and the hot-reload baseline.
+pub const changes = @import("assets/changes.zig");
 /// Pure image decoders (BMP/TGA/QOI) normalizing to RGBA8.
 pub const image = @import("assets/image.zig");
 /// DEFLATE/zlib decompression (the foundation the PNG decoder needs).
@@ -63,6 +66,9 @@ pub const ImportError = importer.ImportError;
 pub const Report = pipeline.Report;
 pub const Options = pipeline.Options;
 pub const Status = pipeline.Status;
+pub const Snapshot = changes.Snapshot;
+pub const ChangeSet = changes.ChangeSet;
+pub const ChangeKind = changes.ChangeKind;
 pub const Image = image.Image;
 pub const Texture = texture.Texture;
 pub const Mesh = mesh.Mesh;
@@ -121,6 +127,7 @@ test {
     _ = cache;
     _ = importer;
     _ = pipeline;
+    _ = changes;
     _ = image;
     _ = inflate;
     _ = png;
@@ -544,4 +551,85 @@ test "pipeline imports a PNG to a CXTX artifact and hits the cache on re-run" {
     try std.testing.expectEqual(@as(usize, 0), second.imported);
     try std.testing.expectEqual(@as(usize, 1), second.cached);
     try std.testing.expectEqual(key, second.entries[0].key.?);
+}
+
+test "hot-reload: detect, re-import only changes, then gc with the full live set" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "assets");
+    try tmp.dir.createDirPath(io, "cache");
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/a.txt", .data = "alpha\r\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/b.json", .data = "{ \"x\": 1 }" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/c.bin", .data = "opaque" });
+
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buf);
+    const root_path = buf[0..n];
+    var root = try Io.Dir.openDirAbsolute(io, root_path, .{});
+    defer root.close(io);
+    var cache_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const cache_path = try std.fmt.bufPrint(&cache_buf, "{s}/cache", .{root_path});
+    var store = try Cache.open(io, cache_path);
+    defer store.deinit();
+
+    var idx = try indexDirectories(gpa, io, root_path, &.{"assets"});
+    defer idx.deinit();
+    var baseline = try changes.capture(gpa, io, root, idx, .{});
+    defer baseline.deinit();
+
+    var first = try pipeline.runSequential(gpa, io, root, idx, &store, .{ .registry = engineRegistry() });
+    defer first.deinit();
+    try std.testing.expectEqual(@as(usize, 3), first.imported);
+
+    // Edit one asset, add another, delete a third — a typical editor frame.
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/a.txt", .data = "alpha edited\r\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/d.txt", .data = "delta" });
+    try tmp.dir.deleteFile(io, "assets/c.bin");
+    idx.deinit();
+    idx = try indexDirectories(gpa, io, root_path, &.{"assets"});
+
+    var detected = try changes.detect(gpa, io, root, &baseline, idx, .{});
+    defer detected.deinit();
+    try std.testing.expectEqual(@as(usize, 1), detected.changes.added.len);
+    try std.testing.expectEqual(@as(usize, 1), detected.changes.modified.len);
+    try std.testing.expectEqual(@as(usize, 1), detected.changes.removed.len);
+
+    const only = try detected.changes.changedPaths(gpa);
+    defer gpa.free(only);
+    var incremental = try pipeline.runSequential(gpa, io, root, idx, &store, .{
+        .registry = engineRegistry(),
+        .only = only,
+    });
+    defer incremental.deinit();
+    try std.testing.expectEqual(@as(usize, 2), incremental.count());
+    try std.testing.expectEqual(@as(usize, 2), incremental.imported);
+    try std.testing.expectEqual(@as(usize, 0), incremental.failed);
+
+    // The filtered report only knows two keys; the snapshot knows all three.
+    const partial = try incremental.liveKeys(gpa);
+    defer gpa.free(partial);
+    try std.testing.expectEqual(@as(usize, 2), partial.len);
+    const live = try detected.snapshot.cacheKeys(gpa, engineRegistry(), "");
+    defer gpa.free(live);
+    try std.testing.expectEqual(@as(usize, 3), live.len);
+    for (live) |key| try std.testing.expect(try store.has(gpa, key));
+
+    // GC with the complete live set: the edited asset's old artifact and the
+    // deleted asset's artifact are the only orphans.
+    const stats = try store.gc(gpa, live);
+    try std.testing.expectEqual(@as(usize, 3), stats.kept);
+    try std.testing.expectEqual(@as(usize, 2), stats.removed);
+    for (live) |key| try std.testing.expect(try store.has(gpa, key));
+
+    // A second pass over the untouched project reports nothing and re-imports
+    // nothing: every asset is a verified cache hit.
+    var quiet = try changes.detect(gpa, io, root, &detected.snapshot, idx, .{});
+    defer quiet.deinit();
+    try std.testing.expect(quiet.changes.isEmpty());
+    var again = try pipeline.runSequential(gpa, io, root, idx, &store, .{ .registry = engineRegistry() });
+    defer again.deinit();
+    try std.testing.expectEqual(@as(usize, 0), again.imported);
+    try std.testing.expectEqual(@as(usize, 3), again.cached);
 }

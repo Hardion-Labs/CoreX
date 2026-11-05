@@ -157,12 +157,18 @@ Options (`Options`):
 | `registry`         | `defaultRegistry()` | Extension-to-importer registry.                |
 | `max_source_bytes` | 64 MiB              | Read limit per source file.                    |
 | `options_salt`     | `""`                | Extra bytes folded into the cache key.         |
+| `only`             | `null`              | Import only these project-relative paths (incremental/hot-reload runs). `null` imports the whole index. |
 
-The report (`Report`) contains one entry per asset in index order, with `status`
-(`imported`, `cached`, `failed`), `importer_id`, `key`, `output_size` and
+The report (`Report`) contains one entry per selected asset in index order, with
+`status` (`imported`, `cached`, `failed`), `importer_id`, `key`, `output_size` and
 `error_name`, plus the totals (`imported`, `cached`, `failed`,
-`total_output_bytes`). `Report.liveKeys(gpa)` collects the keys of every
-successfully imported/cached asset — the `live` set for garbage collection.
+`total_output_bytes`). All indexed assets are selected unless `only` restricts the
+run. `Report.liveKeys(gpa)` collects the keys of every successfully
+imported/cached asset **in that run**.
+
+> After a filtered (`only`) run, `Report.liveKeys` is a *partial* set. Use
+> `changes.Snapshot.cacheKeys` for the project's complete live set before calling
+> `Cache.gc` — see [asset-change-detection.md](asset-change-detection.md).
 
 ## Garbage collection (GC)
 
@@ -182,6 +188,15 @@ defer gpa.free(live);
 
 const stats = try cache.gc(gpa, live);
 // stats.scanned / .kept / .removed / .bytes_freed
+```
+
+For an incremental (hot-reload) run, take the live set from the snapshot instead,
+because the report only covers the assets that run imported:
+
+```zig
+const live = try snapshot.cacheKeys(gpa, corex.assets.engineRegistry(), "");
+defer gpa.free(live);
+const stats = try cache.gc(gpa, live);
 ```
 
 Guarantees and behavior:
@@ -213,7 +228,10 @@ Guarantees and behavior:
   keys); determinism is by source content, which is sufficient for a
   content-addressed cache.
 - The pipeline is not wired into startup/editor yet; it is an independent public
-  API. Startup integration and hot-reload are next steps.
+  API. **Change detection and incremental import are implemented**
+  (`corex.assets.changes` + `Options.only`, see
+  [asset-change-detection.md](asset-change-detection.md)); an OS event watcher and
+  editor/runtime wiring are next steps.
 - Garbage collection (GC) of orphan cache entries is **implemented** (`Cache.gc`,
   see above). There is no dependency tracking between assets yet, nor cleanup of
   temporary files left behind by interrupted writes (crash); both are planned
@@ -234,6 +252,8 @@ Guarantees and behavior:
 ## Related links
 
 - [architecture.md](architecture.md) — subsystem map and status.
+- [asset-change-detection.md](asset-change-detection.md) — change detection,
+  incremental import and the complete live set for GC.
 - [asset-decoders.md](asset-decoders.md) — image decoders (PNG/BMP/TGA/QOI), the
   DEFLATE/zlib inflater and the CXTX artifact.
 - [mesh-import.md](mesh-import.md) — OBJ mesh importer and the CXMH artifact.

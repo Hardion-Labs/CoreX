@@ -63,7 +63,11 @@ pub const EntryResult = struct {
     error_name: ?[]const u8,
 };
 
-/// Owned import report, one entry per indexed asset in index order.
+/// Owned import report: one entry per selected asset in index order. All
+/// indexed assets are selected unless `Options.only` restricts the run, so a
+/// filtered report's `liveKeys` is **not** the project's complete live set (use
+/// `changes.Snapshot.cacheKeys` for garbage collection after an incremental
+/// import).
 pub const Report = struct {
     gpa: Allocator,
     entries: []EntryResult,
@@ -103,7 +107,62 @@ pub const Options = struct {
     max_source_bytes: usize = max_source_bytes_default,
     /// Extra bytes folded into every cache key (e.g. a project import profile).
     options_salt: []const u8 = "",
+    /// When set, import only the assets whose project-relative path is listed
+    /// here (exact match). This is how an incremental/hot-reload pass imports
+    /// just what `changes.detect` reported. `null` (the default) imports the
+    /// whole index, which is the historical behavior.
+    only: ?[]const []const u8 = null,
 };
+
+/// The entries a run will import: either the index's own array (borrowed, no
+/// allocation) or an owned filtered copy.
+const Selection = struct {
+    gpa: Allocator,
+    entries: []AssetEntry,
+    owned: bool,
+
+    fn deinit(self: *Selection) void {
+        if (self.owned) self.gpa.free(self.entries);
+        self.* = undefined;
+    }
+};
+
+fn pathLessThan(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.lessThan(u8, a, b);
+}
+
+fn containsPath(sorted: []const []const u8, path: []const u8) bool {
+    var lo: usize = 0;
+    var hi: usize = sorted.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        switch (std.mem.order(u8, sorted[mid], path)) {
+            .lt => lo = mid + 1,
+            .gt => hi = mid,
+            .eq => return true,
+        }
+    }
+    return false;
+}
+
+/// Resolve `Options.only`. The filter paths are sorted once and each indexed
+/// asset is binary-searched, so selection costs O(n log m) instead of O(n*m).
+fn selectEntries(gpa: Allocator, index: AssetIndex, only: ?[]const []const u8) Error!Selection {
+    const paths = only orelse return .{ .gpa = gpa, .entries = index.entries.items, .owned = false };
+    if (paths.len == 0) return .{ .gpa = gpa, .entries = &.{}, .owned = false };
+
+    const sorted = gpa.dupe([]const u8, paths) catch return error.OutOfMemory;
+    defer gpa.free(sorted);
+    std.mem.sort([]const u8, sorted, {}, pathLessThan);
+
+    var list: std.ArrayList(AssetEntry) = .empty;
+    errdefer list.deinit(gpa);
+    for (index.entries.items) |e| {
+        if (containsPath(sorted, e.path)) list.append(gpa, e) catch return error.OutOfMemory;
+    }
+    const owned = list.toOwnedSlice(gpa) catch return error.OutOfMemory;
+    return .{ .gpa = gpa, .entries = owned, .owned = true };
+}
 
 const Task = struct {
     gpa: Allocator,
@@ -128,14 +187,16 @@ pub fn run(
     cache: *Cache,
     options: Options,
 ) Error!Report {
-    const entries = try gpa.alloc(EntryResult, index.count());
+    var selection = try selectEntries(gpa, index, options.only);
+    defer selection.deinit();
+    const entries = try gpa.alloc(EntryResult, selection.entries.len);
     errdefer gpa.free(entries);
-    initSlots(entries, index);
+    initSlots(entries, selection.entries);
 
     if (entries.len > 0) {
         const options_hash = cache_mod.hashBytes(options.options_salt);
         var group: Io.Group = .init;
-        for (entries, index.entries.items, 0..) |*slot, e, i| {
+        for (entries, selection.entries, 0..) |*slot, e, i| {
             group.async(io, work, .{Task{
                 .gpa = gpa,
                 .io = io,
@@ -164,12 +225,14 @@ pub fn runSequential(
     cache: *Cache,
     options: Options,
 ) Error!Report {
-    const entries = try gpa.alloc(EntryResult, index.count());
+    var selection = try selectEntries(gpa, index, options.only);
+    defer selection.deinit();
+    const entries = try gpa.alloc(EntryResult, selection.entries.len);
     errdefer gpa.free(entries);
-    initSlots(entries, index);
+    initSlots(entries, selection.entries);
 
     const options_hash = cache_mod.hashBytes(options.options_salt);
-    for (entries, index.entries.items, 0..) |*slot, e, i| {
+    for (entries, selection.entries, 0..) |*slot, e, i| {
         work(.{
             .gpa = gpa,
             .io = io,
@@ -186,8 +249,8 @@ pub fn runSequential(
     return tally(gpa, entries);
 }
 
-fn initSlots(entries: []EntryResult, index: AssetIndex) void {
-    for (entries, index.entries.items) |*slot, e| {
+fn initSlots(entries: []EntryResult, selected: []const AssetEntry) void {
+    for (entries, selected) |*slot, e| {
         slot.* = .{
             .path = e.path,
             .kind = e.kind,
@@ -504,4 +567,70 @@ test "pipeline: parallel run matches sequential results" {
     defer again.deinit();
     try testing.expectEqual(@as(usize, 16), again.cached);
     try testing.expectEqual(@as(usize, 0), again.imported);
+}
+
+test "pipeline: only restricts the run to the selected paths" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    try env.writeAsset("assets/a.txt", "alpha");
+    try env.writeAsset("assets/b.txt", "beta");
+    try env.writeAsset("assets/c.txt", "gamma");
+
+    var root = try env.openRoot();
+    defer root.close(testing.io);
+    var cache = try env.openCache();
+    defer cache.deinit();
+    var idx = try env.index();
+    defer idx.deinit();
+
+    // Unsorted, with a duplicate and a path that is not in the index.
+    const only = [_][]const u8{ "assets/c.txt", "assets/a.txt", "assets/c.txt", "assets/absent.txt" };
+    var first = try runSequential(testing.allocator, testing.io, root, idx, &cache, .{ .only = &only });
+    defer first.deinit();
+    try testing.expectEqual(@as(usize, 2), first.count());
+    try testing.expectEqual(@as(usize, 2), first.imported);
+    // Report order follows the index, not the filter.
+    try testing.expectEqualStrings("assets/a.txt", first.entries[0].path);
+    try testing.expectEqualStrings("assets/c.txt", first.entries[1].path);
+
+    var second = try runSequential(testing.allocator, testing.io, root, idx, &cache, .{ .only = &only });
+    defer second.deinit();
+    try testing.expectEqual(@as(usize, 0), second.imported);
+    try testing.expectEqual(@as(usize, 2), second.cached);
+
+    // The unfiltered asset is still untouched, and imports on a full run.
+    try testing.expect(try cache.has(testing.allocator, first.entries[0].key.?));
+    var full = try runSequential(testing.allocator, testing.io, root, idx, &cache, .{});
+    defer full.deinit();
+    try testing.expectEqual(@as(usize, 3), full.count());
+    try testing.expectEqual(@as(usize, 1), full.imported);
+    try testing.expectEqual(@as(usize, 2), full.cached);
+}
+
+test "pipeline: an empty or unmatched selection imports nothing" {
+    var env = try TestEnv.init();
+    defer env.deinit();
+    try env.writeAsset("assets/a.txt", "alpha");
+
+    var root = try env.openRoot();
+    defer root.close(testing.io);
+    var cache = try env.openCache();
+    defer cache.deinit();
+    var idx = try env.index();
+    defer idx.deinit();
+
+    var none = try runSequential(testing.allocator, testing.io, root, idx, &cache, .{ .only = &.{} });
+    defer none.deinit();
+    try testing.expectEqual(@as(usize, 0), none.count());
+    try testing.expectEqual(@as(usize, 0), none.imported);
+
+    const only = [_][]const u8{"assets/other.txt"};
+    var unmatched = try runSequential(testing.allocator, testing.io, root, idx, &cache, .{ .only = &only });
+    defer unmatched.deinit();
+    try testing.expectEqual(@as(usize, 0), unmatched.count());
+
+    // The parallel path honors the filter too.
+    var parallel = try run(testing.allocator, testing.io, root, idx, &cache, .{ .only = &only });
+    defer parallel.deinit();
+    try testing.expectEqual(@as(usize, 0), parallel.count());
 }

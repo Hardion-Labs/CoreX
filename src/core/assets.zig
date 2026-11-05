@@ -2,8 +2,10 @@
 //!
 //! Walks the project's asset directories and builds an index of files with a
 //! coarse kind (derived from extension) and byte size. This is the "index
-//! assets" startup stage. Importing, caching and dependency tracking are
-//! planned extensions of the asset system (see docs/architecture.md).
+//! assets" startup stage. The layers above it (`src/assets/`) implement
+//! importing, the content-addressed cache and change detection; dependency
+//! tracking between assets is still a planned extension (see
+//! docs/architecture.md).
 //!
 //! Missing asset directories are skipped (a project may legitimately have no
 //! assets yet); unreadable directories are an error.
