@@ -313,7 +313,12 @@ pub fn applyPair(kernel: *const Kernel, src: []const f32, frames: usize, looping
 }
 
 /// Windowed sinc in double precision, used only to build the table.
-fn prototype(x: f64, half_support: f64) f64 {
+/// Blackman-windowed sinc at `x`, zero outside `|x| >= half_support`.
+///
+/// This is the shared filter prototype for the whole audio stack: the resampler
+/// builds its polyphase bank from it, and the effects module builds its
+/// oversampling kernels from it. Exported so the two never drift apart.
+pub fn prototype(x: f64, half_support: f64) f64 {
     const sinc = if (@abs(x) < 1e-12) 1.0 else @sin(std.math.pi * x) / (std.math.pi * x);
     const u = x / half_support;
     // Blackman: zero at |u| == 1, so the truncated filter tapers smoothly.

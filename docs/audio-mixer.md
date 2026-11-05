@@ -316,6 +316,10 @@ const lim_mem = try gpa.alloc(f32, try A.Limiter.requiredSamples(48_000, 2, .{})
 defer gpa.free(lim_mem);
 var limiter = try A.Limiter.init(48_000, 2, .{ .ceiling_db = -1 }, lim_mem);
 try mixer.setMasterEffect(2, A.Effect.limiter(&limiter));
+
+// Oversampled drive. All state is inline, so there is no buffer to allocate.
+var saturator = try A.Saturator.init(48_000, 2, .{ .drive = 6, .oversample = 2 });
+try mixer.setBusEffect(2, 0, A.Effect.saturator(&saturator));
 ```
 
 The guarantees that matter for the mixing contract:
@@ -439,6 +443,9 @@ it plays real imported fixtures end to end.
 - **Limiter**: four full-scale voices clip an unprotected mixer; with a master
   limiter `clipped_samples` is **zero** and the peak sits at the ceiling, while a
   quiet mix still passes at unity gain.
+- **Saturator**: saturation into a true-peak limiter also produces zero clipped
+  samples, and an instance is rejected in a second slot even though it borrows no
+  buffer — sharing it would advance its histories twice per sample.
 - **Borrowed effect memory**: a delay/reverb/limiter instance cannot be inserted twice,
   two instances cannot share or partially overlap a buffer, the layout must match
   the output, replacing the holding slot is allowed, and clearing releases the
@@ -507,9 +514,10 @@ Reading the table honestly:
   `AudioSystem` (see [audio-spatial.md](audio-spatial.md)), which feed this
   mixer's gain/pan/pitch. There is no HRTF or binaural rendering anywhere yet.
 - **Effects**: biquads, a stereo-linked compressor, a feedback delay, a
-  Freeverb-style reverb and a lookahead brickwall limiter on per-bus and master
-  chains ([audio-effects.md](audio-effects.md)). No chorus/flanger, convolution,
-  oversampled saturation, side-chain or per-voice inserts.
+  Freeverb-style reverb, a lookahead brickwall limiter with optional true-peak
+  detection, and an oversampled saturator on per-bus and master chains
+  ([audio-effects.md](audio-effects.md)). No chorus/flanger, convolution,
+  side-chain or per-voice inserts.
   Delay-based effects borrow their memory from the caller, so they add **no mixer
   allocation**; the mixer rejects two slots claiming the same instance or
   overlapping buffers.

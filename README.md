@@ -35,8 +35,8 @@ control, and maintainable code.
 > layer (camera math, frustum culling, sorted draw lists) and the
 > device-independent audio runtime (mixer with voices, buses, pan, pitch,
 > linear/band-limited resampling, priority voice stealing and
-> biquad/compressor/delay/reverb/limiter insert chains, plus spatialization and
-> the `AudioSource` scene bridge) are
+> biquad/compressor/delay/reverb/limiter/saturator insert chains, plus
+> spatialization and the `AudioSource` scene bridge) are
 > implemented and tested. The larger
 > subsystems (GPU renderer backends, GUI, editor, Lua, export, native modules) are
 > in scope and either contract-defined or planned. See
@@ -365,7 +365,8 @@ planned.
 Buses and the master accept **insert chains** (`.effect_slots > 0`): RBJ biquad
 filters (low/high pass, band pass, notch, peaking, shelves), a stereo-linked
 soft-knee compressor, a feedback delay with damping, a Freeverb-style reverb, and
-a lookahead brickwall limiter whose cost is flat in the lookahead length. Only buses with an active chain are isolated into a
+a lookahead brickwall limiter whose cost is flat in the lookahead length and
+which can measure true (inter-sample) peaks, and an oversampled saturator. Only buses with an active chain are isolated into a
 preallocated submix, so an all-bypass configuration is bit-identical to the
 effect-free path and `render` still never allocates. Parameters, measured costs
 and limits are in [`docs/audio-effects.md`](docs/audio-effects.md).
@@ -388,6 +389,10 @@ const lim_mem = try allocator.alloc(f32, try A.Limiter.requiredSamples(48_000, 2
 defer allocator.free(lim_mem);
 var limiter = try A.Limiter.init(48_000, 2, .{ .ceiling_db = -1 }, lim_mem);
 try mixer.setMasterEffect(2, A.Effect.limiter(&limiter));
+
+// Oversampled drive; all state is inline, so there is no buffer to allocate.
+var saturator = try A.Saturator.init(48_000, 2, .{ .drive = 6, .oversample = 2 });
+try mixer.setBusEffect(2, 0, A.Effect.saturator(&saturator));
 ```
 
 ```zig
@@ -528,7 +533,8 @@ Indicative; subject to change as technical decisions are validated.
 - [x] Insert effects: biquad filters + compressor on per-bus and master chains.
 - [x] Delay-based effects: feedback delay with damping + Freeverb-style reverb.
 - [x] Lookahead brickwall limiter (O(1) sliding maximum, exact ceiling, no overshoot).
-- [ ] Chorus/flanger, convolution, oversampled saturation, side-chain.
+- [x] Oversampled saturation + true-peak (inter-sample) limiting.
+- [ ] Chorus/flanger, convolution, side-chain.
 - [ ] Audio device backends (ALSA/WASAPI/CoreAudio), HRTF/occlusion, effects, streaming.
 - [ ] Hot-reload event watcher (inotify/FSEvents), dependency graph, startup/editor integration.
 - [x] Backend-independent render extraction (camera, frustum culling, sorted draw lists).
