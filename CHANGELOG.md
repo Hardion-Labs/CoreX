@@ -184,6 +184,23 @@ declared yet.
   f32 output (compared as bit patterns) plus 23 malformed/unsupported WAVs, all
   generated with Python's `struct` so the tests compare against an independent
   encoder.
+- Device-independent audio mixer (`src/audio/`, re-exported as `corex.audio`
+  with `Mixer`/`VoiceHandle`/`Clip`/`Config`/`PlayOptions`/`RenderStats`/`State`/
+  `ChannelMap`/`PanLaw`, `docs/audio-mixer.md`): a fixed-capacity voice pool with
+  generational handles (stale handles are inert; a slot whose generation would
+  wrap is retired), buses with gain/mute, master gain, stereo pan (linear or
+  equal-power), pitch, looping and linear-interpolated resampling with a float64
+  cursor. `render` takes **no allocator** and cannot allocate: voices accumulate
+  into the caller's interleaved f32 buffer and a single output pass applies
+  master gain, replaces non-finite mixes with silence, clamps (optional) and
+  meters peak/clipped samples. Channel mapping is explicit (mono/stereo
+  passthrough, mono→stereo duplication, stereo→mono and N→mono averaging;
+  surround→stereo is rejected rather than guessed). `toPcm16` converts a mix for
+  a device and round-trips every i16 value exactly. The mixing core is
+  monomorphized per (channel map, resampling) pair, with an interpolation-free
+  fast path at unit step. Consumes `CXAW` artifacts without importing the asset
+  layer, so both stay independently testable. No device backend, 3D audio,
+  effects, voice stealing or streaming yet (planned).
 - Shared display-name validation (`src/core/validation.zig`) used by both the
   `.corex` manifest and scene documents.
 - Native Module ABI contract for C++ (`docs/native-module-api.md`,
@@ -194,7 +211,7 @@ declared yet.
   automatic dependency graphs, observers, frame budgets and profiling), scenes,
   asset import/cache, world-space transforms, texture decoders, cache GC, render
   extraction, OBJ mesh import, scene prefabs, DEFLATE/zlib, PNG, asset change
-  detection and WAV audio import (351 tests), including allocation-failure
+  detection, WAV audio import and audio mixing (386 tests), including allocation-failure
   probes, cache corruption/truncation probes, a deep-hierarchy stress test, QOI
   encode/decode roundtrips, end-to-end texture-import-and-cache, OBJ-import-and-
   cache and import-then-GC tests, camera/frustum/culling and draw-list extraction
@@ -203,7 +220,9 @@ declared yet.
   reference-vector and rejection suites (including a 200 KiB multi-block stream
   and truncation probes), change-detection classification/blind-spot/key-parity
   tests, a full hot-reload cycle (detect, incremental re-import, GC), WAV
-  reference-vector/rejection/alignment and WAV-import-and-cache tests, and job-system
+  reference-vector/rejection/alignment and WAV-import-and-cache tests, mixer
+  exactness/resampling/looping/lifecycle/handle-safety/metering/determinism tests,
+  an exhaustive PCM16 round trip, WAV-to-mixer playback integration, and job-system
   integration tests (including parallel graph/frame profiling over `JobSystem`
   workers), validated in Debug, ReleaseSafe and ReleaseFast.
 
@@ -222,8 +241,9 @@ declared yet.
   detection as `corex.assets.changes`, the OBJ
   mesh importer and `CXMH` artifact as `corex.assets.mesh`, the WAV audio importer
   and `CXAW` artifact as `corex.assets.audio`,
-  `Image`/`Texture`/`Mesh`/`MeshView`/`Audio`/`AudioView`/`GcStats`) and render (backend-independent
-  extraction as `corex.render`) subsystems.
+  `Image`/`Texture`/`Mesh`/`MeshView`/`Audio`/`AudioView`/`GcStats`), render
+  (backend-independent extraction as `corex.render`) and audio
+  (device-independent mixing as `corex.audio`) subsystems.
 - The engine import registry now decodes `.png`/`.bmp`/`.tga`/`.qoi` textures to `CXTX`
   and `.obj` meshes to `CXMH` artifacts instead of copying them verbatim; the cache
   key includes the importer identity/version, so this does not collide with

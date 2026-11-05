@@ -12,15 +12,16 @@ produces. The code lives in `src/assets/audio.zig` and is exposed as
 > audio (ADPCM, A-law/µ-law, GSM, Ogg/Vorbis, MP3, FLAC, Opus) and other
 > containers (AIFF, CAF, RF64) have no decoder** and are rejected or fall back to
 > `raw`; they are not described here as an existing capability. There is **no
-> audio playback device/mixer yet** — this stage delivers the decode + artifact
-> half of the audio path.
+> audio playback device yet**. The device-independent **mixer** that consumes
+> these artifacts is implemented — see [audio-mixer.md](audio-mixer.md) — while
+> the OS device backends remain planned.
 
 ## Overview
 
 ```
 .wav source ──► decodeWav ──► Audio (interleaved f32 + rate + channels + frames)
                           ──► serialize ──► CXAW artifact ──► content-addressed cache
-                                                          ──► parse (zero-copy view) ──► future mixer
+                                                          ──► parse (zero-copy view) ──► mixer
 ```
 
 The importer is a pure `bytes -> bytes` transformation with its own identity
@@ -206,9 +207,9 @@ Measured on this machine, `ReleaseFast`, best of 5 runs, 10 s of 48 kHz stereo
   decoder and use the `raw` importer (verbatim copy).
 - **No resampling, downmixing or channel reordering** — a consumer that needs
   48 kHz stereo must handle the source rate/layout itself for now.
-- **No playback**: there is no audio device backend, mixer, voice/bus graph,
-  streaming of long clips or 3D attenuation yet. `CXAW` is the input those will
-  consume.
+- **No device playback**: the voice/bus mixer that consumes `CXAW` is implemented
+  (`corex.audio`, see [audio-mixer.md](audio-mixer.md)), but there is no OS audio
+  device backend, streaming of long clips or 3D attenuation yet.
 - **No loop points**: `smpl`/`cue ` chunks are skipped, so loop markers are not
   carried into the artifact yet.
 - The whole clip is decoded into memory (bounded by `max_sample_bytes`); streaming
@@ -218,6 +219,7 @@ Measured on this machine, `ReleaseFast`, best of 5 runs, 10 s of 48 kHz stereo
 
 ## Related
 
+- Audio runtime / mixer: [audio-mixer.md](audio-mixer.md)
 - Import and cache: [asset-import.md](asset-import.md)
 - Change detection / incremental import: [asset-change-detection.md](asset-change-detection.md)
 - Texture decoders / CXTX: [asset-decoders.md](asset-decoders.md)

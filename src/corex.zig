@@ -43,6 +43,10 @@ pub const assets = @import("assets.zig");
 /// draw-list extraction (the CPU foundation the GPU tiers will consume).
 pub const render = @import("render.zig");
 
+/// Audio subsystem: device-independent mixing (voices, buses, gain/pan, pitch,
+/// resampling) — the CPU foundation the OS playback backends will consume.
+pub const audio = @import("audio.zig");
+
 // Pull every submodule's tests into the test build.
 test {
     std.testing.refAllDecls(@This());
@@ -60,6 +64,8 @@ test {
     _ = ecs;
     _ = scene;
     _ = assets;
+    _ = audio;
+    _ = @import("audio/cxaw_playback_test.zig");
     _ = @import("ecs/schedule_jobs_test.zig");
     _ = @import("ecs/frame_jobs_test.zig");
     _ = @import("assets/pipeline_jobs_test.zig");
