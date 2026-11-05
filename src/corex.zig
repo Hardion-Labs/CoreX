@@ -24,11 +24,16 @@ pub const core = struct {
     pub const splash = @import("core/splash.zig");
     pub const diagnostics = @import("core/diagnostics.zig");
     pub const startup = @import("core/startup.zig");
+    pub const validation = @import("core/validation.zig");
 };
 
 /// Entity-Component-System: generational entities, sparse-set component pools,
 /// and a type-safe world with multi-component views.
 pub const ecs = @import("ecs.zig");
+
+/// Scene system: versioned scene documents, stable entity IDs, hierarchy and
+/// ECS-backed components.
+pub const scene = @import("scene.zig");
 
 // Pull every submodule's tests into the test build.
 test {
@@ -43,5 +48,7 @@ test {
     _ = core.splash;
     _ = core.diagnostics;
     _ = core.startup;
+    _ = core.validation;
     _ = ecs;
+    _ = scene;
 }

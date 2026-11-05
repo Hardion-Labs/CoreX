@@ -1,9 +1,10 @@
 # HelloProject
 
 A minimal example project for the CoreXEngine. It exists to demonstrate the
-[launch contract](../../docs/launch-contract.md) and the
-[`.corex` project format](../../docs/project-format.md). The engine does not
-create projects; this example was authored by hand.
+[launch contract](../../docs/launch-contract.md), the
+[`.corex` project format](../../docs/project-format.md) and the
+[`.scene` format](../../docs/scene-format.md). The engine does not create
+projects; this example was authored by hand.
 
 ## Layout
 
@@ -12,7 +13,7 @@ hello-project/
 ├── HelloProject.corex     # Project entry point (manifest)
 ├── settings.json          # Optional project configuration
 ├── scenes/
-│   └── main.scene         # Initial scene
+│   └── main.scene         # Initial scene (format_version 1, two entities)
 ├── scripts/
 │   └── main.lua           # Gameplay script (Lua VM is planned)
 └── assets/

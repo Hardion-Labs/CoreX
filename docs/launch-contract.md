@@ -83,8 +83,9 @@ Ao receber um projeto, a engine executa, nesta ordem:
 4. **Carregar configurações em workers** — carrega as configurações do projeto
    de forma assíncrona no sistema de jobs.
 5. **Indexar assets** — varre os diretórios de assets e constrói o índice.
-6. **Preparar a cena inicial** — resolve e verifica a cena inicial (manifesto ou
-   `--scene`). Não se aplica ao modo `validate`.
+6. **Preparar a cena inicial** — resolve, valida e carrega a cena inicial
+   (manifesto ou `--scene`) no ECS; sem cena indicada, prepara uma cena vazia.
+   Não se aplica ao modo `validate`. Formato: [scene-format.md](scene-format.md).
 7. **Abrir o editor gráfico** — abre a sessão do editor (ou prepara o runtime no
    modo `runtime`). Não se aplica ao modo `validate`.
 
@@ -119,5 +120,6 @@ ou reutilizados com outro significado.
 ## Relacionados
 
 - Formato do projeto: [project-format.md](project-format.md)
+- Formato de cena: [scene-format.md](scene-format.md)
 - Versionamento e compatibilidade: [versioning.md](versioning.md)
 - Escopo: [scope.md](scope.md)

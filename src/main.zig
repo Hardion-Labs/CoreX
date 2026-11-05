@@ -105,6 +105,11 @@ fn printSummary(io: Io, result: *const startup.StartupResult) void {
         scene,
     }) catch return;
     writeOut(io, line);
+    if (result.scene_data) |s| {
+        var entity_buf: [64]u8 = undefined;
+        const entity_line = std.fmt.bufPrint(&entity_buf, "Scene entities: {d}\n", .{s.count()}) catch return;
+        writeOut(io, entity_line);
+    }
     if (result.mode == .validate) {
         writeOut(io, "Project is valid and compatible.\n");
     }

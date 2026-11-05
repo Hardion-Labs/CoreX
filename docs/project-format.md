@@ -29,7 +29,7 @@ do CoreXHub (ou de ferramenta externa). A engine apenas lê e valida.
 | `name` | string | sim | Nome de exibição do projeto. Não vazio, sem separadores de caminho nem caracteres de controle. |
 | `id` | string | não | Identificador estável do projeto (ex.: UUID). Atribuído por quem cria o projeto (Hub). A engine não o gera. |
 | `engine_version` | string (semver) | sim | Versão da engine para a qual o projeto foi criado. Usada na verificação de compatibilidade. |
-| `initial_scene` | string | não | Cena inicial, relativa à raiz do projeto. Padrão: nenhuma (o editor/runtime prepara uma cena vazia). |
+| `initial_scene` | string | não | Cena inicial, relativa à raiz do projeto. Padrão: nenhuma (o editor/runtime prepara uma cena vazia). Nos modos `editor`/`runtime` o arquivo deve ser uma cena válida ([scene-format.md](scene-format.md)); `validate` não carrega a cena. |
 | `asset_directories` | array de string | não | Diretórios de assets, relativos à raiz. Padrão: `["assets"]`. |
 | `script_directories` | array de string | não | Diretórios de scripts, relativos à raiz. Padrão: `["scripts"]`. |
 
