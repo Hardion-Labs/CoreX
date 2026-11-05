@@ -538,6 +538,46 @@ pub const Mixer = struct {
         return self.effect_slots;
     }
 
+    /// Reject an insert that would not run correctly on this mixer: wrong rate,
+    /// wrong layout, or borrowed memory already claimed by another slot. The
+    /// slot being replaced is excluded, so swapping an effect for a new one over
+    /// the same buffer is allowed.
+    fn validateEffect(self: *const Mixer, effect: Effect, bus: ?u16, slot: u8) ParamError!void {
+        if (effect.kind != .bypass and effect.sample_rate != self.sample_rate) return error.InvalidValue;
+        const layout = effect.channelCount();
+        if (layout != 0 and layout != self.channels) return error.InvalidValue;
+        const memory = effect.borrowedMemory() orelse return;
+        const address = effect.stateAddress().?;
+        const start = @intFromPtr(memory.ptr);
+        const end = start + memory.len * @sizeOf(f32);
+
+        for (0..self.buses.len) |b| {
+            for (0..self.effect_slots) |k| {
+                if (bus != null and bus.? == b and slot == k) continue;
+                if (claims(self.bus_effects[b * self.effect_slots + k], address, start, end)) return error.InvalidValue;
+            }
+        }
+        for (0..self.effect_slots) |k| {
+            if (bus == null and slot == k) continue;
+            if (claims(self.master_effects[k], address, start, end)) return error.InvalidValue;
+        }
+    }
+
+    /// True when `other` is the same borrowed instance or its memory overlaps
+    /// the range being inserted. Either would make two slots fight over one
+    /// set of cursors, which is silent corruption rather than a crash.
+    fn claims(other: Effect, address: usize, start: usize, end: usize) bool {
+        if (other.stateAddress()) |existing| {
+            if (existing == address) return true;
+        }
+        if (other.borrowedMemory()) |memory| {
+            const other_start = @intFromPtr(memory.ptr);
+            const other_end = other_start + memory.len * @sizeOf(f32);
+            if (start < other_end and other_start < end) return true;
+        }
+        return false;
+    }
+
     /// Replace one bus insert. The effect is stored as given, including its
     /// state, so a warm filter can be moved between buses. An effect built for a
     /// different sample rate is rejected rather than silently filtering at the
@@ -545,7 +585,7 @@ pub const Mixer = struct {
     pub fn setBusEffect(self: *Mixer, bus: u16, slot: u8, effect: Effect) ParamError!void {
         if (bus >= self.buses.len) return error.InvalidValue;
         if (self.effect_slots == 0 or slot >= self.effect_slots) return error.InvalidValue;
-        if (effect.kind != .bypass and effect.sample_rate != self.sample_rate) return error.InvalidValue;
+        try self.validateEffect(effect, bus, slot);
         self.bus_effects[@as(usize, bus) * self.effect_slots + slot] = effect;
     }
 
@@ -565,7 +605,8 @@ pub const Mixer = struct {
     /// Master inserts, applied to the summed mix before the master gain.
     pub fn setMasterEffect(self: *Mixer, slot: u8, effect: Effect) ParamError!void {
         if (self.effect_slots == 0 or slot >= self.effect_slots) return error.InvalidValue;
-        if (effect.kind != .bypass and effect.sample_rate != self.sample_rate) return error.InvalidValue;
+        // A null bus identifies the master chain when skipping the target slot.
+        try self.validateEffect(effect, null, slot);
         self.master_effects[slot] = effect;
     }
 
@@ -2132,4 +2173,156 @@ test "mixer: rendering with effects is deterministic" {
         _ = try b.render(&buf_b);
         try testing.expectEqualSlices(f32, &buf_a, &buf_b);
     }
+}
+
+test "mixer: borrowed effect memory cannot be claimed twice" {
+    const gpa = testing.allocator;
+    var mixer = try Mixer.init(gpa, .{ .channels = 1, .max_buses = 2, .effect_slots = 2 });
+    defer mixer.deinit();
+
+    const delay_params = effects.DelayParams{ .delay_ms = 1, .feedback = 0.5, .mix = 1 };
+    const need = try effects.Delay.requiredSamples(48000, 1, delay_params);
+    // A little slack so a second instance can be carved one sample later and
+    // still be large enough to be valid on its own.
+    const memory = try gpa.alloc(f32, need + 8);
+    defer gpa.free(memory);
+    var echo = try effects.Delay.init(48000, 1, delay_params, memory[0..need]);
+    const wrapped = Effect.delay(&echo);
+
+    try mixer.setBusEffect(0, 0, wrapped);
+    // The same instance in another slot would advance its cursor twice a sample.
+    try testing.expectError(error.InvalidValue, mixer.setBusEffect(0, 1, wrapped));
+    try testing.expectError(error.InvalidValue, mixer.setBusEffect(1, 0, wrapped));
+    try testing.expectError(error.InvalidValue, mixer.setMasterEffect(0, wrapped));
+
+    // A *different* instance over the same memory is just as bad.
+    var twin = try effects.Delay.init(48000, 1, delay_params, memory[0..need]);
+    try testing.expectError(error.InvalidValue, mixer.setBusEffect(0, 1, Effect.delay(&twin)));
+    try testing.expectError(error.InvalidValue, mixer.setMasterEffect(1, Effect.delay(&twin)));
+
+    // Replacing the very slot that holds it is allowed: the claim is released.
+    try mixer.setBusEffect(0, 0, Effect.delay(&twin));
+    try testing.expectError(error.InvalidValue, mixer.setBusEffect(0, 1, wrapped));
+
+    // Partial overlap is rejected too, not just identical ranges.
+    var shifted = try effects.Delay.init(48000, 1, delay_params, memory[1 .. need + 1]);
+    try testing.expectError(error.InvalidValue, mixer.setBusEffect(1, 1, Effect.delay(&shifted)));
+
+    // A disjoint buffer is fine.
+    const other = try gpa.alloc(f32, need);
+    defer gpa.free(other);
+    var second = try effects.Delay.init(48000, 1, delay_params, other);
+    try mixer.setBusEffect(1, 1, Effect.delay(&second));
+
+    // Clearing the bus frees its claims for reuse.
+    try mixer.clearBusEffects(1);
+    try mixer.setMasterEffect(0, Effect.delay(&second));
+    try testing.expectError(error.InvalidValue, mixer.setBusEffect(1, 1, Effect.delay(&second)));
+    mixer.clearMasterEffects();
+    try mixer.setBusEffect(1, 1, Effect.delay(&second));
+}
+
+test "mixer: a delay line must match the output layout" {
+    const gpa = testing.allocator;
+    var mixer = try Mixer.init(gpa, .{ .channels = 1, .effect_slots = 1 });
+    defer mixer.deinit();
+    const params = effects.DelayParams{ .delay_ms = 1 };
+    const memory = try gpa.alloc(f32, try effects.Delay.requiredSamples(48000, 2, params));
+    defer gpa.free(memory);
+    var stereo = try effects.Delay.init(48000, 2, params, memory);
+    // Reinterpreting a stereo line as mono would read the wrong samples.
+    try testing.expectError(error.InvalidValue, mixer.setBusEffect(0, 0, Effect.delay(&stereo)));
+    try testing.expectError(error.InvalidValue, mixer.setMasterEffect(0, Effect.delay(&stereo)));
+
+    const rev_mem = try gpa.alloc(f32, try effects.Reverb.requiredSamples(48000, 2));
+    defer gpa.free(rev_mem);
+    var reverb = try effects.Reverb.init(48000, 2, .{}, rev_mem);
+    try testing.expectError(error.InvalidValue, mixer.setMasterEffect(0, Effect.reverb(&reverb)));
+
+    // Inline effects still adapt to any layout.
+    try mixer.setBusEffect(0, 0, try Effect.biquad(48000, .{}));
+}
+
+test "mixer: a delay insert echoes across block boundaries" {
+    const gpa = testing.allocator;
+    const params = effects.DelayParams{ .delay_ms = 1, .feedback = 0.5, .mix = 1 };
+    const memory = try gpa.alloc(f32, try effects.Delay.requiredSamples(48000, 1, params));
+    defer gpa.free(memory);
+    var echo = try effects.Delay.init(48000, 1, params, memory);
+
+    // Blocks of 16 frames, a 48-frame delay: the line must survive the chopping.
+    var mixer = try Mixer.init(gpa, .{ .channels = 1, .effect_slots = 1, .block_frames = 16 });
+    defer mixer.deinit();
+    try mixer.setBusEffect(0, 0, Effect.delay(&echo));
+
+    const impulse = [_]f32{1.0};
+    _ = try mixer.play(monoClip(&impulse, 48000), .{});
+    var out: [200]f32 = undefined;
+    const stats = try mixer.render(&out);
+    try testing.expectEqual(@as(usize, 1), stats.voices_finished);
+    try testing.expectEqual(@as(f32, 1), out[48]);
+    try testing.expectEqual(@as(f32, 0.5), out[96]);
+    try testing.expectEqual(@as(f32, 0.25), out[144]);
+    try testing.expectEqual(@as(f32, 0), out[10]);
+
+    // resetEffects reaches through the borrowed instance.
+    mixer.resetEffects();
+    for (memory) |v| try testing.expectEqual(@as(f32, 0), v);
+    _ = try mixer.render(&out);
+    for (out) |v| try testing.expectEqual(@as(f32, 0), v);
+}
+
+test "mixer: a master reverb tails after the mix goes silent" {
+    const gpa = testing.allocator;
+    const memory = try gpa.alloc(f32, try effects.Reverb.requiredSamples(48000, 1));
+    defer gpa.free(memory);
+    var reverb = try effects.Reverb.init(48000, 1, .{ .wet = 1, .dry = 0, .room_size = 0.8 }, memory);
+
+    var mixer = try Mixer.init(gpa, .{ .channels = 1, .effect_slots = 1, .block_frames = 128 });
+    defer mixer.deinit();
+    try mixer.setMasterEffect(0, Effect.reverb(&reverb));
+
+    const impulse = [_]f32{1.0};
+    _ = try mixer.play(monoClip(&impulse, 48000), .{});
+    var out: [4096]f32 = undefined;
+    _ = try mixer.render(&out);
+    // Nothing before the shortest comb delay, energy after it.
+    for (out[0..1000]) |v| try testing.expectEqual(@as(f32, 0), v);
+    var energy: f64 = 0;
+    for (out[1300..]) |v| {
+        try testing.expect(std.math.isFinite(v));
+        energy += @as(f64, @abs(v));
+    }
+    try testing.expect(energy > 0.01);
+    try testing.expectEqual(@as(usize, 0), mixer.liveVoices());
+
+    // The tail continues into the next render even with no voice at all.
+    _ = try mixer.render(&out);
+    var more: f64 = 0;
+    for (out) |v| more += @as(f64, @abs(v));
+    try testing.expect(more > 0);
+}
+
+test "mixer: delay-based inserts need no mixer allocation" {
+    const gpa = testing.allocator;
+    const memory = try gpa.alloc(f32, try effects.Reverb.requiredSamples(48000, 1));
+    defer gpa.free(memory);
+    var reverb = try effects.Reverb.init(48000, 1, .{}, memory);
+
+    // The reverb and its memory live outside the probe: the mixer must not
+    // allocate anything for them, at insert time or during render.
+    try testing.checkAllAllocationFailures(gpa, struct {
+        fn f(alloc: Allocator, instance: *effects.Reverb) !void {
+            const samples = [_]f32{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8 };
+            var mixer = try Mixer.init(alloc, .{ .channels = 1, .effect_slots = 2, .block_frames = 4 });
+            defer mixer.deinit();
+            try mixer.setMasterEffect(0, Effect.reverb(instance));
+            try mixer.setBusEffect(0, 0, try Effect.biquad(48000, .{ .cutoff_hz = 4000 }));
+            _ = try mixer.play(monoClip(&samples, 48000), .{ .looping = true });
+            var out: [32]f32 = undefined;
+            _ = try mixer.render(&out);
+            mixer.resetEffects();
+            _ = try mixer.render(&out);
+        }
+    }.f, .{&reverb});
 }

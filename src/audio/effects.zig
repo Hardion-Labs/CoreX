@@ -23,9 +23,21 @@
 //!   the same caveat the equal-power pan law already documents.
 //!
 //! Implemented: RBJ biquad filters (low/high pass, band pass, notch, peaking,
-//! low/high shelf) and a feed-forward stereo-linked compressor with a soft knee.
-//! Not implemented: reverb, delay, convolution, lookahead limiting, oversampled
-//! saturation. Those need delay lines and are a separate stage.
+//! low/high shelf), a feed-forward stereo-linked compressor with a soft knee, a
+//! feedback delay with damping, and a Freeverb-style reverb (eight damped comb
+//! filters into four diffusion sections per channel; see `allpassStep`).
+//!
+//! **Delay-based effects borrow their memory from the caller**, exactly like a
+//! `Clip` borrows its samples: `Delay.requiredSamples` / `Reverb.requiredSamples`
+//! say how much to allocate, `init` carves the lines out of that buffer, and the
+//! effect keeps a slice. Nothing here allocates, so a reverb costs no mixer
+//! memory and `render` stays allocation-free. The instance must outlive every
+//! slot that references it, and two slots must not share one instance or one
+//! buffer — the mixer rejects both (see `Effect.borrowedMemory` /
+//! `Effect.stateAddress`).
+//!
+//! Not implemented: convolution, chorus/flanger (modulated delay taps),
+//! lookahead limiting, oversampled saturation.
 
 const std = @import("std");
 
@@ -41,6 +53,19 @@ const flush_threshold: f32 = 1e-15;
 /// Invalid effect parameters (also used for an out-of-range slot or bus by the
 /// mixer, which re-exports its own `ParamError`).
 pub const Error = error{InvalidValue};
+
+/// Snap an inaudible value to exact zero. Recursive paths that only flush at
+/// block boundaries would otherwise crawl through the denormal range for
+/// seconds inside a long reverb tail.
+inline fn flushSmall(value: f32) f32 {
+    return if (@abs(value) < flush_threshold) 0 else value;
+}
+
+/// A non-finite sample must never enter a feedback loop: it would circulate
+/// forever and silence the effect permanently.
+inline fn finite(value: f32) f32 {
+    return if (std.math.isFinite(value)) value else 0;
+}
 
 // --- biquad ----------------------------------------------------------------
 
@@ -373,6 +398,313 @@ fn dbToLinear(db: f32) f32 {
     return @exp(@as(f32, db) * 0.11512925464970229);
 }
 
+// --- delay lines -----------------------------------------------------------
+
+/// A circular mono delay line over borrowed memory. Reading and then writing at
+/// the same cursor yields a delay of exactly `data.len` samples.
+const Line = struct {
+    data: []f32,
+    index: usize = 0,
+
+    inline fn read(self: *const Line) f32 {
+        return self.data[self.index];
+    }
+
+    inline fn write(self: *Line, value: f32) void {
+        // Flushing on write is what keeps a long tail out of the denormal range:
+        // once a value is below the threshold, feedback < 1 keeps it there.
+        self.data[self.index] = flushSmall(value);
+        self.index += 1;
+        if (self.index == self.data.len) self.index = 0;
+    }
+};
+
+/// Longest delay the parameters may ask for, bounding the size arithmetic.
+pub const max_delay_ms: f32 = 10_000;
+
+pub const DelayParams = struct {
+    /// Delay time in milliseconds, rounded up to whole samples.
+    delay_ms: f32 = 250,
+    /// Amount fed back into the line. Must be < 1 so the echo always decays.
+    feedback: f32 = 0.35,
+    /// 0 = dry only (bit-exact passthrough), 1 = wet only.
+    mix: f32 = 0.3,
+    /// One-pole low pass in the feedback path, in Hz. 0 disables damping, so
+    /// repeats keep their brightness; a few kHz makes them darken naturally.
+    damping_hz: f32 = 0,
+};
+
+/// Feedback delay (echo). The caller owns the memory: allocate
+/// `requiredSamples(...)` floats, keep them alive while the effect is inserted,
+/// and never hand the same buffer to two instances.
+pub const Delay = struct {
+    sample_rate: u32,
+    channels: usize,
+    lines: [max_channels]Line,
+    damp_state: [max_channels]f32 = @splat(0),
+    /// Pole of the feedback low pass; 0 means no damping.
+    damp_coeff: f32,
+    feedback: f32,
+    wet: f32,
+    dry: f32,
+    memory: []f32,
+
+    /// Number of f32 samples the caller must provide.
+    pub fn requiredSamples(sample_rate: u32, channels: usize, params: DelayParams) Error!usize {
+        const frames = try delayFrames(sample_rate, params.delay_ms);
+        try validateChannels(channels);
+        return frames * channels;
+    }
+
+    pub fn init(sample_rate: u32, channels: usize, params: DelayParams, buffer: []f32) Error!Delay {
+        const frames = try delayFrames(sample_rate, params.delay_ms);
+        try validateChannels(channels);
+        if (!std.math.isFinite(params.feedback) or params.feedback < 0 or params.feedback >= 1) return error.InvalidValue;
+        if (!std.math.isFinite(params.mix) or params.mix < 0 or params.mix > 1) return error.InvalidValue;
+        if (!std.math.isFinite(params.damping_hz) or params.damping_hz < 0) return error.InvalidValue;
+        if (params.damping_hz >= @as(f32, @floatFromInt(sample_rate)) * 0.5) return error.InvalidValue;
+        const need = frames * channels;
+        if (buffer.len < need) return error.InvalidValue;
+
+        var lines: [max_channels]Line = @splat(.{ .data = buffer[0..0] });
+        for (0..channels) |c| lines[c] = .{ .data = buffer[c * frames ..][0..frames] };
+        @memset(buffer[0..need], 0);
+
+        const rate: f64 = @floatFromInt(sample_rate);
+        const coeff: f32 = if (params.damping_hz > 0)
+            @floatCast(@exp(-2.0 * std.math.pi * @as(f64, params.damping_hz) / rate))
+        else
+            0;
+        return .{
+            .sample_rate = sample_rate,
+            .channels = channels,
+            .lines = lines,
+            .damp_coeff = coeff,
+            .feedback = params.feedback,
+            .wet = params.mix,
+            .dry = 1.0 - params.mix,
+            .memory = buffer[0..need],
+        };
+    }
+
+    pub fn process(self: *Delay, buffer: []f32, channels: usize) void {
+        std.debug.assert(channels == self.channels);
+        const frames = buffer.len / channels;
+        // Planar traversal: one line stays hot in cache for the whole block.
+        for (0..channels) |c| {
+            const line = &self.lines[c];
+            var damp = self.damp_state[c];
+            var i: usize = c;
+            var n: usize = 0;
+            while (n < frames) : (n += 1) {
+                const x = finite(buffer[i]);
+                const delayed = line.read();
+                damp = delayed * (1.0 - self.damp_coeff) + damp * self.damp_coeff;
+                line.write(x + self.feedback * damp);
+                buffer[i] = x * self.dry + delayed * self.wet;
+                i += channels;
+            }
+            self.damp_state[c] = flushSmall(damp);
+        }
+    }
+
+    /// Silence the line and the damping history, keeping the settings.
+    pub fn reset(self: *Delay) void {
+        @memset(self.memory, 0);
+        for (&self.lines) |*line| line.index = 0;
+        self.damp_state = @splat(0);
+    }
+};
+
+fn validateChannels(channels: usize) Error!void {
+    if (channels < 1 or channels > max_channels) return error.InvalidValue;
+}
+
+fn delayFrames(sample_rate: u32, delay_ms: f32) Error!usize {
+    if (sample_rate == 0) return error.InvalidValue;
+    if (!std.math.isFinite(delay_ms) or delay_ms <= 0 or delay_ms > max_delay_ms) return error.InvalidValue;
+    const rate: f64 = @floatFromInt(sample_rate);
+    const frames = @ceil(@as(f64, delay_ms) * 0.001 * rate);
+    if (!(frames >= 1) or frames > @as(f64, @floatFromInt(std.math.maxInt(i32)))) return error.InvalidValue;
+    return @intFromFloat(frames);
+}
+
+// --- reverb ----------------------------------------------------------------
+
+/// Freeverb's comb and all-pass tunings at 44.1 kHz, scaled to the running rate.
+/// The lengths are mutually prime-ish, which is what spreads the resonances out
+/// instead of stacking them into a metallic ring.
+pub const comb_count: usize = 8;
+pub const allpass_count: usize = 4;
+const comb_tunings = [comb_count]u32{ 1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617 };
+const allpass_tunings = [allpass_count]u32{ 556, 441, 341, 225 };
+/// Extra samples on the right channel, so the two tails decorrelate.
+const stereo_spread: u32 = 23;
+const reference_rate: f64 = 44100;
+/// All-pass section gain; 0.5 is the classic lossless-ish choice.
+const allpass_feedback: f32 = 0.5;
+/// Comb outputs are summed, so normalize by the count to keep `wet` meaningful.
+const comb_gain: f32 = 1.0 / @as(f32, comb_count);
+
+pub const ReverbParams = struct {
+    /// 0 = small/dead, 1 = long tail. Maps to comb feedback 0.70..0.98.
+    room_size: f32 = 0.7,
+    /// 0 = bright tail, 1 = heavily damped (soft surfaces).
+    damping: f32 = 0.5,
+    /// Level of the reverberated signal.
+    wet: f32 = 0.35,
+    /// Level of the dry signal; 1 with `wet = 0` is bit-exact passthrough.
+    dry: f32 = 1.0,
+};
+
+/// One diffusion step, in Freeverb's form: `v[n] = x[n] + g*v[n-N]` is written to
+/// the line and `y[n] = v[n-N] - v[n]` is returned, so
+/// `H(z) = (z^-N - 1) / (1 - g*z^-N)`.
+///
+/// This is *not* a textbook all pass: it has a null at DC and rises to `2/(1+g)`
+/// where `z^N = -1`. The null is deliberate and is why the reference uses this
+/// form — the comb filters have a DC gain of `1/(1-feedback)` (over 13x at
+/// `room_size = 1`), so a flat-magnitude all pass would let an impulse build a
+/// slow low-frequency rumble that takes seconds to decay. Diffusing the phase
+/// while rejecting DC is what keeps the tail clean.
+inline fn allpassStep(line: *Line, input: f32, feedback: f32) f32 {
+    const stored = line.read();
+    const written = input + stored * feedback;
+    line.write(written);
+    return stored - written;
+}
+
+const Comb = struct {
+    line: Line,
+    damp: f32 = 0,
+};
+
+/// Freeverb-style reverb: eight parallel damped comb filters into four series
+/// all-pass sections, per channel, with a stereo spread on the right.
+///
+/// Like `Delay`, the memory is **borrowed**: allocate `requiredSamples(...)`
+/// floats (about 114 KiB for stereo at 48 kHz), keep them alive, and never share
+/// them between instances.
+pub const Reverb = struct {
+    sample_rate: u32,
+    channels: usize,
+    combs: [max_channels][comb_count]Comb,
+    allpasses: [max_channels][allpass_count]Line,
+    feedback: f32,
+    damp1: f32,
+    damp2: f32,
+    wet: f32,
+    dry: f32,
+    memory: []f32,
+
+    pub fn requiredSamples(sample_rate: u32, channels: usize) Error!usize {
+        try validateChannels(channels);
+        const scale = try rateScale(sample_rate);
+        var total: usize = 0;
+        for (0..channels) |c| {
+            const spread: u32 = if (c == 1) stereo_spread else 0;
+            for (comb_tunings) |t| total += scaledLength(t + spread, scale);
+            for (allpass_tunings) |t| total += scaledLength(t + spread, scale);
+        }
+        return total;
+    }
+
+    pub fn init(sample_rate: u32, channels: usize, params: ReverbParams, buffer: []f32) Error!Reverb {
+        try validateChannels(channels);
+        const scale = try rateScale(sample_rate);
+        inline for (.{ "room_size", "damping", "wet", "dry" }) |field| {
+            const value = @field(params, field);
+            if (!std.math.isFinite(value) or value < 0 or value > 1) return error.InvalidValue;
+        }
+        const need = try requiredSamples(sample_rate, channels);
+        if (buffer.len < need) return error.InvalidValue;
+
+        const empty = Line{ .data = buffer[0..0] };
+        var combs: [max_channels][comb_count]Comb = @splat(@splat(.{ .line = empty }));
+        var allpasses: [max_channels][allpass_count]Line = @splat(@splat(empty));
+        var offset: usize = 0;
+        for (0..channels) |c| {
+            const spread: u32 = if (c == 1) stereo_spread else 0;
+            for (comb_tunings, 0..) |t, k| {
+                const len = scaledLength(t + spread, scale);
+                combs[c][k] = .{ .line = .{ .data = buffer[offset..][0..len] } };
+                offset += len;
+            }
+            for (allpass_tunings, 0..) |t, k| {
+                const len = scaledLength(t + spread, scale);
+                allpasses[c][k] = .{ .data = buffer[offset..][0..len] };
+                offset += len;
+            }
+        }
+        std.debug.assert(offset == need);
+        @memset(buffer[0..need], 0);
+
+        const damp1 = params.damping * 0.4;
+        return .{
+            .sample_rate = sample_rate,
+            .channels = channels,
+            .combs = combs,
+            .allpasses = allpasses,
+            .feedback = params.room_size * 0.28 + 0.7,
+            .damp1 = damp1,
+            .damp2 = 1.0 - damp1,
+            .wet = params.wet,
+            .dry = params.dry,
+            .memory = buffer[0..need],
+        };
+    }
+
+    pub fn process(self: *Reverb, buffer: []f32, channels: usize) void {
+        std.debug.assert(channels == self.channels);
+        const frames = buffer.len / channels;
+        for (0..channels) |c| {
+            const combs = &self.combs[c];
+            const allpasses = &self.allpasses[c];
+            var i: usize = c;
+            var n: usize = 0;
+            while (n < frames) : (n += 1) {
+                const x = finite(buffer[i]);
+                var acc: f32 = 0;
+                for (combs) |*comb| {
+                    const out = comb.line.read();
+                    comb.damp = out * self.damp2 + comb.damp * self.damp1;
+                    comb.line.write(x + comb.damp * self.feedback);
+                    acc += out;
+                }
+                acc *= comb_gain;
+                for (allpasses) |*ap| acc = allpassStep(ap, acc, allpass_feedback);
+                buffer[i] = x * self.dry + acc * self.wet;
+                i += channels;
+            }
+            for (combs) |*comb| comb.damp = flushSmall(comb.damp);
+        }
+    }
+
+    /// Silence every line and damping history, keeping the settings.
+    pub fn reset(self: *Reverb) void {
+        @memset(self.memory, 0);
+        for (&self.combs) |*channel| {
+            for (channel) |*comb| {
+                comb.line.index = 0;
+                comb.damp = 0;
+            }
+        }
+        for (&self.allpasses) |*channel| {
+            for (channel) |*ap| ap.index = 0;
+        }
+    }
+};
+
+fn rateScale(sample_rate: u32) Error!f64 {
+    if (sample_rate == 0) return error.InvalidValue;
+    return @as(f64, @floatFromInt(sample_rate)) / reference_rate;
+}
+
+fn scaledLength(tuning: u32, scale: f64) usize {
+    const scaled = @round(@as(f64, @floatFromInt(tuning)) * scale);
+    return @max(1, @as(usize, @intFromFloat(scaled)));
+}
+
 // --- effect + chain --------------------------------------------------------
 
 /// One insert slot. The `sample_rate` it was designed for travels with it, so a
@@ -386,6 +718,11 @@ pub const Effect = struct {
         bypass,
         biquad: Biquad,
         compressor: Compressor,
+        /// Borrowed instance: the caller owns the struct *and* its delay memory.
+        /// A pointer keeps `Effect` small — a reverb carries ~750 bytes of line
+        /// state, and inlining that would bloat every insert slot on every bus.
+        delay: *Delay,
+        reverb: *Reverb,
     };
 
     /// Identity. `process` returns immediately, and a chain of these is bit-exact.
@@ -405,6 +742,48 @@ pub const Effect = struct {
         };
     }
 
+    /// Wrap an initialized `Delay`. Infallible: the instance validated its own
+    /// parameters and buffer in `init`. Keep it alive and unshared while it is
+    /// inserted — the host checks both (see `borrowedMemory`/`stateAddress`).
+    pub fn delay(instance: *Delay) Effect {
+        return .{ .sample_rate = instance.sample_rate, .kind = .{ .delay = instance } };
+    }
+
+    /// Wrap an initialized `Reverb`. Same ownership rules as `delay`.
+    pub fn reverb(instance: *Reverb) Effect {
+        return .{ .sample_rate = instance.sample_rate, .kind = .{ .reverb = instance } };
+    }
+
+    /// Layout this effect was built for, or 0 when it adapts to any layout.
+    /// Delay lines are allocated per channel, so they cannot be reinterpreted.
+    pub fn channelCount(self: Effect) u16 {
+        return switch (self.kind) {
+            .delay => |instance| @intCast(instance.channels),
+            .reverb => |instance| @intCast(instance.channels),
+            else => 0,
+        };
+    }
+
+    /// The delay memory this effect borrows, if any. The host uses it to reject
+    /// two inserts whose buffers overlap, which would corrupt both.
+    pub fn borrowedMemory(self: Effect) ?[]const f32 {
+        return switch (self.kind) {
+            .delay => |instance| instance.memory,
+            .reverb => |instance| instance.memory,
+            else => null,
+        };
+    }
+
+    /// Address of the borrowed instance, if any. Two slots holding the same
+    /// instance would advance its cursors twice per sample.
+    pub fn stateAddress(self: Effect) ?usize {
+        return switch (self.kind) {
+            .delay => |instance| @intFromPtr(instance),
+            .reverb => |instance| @intFromPtr(instance),
+            else => null,
+        };
+    }
+
     pub fn process(self: *Effect, buffer: []f32, channels: usize) void {
         std.debug.assert(channels >= 1 and channels <= max_channels);
         std.debug.assert(buffer.len % channels == 0);
@@ -412,6 +791,8 @@ pub const Effect = struct {
             .bypass => {},
             .biquad => |*filter| filter.process(buffer, channels),
             .compressor => |*comp| comp.process(buffer, channels),
+            .delay => |instance| instance.process(buffer, channels),
+            .reverb => |instance| instance.process(buffer, channels),
         }
     }
 
@@ -422,6 +803,8 @@ pub const Effect = struct {
             .bypass => {},
             .biquad => |*filter| filter.reset(),
             .compressor => |*comp| comp.reset(),
+            .delay => |instance| instance.reset(),
+            .reverb => |instance| instance.reset(),
         }
     }
 };
@@ -831,4 +1214,418 @@ test "effects: processing is deterministic for identical state" {
         Chain.process(.{ .effects = &b }, buf_b[offset..][0..64], 2);
     }
     try testing.expectEqualSlices(f32, &buf_a, &buf_b);
+}
+
+test "effects: delay parameters and buffer size are validated" {
+    const gpa = testing.allocator;
+    const rate = 48000;
+    const params = DelayParams{ .delay_ms = 1 };
+    // 1 ms at 48 kHz is exactly 48 frames.
+    try testing.expectEqual(@as(usize, 48), try Delay.requiredSamples(rate, 1, params));
+    try testing.expectEqual(@as(usize, 96), try Delay.requiredSamples(rate, 2, params));
+    // A sub-sample delay still needs one frame.
+    try testing.expectEqual(@as(usize, 1), try Delay.requiredSamples(rate, 1, .{ .delay_ms = 0.001 }));
+
+    try testing.expectError(error.InvalidValue, Delay.requiredSamples(0, 1, params));
+    try testing.expectError(error.InvalidValue, Delay.requiredSamples(rate, 0, params));
+    try testing.expectError(error.InvalidValue, Delay.requiredSamples(rate, 3, params));
+    try testing.expectError(error.InvalidValue, Delay.requiredSamples(rate, 1, .{ .delay_ms = 0 }));
+    try testing.expectError(error.InvalidValue, Delay.requiredSamples(rate, 1, .{ .delay_ms = -5 }));
+    try testing.expectError(error.InvalidValue, Delay.requiredSamples(rate, 1, .{ .delay_ms = max_delay_ms + 1 }));
+    try testing.expectError(error.InvalidValue, Delay.requiredSamples(rate, 1, .{ .delay_ms = std.math.nan(f32) }));
+
+    const buf = try gpa.alloc(f32, try Delay.requiredSamples(rate, 1, params));
+    defer gpa.free(buf);
+    try testing.expectError(error.InvalidValue, Delay.init(rate, 1, .{ .feedback = 1 }, buf));
+    try testing.expectError(error.InvalidValue, Delay.init(rate, 1, .{ .feedback = -0.1 }, buf));
+    try testing.expectError(error.InvalidValue, Delay.init(rate, 1, .{ .mix = 1.5 }, buf));
+    try testing.expectError(error.InvalidValue, Delay.init(rate, 1, .{ .damping_hz = 24000 }, buf));
+    try testing.expectError(error.InvalidValue, Delay.init(rate, 1, .{ .damping_hz = -1 }, buf));
+    // One sample short is rejected rather than silently truncating the delay.
+    try testing.expectError(error.InvalidValue, Delay.init(rate, 1, params, buf[0 .. buf.len - 1]));
+    _ = try Delay.init(rate, 1, params, buf);
+}
+
+test "effects: a dry delay is bit-exact and a wet delay echoes on schedule" {
+    const gpa = testing.allocator;
+    const rate = 48000;
+    const params = DelayParams{ .delay_ms = 1, .feedback = 0.5, .mix = 1 };
+    const buf = try gpa.alloc(f32, try Delay.requiredSamples(rate, 1, params));
+    defer gpa.free(buf);
+    var echo = try Delay.init(rate, 1, params, buf);
+
+    // Dry only: every sample passes through untouched. This needs its own
+    // buffer -- copying the struct would alias the same delay line, which is
+    // exactly what the mixer's overlap check refuses.
+    const dry_buf = try gpa.alloc(f32, buf.len);
+    defer gpa.free(dry_buf);
+    var dry = try Delay.init(rate, 1, .{ .delay_ms = 1, .feedback = 0.5, .mix = 0 }, dry_buf);
+    var signal = [_]f32{ 0.1, -0.4, 0.9, -0.2, 0.33, 0.7, -0.85, 0.05 };
+    const original = signal;
+    dry.process(&signal, 1);
+    try testing.expectEqualSlices(f32, &original, &signal);
+
+    // Wet only with feedback 0.5: an impulse returns at 48, 96, 144, 192 with
+    // halving amplitude, and nowhere else. Powers of two make this exact.
+    const total = 48 * 4 + 1;
+    const impulse = try gpa.alloc(f32, total);
+    defer gpa.free(impulse);
+    @memset(impulse, 0);
+    impulse[0] = 1;
+    echo.process(impulse, 1);
+    try testing.expectEqual(@as(f32, 1), impulse[48]);
+    try testing.expectEqual(@as(f32, 0.5), impulse[96]);
+    try testing.expectEqual(@as(f32, 0.25), impulse[144]);
+    try testing.expectEqual(@as(f32, 0.125), impulse[192]);
+    for (impulse, 0..) |v, i| {
+        if (i == 48 or i == 96 or i == 144 or i == 192) continue;
+        try testing.expectEqual(@as(f32, 0), v);
+    }
+}
+
+test "effects: delay damping darkens the repeats and the tail reaches zero" {
+    const gpa = testing.allocator;
+    const rate = 48000;
+    const plain_params = DelayParams{ .delay_ms = 1, .feedback = 0.5, .mix = 1 };
+    const plain_buf = try gpa.alloc(f32, try Delay.requiredSamples(rate, 1, plain_params));
+    defer gpa.free(plain_buf);
+    var plain = try Delay.init(rate, 1, plain_params, plain_buf);
+
+    const damped_params = DelayParams{ .delay_ms = 1, .feedback = 0.5, .mix = 1, .damping_hz = 500 };
+    const damped_buf = try gpa.alloc(f32, try Delay.requiredSamples(rate, 1, damped_params));
+    defer gpa.free(damped_buf);
+    var damped = try Delay.init(rate, 1, damped_params, damped_buf);
+
+    const total = 4096;
+    const a = try gpa.alloc(f32, total);
+    defer gpa.free(a);
+    const b = try gpa.alloc(f32, total);
+    defer gpa.free(b);
+    @memset(a, 0);
+    @memset(b, 0);
+    a[0] = 1;
+    b[0] = 1;
+    plain.process(a, 1);
+    damped.process(b, 1);
+
+    // The first repeat is the raw impulse in both; the second is heavily
+    // attenuated by the feedback low pass in the damped one.
+    try testing.expectEqual(@as(f32, 1), a[48]);
+    try testing.expectEqual(@as(f32, 1), b[48]);
+    try testing.expectEqual(@as(f32, 0.5), a[96]);
+    try testing.expect(b[96] < 0.1);
+    try testing.expect(b[96] > 0);
+
+    // Feedback below 1 plus the write flush means the tail lands on exact zero
+    // instead of crawling through denormals forever.
+    try testing.expectEqual(@as(f32, 0), a[total - 1]);
+    try testing.expectEqual(@as(f32, 0), b[total - 1]);
+    // 0.5^k drops below the 1e-15 flush threshold at k = 50, i.e. frame 2400;
+    // the next read is already exact zero, so everything after is silence.
+    var silent = true;
+    for (a[2560..]) |v| {
+        if (v != 0) silent = false;
+    }
+    try testing.expect(silent);
+}
+
+test "effects: delay channels are independent, reset silences, NaN recovers" {
+    const gpa = testing.allocator;
+    const rate = 48000;
+    const params = DelayParams{ .delay_ms = 1, .feedback = 0.5, .mix = 1 };
+    const buf = try gpa.alloc(f32, try Delay.requiredSamples(rate, 2, params));
+    defer gpa.free(buf);
+    var echo = try Delay.init(rate, 2, params, buf);
+
+    const frames = 200;
+    const signal = try gpa.alloc(f32, frames * 2);
+    defer gpa.free(signal);
+    @memset(signal, 0);
+    signal[0] = 1; // left impulse only
+    echo.process(signal, 2);
+    for (0..frames) |i| try testing.expectEqual(@as(f32, 0), signal[i * 2 + 1]);
+    try testing.expectEqual(@as(f32, 1), signal[48 * 2]);
+
+    // Reset clears the line, so the same impulse produces the same echo again.
+    echo.reset();
+    @memset(signal, 0);
+    signal[0] = 1;
+    echo.process(signal, 2);
+    try testing.expectEqual(@as(f32, 1), signal[48 * 2]);
+    try testing.expectEqual(@as(f32, 0.5), signal[96 * 2]);
+
+    // A non-finite sample must not circulate in the feedback loop forever.
+    echo.reset();
+    @memset(signal, 0);
+    signal[0] = std.math.nan(f32);
+    signal[2] = std.math.inf(f32);
+    signal[4] = 1;
+    echo.process(signal, 2);
+    for (signal) |v| try testing.expect(std.math.isFinite(v));
+    try testing.expectEqual(@as(f32, 1), signal[48 * 2 + 4]);
+}
+
+test "effects: reverb parameters and buffer size are validated" {
+    const gpa = testing.allocator;
+    const rate = 48000;
+    const mono = try Reverb.requiredSamples(rate, 1);
+    const stereo = try Reverb.requiredSamples(rate, 2);
+    try testing.expect(mono > 10_000);
+    // The right channel is longer by the stereo spread on every line.
+    try testing.expect(stereo > mono * 2);
+    try testing.expect(try Reverb.requiredSamples(96000, 1) > mono);
+    try testing.expectError(error.InvalidValue, Reverb.requiredSamples(0, 1));
+    try testing.expectError(error.InvalidValue, Reverb.requiredSamples(rate, 0));
+    try testing.expectError(error.InvalidValue, Reverb.requiredSamples(rate, 3));
+
+    const buf = try gpa.alloc(f32, mono);
+    defer gpa.free(buf);
+    try testing.expectError(error.InvalidValue, Reverb.init(rate, 1, .{ .room_size = 1.1 }, buf));
+    try testing.expectError(error.InvalidValue, Reverb.init(rate, 1, .{ .damping = -0.1 }, buf));
+    try testing.expectError(error.InvalidValue, Reverb.init(rate, 1, .{ .wet = std.math.nan(f32) }, buf));
+    try testing.expectError(error.InvalidValue, Reverb.init(rate, 1, .{ .dry = 2 }, buf));
+    try testing.expectError(error.InvalidValue, Reverb.init(rate, 1, .{}, buf[0 .. buf.len - 1]));
+    // A stereo instance cannot be carved out of a mono-sized buffer.
+    try testing.expectError(error.InvalidValue, Reverb.init(rate, 2, .{}, buf));
+    _ = try Reverb.init(rate, 1, .{}, buf);
+}
+
+test "effects: reverb dry/wry extremes are exact" {
+    const gpa = testing.allocator;
+    const rate = 48000;
+    const buf = try gpa.alloc(f32, try Reverb.requiredSamples(rate, 1));
+    defer gpa.free(buf);
+
+    var bypassed = try Reverb.init(rate, 1, .{ .wet = 0, .dry = 1 }, buf);
+    var signal = [_]f32{ 0.1, -0.4, 0.9, -0.2, 0.33, 0.7, -0.85, 0.05 };
+    const original = signal;
+    bypassed.process(&signal, 1);
+    try testing.expectEqualSlices(f32, &original, &signal);
+
+    // A second instance needs its own memory, not a copy of the first.
+    const other = try gpa.alloc(f32, buf.len);
+    defer gpa.free(other);
+    var muted = try Reverb.init(rate, 1, .{ .wet = 0, .dry = 0 }, other);
+    muted.process(&signal, 1);
+    for (signal) |v| try testing.expectEqual(@as(f32, 0), v);
+}
+
+test "effects: reverb produces a bounded, decaying tail after the direct sound" {
+    const gpa = testing.allocator;
+    const rate = 48000;
+    const memory = try gpa.alloc(f32, try Reverb.requiredSamples(rate, 1));
+    defer gpa.free(memory);
+    var reverb = try Reverb.init(rate, 1, .{ .wet = 1, .dry = 0, .room_size = 0.8 }, memory);
+
+    const frames = 16384;
+    const signal = try gpa.alloc(f32, frames);
+    defer gpa.free(signal);
+    @memset(signal, 0);
+    signal[0] = 1;
+    reverb.process(signal, 1);
+
+    // Nothing can come back before the shortest comb delay (~1215 at 48 kHz).
+    for (signal[0..1000]) |v| try testing.expectEqual(@as(f32, 0), v);
+
+    // Equal-length windows, so this compares decay rather than window size.
+    const window = 2000;
+    var early: f64 = 0;
+    var late: f64 = 0;
+    for (signal[2000..][0..window]) |v| {
+        try testing.expect(std.math.isFinite(v));
+        try testing.expect(@abs(v) < 2);
+        early += @as(f64, @abs(v));
+    }
+    for (signal[14000..][0..window]) |v| {
+        try testing.expect(std.math.isFinite(v));
+        late += @as(f64, @abs(v));
+    }
+    try testing.expect(early > 0.01);
+    try testing.expect(late < early);
+
+    // Reset silences it completely.
+    reverb.reset();
+    @memset(signal, 0);
+    reverb.process(signal, 1);
+    for (signal) |v| try testing.expectEqual(@as(f32, 0), v);
+}
+
+test "effects: reverb stays stable at maximum room size" {
+    const gpa = testing.allocator;
+    const rate = 48000;
+    const memory = try gpa.alloc(f32, try Reverb.requiredSamples(rate, 1));
+    defer gpa.free(memory);
+    // room_size 1 is the highest feedback the mapping allows (0.98).
+    var reverb = try Reverb.init(rate, 1, .{ .wet = 1, .dry = 0, .room_size = 1, .damping = 0 }, memory);
+
+    const frames = 48000;
+    const signal = try gpa.alloc(f32, frames);
+    defer gpa.free(signal);
+    @memset(signal, 0);
+    signal[0] = 1;
+    reverb.process(signal, 1);
+    var peak: f32 = 0;
+    for (signal) |v| {
+        try testing.expect(std.math.isFinite(v));
+        peak = @max(peak, @abs(v));
+    }
+    // Feedback < 1 keeps the network bounded even with no damping at all.
+    try testing.expect(peak < 10);
+    try testing.expect(peak > 0.001);
+}
+
+test "effects: reverb channels decorrelate and survive non-finite input" {
+    const gpa = testing.allocator;
+    const rate = 48000;
+    const memory = try gpa.alloc(f32, try Reverb.requiredSamples(rate, 2));
+    defer gpa.free(memory);
+    var reverb = try Reverb.init(rate, 2, .{ .wet = 1, .dry = 0 }, memory);
+
+    const frames = 8192;
+    const signal = try gpa.alloc(f32, frames * 2);
+    defer gpa.free(signal);
+    @memset(signal, 0);
+    // Identical impulses: the stereo spread must still make the tails differ.
+    signal[0] = 1;
+    signal[1] = 1;
+    reverb.process(signal, 2);
+    var differences: usize = 0;
+    for (0..frames) |i| {
+        const l = signal[i * 2];
+        const r = signal[i * 2 + 1];
+        try testing.expect(std.math.isFinite(l) and std.math.isFinite(r));
+        if (l != r) differences += 1;
+    }
+    try testing.expect(differences > 100);
+
+    reverb.reset();
+    @memset(signal, 0);
+    signal[0] = std.math.nan(f32);
+    signal[1] = std.math.inf(f32);
+    signal[2] = 1;
+    signal[3] = 1;
+    reverb.process(signal, 2);
+    for (signal) |v| try testing.expect(std.math.isFinite(v));
+    // The impulse after the poison still excites the network.
+    var energy: f64 = 0;
+    for (signal[3000..]) |v| energy += @as(f64, @abs(v));
+    try testing.expect(energy > 0);
+}
+
+test "effects: delay-based processing is independent of the block size" {
+    const gpa = testing.allocator;
+    const rate = 48000;
+    const frames = 4096;
+
+    const delay_mem_a = try gpa.alloc(f32, try Delay.requiredSamples(rate, 1, .{ .delay_ms = 3 }));
+    defer gpa.free(delay_mem_a);
+    const delay_mem_b = try gpa.alloc(f32, delay_mem_a.len);
+    defer gpa.free(delay_mem_b);
+    var delay_a = try Delay.init(rate, 1, .{ .delay_ms = 3, .feedback = 0.6, .mix = 0.5 }, delay_mem_a);
+    var delay_b = try Delay.init(rate, 1, .{ .delay_ms = 3, .feedback = 0.6, .mix = 0.5 }, delay_mem_b);
+
+    const rev_mem_a = try gpa.alloc(f32, try Reverb.requiredSamples(rate, 1));
+    defer gpa.free(rev_mem_a);
+    const rev_mem_b = try gpa.alloc(f32, rev_mem_a.len);
+    defer gpa.free(rev_mem_b);
+    var rev_a = try Reverb.init(rate, 1, .{}, rev_mem_a);
+    var rev_b = try Reverb.init(rate, 1, .{}, rev_mem_b);
+
+    var chain_a = [_]Effect{ Effect.delay(&delay_a), Effect.reverb(&rev_a) };
+    var chain_b = [_]Effect{ Effect.delay(&delay_b), Effect.reverb(&rev_b) };
+
+    const a = try gpa.alloc(f32, frames);
+    defer gpa.free(a);
+    const b = try gpa.alloc(f32, frames);
+    defer gpa.free(b);
+    for (a, 0..) |*v, i| {
+        const value: f32 = if (i == 0) 1 else 0.2 * @sin(@as(f32, @floatFromInt(i)) * 0.05);
+        v.* = value;
+        b[i] = value;
+    }
+    Chain.process(.{ .effects = &chain_a }, a, 1);
+    var offset: usize = 0;
+    while (offset < frames) : (offset += 97) {
+        const n = @min(97, frames - offset);
+        Chain.process(.{ .effects = &chain_b }, b[offset..][0..n], 1);
+    }
+    try testing.expectEqualSlices(f32, a, b);
+}
+
+test "effects: the diffusion sections reject DC and stay bounded" {
+    const gpa = testing.allocator;
+    const rate = 48000;
+    const length = 341;
+    const memory = try gpa.alloc(f32, length);
+    defer gpa.free(memory);
+
+    // DC in, nothing out: this is what stops the comb network's 1/(1-feedback)
+    // low-frequency gain from turning an impulse into a slow rumble.
+    @memset(memory, 0);
+    var dc = Line{ .data = memory };
+    var last: f32 = 0;
+    for (0..8000) |i| {
+        last = allpassStep(&dc, 1, allpass_feedback);
+        try testing.expect(std.math.isFinite(last));
+        if (i > 7000) try testing.expect(@abs(last) < 1e-4);
+    }
+
+    // Across the audio band the response is the documented shelving shape:
+    // bounded between 1 and 2/(1+g) = 1.333, never a resonant peak.
+    const freqs = [_]f64{ 500, 1500, 4000, 6000, 12000 };
+    for (freqs) |freq| {
+        @memset(memory, 0);
+        var line = Line{ .data = memory };
+        const frames = 24000;
+        const buf = try gpa.alloc(f32, frames);
+        defer gpa.free(buf);
+        const w = 2.0 * std.math.pi * freq / @as(f64, @floatFromInt(rate));
+        for (buf, 0..) |*v, i| v.* = @floatCast(@sin(w * @as(f64, @floatFromInt(i))));
+        for (buf) |*v| v.* = allpassStep(&line, v.*, allpass_feedback);
+
+        const period: usize = @intFromFloat(@round(@as(f64, @floatFromInt(rate)) / freq));
+        const settle = frames / 2;
+        const usable = ((frames - settle) / period) * period;
+        var sum_sq: f64 = 0;
+        for (buf[settle..][0..usable]) |v| sum_sq += @as(f64, v) * @as(f64, v);
+        const gain = @sqrt(sum_sq / @as(f64, @floatFromInt(usable))) * @sqrt(2.0);
+        try testing.expect(gain > 0.5 and gain < 1.4);
+    }
+}
+
+test "effects: borrowed variants do not inflate an insert slot" {
+    // The delay/reverb variants are pointers on purpose: inlining their line
+    // state (752 bytes for a reverb) would grow every slot on every bus,
+    // including biquad-only chains. Measured: 48 bytes on x86-64 -- the pointer
+    // variants raise the union's alignment to 8, costing 4 bytes of padding over
+    // the inline-only layout. That is the whole price of the indirection.
+    try testing.expect(@sizeOf(Effect) <= @sizeOf(Biquad) + 16);
+    try testing.expect(@sizeOf(Effect) * 8 < @sizeOf(Reverb));
+}
+
+test "effects: borrowed instances expose their memory and identity" {
+    const gpa = testing.allocator;
+    const rate = 48000;
+    const memory = try gpa.alloc(f32, try Reverb.requiredSamples(rate, 2));
+    defer gpa.free(memory);
+    var reverb = try Reverb.init(rate, 2, .{}, memory);
+    const effect = Effect.reverb(&reverb);
+
+    try testing.expectEqual(@as(u16, 2), effect.channelCount());
+    try testing.expectEqual(@as(usize, @intFromPtr(&reverb)), effect.stateAddress().?);
+    try testing.expectEqual(memory.len, effect.borrowedMemory().?.len);
+    try testing.expectEqual(@intFromPtr(memory.ptr), @intFromPtr(effect.borrowedMemory().?.ptr));
+
+    // Inline effects adapt to any layout and borrow nothing.
+    const filter = try Effect.biquad(rate, .{});
+    try testing.expectEqual(@as(u16, 0), filter.channelCount());
+    try testing.expectEqual(@as(?[]const f32, null), filter.borrowedMemory());
+    try testing.expectEqual(@as(?usize, null), filter.stateAddress());
+    try testing.expectEqual(@as(u16, 0), Effect.bypass.channelCount());
+
+    // Effect.reset reaches through the pointer.
+    var slot = effect;
+    slot.process(memory[0..2], 2);
+    slot.reset();
+    for (reverb.memory) |v| try testing.expectEqual(@as(f32, 0), v);
 }
