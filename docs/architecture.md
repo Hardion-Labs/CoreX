@@ -82,6 +82,7 @@ src/
 │   ├── png.zig           # PNG decoder -> RGBA8 (all filters)          [implemented]
 │   ├── texture.zig       # CXTX texture artifact + texture importers   [implemented]
 │   ├── mesh.zig          # OBJ decoder + CXMH mesh artifact/importer   [implemented]
+│   ├── audio.zig         # WAV decoder + CXAW audio artifact/importer  [implemented]
 │   ├── changes.zig       # Change detection + hot-reload baseline      [implemented]
 │   └── pipeline.zig      # Parallel import orchestration + report      [implemented]
 ├── render.zig            # Render public module; backend-independent extraction
@@ -250,17 +251,19 @@ self-describing `CXTX` artifact (`src/assets/image.zig`, `src/assets/png.zig`,
 `src/assets/texture.zig`), backed by a dependency-free **DEFLATE/zlib inflater**
 (`src/assets/inflate.zig`), and an **OBJ mesh importer** that decodes the geometry
 subset to an indexed triangle mesh and serializes a `CXMH` artifact
-(`src/assets/mesh.zig`).
+(`src/assets/mesh.zig`), and a **WAV audio importer** that decodes the
+uncompressed RIFF/WAVE subset (PCM 8/16/24/32-bit, IEEE float32, extensible) to
+interleaved float32 and serializes a `CXAW` artifact (`src/assets/audio.zig`).
 A mark-and-sweep **cache GC** (`Cache.gc` + `Report.liveKeys`) reclaims orphan
 entries. **Change detection** (`src/assets/changes.zig`) compares a path-sorted
 snapshot against the current index using a size/mtime fingerprint confirmed by
 BLAKE3, reports added/modified/removed, and derives the complete live key set for
-GC; `pipeline.Options.only` then re-imports just what changed. JPEG/audio/font and
-other model-format (glTF/FBX/DAE) decoders,
-Adam7-interlaced PNG, dependency tracking, temp-file cleanup and hot-reload are
-planned extensions. See
-[asset-import.md](asset-import.md), [asset-decoders.md](asset-decoders.md) and
-[mesh-import.md](mesh-import.md).
+GC; `pipeline.Options.only` then re-imports just what changed.
+JPEG/compressed-audio/font and other model-format (glTF/FBX/DAE) decoders,
+Adam7-interlaced PNG, audio playback, dependency tracking, temp-file cleanup and
+hot-reload are planned extensions. See [asset-import.md](asset-import.md),
+[asset-decoders.md](asset-decoders.md), [mesh-import.md](mesh-import.md) and
+[asset-audio.md](asset-audio.md).
 
 ### Import and cache — implemented
 `assets.pipeline` imports an indexed asset set into derived artifacts stored in a
@@ -340,7 +343,7 @@ profiling), the scene system (versioned JSON scenes, stable IDs, hierarchy, ECS
 load/save, world-space transforms, reusable single-root prefabs), the asset import pipeline + content-addressed
 cache (raw/text/json/scene importers, PNG/BMP/TGA/QOI texture decoders over a
 dependency-free DEFLATE/zlib inflater, OBJ mesh
-importer, atomic verified storage, parallel import over the job system,
+importer, WAV audio importer, atomic verified storage, parallel import over the job system,
 mark-and-sweep GC, change detection with incremental re-import) and the
 backend-independent render extraction layer (camera,
 frustum culling, sorted draw lists) are implemented and tested, and the executable
