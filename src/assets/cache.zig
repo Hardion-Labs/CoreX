@@ -87,6 +87,29 @@ pub const PutInfo = struct {
     kind: []const u8,
 };
 
+/// Outcome of a garbage-collection sweep.
+pub const GcStats = struct {
+    /// Entry files examined (valid 64-hex names).
+    scanned: usize = 0,
+    /// Live entries retained.
+    kept: usize = 0,
+    /// Orphan entries deleted.
+    removed: usize = 0,
+    /// Total on-disk bytes reclaimed from deleted entries.
+    bytes_freed: u64 = 0,
+};
+
+/// Whether `name` is a cache entry filename: exactly `key_hex_len` lowercase
+/// hex digits. Anything else (temp files, foreign files) is not an entry.
+fn isEntryName(name: []const u8) bool {
+    if (name.len != key_hex_len) return false;
+    for (name) |c| {
+        const ok = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f');
+        if (!ok) return false;
+    }
+    return true;
+}
+
 const Meta = struct {
     key: []const u8,
     source_path: []const u8,
@@ -103,14 +126,15 @@ pub const Cache = struct {
     dir: Io.Dir,
     tmp_counter: std.atomic.Value(u64),
 
-    /// Open (creating if needed) the cache directory at `path`.
+    /// Open (creating if needed) the cache directory at `path`. The directory is
+    /// opened with iteration enabled so `gc` can enumerate entries.
     pub fn open(io: Io, path: []const u8) Error!Cache {
         const cwd = Io.Dir.cwd();
         cwd.createDirPath(io, path) catch return error.CacheIo;
         const dir = if (std.fs.path.isAbsolute(path))
-            Io.Dir.openDirAbsolute(io, path, .{}) catch return error.CacheIo
+            Io.Dir.openDirAbsolute(io, path, .{ .iterate = true }) catch return error.CacheIo
         else
-            cwd.openDir(io, path, .{}) catch return error.CacheIo;
+            cwd.openDir(io, path, .{ .iterate = true }) catch return error.CacheIo;
         return .{ .io = io, .dir = dir, .tmp_counter = .init(0) };
     }
 
@@ -199,6 +223,55 @@ pub const Cache = struct {
             error.FileNotFound => {},
             else => return error.CacheIo,
         };
+    }
+
+    /// Mark-and-sweep garbage collection: delete every cache entry whose key is
+    /// NOT in `live`, retaining the rest. `live` must be the complete set of keys
+    /// the caller wants to keep — typically the keys produced by a full pipeline
+    /// run over the current asset index (see `Report.liveKeys`). Entries are
+    /// identified strictly by their 64-hex filename; temp files and unrelated
+    /// files are left untouched.
+    ///
+    /// Runs in O(entries + live) with a hash set for membership. Call this when
+    /// no concurrent `put` is in flight (it is a maintenance operation, not part
+    /// of the per-frame import path). Returns counts and reclaimed bytes.
+    pub fn gc(self: *Cache, gpa: Allocator, live: []const Key) Error!GcStats {
+        var live_set = std.AutoHashMap(Key, void).init(gpa);
+        defer live_set.deinit();
+        for (live) |k| live_set.put(k, {}) catch return error.OutOfMemory;
+
+        var stats = GcStats{};
+        var it = self.dir.iterate();
+        while (it.next(self.io) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => return error.CacheIo,
+        }) |entry| {
+            if (entry.kind != .file) continue;
+            if (!isEntryName(entry.name)) continue;
+            stats.scanned += 1;
+
+            var key: Key = undefined;
+            _ = std.fmt.hexToBytes(&key, entry.name) catch continue; // unreachable: validated above
+            if (live_set.contains(key)) {
+                stats.kept += 1;
+                continue;
+            }
+
+            // Orphan: record its size, then delete it.
+            const stat = self.dir.statFile(self.io, entry.name, .{}) catch |err| switch (err) {
+                error.FileNotFound => continue, // vanished concurrently; nothing to do
+                error.Canceled => return error.Canceled,
+                else => return error.CacheIo,
+            };
+            self.dir.deleteFile(self.io, entry.name) catch |err| switch (err) {
+                error.FileNotFound => {},
+                error.Canceled => return error.Canceled,
+                else => return error.CacheIo,
+            };
+            stats.removed += 1;
+            stats.bytes_freed += stat.size;
+        }
+        return stats;
     }
 };
 
@@ -430,4 +503,155 @@ test "cache: empty payload round-trips" {
     const got = (try cache.get(testing.allocator, key)).?;
     defer testing.allocator.free(got);
     try testing.expectEqual(@as(usize, 0), got.len);
+}
+
+// --- garbage collection ----------------------------------------------------
+
+fn putTestEntry(cache: *Cache, key: Key, payload: []const u8) !void {
+    try cache.put(testing.allocator, key, .{
+        .path = "a.bin",
+        .source_hash = hashBytes("src"),
+        .importer_id = "raw",
+        .importer_version = 1,
+        .kind = "unknown",
+    }, payload, 0);
+}
+
+test "gc: removes orphans, keeps live entries and reports reclaimed bytes" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(testing.io, &buf);
+    var cache = try testCache(buf[0..n]);
+    defer cache.deinit();
+
+    const oh = hashBytes("");
+    const k1 = deriveKey(hashBytes("one"), "raw", 1, oh);
+    const k2 = deriveKey(hashBytes("two"), "raw", 1, oh);
+    const k3 = deriveKey(hashBytes("three"), "raw", 1, oh);
+    try putTestEntry(&cache, k1, "payload-one");
+    try putTestEntry(&cache, k2, "payload-two-longer");
+    try putTestEntry(&cache, k3, "payload-three");
+
+    // Measure the orphan's on-disk size before sweeping.
+    const orphan_hex = keyHex(k2);
+    const orphan_stat = try tmp.dir.statFile(testing.io, &orphan_hex, .{});
+
+    const live = [_]Key{ k1, k3 };
+    const stats = try cache.gc(testing.allocator, &live);
+    try testing.expectEqual(@as(usize, 3), stats.scanned);
+    try testing.expectEqual(@as(usize, 2), stats.kept);
+    try testing.expectEqual(@as(usize, 1), stats.removed);
+    try testing.expectEqual(orphan_stat.size, stats.bytes_freed);
+
+    try testing.expect(try cache.has(testing.allocator, k1));
+    try testing.expect(!try cache.has(testing.allocator, k2));
+    try testing.expect(try cache.has(testing.allocator, k3));
+}
+
+test "gc: empty live set removes every entry" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(testing.io, &buf);
+    var cache = try testCache(buf[0..n]);
+    defer cache.deinit();
+
+    const oh = hashBytes("");
+    try putTestEntry(&cache, deriveKey(hashBytes("a"), "raw", 1, oh), "aa");
+    try putTestEntry(&cache, deriveKey(hashBytes("b"), "raw", 1, oh), "bb");
+
+    const stats = try cache.gc(testing.allocator, &.{});
+    try testing.expectEqual(@as(usize, 2), stats.scanned);
+    try testing.expectEqual(@as(usize, 0), stats.kept);
+    try testing.expectEqual(@as(usize, 2), stats.removed);
+    try testing.expect(stats.bytes_freed > 0);
+}
+
+test "gc: all-live set removes nothing" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(testing.io, &buf);
+    var cache = try testCache(buf[0..n]);
+    defer cache.deinit();
+
+    const oh = hashBytes("");
+    const k1 = deriveKey(hashBytes("a"), "raw", 1, oh);
+    const k2 = deriveKey(hashBytes("b"), "raw", 1, oh);
+    try putTestEntry(&cache, k1, "aa");
+    try putTestEntry(&cache, k2, "bb");
+
+    const live = [_]Key{ k1, k2 };
+    const stats = try cache.gc(testing.allocator, &live);
+    try testing.expectEqual(@as(usize, 2), stats.scanned);
+    try testing.expectEqual(@as(usize, 2), stats.kept);
+    try testing.expectEqual(@as(usize, 0), stats.removed);
+    try testing.expectEqual(@as(u64, 0), stats.bytes_freed);
+}
+
+test "gc: ignores temp files and foreign files" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(testing.io, &buf);
+    var cache = try testCache(buf[0..n]);
+    defer cache.deinit();
+
+    const oh = hashBytes("");
+    const k1 = deriveKey(hashBytes("a"), "raw", 1, oh);
+    try putTestEntry(&cache, k1, "aa");
+
+    // A leftover temp file and an unrelated file must not be touched.
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "deadbeef.tmp.0", .data = "partial" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "notes.txt", .data = "keep me" });
+    // An uppercase-hex name is not a valid entry name either.
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789", .data = "x" });
+
+    const stats = try cache.gc(testing.allocator, &.{});
+    try testing.expectEqual(@as(usize, 1), stats.scanned); // only the real entry
+    try testing.expectEqual(@as(usize, 1), stats.removed);
+
+    // Foreign/temp files survive.
+    const notes = try tmp.dir.readFileAlloc(testing.io, "notes.txt", testing.allocator, .limited(1024));
+    defer testing.allocator.free(notes);
+    try testing.expectEqualStrings("keep me", notes);
+    const tmp_file = try tmp.dir.readFileAlloc(testing.io, "deadbeef.tmp.0", testing.allocator, .limited(1024));
+    defer testing.allocator.free(tmp_file);
+    try testing.expectEqualStrings("partial", tmp_file);
+}
+
+test "gc: empty cache yields zero stats" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(testing.io, &buf);
+    var cache = try testCache(buf[0..n]);
+    defer cache.deinit();
+
+    const stats = try cache.gc(testing.allocator, &.{});
+    try testing.expectEqual(@as(usize, 0), stats.scanned);
+    try testing.expectEqual(@as(usize, 0), stats.removed);
+    try testing.expectEqual(@as(u64, 0), stats.bytes_freed);
+}
+
+test "gc: is idempotent (second sweep removes nothing)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(testing.io, &buf);
+    var cache = try testCache(buf[0..n]);
+    defer cache.deinit();
+
+    const oh = hashBytes("");
+    const k1 = deriveKey(hashBytes("a"), "raw", 1, oh);
+    try putTestEntry(&cache, k1, "aa");
+    try putTestEntry(&cache, deriveKey(hashBytes("b"), "raw", 1, oh), "bb");
+
+    const live = [_]Key{k1};
+    _ = try cache.gc(testing.allocator, &live);
+    const again = try cache.gc(testing.allocator, &live);
+    try testing.expectEqual(@as(usize, 1), again.scanned);
+    try testing.expectEqual(@as(usize, 1), again.kept);
+    try testing.expectEqual(@as(usize, 0), again.removed);
 }

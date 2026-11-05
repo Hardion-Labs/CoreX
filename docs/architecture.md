@@ -205,9 +205,10 @@ import cache, an importer framework (raw/text/json + a scene importer that reuse
 the scene system), a parallel import pipeline over `std.Io`, and dependency-free
 **texture decoders** (BMP/TGA/QOI) that normalize to RGBA8 and serialize a
 self-describing `CXTX` artifact (`src/assets/image.zig`, `src/assets/texture.zig`).
-PNG/JPEG/audio/model/font decoders, dependency tracking, cache GC and hot-reload
-are planned extensions. See [asset-import.md](asset-import.md) and
-[asset-decoders.md](asset-decoders.md).
+A mark-and-sweep **cache GC** (`Cache.gc` + `Report.liveKeys`) reclaims orphan
+entries. PNG/JPEG/audio/model/font decoders, dependency tracking, temp-file
+cleanup and hot-reload are planned extensions. See
+[asset-import.md](asset-import.md) and [asset-decoders.md](asset-decoders.md).
 
 ### Importação e cache — implemented
 `assets.pipeline` imports an indexed asset set into derived artifacts stored in a
