@@ -54,6 +54,16 @@ declared yet.
   Entities without a `Transform` use the identity local transform. The `.scene`
   format is unchanged: only local TRS values are serialized, world matrices are
   computed at runtime.
+- Texture decoders (`src/assets/image.zig`, `src/assets/texture.zig`,
+  re-exported as `corex.assets.image` / `corex.assets.texture`,
+  `docs/asset-decoders.md`): dependency-free BMP (uncompressed 24/32-bit),
+  TGA (uncompressed + RLE true-color) and QOI (decode + encode) decoders
+  normalizing to RGBA8, serialized into a self-describing `CXTX` artifact
+  (magic + version + dimensions + pixel format + pixels). Registered in the
+  engine import registry for `.bmp`/`.tga`/`.qoi`; `.qoi` added to the texture
+  index classification. All reads are bounds-checked and allocations bounded;
+  malformed/truncated sources are rejected. PNG/JPEG/audio/model/font remain
+  `raw` imports until dedicated decoders exist.
 - Shared display-name validation (`src/core/validation.zig`) used by both the
   `.corex` manifest and scene documents.
 - Native Module ABI contract for C++ (`docs/native-module-api.md`,
@@ -61,10 +71,11 @@ declared yet.
 - A minimal example project (`examples/hello-project/`) with a valid versioned
   initial scene.
 - Test suite covering the startup spine, ECS, scheduling, scenes, asset
-  import/cache and world-space transforms (192 tests), including
-  allocation-failure probes, cache corruption/truncation probes, a deep-hierarchy
-  stress test and job-system integration tests, validated in Debug, ReleaseSafe
-  and ReleaseFast.
+  import/cache, world-space transforms and texture decoders (215 tests),
+  including allocation-failure probes, cache corruption/truncation probes, a
+  deep-hierarchy stress test, QOI encode/decode roundtrips, an end-to-end
+  texture-import-and-cache test and job-system integration tests, validated in
+  Debug, ReleaseSafe and ReleaseFast.
 
 ### Changed
 
@@ -73,7 +84,12 @@ declared yet.
   per-subsystem implementation status.
 - The public module `src/corex.zig` re-exports the implemented core, ECS
   (including scheduling), scene (including transform math as `corex.scene.transform`,
-  `Mat4`/`Vec3`/`Quat`) and asset (import/cache) subsystems.
+  `Mat4`/`Vec3`/`Quat`) and asset (import/cache, image decoders and the `CXTX`
+  texture artifact as `corex.assets.image`/`corex.assets.texture`, `Image`/`Texture`)
+  subsystems.
+- The engine import registry now decodes `.bmp`/`.tga`/`.qoi` textures to `CXTX`
+  artifacts instead of copying them verbatim; the cache key includes the importer
+  identity/version, so this does not collide with previously cached `raw` entries.
 - Startup `editor`/`runtime` now validates and loads the initial scene into the
   ECS (or prepares an empty scene). `validate` mode and the stable CLI/exit-code
   contract are unchanged; scene failures map to exit code 6.

@@ -26,9 +26,9 @@ control, and maintainable code.
 > system scheduling over the job system), the scene system (versioned JSON
 > scenes, stable entity IDs, hierarchy, ECS load/save, world-space transform
 > propagation) and the asset import
-> pipeline + content-addressed cache (raw/text/json/scene importers, atomic
-> verified storage, parallel import over the job system) are implemented and
-> tested. The larger subsystems (renderers, GUI, editor, Lua, export, native
+> pipeline + content-addressed cache (raw/text/json/scene importers, BMP/TGA/QOI
+> texture decoders, atomic verified storage, parallel import over the job system)
+> are implemented and tested. The larger subsystems (renderers, GUI, editor, Lua, export, native
 > modules) are in scope and either contract-defined or planned. See
 > [`docs/architecture.md`](docs/architecture.md) for the per-subsystem status.
 
@@ -197,7 +197,10 @@ unchanged sources are reused, and bumping an importer version invalidates its
 entries. Writes are atomic and reads verify the payload hash (corrupt entries
 self-heal). Built-in importers cover raw binary, text (UTF-8 + line-ending
 normalization), JSON (strict validation + lossless minification) and scenes
-(validated and canonicalized via the scene system).
+(validated and canonicalized via the scene system). Texture sources in **BMP,
+TGA and QOI** are decoded to RGBA8 and stored as a self-describing `CXTX`
+artifact; other binary formats (PNG/JPEG/audio/model) still import as `raw`
+until decoders exist.
 
 ```zig
 const corex = @import("corex");
@@ -219,7 +222,9 @@ defer report.deinit();
 
 `pipeline.run` imports concurrently over the job system; `runSequential` is a
 single-threaded fallback. The cache format, importer contract and limits are
-documented in [`docs/asset-import.md`](docs/asset-import.md).
+documented in [`docs/asset-import.md`](docs/asset-import.md); the texture
+decoders and `CXTX` artifact are documented in
+[`docs/asset-decoders.md`](docs/asset-decoders.md).
 
 ## Project Structure
 
@@ -231,6 +236,7 @@ CoreX/
 │   ├── architecture.md         # Subsystem map and implementation status
 │   ├── ecs-scheduling.md       # ECS system scheduling guide
 │   ├── asset-import.md         # Asset import pipeline + cache
+│   ├── asset-decoders.md       # Texture decoders (BMP/TGA/QOI) + CXTX artifact
 │   ├── launch-contract.md      # Stable startup contract (CLI, exit codes)
 │   ├── project-format.md       # .corex manifest format
 │   ├── scene-format.md         # Versioned .scene format
@@ -272,7 +278,8 @@ Indicative; subject to change as technical decisions are validated.
 - [x] Scene world-space transforms (column-major Mat4 propagation, deterministic, iterative).
 - [ ] Scene extensions: prefabs, streaming.
 - [x] Asset import pipeline and content-addressed cache (raw/text/json/scene).
-- [ ] Asset decoders (texture/audio/model), cache GC, hot-reload, startup integration.
+- [x] Texture decoders (BMP/TGA/QOI → RGBA8 `CXTX` artifact).
+- [ ] Asset decoders (PNG/JPEG/audio/model), cache GC, hot-reload, startup integration.
 - [ ] Renderer Low / Medium; Advanced contract.
 - [ ] GUI library and graphical editor.
 - [ ] Lua VM and gameplay scripting.
