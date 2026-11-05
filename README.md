@@ -23,12 +23,12 @@ control, and maintainable code.
 > **Status:** early development. The startup spine (CLI, project manifest,
 > compatibility, jobs, configuration, asset indexing, splash contract,
 > diagnostics, and the project-open pipeline), the ECS (generational entities,
-> sparse-set component pools, type-safe world and multi-component views) and the
-> scene system (versioned JSON scenes, stable entity IDs, hierarchy, ECS
-> load/save) are implemented and tested. The larger subsystems (renderers, GUI,
-> editor, Lua, export, native modules) are in scope and either contract-defined
-> or planned. See [`docs/architecture.md`](docs/architecture.md) for the
-> per-subsystem status.
+> sparse-set component pools, type-safe world, multi-component views and comptime
+> system scheduling over the job system) and the scene system (versioned JSON
+> scenes, stable entity IDs, hierarchy, ECS load/save) are implemented and
+> tested. The larger subsystems (renderers, GUI, editor, Lua, export, native
+> modules) are in scope and either contract-defined or planned. See
+> [`docs/architecture.md`](docs/architecture.md) for the per-subsystem status.
 
 ## Overview
 
@@ -125,6 +125,28 @@ while (it.next()) |entry| {
 
 See [`docs/architecture.md`](docs/architecture.md) for the design and status.
 
+### Scheduling systems
+
+Systems declare read/write component access and are grouped into comptime
+stages. Non-conflicting systems in a stage run concurrently over the job system;
+conflicts are rejected at compile time.
+
+```zig
+const Movement = corex.ecs.schedule.system(World, Context, "movement", move, .{
+    .reads = .{Velocity},
+    .writes = .{Transform},
+});
+const Schedule = corex.ecs.Schedule(World, Context, .{.{Movement}});
+
+var js: corex.core.jobs.JobSystem = undefined;
+js.init(allocator, null);
+defer js.deinit();
+try Schedule.run(js.io(), &world, &context);
+```
+
+See [`docs/ecs-scheduling.md`](docs/ecs-scheduling.md) for the safety model,
+exclusive systems, error semantics and the sequential fallback.
+
 ## Scenes
 
 Scenes are versioned JSON documents (`.scene`, `format_version = 1`) backed by
@@ -156,6 +178,7 @@ CoreX/
 ├── docs/
 │   ├── scope.md                # Definitive project scope (Engine vs Hub)
 │   ├── architecture.md         # Subsystem map and implementation status
+│   ├── ecs-scheduling.md       # ECS system scheduling guide
 │   ├── launch-contract.md      # Stable startup contract (CLI, exit codes)
 │   ├── project-format.md       # .corex manifest format
 │   ├── scene-format.md         # Versioned .scene format
@@ -170,7 +193,7 @@ CoreX/
 │   ├── corex.zig               # Public module
 │   ├── core/                   # Implemented startup-spine subsystems
 │   ├── ecs.zig                 # ECS public module
-│   ├── ecs/                    # Entities, component pools, world + views
+│   ├── ecs/                    # Entities, pools, world/views, scheduling
 │   ├── scene.zig               # Scene public module (EngineScene)
 │   └── scene/                  # Scene components + versioned documents
 ├── build.zig                   # Build configuration
@@ -188,7 +211,8 @@ Indicative; subject to change as technical decisions are validated.
 - [x] Job system and async loading foundation.
 - [x] Diagnostics and profiling foundation.
 - [x] ECS: generational entities, sparse-set components, type-safe world + views.
-- [ ] ECS system scheduling over the job system.
+- [x] ECS system scheduling over the job system (comptime stages, access validation).
+- [ ] ECS scheduling extensions: dependency graph, frame budget, profiling.
 - [x] Scene system and versioned scene serialization (format v1, ECS load/save).
 - [ ] Scene extensions: prefabs, streaming, world-space transforms.
 - [ ] Asset import pipeline and cache.

@@ -51,4 +51,5 @@ test {
     _ = core.validation;
     _ = ecs;
     _ = scene;
+    _ = @import("ecs/schedule_jobs_test.zig");
 }

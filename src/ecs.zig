@@ -23,16 +23,20 @@ const std = @import("std");
 pub const entity = @import("ecs/entity.zig");
 pub const pool = @import("ecs/pool.zig");
 pub const world = @import("ecs/world.zig");
+pub const schedule = @import("ecs/schedule.zig");
 
 pub const Entity = entity.Entity;
 pub const Entities = entity.Entities;
 pub const Pool = pool.Pool;
 pub const World = world.World;
 pub const AddError = world.AddError;
+pub const Schedule = schedule.Schedule;
+pub const system = schedule.system;
 
 test {
     std.testing.refAllDecls(@This());
     _ = entity;
     _ = pool;
     _ = world;
+    _ = schedule;
 }
