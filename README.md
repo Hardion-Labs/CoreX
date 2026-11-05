@@ -31,8 +31,10 @@ control, and maintainable code.
 > texture decoders over a dependency-free DEFLATE/zlib inflater, OBJ mesh decoder,
 > WAV audio decoder, atomic verified storage, parallel import over
 > the job system, mark-and-sweep GC, change detection with incremental re-import),
-> and the backend-independent render extraction
-> layer (camera math, frustum culling, sorted draw lists) are implemented and tested. The larger
+> the backend-independent render extraction
+> layer (camera math, frustum culling, sorted draw lists) and the
+> device-independent audio mixer (voices, buses, pan, pitch, resampling,
+> allocation-free render) are implemented and tested. The larger
 > subsystems (GPU renderer backends, GUI, editor, Lua, export, native modules) are
 > in scope and either contract-defined or planned. See
 > [`docs/architecture.md`](docs/architecture.md) for the per-subsystem status.
@@ -340,6 +342,45 @@ defer frame.deinit();
 The design, math conventions and guarantees are documented in
 [`docs/render-extraction.md`](docs/render-extraction.md).
 
+## Audio
+
+The audio subsystem (`corex.audio`) provides the **device-independent mixer** —
+the CPU foundation the OS playback backends will consume. It mixes a fixed pool
+of voices with gain, stereo pan (linear or equal-power), buses, master gain,
+pitch, looping and linear-interpolated resampling into an interleaved float32
+buffer. `render` takes no allocator: it cannot allocate, and it is deterministic
+(bit-identical output for the same call sequence). Voices are addressed by
+generational handles, so a stale handle is inert instead of aliasing a recycled
+voice. It has no device dependency, so it runs and is fully tested headlessly;
+ALSA/WASAPI/CoreAudio backends, 3D audio and effects are planned.
+
+```zig
+const corex = @import("corex");
+const A = corex.audio;
+var mixer = try A.Mixer.init(allocator, .{ .sample_rate = 48_000, .channels = 2 });
+defer mixer.deinit();
+
+// `samples` is a borrowed interleaved f32 buffer (e.g. from a CXAW artifact).
+const voice = try mixer.play(.{
+    .sample_rate = 44_100,
+    .channels = 2,
+    .frames = frame_count,
+    .samples = samples,
+}, .{ .gain = 0.8, .pan = -0.25, .looping = true, .bus = 1 });
+
+try mixer.setBusGain(1, 0.5); // music bus
+var buffer: [512 * 2]f32 = undefined;
+const stats = try mixer.render(&buffer); // stats.peak / .voices_active / .clipped_samples
+var pcm: [512 * 2]i16 = undefined;
+try A.toPcm16(&pcm, &buffer); // device-ready conversion
+mixer.stop(voice);
+```
+
+Clips come from the asset pipeline: a `CXAW` artifact parsed with
+`corex.assets.audio.parse` maps to `A.Clip` field by field, and the mixer never
+imports the asset layer. The mixing contract, channel/pan rules, metering and
+limitations are documented in [`docs/audio-mixer.md`](docs/audio-mixer.md).
+
 ## Project Structure
 
 ```text
@@ -360,6 +401,7 @@ CoreX/
 │   ├── scene-transforms.md     # World-space transform propagation
 │   ├── scene-prefabs.md        # Reusable single-root prefabs (.prefab)
 │   ├── render-extraction.md    # Backend-independent render extraction
+│   ├── audio-mixer.md          # Device-independent audio mixer (voices/buses)
 │   ├── versioning.md           # Versioning and compatibility policy
 │   ├── native-module-api.md    # C++ native module ABI contract
 │   ├── development/            # Coding standards, commit guidelines
@@ -377,7 +419,9 @@ CoreX/
 │   ├── assets.zig              # Asset public module (index + import + cache)
 │   ├── assets/                 # Import cache, importers, decoders, change detection, pipeline
 │   ├── render.zig              # Render public module (extraction layer)
-│   └── render/                 # Camera, frustum culling, draw-list extraction
+│   ├── render/                 # Camera, frustum culling, draw-list extraction
+│   ├── audio.zig               # Audio public module (mixing runtime)
+│   └── audio/                  # Clip descriptors, voice pool, buses, mixer
 ├── tools/                      # Reproducible test-vector generators
 ├── build.zig                   # Build configuration
 └── CHANGELOG.md, CONTRIBUTING.md, LICENSE, README.md, ...
@@ -408,7 +452,8 @@ Indicative; subject to change as technical decisions are validated.
 - [x] Mesh decoder (OBJ → indexed triangle mesh, `CXMH` artifact).
 - [x] Audio decoder (WAV/PCM + IEEE float32 → interleaved f32 `CXAW` artifact).
 - [ ] Asset decoders (JPEG, compressed audio, other model formats), Adam7 PNG.
-- [ ] Audio playback (device backend, mixer, voices/buses, streaming).
+- [x] Audio mixer (voices, buses, gain/pan, pitch, resampling, allocation-free render).
+- [ ] Audio device backends (ALSA/WASAPI/CoreAudio), 3D audio, effects, streaming.
 - [ ] Hot-reload event watcher (inotify/FSEvents), dependency graph, startup/editor integration.
 - [x] Backend-independent render extraction (camera, frustum culling, sorted draw lists).
 - [ ] Renderer Low / Medium GPU backends; Advanced contract.
