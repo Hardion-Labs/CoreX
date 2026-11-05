@@ -108,6 +108,10 @@ Keep statements aligned with the implementation. Clearly label planned work as
 planned; do not document roadmap items as existing capabilities. Verify relative
 links and commands when changing documentation.
 
+Write documentation and code comments in English. This applies to Markdown under
+`docs/`, the root project documents, and Zig doc comments (`///`, `//!`). Keep API
+names, CLI flags, and format identifiers unchanged when translating prose.
+
 ## AI-assisted contributions
 
 AI tools are permitted, subject to the mandatory requirements in
