@@ -2,7 +2,7 @@
 //!
 //! This is the audio counterpart of the render extraction layer. It mixes a
 //! fixed pool of voices into an interleaved float32 output buffer with gain,
-//! pan, buses, pitch and linear-interpolated resampling. There is **no device
+//! pan, buses, pitch and resampling. There is **no device
 //! dependency and no allocation in `render`**, so it is fully testable headlessly
 //! and deterministic: the same sequence of calls produces bit-identical output on
 //! a given build. (The equal-power pan law uses `@cos`/`@sin`, whose last bit can
@@ -18,6 +18,12 @@
 //!   `null`. A slot whose generation would wrap is retired instead of reused.
 //! - **Borrowed clips.** A voice holds a `Clip` (pointer + layout), never a copy.
 //!   The caller must keep the samples alive while the voice plays.
+//! - **Optional voice stealing.** With `Config.steal_policy = .lowest_priority`,
+//!   a full pool recycles the least important voice instead of failing: lowest
+//!   `PlayOptions.priority` first, ties broken by oldest start. A voice of
+//!   *higher* priority is never taken, and `terminationOf` reports why a handle
+//!   died (`.stopped`, `.finished` or `.stolen`) even after its slot is reused.
+//!   The default `.none` keeps `play` a hard failure on a full pool.
 //! - **One output pass.** Voices accumulate into the caller's buffer; master
 //!   gain, non-finite sanitizing, clamping and peak metering happen in a single
 //!   final pass, so there is no scratch buffer.
@@ -26,17 +32,25 @@
 //! device callback owns the mixer; other threads must post commands to it (or
 //! synchronize externally). Nothing here locks or uses atomics.
 //!
-//! Resampling is linear interpolation with a float64 cursor: cheap, allocation
-//! free and adequate for playback. It is not a band-limited (polyphase/sinc)
-//! resampler, so downsampling by large ratios can alias — documented, not hidden.
+//! Resampling always uses a float64 cursor. Two qualities are available:
+//! `.linear` (the default) is two-point interpolation — cheap, allocation free,
+//! exact at unity rate, but it aliases when decimating because it is not a
+//! low-pass filter. `.sinc` is band-limited windowed-sinc (`resample.zig`): one
+//! ~16 KiB prototype table built in `init`, cutoff scaled by the decimation
+//! ratio, unity DC gain, and no per-sample allocation. An integral cursor at
+//! unit step bypasses both and copies samples bit-exactly. See
+//! `docs/audio-mixer.md` for the measured trade-offs.
 
 const std = @import("std");
 const clip_mod = @import("clip.zig");
+const resample_mod = @import("resample.zig");
 
 const Allocator = std.mem.Allocator;
 
 pub const Clip = clip_mod.Clip;
 pub const ChannelMap = clip_mod.ChannelMap;
+/// Resampling quality for voices whose rate or pitch differs from the output.
+pub const Resample = resample_mod.Quality;
 pub const PanLaw = clip_mod.PanLaw;
 pub const panGains = clip_mod.panGains;
 pub const max_sample_rate = clip_mod.max_sample_rate;
@@ -77,6 +91,18 @@ pub const State = enum {
     paused,
 };
 
+/// What happens when `play` is called with a full voice pool.
+pub const StealPolicy = enum {
+    /// Refuse the new voice with `error.NoVoiceAvailable` (the default, and the
+    /// behavior of every earlier version).
+    none,
+    /// Recycle the least important voice: lowest `priority` first, oldest start
+    /// as the tie-break. A voice with a **higher** priority than the request is
+    /// never stolen, so a low-priority request still fails when the pool is full
+    /// of more important voices.
+    lowest_priority,
+};
+
 pub const Config = struct {
     /// Output sample rate in Hz (1..384000).
     sample_rate: u32 = 48_000,
@@ -84,6 +110,10 @@ pub const Config = struct {
     channels: u16 = 2,
     /// Voice pool capacity.
     max_voices: u32 = 64,
+    /// How voices are interpolated when their step is not exactly 1. `.linear`
+    /// (the default) is two-point and allocation-free; `.sinc` is band-limited
+    /// and allocates one ~16 KiB prototype table at init.
+    resample: Resample = .linear,
     /// Bus count; bus 0 is the default bus every voice starts on.
     max_buses: u32 = 8,
     pan_law: PanLaw = .equal_power,
@@ -91,6 +121,7 @@ pub const Config = struct {
     /// Clamp the mixed output to [-1, 1]. Disable for offline rendering that
     /// wants the unclamped sum (metering still reports the peak).
     clamp_output: bool = true,
+    steal_policy: StealPolicy = .none,
 };
 
 pub const PlayOptions = struct {
@@ -108,6 +139,13 @@ pub const PlayOptions = struct {
     start_frame: u32 = 0,
     /// Start paused (renders silence and does not advance until resumed).
     paused: bool = false,
+    /// Importance for voice stealing: 0 is the least, 255 the most. Only used
+    /// when the mixer's `steal_policy` is not `.none`.
+    priority: u8 = 128,
+    /// Allow this request to steal a voice under the mixer's policy. Set false
+    /// to retry a previously stolen source without taking a slot from anyone
+    /// else (which is how the scene bridge avoids steal ping-pong).
+    allow_steal: bool = true,
 };
 
 /// Per-render diagnostics. All fields describe the buffer just rendered.
@@ -123,6 +161,17 @@ pub const RenderStats = struct {
     clipped_samples: usize = 0,
     /// Non-finite mixes replaced with silence. Always 0 for well-formed clips.
     non_finite_samples: usize = 0,
+};
+
+/// Why a voice slot was released. Recorded per slot so the owner of a dead
+/// handle can tell a natural end from a steal.
+pub const Termination = enum {
+    /// `stop`/`stopAll` was called.
+    stopped,
+    /// The clip reached its end (non-looping).
+    finished,
+    /// The slot was recycled by a higher-or-equal-priority `play`.
+    stolen,
 };
 
 pub const InitError = error{ InvalidConfig, OutOfMemory };
@@ -147,6 +196,14 @@ const Voice = struct {
     pan: f32 = 0,
     looping: bool = false,
     bus: u16 = 0,
+    priority: u8 = 128,
+    /// Monotonic start order, the tie-break for stealing (smaller = older).
+    seq: u64 = 0,
+    /// Generation of the last voice terminated in this slot. Generations are
+    /// unique per occupancy, so this identifies one exact dead handle even
+    /// after the slot has been reused.
+    terminated_generation: u32 = retired_generation,
+    last_termination: Termination = .stopped,
 };
 
 pub const Mixer = struct {
@@ -162,6 +219,12 @@ pub const Mixer = struct {
     pan_law: PanLaw,
     master_gain: f32,
     clamp_output: bool,
+    steal_policy: StealPolicy,
+    next_seq: u64,
+    stolen_total: u64,
+    resample_quality: Resample,
+    /// Prototype table, present only when `resample_quality == .sinc`.
+    sinc: ?resample_mod.Sinc,
 
     pub fn init(gpa: Allocator, config: Config) InitError!Mixer {
         if (config.sample_rate == 0 or config.sample_rate > max_sample_rate) return error.InvalidConfig;
@@ -184,6 +247,14 @@ pub const Mixer = struct {
         // the mixing order) follows the order voices were started.
         for (free_slots, 0..) |*slot, i| slot.* = @intCast(config.max_voices - 1 - i);
 
+        // The band-limited path needs a prototype table; build it once here so
+        // `render` stays allocation-free. `.linear` never allocates it.
+        var sinc: ?resample_mod.Sinc = null;
+        if (config.resample == .sinc) {
+            sinc = try resample_mod.Sinc.init(gpa);
+        }
+        errdefer if (sinc) |*table| table.deinit(gpa);
+
         return .{
             .gpa = gpa,
             .voices = voices,
@@ -196,10 +267,16 @@ pub const Mixer = struct {
             .pan_law = config.pan_law,
             .master_gain = config.master_gain,
             .clamp_output = config.clamp_output,
+            .steal_policy = config.steal_policy,
+            .next_seq = 0,
+            .stolen_total = 0,
+            .resample_quality = config.resample,
+            .sinc = sinc,
         };
     }
 
     pub fn deinit(self: *Mixer) void {
+        if (self.sinc) |*table| table.deinit(self.gpa);
         self.gpa.free(self.voices);
         self.gpa.free(self.buses);
         self.gpa.free(self.free_slots);
@@ -210,7 +287,7 @@ pub const Mixer = struct {
 
     /// Start a voice. The clip is borrowed: keep `clip.samples` alive until the
     /// voice is stopped or finishes. Fails with `NoVoiceAvailable` when the pool
-    /// is full (no implicit voice stealing).
+    /// is full and no voice can be stolen (see `Config.steal_policy`).
     pub fn play(self: *Mixer, clip: Clip, options: PlayOptions) PlayError!VoiceHandle {
         try clip.validate();
         if (!std.math.isFinite(options.gain)) return error.InvalidOptions;
@@ -224,12 +301,21 @@ pub const Mixer = struct {
             @as(f64, @floatFromInt(self.sample_rate))) * @as(f64, pitch);
         if (!(step > 0) or !std.math.isFinite(step)) return error.InvalidOptions;
 
-        if (self.free_count == 0) return error.NoVoiceAvailable;
+        if (self.free_count == 0) {
+            const victim = self.stealCandidate(options.priority, options.allow_steal) orelse
+                return error.NoVoiceAvailable;
+            self.releaseSlot(victim, .stolen);
+            self.stolen_total += 1;
+        }
         self.free_count -= 1;
         const index = self.free_slots[self.free_count];
         const v = &self.voices[index];
+        const seq = self.next_seq;
+        self.next_seq += 1;
         v.* = .{
             .generation = v.generation,
+            .terminated_generation = v.terminated_generation,
+            .last_termination = v.last_termination,
             .state = if (options.paused) .paused else .playing,
             .clip = clip,
             .map = map,
@@ -239,6 +325,8 @@ pub const Mixer = struct {
             .pan = std.math.clamp(options.pan, -1.0, 1.0),
             .looping = options.looping,
             .bus = options.bus,
+            .priority = options.priority,
+            .seq = seq,
         };
         self.live_count += 1;
         return .{ .index = index, .generation = v.generation };
@@ -247,14 +335,14 @@ pub const Mixer = struct {
     /// Stop a voice and recycle its slot. No-op for a dead handle.
     pub fn stop(self: *Mixer, handle: VoiceHandle) void {
         const index = self.slotOf(handle) orelse return;
-        self.releaseSlot(index);
+        self.releaseSlot(index, .stopped);
     }
 
     /// Stop every voice. Bus and master settings are kept.
     pub fn stopAll(self: *Mixer) void {
         for (self.voices, 0..) |*v, i| {
             if (v.state == .idle) continue;
-            self.releaseSlot(@intCast(i));
+            self.releaseSlot(@intCast(i), .stopped);
         }
     }
 
@@ -324,6 +412,22 @@ pub const Mixer = struct {
         return v.position;
     }
 
+    /// Why the voice behind `handle` was released, or null when the handle never
+    /// identified a voice in this slot (or its record has been overwritten by a
+    /// later release). Works after the slot has been recycled, so a stolen voice
+    /// can be told apart from one that finished.
+    pub fn terminationOf(self: *const Mixer, handle: VoiceHandle) ?Termination {
+        if (handle.index >= self.voices.len) return null;
+        const v = &self.voices[handle.index];
+        if (v.terminated_generation != handle.generation) return null;
+        return v.last_termination;
+    }
+
+    /// Cumulative number of voices recycled by stealing.
+    pub fn stolenCount(self: *const Mixer) u64 {
+        return self.stolen_total;
+    }
+
     /// Voices holding a slot (playing + paused).
     pub fn liveVoices(self: *const Mixer) usize {
         return self.live_count;
@@ -385,7 +489,7 @@ pub const Mixer = struct {
             for (self.voices, 0..) |*v, i| {
                 if (v.state != .playing) continue;
                 if (self.mixVoice(v, out, frames)) {
-                    self.releaseSlot(@intCast(i));
+                    self.releaseSlot(@intCast(i), .finished);
                     stats.voices_finished += 1;
                 }
             }
@@ -434,10 +538,34 @@ pub const Mixer = struct {
         return &self.voices[index];
     }
 
+    /// Pick the least important live voice for a request, or null when nothing
+    /// may be stolen. Ascending slot order with strict comparisons keeps the
+    /// choice deterministic.
+    fn stealCandidate(self: *const Mixer, priority: u8, allow_steal: bool) ?u32 {
+        if (self.steal_policy == .none or !allow_steal) return null;
+        var best: ?u32 = null;
+        var best_priority: u8 = std.math.maxInt(u8);
+        var best_seq: u64 = std.math.maxInt(u64);
+        for (self.voices, 0..) |*v, i| {
+            if (v.state == .idle) continue;
+            if (v.priority > priority) continue; // more important than the request
+            if (best == null or v.priority < best_priority or
+                (v.priority == best_priority and v.seq < best_seq))
+            {
+                best = @intCast(i);
+                best_priority = v.priority;
+                best_seq = v.seq;
+            }
+        }
+        return best;
+    }
+
     /// Release a slot in place. Infallible: the free stack was sized for every
     /// slot at init, so pushing back can never allocate or overflow.
-    fn releaseSlot(self: *Mixer, index: u32) void {
+    fn releaseSlot(self: *Mixer, index: u32, reason: Termination) void {
         const v = &self.voices[index];
+        v.terminated_generation = v.generation;
+        v.last_termination = reason;
         v.state = .idle;
         v.clip = .{ .sample_rate = 0, .channels = 0, .frames = 0, .samples = &.{} };
         self.live_count -= 1;
@@ -461,57 +589,82 @@ pub const Mixer = struct {
         const gain_r = v.gain * bus_gain * (if (stereo_out) pan[1] else 1.0);
         // The interpolation-free path is only valid for an integral cursor at
         // unit step; hoisting the decision keeps the hot loop branch-free.
-        const resample = v.step != 1.0 or v.position != @floor(v.position);
+        const needs_resample = v.step != 1.0 or v.position != @floor(v.position);
+        const mode: Mode = if (!needs_resample)
+            .copy
+        else if (self.resample_quality == .sinc) .sinc else .linear;
         switch (v.map) {
             inline else => |map| {
-                return if (resample)
-                    mixLoop(map, true, v, out, frames, gain_l, gain_r)
-                else
-                    mixLoop(map, false, v, out, frames, gain_l, gain_r);
+                return switch (mode) {
+                    .copy => mixLoop(map, .copy, v, out, frames, gain_l, gain_r, null),
+                    .linear => mixLoop(map, .linear, v, out, frames, gain_l, gain_r, null),
+                    .sinc => mixLoop(map, .sinc, v, out, frames, gain_l, gain_r, &self.sinc.?),
+                };
             },
         }
     }
 };
 
+/// Which fetch specialization the hot loop is compiled for.
+const Mode = enum {
+    /// Integral cursor at unit step: read the sample directly.
+    copy,
+    /// Two-point linear interpolation.
+    linear,
+    /// Band-limited windowed sinc over a precomputed prototype.
+    sinc,
+};
+
+/// Per-frame read cursor. `index0/index1/t` feed the copy and linear paths;
+/// `kernel` feeds the sinc path. Unused fields cost nothing: every reader is
+/// specialized on a comptime `Mode`, so the dead branches are pruned.
+const Reader = struct {
+    src: []const f32,
+    channels: usize,
+    frames: usize,
+    looping: bool,
+    index0: usize = 0,
+    index1: usize = 0,
+    t: f32 = 0,
+    kernel: *const resample_mod.Kernel,
+};
+
 /// One source sample, interpolated only when the specialization needs it.
-inline fn sampleAt(comptime resample: bool, src: []const f32, index0: usize, index1: usize, t: f32) f32 {
-    const a = src[index0];
-    if (!resample) return a;
-    const b = src[index1];
-    return a + (b - a) * t;
+inline fn readSample(comptime mode: Mode, reader: Reader, channel: usize) f32 {
+    if (mode == .sinc) {
+        return resample_mod.apply(reader.kernel, reader.src, reader.channels, channel, reader.frames, reader.looping);
+    }
+    const a = reader.src[reader.index0 * reader.channels + channel];
+    if (mode == .copy) return a;
+    const b = reader.src[reader.index1 * reader.channels + channel];
+    return a + (b - a) * reader.t;
 }
 
 /// Left/right source pair for one output frame, before gain and pan.
-inline fn fetchPair(
-    comptime map: ChannelMap,
-    comptime resample: bool,
-    src: []const f32,
-    src_channels: usize,
-    index0: usize,
-    index1: usize,
-    t: f32,
-) [2]f32 {
+inline fn fetchPair(comptime map: ChannelMap, comptime mode: Mode, reader: Reader) [2]f32 {
     if (map == .mono_to_mono or map == .mono_to_stereo) {
-        const m = sampleAt(resample, src, index0, index1, t);
+        const m = readSample(mode, reader, 0);
         return .{ m, m };
     }
     if (map == .stereo_to_stereo) {
-        return .{
-            sampleAt(resample, src, index0 * 2, index1 * 2, t),
-            sampleAt(resample, src, index0 * 2 + 1, index1 * 2 + 1, t),
-        };
+        if (mode == .sinc) {
+            return resample_mod.applyPair(reader.kernel, reader.src, reader.frames, reader.looping);
+        }
+        return .{ readSample(mode, reader, 0), readSample(mode, reader, 1) };
     }
     if (map == .stereo_to_mono) {
-        const l = sampleAt(resample, src, index0 * 2, index1 * 2, t);
-        const r = sampleAt(resample, src, index0 * 2 + 1, index1 * 2 + 1, t);
+        if (mode == .sinc) {
+            const pair = resample_mod.applyPair(reader.kernel, reader.src, reader.frames, reader.looping);
+            return .{ (pair[0] + pair[1]) * 0.5, 0 };
+        }
+        const l = readSample(mode, reader, 0);
+        const r = readSample(mode, reader, 1);
         return .{ (l + r) * 0.5, 0 };
     }
     // many_to_mono: equal-weight mean of every source channel.
     var sum: f32 = 0;
-    for (0..src_channels) |c| {
-        sum += sampleAt(resample, src, index0 * src_channels + c, index1 * src_channels + c, t);
-    }
-    return .{ sum / @as(f32, @floatFromInt(src_channels)), 0 };
+    for (0..reader.channels) |c| sum += readSample(mode, reader, c);
+    return .{ sum / @as(f32, @floatFromInt(reader.channels)), 0 };
 }
 
 /// The mixing core, monomorphized per (channel map, resampling) pair so the
@@ -519,12 +672,13 @@ inline fn fetchPair(
 /// voice reached its end.
 fn mixLoop(
     comptime map: ChannelMap,
-    comptime resample: bool,
+    comptime mode: Mode,
     v: *Voice,
     out: []f32,
     frames: usize,
     gain_l: f32,
     gain_r: f32,
+    sinc: ?*const resample_mod.Sinc,
 ) bool {
     const src = v.clip.samples;
     const src_channels: usize = if (map == .many_to_mono)
@@ -537,6 +691,13 @@ fn mixLoop(
     const looping = v.looping;
     var pos = v.position;
     const stereo_out = comptime map.outputChannels() == 2;
+    // One kernel per voice render, refilled per frame: no allocation, and the
+    // coefficients are shared by every channel of the frame.
+    var kernel: resample_mod.Kernel = undefined;
+    // The coefficients depend only on the fractional cursor and the (constant)
+    // step, so an exactly repeated fraction reuses them and only moves `start`.
+    // Integer and half-integer steps hit this on every frame but the first.
+    var cached_frac: f64 = -1;
 
     var frame: usize = 0;
     while (frame < frames) : (frame += 1) {
@@ -545,14 +706,33 @@ fn mixLoop(
             // `@rem` handles any step, including steps larger than the clip.
             pos = @rem(pos, end);
         }
-        const index0: usize = @intFromFloat(pos);
-        var t: f32 = 0;
-        var index1: usize = index0;
-        if (resample) {
-            t = @floatCast(pos - @floor(pos));
-            index1 = if (index0 + 1 >= src_frames) (if (looping) 0 else src_frames - 1) else index0 + 1;
+        var reader = Reader{
+            .src = src,
+            .channels = src_channels,
+            .frames = src_frames,
+            .looping = looping,
+            .kernel = &kernel,
+        };
+        if (mode == .sinc) {
+            const frac = pos - @floor(pos);
+            if (frac != cached_frac) {
+                sinc.?.build(pos, step, &kernel);
+                cached_frac = frac;
+            } else {
+                kernel.start = @as(i64, @intFromFloat(@floor(pos))) + kernel.first_offset;
+            }
+        } else {
+            reader.index0 = @intFromFloat(pos);
+            reader.index1 = reader.index0;
+            if (mode == .linear) {
+                reader.t = @floatCast(pos - @floor(pos));
+                reader.index1 = if (reader.index0 + 1 >= src_frames)
+                    (if (looping) 0 else src_frames - 1)
+                else
+                    reader.index0 + 1;
+            }
         }
-        const pair = fetchPair(map, resample, src, src_channels, index0, index1, t);
+        const pair = fetchPair(map, mode, reader);
         if (stereo_out) {
             out[frame * 2] += pair[0] * gain_l;
             out[frame * 2 + 1] += pair[1] * gain_r;
@@ -616,6 +796,17 @@ test "mixer: init and play survive allocation failure" {
             var mixer = try Mixer.init(alloc, .{ .max_voices = 2, .max_buses = 2 });
             defer mixer.deinit();
             const handle = try mixer.play(monoClip(&samples, 48000), .{});
+            var out: [8]f32 = undefined;
+            _ = try mixer.render(&out);
+            mixer.stop(handle);
+        }
+    }.f, .{});
+    // The band-limited path adds one table allocation; it must unwind cleanly.
+    try testing.checkAllAllocationFailures(gpa, struct {
+        fn f(alloc: Allocator) !void {
+            var mixer = try Mixer.init(alloc, .{ .max_voices = 2, .max_buses = 2, .resample = .sinc });
+            defer mixer.deinit();
+            const handle = try mixer.play(monoClip(&samples, 44100), .{});
             var out: [8]f32 = undefined;
             _ = try mixer.render(&out);
             mixer.stop(handle);
@@ -1168,4 +1359,322 @@ test "mixer: a slot whose generation would wrap is retired, never reused" {
     // A handle forged at the retired generation is still inert.
     const forged = VoiceHandle{ .index = first.index, .generation = retired_generation };
     try testing.expect(!mixer.isLive(forged));
+}
+
+test "mixer: the default policy refuses a full pool and never steals" {
+    const gpa = testing.allocator;
+    const samples = [_]f32{ 0.5, 0.5 };
+    var mixer = try Mixer.init(gpa, .{ .channels = 1, .max_voices = 2 });
+    defer mixer.deinit();
+
+    const a = try mixer.play(monoClip(&samples, 48000), .{ .looping = true, .priority = 0 });
+    _ = try mixer.play(monoClip(&samples, 48000), .{ .looping = true, .priority = 0 });
+    try testing.expectError(error.NoVoiceAvailable, mixer.play(monoClip(&samples, 48000), .{ .priority = 255 }));
+    try testing.expectEqual(@as(u64, 0), mixer.stolenCount());
+    try testing.expect(mixer.isLive(a));
+    try testing.expectEqual(@as(?Termination, null), mixer.terminationOf(a));
+}
+
+test "mixer: lowest-priority stealing recycles the least important voice" {
+    const gpa = testing.allocator;
+    const samples = [_]f32{ 0.5, 0.5 };
+    var mixer = try Mixer.init(gpa, .{ .channels = 1, .max_voices = 2, .steal_policy = .lowest_priority });
+    defer mixer.deinit();
+
+    const music = try mixer.play(monoClip(&samples, 48000), .{ .looping = true, .priority = 200 });
+    const ambience = try mixer.play(monoClip(&samples, 48000), .{ .looping = true, .priority = 10 });
+
+    const shot = try mixer.play(monoClip(&samples, 48000), .{ .looping = true, .priority = 128 });
+    try testing.expect(!mixer.isLive(ambience));
+    try testing.expect(mixer.isLive(music));
+    try testing.expect(mixer.isLive(shot));
+    try testing.expectEqual(@as(u64, 1), mixer.stolenCount());
+    // The stolen slot is reused, and the reason is still attributable.
+    try testing.expectEqual(ambience.index, shot.index);
+    try testing.expectEqual(@as(?Termination, .stolen), mixer.terminationOf(ambience));
+    try testing.expectEqual(@as(usize, 2), mixer.liveVoices());
+
+    // A request below every live voice cannot steal anything.
+    try testing.expectError(error.NoVoiceAvailable, mixer.play(monoClip(&samples, 48000), .{ .priority = 5 }));
+    try testing.expectEqual(@as(u64, 1), mixer.stolenCount());
+
+    // Opting out of stealing fails even when a victim exists.
+    try testing.expectError(error.NoVoiceAvailable, mixer.play(monoClip(&samples, 48000), .{
+        .priority = 255,
+        .allow_steal = false,
+    }));
+    try testing.expectEqual(@as(u64, 1), mixer.stolenCount());
+}
+
+test "mixer: equal priority steals the oldest voice, deterministically" {
+    const gpa = testing.allocator;
+    const samples = [_]f32{ 0.5, 0.5 };
+    var mixer = try Mixer.init(gpa, .{ .channels = 1, .max_voices = 3, .steal_policy = .lowest_priority });
+    defer mixer.deinit();
+
+    const first = try mixer.play(monoClip(&samples, 48000), .{ .looping = true });
+    const second = try mixer.play(monoClip(&samples, 48000), .{ .looping = true });
+    const third = try mixer.play(monoClip(&samples, 48000), .{ .looping = true });
+
+    const fourth = try mixer.play(monoClip(&samples, 48000), .{});
+    try testing.expectEqual(first.index, fourth.index);
+    try testing.expect(!mixer.isLive(first));
+    try testing.expect(mixer.isLive(second));
+    try testing.expect(mixer.isLive(third));
+
+    // The next steal takes the next-oldest, not the just-started voice.
+    const fifth = try mixer.play(monoClip(&samples, 48000), .{});
+    try testing.expectEqual(second.index, fifth.index);
+    try testing.expect(mixer.isLive(fourth));
+    try testing.expectEqual(@as(u64, 2), mixer.stolenCount());
+
+    // A paused voice still holds a slot and is stealable.
+    mixer.setPaused(third, true);
+    const sixth = try mixer.play(monoClip(&samples, 48000), .{});
+    try testing.expectEqual(third.index, sixth.index);
+    try testing.expectEqual(@as(?Termination, .stolen), mixer.terminationOf(third));
+}
+
+test "mixer: termination reasons distinguish stop, finish and steal" {
+    const gpa = testing.allocator;
+    const samples = [_]f32{ 0.25, 0.25 };
+    var mixer = try Mixer.init(gpa, .{ .channels = 1, .max_voices = 1, .steal_policy = .lowest_priority });
+    defer mixer.deinit();
+
+    // Natural end.
+    const one_shot = try mixer.play(monoClip(&samples, 48000), .{});
+    var out: [2]f32 = undefined;
+    _ = try mixer.render(&out);
+    try testing.expectEqual(@as(?Termination, .finished), mixer.terminationOf(one_shot));
+
+    // Explicit stop, and the record survives the slot being reused.
+    const looping = try mixer.play(monoClip(&samples, 48000), .{ .looping = true });
+    mixer.stop(looping);
+    try testing.expectEqual(@as(?Termination, .stopped), mixer.terminationOf(looping));
+    const reused = try mixer.play(monoClip(&samples, 48000), .{ .looping = true });
+    try testing.expectEqual(looping.index, reused.index);
+    try testing.expectEqual(@as(?Termination, .stopped), mixer.terminationOf(looping));
+    try testing.expectEqual(@as(?Termination, null), mixer.terminationOf(reused));
+
+    // A steal records the new occupancy's termination; the slot keeps only the
+    // most recent record, so the older handle's reason is no longer available.
+    const stealer = try mixer.play(monoClip(&samples, 48000), .{ .looping = true });
+    try testing.expectEqual(@as(?Termination, .stolen), mixer.terminationOf(reused));
+    try testing.expectEqual(@as(?Termination, null), mixer.terminationOf(looping));
+    try testing.expect(mixer.isLive(stealer));
+
+    // Unknown handles have no record.
+    try testing.expectEqual(@as(?Termination, null), mixer.terminationOf(VoiceHandle.invalid));
+    try testing.expectEqual(@as(?Termination, null), mixer.terminationOf(.{ .index = 99, .generation = 0 }));
+}
+
+fn sineClip(gpa: Allocator, frames: usize, rate: f64, freq: f64) ![]f32 {
+    const buf = try gpa.alloc(f32, frames);
+    for (buf, 0..) |*v, i| {
+        v.* = @floatCast(@sin(2.0 * std.math.pi * freq * @as(f64, @floatFromInt(i)) / rate));
+    }
+    return buf;
+}
+
+test "mixer: band-limited resampling removes the aliasing of a 2:1 downsample" {
+    const gpa = testing.allocator;
+    // 16 kHz at 48 kHz is above the 12 kHz Nyquist of the 24 kHz output.
+    const src = try sineClip(gpa, 2048, 48000, 16000);
+    defer gpa.free(src);
+
+    var linear = try Mixer.init(gpa, .{ .channels = 1, .sample_rate = 24000, .max_voices = 1 });
+    defer linear.deinit();
+    var sinc = try Mixer.init(gpa, .{ .channels = 1, .sample_rate = 24000, .max_voices = 1, .resample = .sinc });
+    defer sinc.deinit();
+    _ = try linear.play(monoClip(src, 48000), .{});
+    _ = try sinc.play(monoClip(src, 48000), .{});
+
+    var linear_out: [512]f32 = undefined;
+    var sinc_out: [512]f32 = undefined;
+    _ = try linear.render(&linear_out);
+    _ = try sinc.render(&sinc_out);
+
+    // Skip the head, where the filter reads clamped edge samples.
+    var linear_peak: f32 = 0;
+    var sinc_peak: f32 = 0;
+    for (linear_out[64..], sinc_out[64..]) |l, value| {
+        linear_peak = @max(linear_peak, @abs(l));
+        sinc_peak = @max(sinc_peak, @abs(value));
+    }
+    try testing.expect(linear_peak > 0.8);
+    try testing.expect(sinc_peak < 0.2);
+    try testing.expect(sinc_peak < linear_peak * 0.25);
+}
+
+test "mixer: band-limited resampling keeps DC and passband content intact" {
+    const gpa = testing.allocator;
+    var dc: [64]f32 = @splat(0.5);
+    var dc_mixer = try Mixer.init(gpa, .{ .channels = 1, .sample_rate = 44100, .max_voices = 1, .resample = .sinc });
+    defer dc_mixer.deinit();
+    _ = try dc_mixer.play(monoClip(&dc, 48000), .{});
+    var dc_out: [32]f32 = undefined;
+    _ = try dc_mixer.render(&dc_out);
+    for (dc_out) |value| try testing.expectApproxEqAbs(@as(f32, 0.5), value, 1e-5);
+
+    // A 1 kHz tone is far below the cutoff, so decimating 2:1 must preserve it.
+    const src = try sineClip(gpa, 1024, 48000, 1000);
+    defer gpa.free(src);
+    var mixer = try Mixer.init(gpa, .{ .channels = 1, .sample_rate = 24000, .max_voices = 1, .resample = .sinc });
+    defer mixer.deinit();
+    _ = try mixer.play(monoClip(src, 48000), .{});
+    var out: [256]f32 = undefined;
+    _ = try mixer.render(&out);
+    for (out[32..], 32..) |value, i| {
+        const expected: f32 = @floatCast(@sin(2.0 * std.math.pi * 1000.0 * @as(f64, @floatFromInt(i)) / 24000.0));
+        try testing.expectApproxEqAbs(expected, value, 5e-3);
+    }
+}
+
+test "mixer: band-limited mode keeps the unit-rate fast path bit-exact" {
+    const gpa = testing.allocator;
+    const samples = [_]f32{ 0.25, -0.5, 0.125, 0.75, -0.25, 0.5 };
+    var linear = try Mixer.init(gpa, .{ .channels = 1, .max_voices = 1 });
+    defer linear.deinit();
+    var sinc = try Mixer.init(gpa, .{ .channels = 1, .max_voices = 1, .resample = .sinc });
+    defer sinc.deinit();
+    _ = try linear.play(monoClip(&samples, 48000), .{ .looping = true });
+    _ = try sinc.play(monoClip(&samples, 48000), .{ .looping = true });
+
+    var linear_out: [16]f32 = undefined;
+    var sinc_out: [16]f32 = undefined;
+    _ = try linear.render(&linear_out);
+    _ = try sinc.render(&sinc_out);
+    // Same rate and an integral cursor: both take the copy path, bit for bit.
+    try testing.expectEqualSlices(f32, &linear_out, &sinc_out);
+
+    // A fractional pitch leaves the fast path, and then the two modes differ.
+    const linear_voice = linear.voices[0];
+    const sinc_voice = sinc.voices[0];
+    try linear.setPitch(.{ .index = 0, .generation = linear_voice.generation }, 1.5);
+    try sinc.setPitch(.{ .index = 0, .generation = sinc_voice.generation }, 1.5);
+    _ = try linear.render(&linear_out);
+    _ = try sinc.render(&sinc_out);
+    var differs = false;
+    for (linear_out, sinc_out) |l, value| {
+        try testing.expect(std.math.isFinite(value));
+        if (l != value) differs = true;
+    }
+    try testing.expect(differs);
+}
+
+test "mixer: band-limited resampling is continuous across a loop boundary" {
+    const gpa = testing.allocator;
+    // Four whole cycles over 64 frames, so the clip tiles seamlessly.
+    const frames = 64;
+    const src = try gpa.alloc(f32, frames);
+    defer gpa.free(src);
+    for (src, 0..) |*v, i| {
+        v.* = @floatCast(@sin(2.0 * std.math.pi * 4.0 * @as(f64, @floatFromInt(i)) / @as(f64, frames)));
+    }
+
+    var mixer = try Mixer.init(gpa, .{ .channels = 1, .sample_rate = 48000, .max_voices = 1, .resample = .sinc });
+    defer mixer.deinit();
+    _ = try mixer.play(monoClip(src, 24000), .{ .looping = true });
+
+    // 256 output frames at step 0.5 cover two full loops.
+    var out: [256]f32 = undefined;
+    _ = try mixer.render(&out);
+    for (out, 0..) |value, i| {
+        const pos = 0.5 * @as(f64, @floatFromInt(i));
+        const expected: f32 = @floatCast(@sin(2.0 * std.math.pi * 4.0 * pos / @as(f64, frames)));
+        try testing.expectApproxEqAbs(expected, value, 5e-3);
+    }
+}
+
+test "mixer: band-limited resampling filters every channel independently" {
+    const gpa = testing.allocator;
+    // Stereo: left is a constant, right its negation.
+    const stereo = try gpa.alloc(f32, 256);
+    defer gpa.free(stereo);
+    for (0..128) |i| {
+        stereo[i * 2] = 0.5;
+        stereo[i * 2 + 1] = -0.5;
+    }
+    // Linear pan law at center is unity on both channels, so the assertions
+    // below measure the filter rather than the pan attenuations.
+    var mixer = try Mixer.init(gpa, .{ .sample_rate = 44100, .max_voices = 1, .resample = .sinc, .pan_law = .linear });
+    defer mixer.deinit();
+    _ = try mixer.play(stereoClip(stereo, 48000), .{});
+    var out: [64]f32 = undefined;
+    _ = try mixer.render(&out);
+    var i: usize = 0;
+    while (i < out.len) : (i += 2) {
+        try testing.expectApproxEqAbs(@as(f32, 0.5), out[i], 1e-5);
+        try testing.expectApproxEqAbs(@as(f32, -0.5), out[i + 1], 1e-5);
+    }
+
+    // Surround to mono still averages the channels, now after filtering.
+    const surround = [_]f32{ 0.1, 0.2, 0.3, 0.4, 0.1, 0.2, 0.3, 0.4, 0.1, 0.2, 0.3, 0.4, 0.1, 0.2, 0.3, 0.4 };
+    var mono = try Mixer.init(gpa, .{ .channels = 1, .sample_rate = 32000, .max_voices = 1, .resample = .sinc });
+    defer mono.deinit();
+    _ = try mono.play(.{ .sample_rate = 48000, .channels = 4, .frames = 4, .samples = &surround }, .{});
+    var mono_out: [2]f32 = undefined;
+    _ = try mono.render(&mono_out);
+    for (mono_out) |value| try testing.expectApproxEqAbs(@as(f32, 0.25), value, 1e-5);
+}
+
+test "mixer: band-limited rendering is deterministic and allocation free" {
+    const gpa = testing.allocator;
+    const src = try sineClip(gpa, 512, 48000, 5000);
+    defer gpa.free(src);
+
+    var first = try Mixer.init(gpa, .{ .sample_rate = 44100, .max_voices = 2, .resample = .sinc });
+    defer first.deinit();
+    var second = try Mixer.init(gpa, .{ .sample_rate = 44100, .max_voices = 2, .resample = .sinc });
+    defer second.deinit();
+    for ([_]*Mixer{ &first, &second }) |mixer| {
+        _ = try mixer.play(monoClip(src, 48000), .{ .looping = true, .pan = -0.4 });
+        _ = try mixer.play(monoClip(src, 32000), .{ .looping = true, .pan = 0.7, .pitch = 1.25 });
+    }
+
+    var a: [128]f32 = undefined;
+    var b: [128]f32 = undefined;
+    for (0..4) |_| {
+        const stats_a = try first.render(&a);
+        const stats_b = try second.render(&b);
+        try testing.expectEqualSlices(f32, &a, &b);
+        try testing.expectEqual(stats_a.peak, stats_b.peak);
+        try testing.expectEqual(@as(usize, 2), stats_a.voices_active);
+    }
+    // Rendering must not allocate: the table was built once at init.
+    try testing.checkAllAllocationFailures(gpa, struct {
+        fn f(alloc: Allocator) !void {
+            const samples = [_]f32{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 };
+            var mixer = try Mixer.init(alloc, .{ .sample_rate = 44100, .resample = .sinc });
+            defer mixer.deinit();
+            _ = try mixer.play(monoClip(&samples, 48000), .{ .looping = true });
+            var out: [32]f32 = undefined;
+            _ = try mixer.render(&out);
+        }
+    }.f, .{});
+}
+
+test "mixer: an integer step reuses the kernel and still tracks the loop wrap" {
+    const gpa = testing.allocator;
+    const frames = 64;
+    const src = try gpa.alloc(f32, frames);
+    defer gpa.free(src);
+    for (src, 0..) |*v, i| {
+        v.* = @floatCast(@sin(2.0 * std.math.pi * 4.0 * @as(f64, @floatFromInt(i)) / @as(f64, frames)));
+    }
+
+    // Step 2.0 keeps the fractional cursor at exactly 0, so every frame after
+    // the first reuses the cached kernel and only relocates its start index.
+    var mixer = try Mixer.init(gpa, .{ .channels = 1, .sample_rate = 24000, .max_voices = 1, .resample = .sinc });
+    defer mixer.deinit();
+    _ = try mixer.play(monoClip(src, 48000), .{ .looping = true });
+
+    var out: [128]f32 = undefined;
+    _ = try mixer.render(&out);
+    for (out, 0..) |value, i| {
+        // At an integral cursor the prototype is a delta, so the output is the
+        // source sample itself -- across four passes of the loop boundary.
+        const index = (i * 2) % frames;
+        try testing.expectApproxEqAbs(src[index], value, 1e-5);
+    }
 }
