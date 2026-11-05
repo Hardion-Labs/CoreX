@@ -1,17 +1,19 @@
 # Audio Import (WAV) and the CXAW Artifact — CoreXEngine
 
-This document describes CoreXEngine's audio importer: the decoder for the
+This document describes CoreXEngine's WAV importer: the decoder for the
 uncompressed subset of **RIFF/WAVE** and the engine-ready **`CXAW`** artifact it
-produces. The code lives in `src/assets/audio.zig` and is exposed as
+produces. The **FLAC** decoder lives in `src/assets/flac.zig` and produces the
+same `Audio`/`CXAW` artifact — see [asset-flac.md](asset-flac.md). The code lives in `src/assets/audio.zig` and is exposed as
 `corex.assets.audio` (with `corex.assets.Audio` / `corex.assets.AudioView`).
 
 > Status: **implemented and tested**. This is the "audio" part of the asset
 > decoders roadmap item. It consumes the same pipeline/cache as the other
 > importers ([asset-import.md](asset-import.md)) and the same change-detection
-> path ([asset-change-detection.md](asset-change-detection.md)). **Compressed
-> audio (ADPCM, A-law/µ-law, GSM, Ogg/Vorbis, MP3, FLAC, Opus) and other
-> containers (AIFF, CAF, RF64) have no decoder** and are rejected or fall back to
-> `raw`; they are not described here as an existing capability. There is **no
+> path ([asset-change-detection.md](asset-change-detection.md)). **Lossy and
+> other compressed audio (ADPCM, A-law/µ-law, GSM, Ogg/Vorbis, MP3, Opus) and
+> other containers (AIFF, CAF, RF64) have no decoder** and are rejected or fall
+> back to `raw`; they are not described here as an existing capability. Lossless
+> **FLAC is supported** as of this stage ([asset-flac.md](asset-flac.md)). There is **no
 > audio playback device yet**. The device-independent **mixer** that consumes
 > these artifacts is implemented — see [audio-mixer.md](audio-mixer.md) — while
 > the OS device backends remain planned.
@@ -202,9 +204,10 @@ Measured on this machine, `ReleaseFast`, best of 5 runs, 10 s of 48 kHz stereo
 
 ## Limitations and next steps
 
-- **Uncompressed WAV only.** ADPCM, A-law/µ-law, GSM and every other compressed
-  codec are rejected; 64-bit float is rejected; Ogg/MP3/FLAC/Opus/AIFF have no
-  decoder and use the `raw` importer (verbatim copy).
+- **Uncompressed WAV only in this module.** ADPCM, A-law/µ-law, GSM and every
+  other codec inside a RIFF container are rejected, and 64-bit float is rejected.
+  FLAC is handled by the sibling decoder ([asset-flac.md](asset-flac.md));
+  Ogg/MP3/Opus/AIFF have no decoder and use the `raw` importer (verbatim copy).
 - **No resampling, downmixing or channel reordering** — a consumer that needs
   48 kHz stereo must handle the source rate/layout itself for now.
 - **No device playback**: the voice/bus mixer that consumes `CXAW` is implemented
@@ -219,6 +222,7 @@ Measured on this machine, `ReleaseFast`, best of 5 runs, 10 s of 48 kHz stereo
 
 ## Related
 
+- FLAC decoder (same `CXAW` artifact): [asset-flac.md](asset-flac.md)
 - Audio runtime / mixer: [audio-mixer.md](audio-mixer.md)
 - Import and cache: [asset-import.md](asset-import.md)
 - Change detection / incremental import: [asset-change-detection.md](asset-change-detection.md)
