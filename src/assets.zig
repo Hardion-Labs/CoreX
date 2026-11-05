@@ -48,6 +48,7 @@ pub const image = @import("assets/image.zig");
 pub const inflate = @import("assets/inflate.zig");
 /// PNG decoder normalizing to the same RGBA8 `Image` as `image`.
 pub const png = @import("assets/png.zig");
+pub const jpeg = @import("assets/jpeg.zig");
 /// Engine-ready `CXTX` texture artifact and texture importers.
 pub const texture = @import("assets/texture.zig");
 /// Engine-ready `CXMH` mesh artifact and the OBJ mesh importer.
@@ -121,7 +122,7 @@ const engine_bindings = texture.bindings ++ mesh.bindings ++ audio.bindings ++ [
 
 /// The engine's default import registry: texture (PNG/BMP/TGA/QOI) + mesh (OBJ)
 /// + audio (WAV) + scene + prefab + JSON + text importers, with `raw` as the
-/// fallback for binary/unknown extensions (e.g. JPEG, compressed audio and other
+/// fallback for binary/unknown extensions (e.g. compressed audio and other
 /// model formats, which have no decoder yet).
 pub fn engineRegistry() Registry {
     return .{ .bindings = &engine_bindings, .fallback = importer.raw_importer };
@@ -205,8 +206,9 @@ test "engine registry selects importers by extension" {
     try std.testing.expectEqualStrings("wav", reg.select(".WAV").id);
     try std.testing.expectEqualStrings("json", reg.select(".json").id);
     try std.testing.expectEqualStrings("text", reg.select(".lua").id);
+    try std.testing.expectEqualStrings("jpeg", reg.select(".jpg").id);
+    try std.testing.expectEqualStrings("jpeg", reg.select(".JPEG").id);
     // Formats without a decoder yet still fall back to a verbatim raw copy.
-    try std.testing.expectEqualStrings("raw", reg.select(".jpg").id);
     try std.testing.expectEqualStrings("raw", reg.select(".ogg").id);
     try std.testing.expectEqualStrings("raw", reg.select(".mp3").id);
     try std.testing.expectEqualStrings("raw", reg.select(".gltf").id);
