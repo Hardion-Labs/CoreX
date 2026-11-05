@@ -160,6 +160,30 @@ declared yet.
   v1, `AssetKind.model`), so the pipeline imports/caches/GCs meshes like any asset.
   Bounded by `max_vertices`/`max_indices`; feeds the render extraction layer
   (`Renderable.bounds`/mesh handles). glTF/FBX/DAE remain `raw` (planned).
+- WAV audio importer + engine-ready `CXAW` audio artifact (`src/assets/audio.zig`,
+  re-exported as `corex.assets.audio` with `Audio`/`AudioView`,
+  `docs/asset-audio.md`): decodes the uncompressed RIFF/WAVE subset — PCM 8-bit
+  unsigned and 16/24/32-bit signed, IEEE float32, and `WAVE_FORMAT_EXTENSIBLE`
+  with a PCM/float subformat GUID — into interleaved float32. Integer samples are
+  scaled by `2^(bits-1)` (8-bit re-centered on 128, 24-bit sign-extended); float
+  samples pass through unchanged including headroom beyond `[-1, 1]`, while
+  NaN/Infinity are rejected. Ancillary chunks are skipped, `fmt ` must precede
+  `data`, exactly one of each is required, odd chunks are word-padded and the RIFF
+  size must match the file length. `serialize`/`parse` produce a self-describing
+  20-byte-header little-endian `CXAW` container; `parse` is zero-copy,
+  alignment-safe and validates dimensions, exact length and float finiteness in
+  one linear pass. Registered in `engineRegistry()` (`.wav` → `wav` importer v1,
+  `AssetKind.audio` already existed), so the pipeline imports/caches/GCs and
+  incrementally re-imports audio like any asset. Bounded by `max_channels` (8),
+  `max_sample_rate` (384 kHz) and `max_sample_bytes` (256 MiB); conversion is
+  specialized at comptime per bit width. No resampling/downmixing/channel
+  reordering, and no playback device or mixer yet; ADPCM/µ-law/A-law/GSM, 64-bit
+  float and Ogg/MP3/FLAC/Opus/AIFF remain unsupported (rejected or `raw`).
+- Reproducible audio test vectors (`tools/gen_wav_vectors.py`,
+  `src/assets/audio_vectors.zig`): 15 valid WAVs with their expected interleaved
+  f32 output (compared as bit patterns) plus 23 malformed/unsupported WAVs, all
+  generated with Python's `struct` so the tests compare against an independent
+  encoder.
 - Shared display-name validation (`src/core/validation.zig`) used by both the
   `.corex` manifest and scene documents.
 - Native Module ABI contract for C++ (`docs/native-module-api.md`,
@@ -169,8 +193,8 @@ declared yet.
 - Test suite covering the startup spine, ECS, scheduling (manual stages,
   automatic dependency graphs, observers, frame budgets and profiling), scenes,
   asset import/cache, world-space transforms, texture decoders, cache GC, render
-  extraction, OBJ mesh import, scene prefabs, DEFLATE/zlib, PNG and asset change
-  detection (339 tests), including allocation-failure
+  extraction, OBJ mesh import, scene prefabs, DEFLATE/zlib, PNG, asset change
+  detection and WAV audio import (351 tests), including allocation-failure
   probes, cache corruption/truncation probes, a deep-hierarchy stress test, QOI
   encode/decode roundtrips, end-to-end texture-import-and-cache, OBJ-import-and-
   cache and import-then-GC tests, camera/frustum/culling and draw-list extraction
@@ -178,7 +202,8 @@ declared yet.
   capture/instantiate/rollback and prefab-import-and-cache tests, PNG/inflate
   reference-vector and rejection suites (including a 200 KiB multi-block stream
   and truncation probes), change-detection classification/blind-spot/key-parity
-  tests, a full hot-reload cycle (detect, incremental re-import, GC), and job-system
+  tests, a full hot-reload cycle (detect, incremental re-import, GC), WAV
+  reference-vector/rejection/alignment and WAV-import-and-cache tests, and job-system
   integration tests (including parallel graph/frame profiling over `JobSystem`
   workers), validated in Debug, ReleaseSafe and ReleaseFast.
 
@@ -195,8 +220,9 @@ declared yet.
   `CXTX` texture artifact as `corex.assets.image`/`corex.assets.texture`, PNG
   decoding as `corex.assets.png`, DEFLATE/zlib as `corex.assets.inflate` and change
   detection as `corex.assets.changes`, the OBJ
-  mesh importer and `CXMH` artifact as `corex.assets.mesh`,
-  `Image`/`Texture`/`Mesh`/`MeshView`/`GcStats`) and render (backend-independent
+  mesh importer and `CXMH` artifact as `corex.assets.mesh`, the WAV audio importer
+  and `CXAW` artifact as `corex.assets.audio`,
+  `Image`/`Texture`/`Mesh`/`MeshView`/`Audio`/`AudioView`/`GcStats`) and render (backend-independent
   extraction as `corex.render`) subsystems.
 - The engine import registry now decodes `.png`/`.bmp`/`.tga`/`.qoi` textures to `CXTX`
   and `.obj` meshes to `CXMH` artifacts instead of copying them verbatim; the cache

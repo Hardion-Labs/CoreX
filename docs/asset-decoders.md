@@ -7,11 +7,12 @@ artifact (`CXTX`). The code lives in `src/assets/image.zig` (BMP/TGA/QOI),
 `corex.assets.image`, `corex.assets.png`, `corex.assets.inflate` and
 `corex.assets.texture` (types `corex.assets.Image` and `corex.assets.Texture`).
 
-> Status: **implemented and tested** for **PNG, BMP, TGA and QOI**. JPEG, audio
-> and fonts still have no decoder and continue to be imported as `raw` (verbatim
+> Status: **implemented and tested** for **PNG, BMP, TGA and QOI**. JPEG and
+> fonts still have no decoder and continue to be imported as `raw` (verbatim
 > copy). Other model formats also fall back to `raw`; the OBJ mesh importer does
-> exist (see [mesh-import.md](mesh-import.md)). This is documented as a
-> limitation, not as an existing capability.
+> exist (see [mesh-import.md](mesh-import.md)), as does the WAV audio importer
+> (see [asset-audio.md](asset-audio.md)). This is documented as a limitation, not
+> as an existing capability.
 
 ## Overview
 
@@ -231,12 +232,15 @@ var report = try A.pipeline.run(gpa, io, root, idx, &cache, .{
   artifact is always linear RGBA8. `gAMA`/`sRGB`/`iCCP` chunks are skipped, not
   applied.
 - The pipeline is not wired into startup/editor yet; that integration and
-  hot-reload are next steps, as are audio decoders and other model formats (the
-  OBJ mesh importer already exists — see [mesh-import.md](mesh-import.md)).
+  hot-reload are next steps, as are compressed-audio decoders and other model
+  formats (the OBJ mesh importer already exists — see
+  [mesh-import.md](mesh-import.md) — and so does the WAV audio importer, see
+  [asset-audio.md](asset-audio.md)).
 
 ## Related
 
 - Import and cache: [asset-import.md](asset-import.md)
 - Mesh import (OBJ) / CXMH: [mesh-import.md](mesh-import.md)
+- Audio import (WAV) / CXAW: [asset-audio.md](asset-audio.md)
 - Architecture: [architecture.md](architecture.md)
 - Versioning: [versioning.md](versioning.md)
