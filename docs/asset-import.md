@@ -232,9 +232,10 @@ Guarantees and behavior:
   (see [asset-audio.md](asset-audio.md)). JPEG, compressed audio
   (ADPCM/µ-law/Ogg/MP3/FLAC/Opus), other model formats (glTF/FBX/DAE) and fonts
   still have no decoder and use the `raw` importer (verbatim copy); they will be
-  registered as dedicated importers once they exist. Adam7-interlaced PNG and
-  compressed WAV codecs are rejected rather than approximated. There is no audio
-  playback device or mixer yet — only the decode/artifact half of the audio path.
+  registered as dedicated importers once they exist. Compressed WAV codecs are
+  rejected rather than approximated. PNG covers the full format range including
+  Adam7 interlacing. Playback is handled by the software mixer
+  ([audio-mixer.md](audio-mixer.md)); there is still no OS audio device backend.
 - The `json` importer preserves the source key order (it minifies, it does not sort
   keys); determinism is by source content, which is sufficient for a
   content-addressed cache.

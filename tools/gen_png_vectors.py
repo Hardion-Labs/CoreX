@@ -328,10 +328,6 @@ def main() -> None:
     add_invalid("missing_iend", good[: -len(chunk(b"IEND", b""))])
     add_invalid("trailing_bytes", good + b"junk")
     add_invalid("unknown_critical_chunk", SIGNATURE + ihdr(4, 4, 8, 2) + chunk(b"ABCD", b"x") + good[len(SIGNATURE) + 25 :])
-    add_invalid(
-        "interlaced_adam7",
-        SIGNATURE + ihdr(4, 4, 8, 2, interlace=1) + chunk(b"IDAT", zlib.compress(b"\x00" * 52)) + chunk(b"IEND", b""),
-    )
     add_invalid("zero_width", SIGNATURE + ihdr(0, 4, 8, 2) + chunk(b"IDAT", zlib.compress(b"")) + chunk(b"IEND", b""))
     add_invalid(
         "oversize_width",
