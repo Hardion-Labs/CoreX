@@ -39,6 +39,10 @@ pub const importer = @import("assets/importer.zig");
 pub const pipeline = @import("assets/pipeline.zig");
 /// Pure image decoders (BMP/TGA/QOI) normalizing to RGBA8.
 pub const image = @import("assets/image.zig");
+/// DEFLATE/zlib decompression (the foundation the PNG decoder needs).
+pub const inflate = @import("assets/inflate.zig");
+/// PNG decoder normalizing to the same RGBA8 `Image` as `image`.
+pub const png = @import("assets/png.zig");
 /// Engine-ready `CXTX` texture artifact and texture importers.
 pub const texture = @import("assets/texture.zig");
 /// Engine-ready `CXMH` mesh artifact and the OBJ mesh importer.
@@ -103,10 +107,10 @@ const engine_bindings = texture.bindings ++ mesh.bindings ++ [_]Registry.Binding
     .{ .extensions = &[_][]const u8{ ".prefab", ".corexprefab" }, .importer = prefab_importer },
 } ++ importer.builtin_bindings;
 
-/// The engine's default import registry: texture (BMP/TGA/QOI) + mesh (OBJ) +
-/// scene + prefab + JSON + text importers, with `raw` as the fallback for
-/// binary/unknown extensions (e.g. PNG/JPEG/audio and other model formats, which
-/// have no decoder yet).
+/// The engine's default import registry: texture (PNG/BMP/TGA/QOI) + mesh (OBJ)
+/// + scene + prefab + JSON + text importers, with `raw` as the fallback for
+/// binary/unknown extensions (e.g. JPEG/audio and other model formats, which have
+/// no decoder yet).
 pub fn engineRegistry() Registry {
     return .{ .bindings = &engine_bindings, .fallback = importer.raw_importer };
 }
@@ -118,6 +122,8 @@ test {
     _ = importer;
     _ = pipeline;
     _ = image;
+    _ = inflate;
+    _ = png;
     _ = texture;
     _ = mesh;
 }
@@ -177,12 +183,14 @@ test "engine registry selects importers by extension" {
     try std.testing.expectEqualStrings("bmp", reg.select(".bmp").id);
     try std.testing.expectEqualStrings("tga", reg.select(".TGA").id);
     try std.testing.expectEqualStrings("qoi", reg.select(".qoi").id);
+    try std.testing.expectEqualStrings("png", reg.select(".png").id);
+    try std.testing.expectEqualStrings("png", reg.select(".PNG").id);
     try std.testing.expectEqualStrings("obj", reg.select(".obj").id);
     try std.testing.expectEqualStrings("obj", reg.select(".OBJ").id);
     try std.testing.expectEqualStrings("json", reg.select(".json").id);
     try std.testing.expectEqualStrings("text", reg.select(".lua").id);
     // Formats without a decoder yet still fall back to a verbatim raw copy.
-    try std.testing.expectEqualStrings("raw", reg.select(".png").id);
+    try std.testing.expectEqualStrings("raw", reg.select(".jpg").id);
     try std.testing.expectEqualStrings("raw", reg.select(".wav").id);
     try std.testing.expectEqualStrings("raw", reg.select(".gltf").id);
 }
@@ -480,4 +488,60 @@ test "pipeline + gc: removing a source lets gc reclaim its stale artifact" {
     try std.testing.expectEqual(@as(usize, 1), stats.kept);
     try std.testing.expectEqual(@as(usize, 1), stats.removed);
     try std.testing.expect(try store.has(std.testing.allocator, live2[0]));
+}
+
+test "pipeline imports a PNG to a CXTX artifact and hits the cache on re-run" {
+    const vectors = @import("assets/png_vectors.zig");
+    const vector = vectors.valid[0];
+    const gpa = std.testing.allocator;
+    const source = try gpa.alloc(u8, vector.png_hex.len / 2);
+    defer gpa.free(source);
+    _ = try std.fmt.hexToBytes(source, vector.png_hex);
+    const expected = try gpa.alloc(u8, vector.rgba_hex.len / 2);
+    defer gpa.free(expected);
+    _ = try std.fmt.hexToBytes(expected, vector.rgba_hex);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.createDirPath(io, "assets");
+    try tmp.dir.createDirPath(io, "cache");
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/hero.png", .data = source });
+
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buf);
+    const root_path = buf[0..n];
+    var idx = try indexDirectories(gpa, io, root_path, &.{"assets"});
+    defer idx.deinit();
+    var root = try Io.Dir.openDirAbsolute(io, root_path, .{});
+    defer root.close(io);
+    var cache_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const cache_path = try std.fmt.bufPrint(&cache_buf, "{s}/cache", .{root_path});
+    var store = try Cache.open(io, cache_path);
+    defer store.deinit();
+
+    var report = try pipeline.runSequential(gpa, io, root, idx, &store, .{
+        .registry = engineRegistry(),
+    });
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 1), report.imported);
+    try std.testing.expectEqualStrings("png", report.entries[0].importer_id.?);
+    try std.testing.expectEqual(AssetKind.texture, report.entries[0].kind);
+
+    const key = report.entries[0].key.?;
+    const artifact = (try store.get(gpa, key)).?;
+    defer gpa.free(artifact);
+    const tex = try texture.parse(artifact);
+    try std.testing.expectEqual(vector.width, tex.width);
+    try std.testing.expectEqual(vector.height, tex.height);
+    try std.testing.expectEqualSlices(u8, expected, tex.pixels);
+
+    // Second run: identical source and importer identity -> cache hit.
+    var second = try pipeline.runSequential(gpa, io, root, idx, &store, .{
+        .registry = engineRegistry(),
+    });
+    defer second.deinit();
+    try std.testing.expectEqual(@as(usize, 0), second.imported);
+    try std.testing.expectEqual(@as(usize, 1), second.cached);
+    try std.testing.expectEqual(key, second.entries[0].key.?);
 }

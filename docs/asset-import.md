@@ -5,11 +5,11 @@ cache. The code lives in `src/assets/` and is exposed publicly as `corex.assets`
 The asset index (a startup stage) remains in `src/core/assets.zig` and its
 contract is unchanged.
 
-> Status: **implemented and tested**. **Texture** decoders for **BMP, TGA and
-> QOI** exist and produce a `CXTX` artifact (RGBA8) — see
+> Status: **implemented and tested**. **Texture** decoders for **PNG, BMP, TGA
+> and QOI** exist and produce a `CXTX` artifact (RGBA8) — see
 > [asset-decoders.md](asset-decoders.md) — and an **OBJ mesh** decoder produces a
 > `CXMH` artifact — see [mesh-import.md](mesh-import.md). Other binary formats
-> (PNG, JPEG, audio, other models such as glTF/FBX/DAE, fonts) still have no
+> (JPEG, audio, other models such as glTF/FBX/DAE, fonts) still have no
 > decoder and use the `raw` importer (verbatim copy) until decoders are
 > registered. This is documented below and is not described as an existing
 > capability.
@@ -52,10 +52,11 @@ system: it validates the `.scene` document (hierarchy, components, transforms)
 and re-serializes it canonically and deterministically. Invalid scenes are
 rejected at import time.
 
-Texture importers (`corex.assets.texture`, IDs `bmp`/`tga`/`qoi`, version 1)
-decode the image to RGBA8 and serialize it into the `CXTX` artifact. See
-[asset-decoders.md](asset-decoders.md) for supported formats, the artifact layout
-and limitations.
+Texture importers (`corex.assets.texture`, IDs `png`/`bmp`/`tga`/`qoi`, version 1)
+decode the image to RGBA8 and serialize it into the `CXTX` artifact. The PNG
+importer is backed by the dependency-free DEFLATE/zlib inflater in
+`corex.assets.inflate`. See [asset-decoders.md](asset-decoders.md) for supported
+formats, the artifact layout and limitations.
 
 Importer contract:
 
@@ -76,7 +77,7 @@ pub const ImportError = error{ InvalidAsset, OutOfMemory };
 with a fallback for unmatched extensions:
 
 - `importer.defaultRegistry()`: JSON + text, `raw` fallback.
-- `assets.engineRegistry()`: textures (BMP/TGA/QOI) + meshes (OBJ) + scenes +
+- `assets.engineRegistry()`: textures (PNG/BMP/TGA/QOI) + meshes (OBJ) + scenes +
   prefabs (`.prefab`/`.corexprefab`) + JSON + text, `raw` fallback (the engine's
   default registry).
 
@@ -202,11 +203,12 @@ Guarantees and behavior:
 
 ## Limitations
 
-- Texture decoders exist for **BMP, TGA and QOI** (see
+- Texture decoders exist for **PNG, BMP, TGA and QOI** (see
   [asset-decoders.md](asset-decoders.md)) and a mesh decoder for **OBJ** (see
-  [mesh-import.md](mesh-import.md)). PNG, JPEG, audio, other model formats
+  [mesh-import.md](mesh-import.md)). JPEG, audio, other model formats
   (glTF/FBX/DAE) and fonts still have no decoder and use the `raw` importer
   (verbatim copy); they will be registered as dedicated importers once they exist.
+  Adam7-interlaced PNG is rejected rather than approximated.
 - The `json` importer preserves the source key order (it minifies, it does not sort
   keys); determinism is by source content, which is sufficient for a
   content-addressed cache.
@@ -232,7 +234,8 @@ Guarantees and behavior:
 ## Related links
 
 - [architecture.md](architecture.md) — subsystem map and status.
-- [asset-decoders.md](asset-decoders.md) — texture decoders and the CXTX artifact.
+- [asset-decoders.md](asset-decoders.md) — image decoders (PNG/BMP/TGA/QOI), the
+  DEFLATE/zlib inflater and the CXTX artifact.
 - [mesh-import.md](mesh-import.md) — OBJ mesh importer and the CXMH artifact.
 - [scene-format.md](scene-format.md) — scene format validated by the importer.
 - [versioning.md](versioning.md) — format versioning policy.
