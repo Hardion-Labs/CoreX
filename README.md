@@ -26,7 +26,7 @@ control, and maintainable code.
 > system scheduling over the job system, automatic dependency graphs, cooperative
 > frame budgets and system profiling), the scene system (versioned JSON
 > scenes, stable entity IDs, hierarchy, ECS load/save, world-space transform
-> propagation) and the asset import
+> propagation, reusable single-root prefabs) and the asset import
 > pipeline + content-addressed cache (raw/text/json/scene importers, BMP/TGA/QOI
 > texture decoders, OBJ mesh decoder, atomic verified storage, parallel import over
 > the job system, mark-and-sweep GC), and the backend-independent render extraction
@@ -210,6 +210,25 @@ if (wt.get(child)) |world| {
 See [`docs/scene-transforms.md`](docs/scene-transforms.md) for the math
 conventions, API and performance notes.
 
+### Prefabs
+
+Prefabs (`.prefab`) are reusable single-root entity subtrees built on the same
+versioned scene format. They can be parsed from disk, captured from a live scene
+subtree, and instantiated into any same-schema scene with deterministic ID
+remapping and copied hierarchy/components. Multiple instances are independent,
+and failed instantiations roll back created entities. Prefabs are imported and
+cached by the asset pipeline (`AssetKind.prefab`, `prefab` importer).
+
+```zig
+var prefab = try corex.scene.EnginePrefab.parse(allocator, prefab_bytes);
+defer prefab.deinit();
+const a = try prefab.instantiate(&scene, scene.idOf(root));
+const b = try prefab.instantiate(&scene, scene.idOf(root)); // independent copy
+```
+
+See [`docs/scene-prefabs.md`](docs/scene-prefabs.md) for the format, API,
+guarantees and limitations. Scene streaming remains planned.
+
 ## Assets
 
 The asset subsystem (`corex.assets`) indexes source assets and imports them into
@@ -296,6 +315,7 @@ CoreX/
 │   ├── project-format.md       # .corex manifest format
 │   ├── scene-format.md         # Versioned .scene format
 │   ├── scene-transforms.md     # World-space transform propagation
+│   ├── scene-prefabs.md        # Reusable single-root prefabs (.prefab)
 │   ├── render-extraction.md    # Backend-independent render extraction
 │   ├── versioning.md           # Versioning and compatibility policy
 │   ├── native-module-api.md    # C++ native module ABI contract
@@ -310,7 +330,7 @@ CoreX/
 │   ├── ecs.zig                 # ECS public module
 │   ├── ecs/                    # Entities, pools, world/views, scheduling, frame budgets
 │   ├── scene.zig               # Scene public module (EngineScene)
-│   ├── scene/                  # Scene components + versioned documents
+│   ├── scene/                  # Scene components, versioned documents, prefabs
 │   ├── assets.zig              # Asset public module (index + import + cache)
 │   ├── assets/                 # Import cache, importers, parallel pipeline
 │   ├── render.zig              # Render public module (extraction layer)
@@ -334,7 +354,8 @@ Indicative; subject to change as technical decisions are validated.
 - [x] ECS scheduling extensions: dependency graph, frame budget, profiling.
 - [x] Scene system and versioned scene serialization (format v1, ECS load/save).
 - [x] Scene world-space transforms (column-major Mat4 propagation, deterministic, iterative).
-- [ ] Scene extensions: prefabs, streaming.
+- [x] Scene prefabs (single-root `.prefab`, capture/instantiate, ID remap, asset import).
+- [ ] Scene streaming.
 - [x] Asset import pipeline and content-addressed cache (raw/text/json/scene).
 - [x] Texture decoders (BMP/TGA/QOI → RGBA8 `CXTX` artifact).
 - [x] Asset cache garbage collection (mark-and-sweep of orphan entries).
