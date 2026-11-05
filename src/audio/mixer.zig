@@ -24,9 +24,14 @@
 //!   *higher* priority is never taken, and `terminationOf` reports why a handle
 //!   died (`.stopped`, `.finished` or `.stolen`) even after its slot is reused.
 //!   The default `.none` keeps `play` a hard failure on a full pool.
+//! - **Optional insert effects.** `Config.effect_slots > 0` reserves insert
+//!   slots per bus plus a master chain (`effects.zig`). A bus with an active
+//!   chain is mixed into a preallocated submix, processed, then summed; every
+//!   other voice still writes straight to the output. With no slots (the
+//!   default) there is no submix and no extra pass at all.
 //! - **One output pass.** Voices accumulate into the caller's buffer; master
 //!   gain, non-finite sanitizing, clamping and peak metering happen in a single
-//!   final pass, so there is no scratch buffer.
+//!   final pass. The only scratch is the opt-in effect submix.
 //!
 //! Threading contract: a `Mixer` is **single-threaded**. The thread that owns the
 //! device callback owns the mixer; other threads must post commands to it (or
@@ -39,11 +44,13 @@
 //! ~16 KiB prototype table built in `init`, cutoff scaled by the decimation
 //! ratio, unity DC gain, and no per-sample allocation. An integral cursor at
 //! unit step bypasses both and copies samples bit-exactly. See
-//! `docs/audio-mixer.md` for the measured trade-offs.
+//! `docs/audio-mixer.md` for the measured trade-offs and
+//! `docs/audio-effects.md` for the insert DSP.
 
 const std = @import("std");
 const clip_mod = @import("clip.zig");
 const resample_mod = @import("resample.zig");
+const effects_mod = @import("effects.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -51,6 +58,10 @@ pub const Clip = clip_mod.Clip;
 pub const ChannelMap = clip_mod.ChannelMap;
 /// Resampling quality for voices whose rate or pitch differs from the output.
 pub const Resample = resample_mod.Quality;
+/// Insert effects (biquad filters, compressor) and ordered chains.
+pub const effects = effects_mod;
+pub const Effect = effects_mod.Effect;
+pub const EffectChain = effects_mod.Chain;
 pub const PanLaw = clip_mod.PanLaw;
 pub const panGains = clip_mod.panGains;
 pub const max_sample_rate = clip_mod.max_sample_rate;
@@ -63,6 +74,10 @@ pub const max_pitch: f32 = 100.0;
 pub const max_voice_limit: u32 = 4096;
 /// Upper bound on the bus count.
 pub const max_bus_limit: u32 = 64;
+/// Insert slots per bus (and for the master chain) when effects are enabled.
+pub const max_effect_slots: u8 = 8;
+/// Largest internal processing block used when effects are enabled.
+pub const max_block_frames: u32 = 4096;
 
 /// A generational voice handle. Copyable by value; `VoiceHandle.invalid` is
 /// never live. Distinct from an ECS `Entity` on purpose: voice slots are a fixed
@@ -112,7 +127,7 @@ pub const Config = struct {
     max_voices: u32 = 64,
     /// How voices are interpolated when their step is not exactly 1. `.linear`
     /// (the default) is two-point and allocation-free; `.sinc` is band-limited
-    /// and allocates one ~16 KiB prototype table at init.
+    /// and allocates one ~33 KiB prototype table at init.
     resample: Resample = .linear,
     /// Bus count; bus 0 is the default bus every voice starts on.
     max_buses: u32 = 8,
@@ -122,6 +137,16 @@ pub const Config = struct {
     /// wants the unclamped sum (metering still reports the peak).
     clamp_output: bool = true,
     steal_policy: StealPolicy = .none,
+    /// Insert slots per bus **and** for the master chain. `0` (the default)
+    /// disables effects entirely: no extra memory, and `render` keeps its
+    /// single-pass path bit for bit. Above 0 the mixer reserves one submix
+    /// buffer per bus (`max_buses * block_frames * channels` floats) so a bus
+    /// with an active chain can be processed in isolation.
+    effect_slots: u8 = 0,
+    /// Internal block size used when effects are enabled. Smaller blocks mean
+    /// less scratch memory; the DSP is sequential, so the block size does not
+    /// change the output (a test asserts this bit for bit).
+    block_frames: u32 = 256,
 };
 
 pub const PlayOptions = struct {
@@ -225,6 +250,15 @@ pub const Mixer = struct {
     resample_quality: Resample,
     /// Prototype table, present only when `resample_quality == .sinc`.
     sinc: ?resample_mod.Sinc,
+    effect_slots: u8,
+    block_frames: u32,
+    /// `max_buses * effect_slots` insert slots, empty when effects are disabled.
+    bus_effects: []Effect,
+    /// `effect_slots` master inserts, applied after the bus sum.
+    master_effects: []Effect,
+    /// Per-bus submix scratch, `max_buses * block_frames * channels` floats.
+    scratch: []f32,
+    scratch_stride: usize,
 
     pub fn init(gpa: Allocator, config: Config) InitError!Mixer {
         if (config.sample_rate == 0 or config.sample_rate > max_sample_rate) return error.InvalidConfig;
@@ -232,6 +266,8 @@ pub const Mixer = struct {
         if (config.max_voices == 0 or config.max_voices > max_voice_limit) return error.InvalidConfig;
         if (config.max_buses == 0 or config.max_buses > max_bus_limit) return error.InvalidConfig;
         if (!std.math.isFinite(config.master_gain)) return error.InvalidConfig;
+        if (config.effect_slots > max_effect_slots) return error.InvalidConfig;
+        if (config.block_frames == 0 or config.block_frames > max_block_frames) return error.InvalidConfig;
 
         const voices = try gpa.alloc(Voice, config.max_voices);
         errdefer gpa.free(voices);
@@ -255,6 +291,27 @@ pub const Mixer = struct {
         }
         errdefer if (sinc) |*table| table.deinit(gpa);
 
+        // Effects are opt-in: with no slots there is nothing to allocate and
+        // `render` never touches this state.
+        var bus_effects: []Effect = &.{};
+        var master_effects: []Effect = &.{};
+        var scratch: []f32 = &.{};
+        const stride: usize = @as(usize, config.block_frames) * config.channels;
+        // Registered before the allocations: a failure part-way through must
+        // still free whatever succeeded. Freeing an empty slice is a no-op.
+        errdefer if (config.effect_slots > 0) {
+            gpa.free(bus_effects);
+            gpa.free(master_effects);
+            gpa.free(scratch);
+        };
+        if (config.effect_slots > 0) {
+            bus_effects = try gpa.alloc(Effect, @as(usize, config.max_buses) * config.effect_slots);
+            @memset(bus_effects, Effect.bypass);
+            master_effects = try gpa.alloc(Effect, config.effect_slots);
+            @memset(master_effects, Effect.bypass);
+            scratch = try gpa.alloc(f32, @as(usize, config.max_buses) * stride);
+        }
+
         return .{
             .gpa = gpa,
             .voices = voices,
@@ -272,10 +329,21 @@ pub const Mixer = struct {
             .stolen_total = 0,
             .resample_quality = config.resample,
             .sinc = sinc,
+            .effect_slots = config.effect_slots,
+            .block_frames = config.block_frames,
+            .bus_effects = bus_effects,
+            .master_effects = master_effects,
+            .scratch = scratch,
+            .scratch_stride = stride,
         };
     }
 
     pub fn deinit(self: *Mixer) void {
+        if (self.effect_slots > 0) {
+            self.gpa.free(self.bus_effects);
+            self.gpa.free(self.master_effects);
+            self.gpa.free(self.scratch);
+        }
         if (self.sinc) |*table| table.deinit(self.gpa);
         self.gpa.free(self.voices);
         self.gpa.free(self.buses);
@@ -462,6 +530,63 @@ pub const Mixer = struct {
         return self.buses[bus].muted;
     }
 
+    // --- insert effects ----------------------------------------------------
+
+    /// Insert slots per bus and on the master chain. Zero means effects are
+    /// disabled and the setters below reject every request.
+    pub fn effectSlots(self: *const Mixer) u8 {
+        return self.effect_slots;
+    }
+
+    /// Replace one bus insert. The effect is stored as given, including its
+    /// state, so a warm filter can be moved between buses. An effect built for a
+    /// different sample rate is rejected rather than silently filtering at the
+    /// wrong frequency.
+    pub fn setBusEffect(self: *Mixer, bus: u16, slot: u8, effect: Effect) ParamError!void {
+        if (bus >= self.buses.len) return error.InvalidValue;
+        if (self.effect_slots == 0 or slot >= self.effect_slots) return error.InvalidValue;
+        if (effect.kind != .bypass and effect.sample_rate != self.sample_rate) return error.InvalidValue;
+        self.bus_effects[@as(usize, bus) * self.effect_slots + slot] = effect;
+    }
+
+    pub fn busEffect(self: *const Mixer, bus: u16, slot: u8) ?Effect {
+        if (bus >= self.buses.len) return null;
+        if (self.effect_slots == 0 or slot >= self.effect_slots) return null;
+        return self.bus_effects[@as(usize, bus) * self.effect_slots + slot];
+    }
+
+    /// Bypass every insert on a bus, which also discards its filter state.
+    pub fn clearBusEffects(self: *Mixer, bus: u16) ParamError!void {
+        if (bus >= self.buses.len) return error.InvalidValue;
+        if (self.effect_slots == 0) return;
+        @memset(self.bus_effects[@as(usize, bus) * self.effect_slots ..][0..self.effect_slots], Effect.bypass);
+    }
+
+    /// Master inserts, applied to the summed mix before the master gain.
+    pub fn setMasterEffect(self: *Mixer, slot: u8, effect: Effect) ParamError!void {
+        if (self.effect_slots == 0 or slot >= self.effect_slots) return error.InvalidValue;
+        if (effect.kind != .bypass and effect.sample_rate != self.sample_rate) return error.InvalidValue;
+        self.master_effects[slot] = effect;
+    }
+
+    pub fn masterEffect(self: *const Mixer, slot: u8) ?Effect {
+        if (self.effect_slots == 0 or slot >= self.effect_slots) return null;
+        return self.master_effects[slot];
+    }
+
+    pub fn clearMasterEffects(self: *Mixer) void {
+        if (self.effect_slots == 0) return;
+        @memset(self.master_effects, Effect.bypass);
+    }
+
+    /// Clear every insert's history but keep the settings. Call after a seek or
+    /// a device underrun so an old tail does not bleed into the new material.
+    pub fn resetEffects(self: *Mixer) void {
+        if (self.effect_slots == 0) return;
+        for (self.bus_effects) |*effect| effect.reset();
+        for (self.master_effects) |*effect| effect.reset();
+    }
+
     pub fn setMasterGain(self: *Mixer, gain: f32) ParamError!void {
         if (!std.math.isFinite(gain)) return error.InvalidValue;
         self.master_gain = gain;
@@ -486,12 +611,14 @@ pub const Mixer = struct {
 
         var stats = RenderStats{ .frames = frames };
         if (frames > 0) {
-            for (self.voices, 0..) |*v, i| {
-                if (v.state != .playing) continue;
-                if (self.mixVoice(v, out, frames)) {
-                    self.releaseSlot(@intCast(i), .finished);
-                    stats.voices_finished += 1;
-                }
+            if (self.effect_slots == 0) {
+                // No inserts: the original single-pass path, untouched.
+                self.mixRange(false, out, frames, &stats, &.{});
+            } else {
+                self.mixWithEffects(out, frames, &stats);
+                // Master inserts run in place on the summed mix, before the
+                // master gain and the output stage.
+                effects_mod.Chain.process(.{ .effects = self.master_effects }, out, self.channels);
             }
         }
 
@@ -577,6 +704,65 @@ pub const Mixer = struct {
         v.generation += 1;
         self.free_slots[self.free_count] = index;
         self.free_count += 1;
+    }
+
+    /// Mix every playing voice over `frames` into `out` (or into the bus submix
+    /// when `routed` and that bus has an active chain). One loop, specialized at
+    /// comptime, so the effect-free path pays nothing for the routing branch.
+    fn mixRange(
+        self: *Mixer,
+        comptime routed: bool,
+        out: []f32,
+        frames: usize,
+        stats: *RenderStats,
+        isolated: []const bool,
+    ) void {
+        for (self.voices, 0..) |*v, i| {
+            if (v.state != .playing) continue;
+            const target = if (routed and isolated[v.bus]) self.submix(v.bus, frames) else out;
+            if (self.mixVoice(v, target, frames)) {
+                self.releaseSlot(@intCast(i), .finished);
+                stats.voices_finished += 1;
+            }
+        }
+    }
+
+    /// Blocked mix for the effects path. Only buses with an active chain are
+    /// isolated; every other voice still writes straight into the output, in
+    /// slot order, which is what keeps an all-bypass chain bit-identical to the
+    /// effect-free path.
+    fn mixWithEffects(self: *Mixer, out: []f32, frames: usize, stats: *RenderStats) void {
+        var isolated: [max_bus_limit]bool = @splat(false);
+        for (0..self.buses.len) |b| isolated[b] = self.busChain(b).active();
+
+        const channels = self.channels;
+        var start: usize = 0;
+        while (start < frames) {
+            const n = @min(self.block_frames, frames - start);
+            const out_block = out[start * channels ..][0 .. n * channels];
+            for (0..self.buses.len) |b| {
+                if (isolated[b]) @memset(self.submix(b, n), 0);
+            }
+            self.mixRange(true, out_block, n, stats, &isolated);
+            for (0..self.buses.len) |b| {
+                if (!isolated[b]) continue;
+                const sub = self.submix(b, n);
+                // Processing an empty submix still matters: it lets a filter or
+                // compressor tail ring out after its last voice finishes.
+                self.busChain(b).process(sub, channels);
+                for (out_block, sub) |*dst, src| dst.* += src;
+            }
+            start += n;
+        }
+    }
+
+    fn submix(self: *Mixer, bus: usize, frames: usize) []f32 {
+        return self.scratch[bus * self.scratch_stride ..][0 .. frames * self.channels];
+    }
+
+    fn busChain(self: *Mixer, bus: usize) EffectChain {
+        const base = bus * self.effect_slots;
+        return .{ .effects = self.bus_effects[base..][0..self.effect_slots] };
     }
 
     /// Mix one voice; returns true when it reached its end (non-looping).
@@ -1676,5 +1862,274 @@ test "mixer: an integer step reuses the kernel and still tracks the loop wrap" {
         // source sample itself -- across four passes of the loop boundary.
         const index = (i * 2) % frames;
         try testing.expectApproxEqAbs(src[index], value, 1e-5);
+    }
+}
+
+test "mixer: effects are opt-in and the setters reject a disabled chain" {
+    const gpa = testing.allocator;
+    var mixer = try Mixer.init(gpa, .{ .channels = 1 });
+    defer mixer.deinit();
+    try testing.expectEqual(@as(u8, 0), mixer.effectSlots());
+
+    const filter = try Effect.biquad(48000, .{ .kind = .low_pass, .cutoff_hz = 1000 });
+    try testing.expectError(error.InvalidValue, mixer.setBusEffect(0, 0, filter));
+    try testing.expectError(error.InvalidValue, mixer.setMasterEffect(0, filter));
+    try testing.expectEqual(@as(?Effect, null), mixer.busEffect(0, 0));
+    try testing.expectEqual(@as(?Effect, null), mixer.masterEffect(0));
+    // These are safe no-ops rather than errors when the feature is off.
+    try mixer.clearBusEffects(0);
+    mixer.clearMasterEffects();
+    mixer.resetEffects();
+
+    try testing.expectError(error.InvalidConfig, Mixer.init(gpa, .{ .effect_slots = max_effect_slots + 1 }));
+    try testing.expectError(error.InvalidConfig, Mixer.init(gpa, .{ .block_frames = 0 }));
+    try testing.expectError(error.InvalidConfig, Mixer.init(gpa, .{ .block_frames = max_block_frames + 1 }));
+}
+
+test "mixer: insert slots validate the bus, the slot and the sample rate" {
+    const gpa = testing.allocator;
+    var mixer = try Mixer.init(gpa, .{ .channels = 1, .max_buses = 2, .effect_slots = 2 });
+    defer mixer.deinit();
+    try testing.expectEqual(@as(u8, 2), mixer.effectSlots());
+
+    const filter = try Effect.biquad(48000, .{ .kind = .high_pass, .cutoff_hz = 500 });
+    try testing.expectError(error.InvalidValue, mixer.setBusEffect(2, 0, filter));
+    try testing.expectError(error.InvalidValue, mixer.setBusEffect(0, 2, filter));
+    try testing.expectError(error.InvalidValue, mixer.setMasterEffect(2, filter));
+    // An effect designed for another rate would filter at the wrong frequency.
+    const foreign = try Effect.biquad(44100, .{ .kind = .low_pass, .cutoff_hz = 1000 });
+    try testing.expectError(error.InvalidValue, mixer.setBusEffect(0, 0, foreign));
+    try testing.expectError(error.InvalidValue, mixer.setMasterEffect(0, foreign));
+    // Bypass carries no rate and is always accepted.
+    try mixer.setBusEffect(0, 0, Effect.bypass);
+
+    try mixer.setBusEffect(1, 1, filter);
+    try testing.expect(mixer.busEffect(1, 1).?.kind == .biquad);
+    try testing.expect(mixer.busEffect(1, 0).?.kind == .bypass);
+    try testing.expectEqual(@as(?Effect, null), mixer.busEffect(9, 0));
+    try testing.expectEqual(@as(?Effect, null), mixer.busEffect(0, 9));
+
+    try mixer.clearBusEffects(1);
+    try testing.expect(mixer.busEffect(1, 1).?.kind == .bypass);
+    try testing.expectError(error.InvalidValue, mixer.clearBusEffects(2));
+}
+
+test "mixer: an all-bypass chain is bit-identical to the effect-free path" {
+    const gpa = testing.allocator;
+    const src = try sineClip(gpa, 512, 48000, 700);
+    defer gpa.free(src);
+
+    var plain = try Mixer.init(gpa, .{ .sample_rate = 44100, .max_voices = 4, .max_buses = 3 });
+    defer plain.deinit();
+    var wired = try Mixer.init(gpa, .{
+        .sample_rate = 44100,
+        .max_voices = 4,
+        .max_buses = 3,
+        .effect_slots = 4,
+        .block_frames = 64,
+    });
+    defer wired.deinit();
+    for ([_]*Mixer{ &plain, &wired }) |mixer| {
+        _ = try mixer.play(monoClip(src, 48000), .{ .looping = true, .pan = -0.3 });
+        _ = try mixer.play(monoClip(src, 32000), .{ .looping = true, .pan = 0.6, .bus = 1, .pitch = 1.2 });
+        _ = try mixer.play(monoClip(src, 48000), .{ .looping = true, .bus = 2, .gain = 0.4 });
+    }
+    var a: [256]f32 = undefined;
+    var b: [256]f32 = undefined;
+    for (0..6) |_| {
+        const sa = try plain.render(&a);
+        const sb = try wired.render(&b);
+        try testing.expectEqualSlices(f32, &a, &b);
+        try testing.expectEqual(sa.peak, sb.peak);
+        try testing.expectEqual(sa.voices_active, sb.voices_active);
+    }
+}
+
+test "mixer: the block size does not change the processed output" {
+    const gpa = testing.allocator;
+    const src = try sineClip(gpa, 1024, 48000, 900);
+    defer gpa.free(src);
+
+    var small = try Mixer.init(gpa, .{ .channels = 1, .effect_slots = 2, .block_frames = 16 });
+    defer small.deinit();
+    var large = try Mixer.init(gpa, .{ .channels = 1, .effect_slots = 2, .block_frames = 512 });
+    defer large.deinit();
+    for ([_]*Mixer{ &small, &large }) |mixer| {
+        try mixer.setBusEffect(0, 0, try Effect.biquad(48000, .{ .kind = .peaking, .cutoff_hz = 1200, .q = 1.4, .gain_db = 8 }));
+        try mixer.setBusEffect(0, 1, try Effect.compressor(48000, .{ .threshold_db = -24, .ratio = 3 }));
+        try mixer.setMasterEffect(0, try Effect.biquad(48000, .{ .kind = .high_shelf, .cutoff_hz = 6000, .gain_db = -6 }));
+        _ = try mixer.play(monoClip(src, 48000), .{ .looping = true });
+    }
+    // One render larger than both blocks, so the chopping differs.
+    var a: [700]f32 = undefined;
+    var b: [700]f32 = undefined;
+    _ = try small.render(&a);
+    _ = try large.render(&b);
+    try testing.expectEqualSlices(f32, &a, &b);
+}
+
+test "mixer: a bus insert affects only its own bus" {
+    const gpa = testing.allocator;
+    // 6 kHz is far above a 300 Hz low pass, and its quarter period is a whole
+    // number of samples, so the sampled sine really does reach unity.
+    const src = try sineClip(gpa, 4096, 48000, 6000);
+    defer gpa.free(src);
+    var mixer = try Mixer.init(gpa, .{ .channels = 1, .max_buses = 2, .effect_slots = 1 });
+    defer mixer.deinit();
+    _ = try mixer.play(monoClip(src, 48000), .{ .looping = true, .bus = 1 });
+
+    var out: [1024]f32 = undefined;
+    _ = try mixer.render(&out);
+    var peak: f32 = 0;
+    for (out[512..]) |v| peak = @max(peak, @abs(v));
+    try testing.expect(peak > 0.9);
+
+    try mixer.setBusEffect(1, 0, try Effect.biquad(48000, .{ .kind = .low_pass, .cutoff_hz = 300 }));
+    _ = try mixer.render(&out);
+    _ = try mixer.render(&out);
+    peak = 0;
+    for (out[512..]) |v| peak = @max(peak, @abs(v));
+    try testing.expect(peak < 0.05);
+
+    // A voice on the untouched bus still comes through at full level.
+    _ = try mixer.play(monoClip(src, 48000), .{ .looping = true, .bus = 0 });
+    _ = try mixer.render(&out);
+    _ = try mixer.render(&out);
+    peak = 0;
+    for (out[512..]) |v| peak = @max(peak, @abs(v));
+    try testing.expect(peak > 0.9);
+
+    // Clearing the insert restores the filtered bus.
+    try mixer.clearBusEffects(1);
+    mixer.stopAll();
+    _ = try mixer.play(monoClip(src, 48000), .{ .looping = true, .bus = 1 });
+    _ = try mixer.render(&out);
+    peak = 0;
+    for (out[512..]) |v| peak = @max(peak, @abs(v));
+    try testing.expect(peak > 0.9);
+}
+
+test "mixer: master inserts process the whole sum" {
+    const gpa = testing.allocator;
+    const src = try sineClip(gpa, 4096, 48000, 6000);
+    defer gpa.free(src);
+    var mixer = try Mixer.init(gpa, .{ .channels = 1, .max_buses = 2, .effect_slots = 1 });
+    defer mixer.deinit();
+    _ = try mixer.play(monoClip(src, 48000), .{ .looping = true, .bus = 0 });
+    _ = try mixer.play(monoClip(src, 48000), .{ .looping = true, .bus = 1, .gain = 0.5 });
+
+    try mixer.setMasterEffect(0, try Effect.biquad(48000, .{ .kind = .low_pass, .cutoff_hz = 300 }));
+    var out: [1024]f32 = undefined;
+    _ = try mixer.render(&out);
+    _ = try mixer.render(&out);
+    var peak: f32 = 0;
+    for (out[512..]) |v| peak = @max(peak, @abs(v));
+    try testing.expect(peak < 0.08);
+
+    mixer.clearMasterEffects();
+    _ = try mixer.render(&out);
+    _ = try mixer.render(&out);
+    peak = 0;
+    for (out[512..]) |v| peak = @max(peak, @abs(v));
+    // Two voices sum past unity and the output stage clamps them to it.
+    try testing.expect(peak > 0.99);
+}
+
+test "mixer: a bus tail keeps ringing after its last voice finishes" {
+    const gpa = testing.allocator;
+    // A one-frame impulse: the voice ends immediately, the filter does not.
+    const impulse = [_]f32{1.0};
+    var mixer = try Mixer.init(gpa, .{ .channels = 1, .effect_slots = 1, .block_frames = 32 });
+    defer mixer.deinit();
+    try mixer.setBusEffect(0, 0, try Effect.biquad(48000, .{ .kind = .low_pass, .cutoff_hz = 500, .q = 4 }));
+    _ = try mixer.play(monoClip(&impulse, 48000), .{});
+
+    var out: [512]f32 = undefined;
+    const stats = try mixer.render(&out);
+    try testing.expectEqual(@as(usize, 1), stats.voices_finished);
+    try testing.expectEqual(@as(usize, 0), mixer.liveVoices());
+    // Energy well after the voice is gone can only come from the filter tail.
+    var tail: f32 = 0;
+    for (out[64..256]) |v| tail = @max(tail, @abs(v));
+    try testing.expect(tail > 1e-4);
+    // And it decays: the end of the buffer is quieter than the middle.
+    var end: f32 = 0;
+    for (out[480..]) |v| end = @max(end, @abs(v));
+    try testing.expect(end < tail);
+
+    // resetEffects silences the tail immediately.
+    _ = try mixer.play(monoClip(&impulse, 48000), .{});
+    _ = try mixer.render(&out);
+    mixer.resetEffects();
+    _ = try mixer.render(&out);
+    for (out) |v| try testing.expectEqual(@as(f32, 0), v);
+}
+
+test "mixer: a voice finishing inside a block is counted exactly once" {
+    const gpa = testing.allocator;
+    const src = [_]f32{ 0.5, 0.25, -0.5, -0.25, 0.5, 0.25, -0.5, -0.25 };
+    var mixer = try Mixer.init(gpa, .{ .channels = 1, .effect_slots = 2, .block_frames = 3 });
+    defer mixer.deinit();
+    const handle = try mixer.play(monoClip(&src, 48000), .{});
+
+    // 8 source frames over blocks of 3: the voice ends in the third block.
+    var out: [12]f32 = undefined;
+    const stats = try mixer.render(&out);
+    try testing.expectEqual(@as(usize, 1), stats.voices_finished);
+    try testing.expectEqual(@as(usize, 0), stats.voices_active);
+    try testing.expectEqual(@as(?Termination, .finished), mixer.terminationOf(handle));
+    try testing.expectEqualSlices(f32, &src, out[0..8]);
+    for (out[8..]) |v| try testing.expectEqual(@as(f32, 0), v);
+
+    const after = try mixer.render(&out);
+    try testing.expectEqual(@as(usize, 0), after.voices_finished);
+    for (out) |v| try testing.expectEqual(@as(f32, 0), v);
+}
+
+test "mixer: effects survive allocation failure and render allocation free" {
+    const gpa = testing.allocator;
+    try testing.checkAllAllocationFailures(gpa, struct {
+        fn f(alloc: Allocator) !void {
+            const samples = [_]f32{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8 };
+            var mixer = try Mixer.init(alloc, .{
+                .channels = 1,
+                .max_buses = 2,
+                .effect_slots = 2,
+                .block_frames = 4,
+                .resample = .sinc,
+            });
+            defer mixer.deinit();
+            try mixer.setBusEffect(0, 0, try Effect.biquad(48000, .{ .cutoff_hz = 2000 }));
+            try mixer.setMasterEffect(1, try Effect.compressor(48000, .{}));
+            _ = try mixer.play(monoClip(&samples, 44100), .{ .looping = true });
+            var out: [32]f32 = undefined;
+            _ = try mixer.render(&out);
+            mixer.resetEffects();
+            _ = try mixer.render(&out);
+        }
+    }.f, .{});
+}
+
+test "mixer: rendering with effects is deterministic" {
+    const gpa = testing.allocator;
+    const src = try sineClip(gpa, 512, 48000, 400);
+    defer gpa.free(src);
+    var a = try Mixer.init(gpa, .{ .sample_rate = 44100, .effect_slots = 2, .block_frames = 48 });
+    defer a.deinit();
+    var b = try Mixer.init(gpa, .{ .sample_rate = 44100, .effect_slots = 2, .block_frames = 48 });
+    defer b.deinit();
+    for ([_]*Mixer{ &a, &b }) |mixer| {
+        // Effects must be designed for the mixer's own rate (44100 here).
+        try mixer.setBusEffect(0, 0, try Effect.biquad(44100, .{ .kind = .low_shelf, .cutoff_hz = 300, .gain_db = 6 }));
+        try mixer.setMasterEffect(0, try Effect.compressor(44100, .{ .threshold_db = -20, .ratio = 4 }));
+        _ = try mixer.play(monoClip(src, 48000), .{ .looping = true, .pan = -0.5 });
+        _ = try mixer.play(monoClip(src, 24000), .{ .looping = true, .pan = 0.5, .pitch = 0.75 });
+    }
+    var buf_a: [256]f32 = undefined;
+    var buf_b: [256]f32 = undefined;
+    for (0..5) |_| {
+        _ = try a.render(&buf_a);
+        _ = try b.render(&buf_b);
+        try testing.expectEqualSlices(f32, &buf_a, &buf_b);
     }
 }
