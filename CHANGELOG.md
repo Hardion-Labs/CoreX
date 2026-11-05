@@ -114,6 +114,20 @@ declared yet.
   `src/assets/png_vectors.zig`): 24 valid PNGs with reference RGBA8 output plus
   20 malformed PNGs and four DEFLATE/zlib streams, all generated with Python's
   zlib so the tests compare against an independent encoder.
+- Asset change detection (`src/assets/changes.zig`, re-exported as
+  `corex.assets.changes` with `Snapshot`/`ChangeSet`/`ChangeKind`,
+  `docs/asset-change-detection.md`): a path-sorted snapshot of every indexed
+  asset's size, mtime and BLAKE3 hash, and a linear merge join that reports
+  added/modified/removed paths deterministically. Detection is two-tier — an
+  unchanged size+mtime fingerprint reuses the stored hash without reading the
+  file, and only candidates are hashed, so a touch or an identical re-save is not
+  reported as a modification. `Options.verify_all` hashes everything for callers
+  that cannot trust timestamps (the size+mtime blind spot is documented and
+  tested). Change sets own their paths, so they outlive both snapshots.
+  `Snapshot.cacheKeys` derives the complete live key set without importing, which
+  is what `Cache.gc` needs after a partial run; a test asserts byte-for-byte parity
+  with the keys a real pipeline run derives, including the `raw` fallback and a
+  non-empty options salt.
 - Asset cache garbage collection (`Cache.gc`, `Report.liveKeys`,
   `corex.assets.GcStats`): mark-and-sweep that deletes entries whose key is not in
   a caller-supplied live set (typically the keys of a full pipeline run) and
@@ -155,14 +169,16 @@ declared yet.
 - Test suite covering the startup spine, ECS, scheduling (manual stages,
   automatic dependency graphs, observers, frame budgets and profiling), scenes,
   asset import/cache, world-space transforms, texture decoders, cache GC, render
-  extraction, OBJ mesh import, scene prefabs, DEFLATE/zlib and PNG (324 tests), including allocation-failure
+  extraction, OBJ mesh import, scene prefabs, DEFLATE/zlib, PNG and asset change
+  detection (339 tests), including allocation-failure
   probes, cache corruption/truncation probes, a deep-hierarchy stress test, QOI
   encode/decode roundtrips, end-to-end texture-import-and-cache, OBJ-import-and-
   cache and import-then-GC tests, camera/frustum/culling and draw-list extraction
   tests, OBJ decode/artifact roundtrip and malformed-input tests, prefab
   capture/instantiate/rollback and prefab-import-and-cache tests, PNG/inflate
   reference-vector and rejection suites (including a 200 KiB multi-block stream
-  and truncation probes), and job-system
+  and truncation probes), change-detection classification/blind-spot/key-parity
+  tests, a full hot-reload cycle (detect, incremental re-import, GC), and job-system
   integration tests (including parallel graph/frame profiling over `JobSystem`
   workers), validated in Debug, ReleaseSafe and ReleaseFast.
 
@@ -177,7 +193,8 @@ declared yet.
   `corex.scene.Prefab`/`EnginePrefab`,
   `Mat4`/`Vec3`/`Quat`), asset (import/cache with GC, image decoders and the
   `CXTX` texture artifact as `corex.assets.image`/`corex.assets.texture`, PNG
-  decoding as `corex.assets.png` and DEFLATE/zlib as `corex.assets.inflate`, the OBJ
+  decoding as `corex.assets.png`, DEFLATE/zlib as `corex.assets.inflate` and change
+  detection as `corex.assets.changes`, the OBJ
   mesh importer and `CXMH` artifact as `corex.assets.mesh`,
   `Image`/`Texture`/`Mesh`/`MeshView`/`GcStats`) and render (backend-independent
   extraction as `corex.render`) subsystems.
@@ -188,6 +205,12 @@ declared yet.
 - Startup `editor`/`runtime` now validates and loads the initial scene into the
   ECS (or prepares an empty scene). `validate` mode and the stable CLI/exit-code
   contract are unchanged; scene failures map to exit code 6.
+- `pipeline.Options.only` (additive, default `null`) restricts a run to a set of
+  project-relative paths, so a hot-reload pass imports only what changed. Both
+  `run` and `runSequential` honor it; selection sorts the filter once and
+  binary-searches each indexed asset (O(n log m)). A filtered `Report` covers only
+  the selected assets, so its `liveKeys` is a partial set — use
+  `Snapshot.cacheKeys` for garbage collection.
 - The example project's initial scene was migrated from an unversioned placeholder
   to the documented `format_version = 1` scene format.
 - All project documentation is now written in English. The remaining
