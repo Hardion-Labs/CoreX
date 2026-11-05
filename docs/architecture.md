@@ -71,12 +71,17 @@ src/
 │   ├── transform.zig     # Column-major Mat4 + quaternion math         [implemented]
 │   └── scene.zig         # Versioned scene document + ECS/hierarchy    [implemented]
 ├── assets.zig            # Asset public module; index + cache + importers + pipeline
-└── assets/
-    ├── cache.zig         # Content-addressed derived-data cache        [implemented]
-    ├── importer.zig      # Importer framework + raw/text/json          [implemented]
-    ├── image.zig         # BMP/TGA/QOI decoders -> RGBA8               [implemented]
-    ├── texture.zig       # CXTX texture artifact + texture importers   [implemented]
-    └── pipeline.zig      # Parallel import orchestration + report      [implemented]
+├── assets/
+│   ├── cache.zig         # Content-addressed derived-data cache + GC   [implemented]
+│   ├── importer.zig      # Importer framework + raw/text/json          [implemented]
+│   ├── image.zig         # BMP/TGA/QOI decoders -> RGBA8               [implemented]
+│   ├── texture.zig       # CXTX texture artifact + texture importers   [implemented]
+│   └── pipeline.zig      # Parallel import orchestration + report      [implemented]
+├── render.zig            # Render public module; backend-independent extraction
+└── render/
+    ├── camera.zig        # View/projection math (right-handed)         [implemented]
+    ├── culling.zig       # Frustum + AABB/sphere classification        [implemented]
+    └── draw.zig          # Renderable + draw-list extraction + sorting [implemented]
 ```
 
 Planned subsystems will be added as sibling modules (e.g. `src/render/`,
@@ -127,15 +132,25 @@ are planned on top of the GUI library.
 The engine's own GUI toolkit (widgets, layout, input, rendering integration) used
 by the editor and the graphical splash. No third-party GUI dependency is planned.
 
-### Renderer Low / Medium — planned; Advanced — contract defined
+### Renderer — extraction implemented; Low / Medium GPU backends planned
 Three quality tiers:
 - **Low:** minimal feature set, broad hardware reach.
 - **Medium:** default tier; modern features with wide compatibility.
 - **Advanced:** high-end features; only the *contract* is defined for now.
 
-The project selects a tier via `settings.json` (`config.RendererTier`). The
-backend-independent render API, the Low/Medium implementations and the Advanced
-contract will be specified before implementation. No GPU backend is chosen yet.
+The project selects a tier via `settings.json` (`config.RendererTier`). No GPU
+backend is chosen yet.
+
+The **backend-independent extraction layer** is implemented (`src/render/`,
+re-exported as `corex.render`, `docs/render-extraction.md`): right-handed camera
+math (`perspective`/`orthographic`/`lookAt`, `Camera`), frustum culling
+(Gribb–Hartmann plane extraction, conservative AABB/sphere classification), and
+draw-list extraction (`extractDrawList`) that reuses the scene's O(n) world
+transform snapshot, culls each `Renderable`'s world AABB, and emits a sorted
+`DrawCommand` list (`front_to_back` / `back_to_front` / `by_material`). It is pure
+CPU work with no GPU dependency, so it is fully tested headlessly and is the
+contract the Low/Medium/Advanced GPU backends will consume. The GPU backends
+themselves remain planned.
 
 ### ECS — implemented (storage + queries + scheduling), planned (extensions)
 A data-oriented ECS in `src/ecs/`, re-exported as `corex.ecs`:
