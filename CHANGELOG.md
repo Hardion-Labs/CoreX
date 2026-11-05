@@ -46,16 +46,25 @@ declared yet.
   plus a scene importer that reuses the scene system; concurrent import over
   `std.Io` / `JobSystem` with a `runSequential` fallback and a per-asset report.
   The startup asset index (`src/core/assets.zig`) is unchanged.
+- Scene world-space transform propagation (`src/scene/transform.zig`,
+  `Scene.computeWorldTransforms` / `Scene.worldMatrix`, `docs/scene-transforms.md`):
+  column-major `Mat4` math with quaternion helpers; a deterministic O(n)
+  iterative pass (parents before children, no recursion, safe for arbitrarily
+  deep hierarchies) producing a generation-safe snapshot keyed by entity handle.
+  Entities without a `Transform` use the identity local transform. The `.scene`
+  format is unchanged: only local TRS values are serialized, world matrices are
+  computed at runtime.
 - Shared display-name validation (`src/core/validation.zig`) used by both the
   `.corex` manifest and scene documents.
 - Native Module ABI contract for C++ (`docs/native-module-api.md`,
   `include/corex/native_module.h`); the loader is not implemented yet.
 - A minimal example project (`examples/hello-project/`) with a valid versioned
   initial scene.
-- Test suite covering the startup spine, ECS, scheduling, scenes and asset
-  import/cache (166 tests), including allocation-failure probes, cache
-  corruption/truncation probes and job-system integration tests, validated in
-  Debug, ReleaseSafe and ReleaseFast.
+- Test suite covering the startup spine, ECS, scheduling, scenes, asset
+  import/cache and world-space transforms (192 tests), including
+  allocation-failure probes, cache corruption/truncation probes, a deep-hierarchy
+  stress test and job-system integration tests, validated in Debug, ReleaseSafe
+  and ReleaseFast.
 
 ### Changed
 
@@ -63,7 +72,8 @@ declared yet.
 - README and architecture documentation now reflect the definitive scope and the
   per-subsystem implementation status.
 - The public module `src/corex.zig` re-exports the implemented core, ECS
-  (including scheduling), scene and asset (import/cache) subsystems.
+  (including scheduling), scene (including transform math as `corex.scene.transform`,
+  `Mat4`/`Vec3`/`Quat`) and asset (import/cache) subsystems.
 - Startup `editor`/`runtime` now validates and loads the initial scene into the
   ECS (or prepares an empty scene). `validate` mode and the stable CLI/exit-code
   contract are unchanged; scene failures map to exit code 6.
