@@ -15,9 +15,13 @@
 //! causing an out-of-bounds access. This module depends only on `std`, so it is
 //! independently testable and loosely coupled from the pipeline/cache.
 //!
-//! Not yet supported (honest limitations, rejected rather than faked): PNG
-//! (needs inflate), JPEG, compressed BMP, palette/indexed TGA, 16-bit channels
-//! and HDR. These remain `raw` imports until dedicated decoders exist.
+//! PNG lives in `png.zig` (it needs the DEFLATE decoder in `inflate.zig`) and
+//! normalizes to the same RGBA8 `Image`, so the artifact and pipeline layers do
+//! not care which decoder produced the pixels.
+//!
+//! Not yet supported (honest limitations, rejected rather than faked): JPEG,
+//! compressed BMP, palette/indexed TGA and HDR. These remain `raw` imports until
+//! dedicated decoders exist.
 
 const std = @import("std");
 
@@ -46,9 +50,11 @@ pub const Image = struct {
     }
 };
 
-/// Validate dimensions and allocate a zeroed RGBA8 buffer, guarding overflow
-/// and the size ceiling. Returns `error.InvalidImage` for out-of-range sizes.
-fn allocPixels(gpa: Allocator, width: u32, height: u32) DecodeError![]u8 {
+/// Validate dimensions and allocate an RGBA8 buffer, guarding overflow and the
+/// size ceiling. Returns `error.InvalidImage` for out-of-range sizes. Shared by
+/// every decoder in this subsystem (including `png.zig`) so the bounds policy
+/// lives in exactly one place. The caller owns the returned buffer.
+pub fn allocPixels(gpa: Allocator, width: u32, height: u32) DecodeError![]u8 {
     if (width == 0 or height == 0) return error.InvalidImage;
     if (width > max_dimension or height > max_dimension) return error.InvalidImage;
     const count = @as(usize, width) * @as(usize, height);

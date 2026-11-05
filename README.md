@@ -27,8 +27,9 @@ control, and maintainable code.
 > frame budgets and system profiling), the scene system (versioned JSON
 > scenes, stable entity IDs, hierarchy, ECS load/save, world-space transform
 > propagation, reusable single-root prefabs) and the asset import
-> pipeline + content-addressed cache (raw/text/json/scene importers, BMP/TGA/QOI
-> texture decoders, OBJ mesh decoder, atomic verified storage, parallel import over
+> pipeline + content-addressed cache (raw/text/json/scene importers, PNG/BMP/TGA/QOI
+> texture decoders over a dependency-free DEFLATE/zlib inflater, OBJ mesh decoder,
+> atomic verified storage, parallel import over
 > the job system, mark-and-sweep GC), and the backend-independent render extraction
 > layer (camera math, frustum culling, sorted draw lists) are implemented and tested. The larger
 > subsystems (GPU renderer backends, GUI, editor, Lua, export, native modules) are
@@ -240,11 +241,19 @@ self-heal). A mark-and-sweep garbage collector (`Cache.gc` + `Report.liveKeys`)
 reclaims orphan entries when sources change or are removed. Built-in importers
 cover raw binary, text (UTF-8 + line-ending
 normalization), JSON (strict validation + lossless minification) and scenes
-(validated and canonicalized via the scene system). Texture sources in **BMP,
-TGA and QOI** are decoded to RGBA8 and stored as a self-describing `CXTX`
+(validated and canonicalized via the scene system). Texture sources in **PNG,
+BMP, TGA and QOI** are decoded to RGBA8 and stored as a self-describing `CXTX`
 artifact, and **OBJ** meshes are decoded to indexed triangle meshes stored as a
-`CXMH` artifact; other binary formats (PNG/JPEG/audio, glTF/FBX) still import as
+`CXMH` artifact; other binary formats (JPEG/audio, glTF/FBX) still import as
 `raw` until decoders exist.
+
+PNG support covers every non-interlaced color type and bit depth (1/2/4/8/16),
+all five row filters, palette and color-key transparency, and multi-chunk IDAT,
+with chunk CRC-32 and zlib Adler-32 verification. It is backed by a
+dependency-free DEFLATE/zlib inflater (`corex.assets.inflate`) whose output is
+bounded by the caller, so a decompression bomb cannot exceed the size declared by
+the image header. 16-bit samples are reduced to their high byte (the artifact is
+RGBA8) and Adam7-interlaced files are rejected rather than approximated.
 
 ```zig
 const corex = @import("corex");
@@ -309,7 +318,7 @@ CoreX/
 │   ├── architecture.md         # Subsystem map and implementation status
 │   ├── ecs-scheduling.md       # ECS system scheduling guide
 │   ├── asset-import.md         # Asset import pipeline + cache
-│   ├── asset-decoders.md       # Texture decoders (BMP/TGA/QOI) + CXTX artifact
+│   ├── asset-decoders.md       # Image decoders (PNG/BMP/TGA/QOI) + CXTX artifact
 │   ├── mesh-import.md          # OBJ mesh importer + CXMH artifact
 │   ├── launch-contract.md      # Stable startup contract (CLI, exit codes)
 │   ├── project-format.md       # .corex manifest format
@@ -332,9 +341,10 @@ CoreX/
 │   ├── scene.zig               # Scene public module (EngineScene)
 │   ├── scene/                  # Scene components, versioned documents, prefabs
 │   ├── assets.zig              # Asset public module (index + import + cache)
-│   ├── assets/                 # Import cache, importers, parallel pipeline
+│   ├── assets/                 # Import cache, importers, decoders (PNG/inflate), pipeline
 │   ├── render.zig              # Render public module (extraction layer)
 │   └── render/                 # Camera, frustum culling, draw-list extraction
+├── tools/                      # Reproducible test-vector generators
 ├── build.zig                   # Build configuration
 └── CHANGELOG.md, CONTRIBUTING.md, LICENSE, README.md, ...
 ```
@@ -357,10 +367,11 @@ Indicative; subject to change as technical decisions are validated.
 - [x] Scene prefabs (single-root `.prefab`, capture/instantiate, ID remap, asset import).
 - [ ] Scene streaming.
 - [x] Asset import pipeline and content-addressed cache (raw/text/json/scene).
-- [x] Texture decoders (BMP/TGA/QOI → RGBA8 `CXTX` artifact).
+- [x] Texture decoders (PNG/BMP/TGA/QOI → RGBA8 `CXTX` artifact).
+- [x] DEFLATE/zlib inflate (dependency-free, bounded output).
 - [x] Asset cache garbage collection (mark-and-sweep of orphan entries).
 - [x] Mesh decoder (OBJ → indexed triangle mesh, `CXMH` artifact).
-- [ ] Asset decoders (PNG/JPEG/audio, other model formats), hot-reload, startup integration.
+- [ ] Asset decoders (JPEG/audio, other model formats), Adam7 PNG, hot-reload, startup integration.
 - [x] Backend-independent render extraction (camera, frustum culling, sorted draw lists).
 - [ ] Renderer Low / Medium GPU backends; Advanced contract.
 - [ ] GUI library and graphical editor.
