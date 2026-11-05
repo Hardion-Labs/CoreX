@@ -74,6 +74,8 @@ src/
 └── assets/
     ├── cache.zig         # Content-addressed derived-data cache        [implemented]
     ├── importer.zig      # Importer framework + raw/text/json          [implemented]
+    ├── image.zig         # BMP/TGA/QOI decoders -> RGBA8               [implemented]
+    ├── texture.zig       # CXTX texture artifact + texture importers   [implemented]
     └── pipeline.zig      # Parallel import orchestration + report      [implemented]
 ```
 
@@ -196,13 +198,16 @@ new handle cannot read the previous entity's matrix). The `.scene` format is
 unchanged — only local TRS values are serialized. Prefabs, scene streaming,
 change tracking and multi-scene management remain planned extensions.
 
-### Sistema de assets — implemented (indexing + import/cache), planned (decoders)
+### Sistema de assets — implemented (indexing + import/cache + texture decoders), planned (more decoders)
 `core.assets.indexDirectories` builds a kind/size index at startup (unchanged).
 The asset subsystem (`corex.assets`, `src/assets/`) adds a content-addressed
 import cache, an importer framework (raw/text/json + a scene importer that reuses
-the scene system) and a parallel import pipeline over `std.Io`. Format-specific
-decoders (texture/audio/model/font), dependency tracking, cache GC and hot-reload
-are planned extensions. See [asset-import.md](asset-import.md).
+the scene system), a parallel import pipeline over `std.Io`, and dependency-free
+**texture decoders** (BMP/TGA/QOI) that normalize to RGBA8 and serialize a
+self-describing `CXTX` artifact (`src/assets/image.zig`, `src/assets/texture.zig`).
+PNG/JPEG/audio/model/font decoders, dependency tracking, cache GC and hot-reload
+are planned extensions. See [asset-import.md](asset-import.md) and
+[asset-decoders.md](asset-decoders.md).
 
 ### Importação e cache — implemented
 `assets.pipeline` imports an indexed asset set into derived artifacts stored in a

@@ -5,9 +5,11 @@ endereçado por conteúdo da CoreXEngine. O código vive em `src/assets/` e é
 exposto publicamente como `corex.assets`. O índice de assets (etapa de startup)
 permanece em `src/core/assets.zig` e não teve seu contrato alterado.
 
-> Estado: **implementado e testado**. Decodificadores específicos de formato
-> (textura, áudio, modelo) ainda não existem; assets binários usam o importer
-> `raw` (cópia verbatim) até que decodificadores sejam registrados. Isso está
+> Estado: **implementado e testado**. Decodificadores de **textura** para
+> **BMP, TGA e QOI** existem e produzem um artefato `CXTX` (RGBA8) — ver
+> [asset-decoders.md](asset-decoders.md). Demais formatos binários (PNG, JPEG,
+> áudio, modelo, fonte) ainda não têm decodificador e usam o importer `raw`
+> (cópia verbatim) até que decodificadores sejam registrados. Isso está
 > documentado abaixo e não é descrito como capacidade existente.
 
 ## Visão geral
@@ -49,6 +51,11 @@ sistema de cenas: valida o documento `.scene` (hierarquia, componentes,
 transforms) e o re-serializa de forma canônica e determinística. Cenas inválidas
 são rejeitadas em tempo de importação.
 
+Importers de textura (`corex.assets.texture`, IDs `bmp`/`tga`/`qoi`, versão 1)
+decodificam a imagem para RGBA8 e a serializam no artefato `CXTX`. Ver
+[asset-decoders.md](asset-decoders.md) para formatos suportados, layout do
+artefato e limitações.
+
 Contrato de um importer:
 
 ```zig
@@ -67,8 +74,8 @@ pub const ImportError = error{ InvalidAsset, OutOfMemory };
 fallback para extensões não casadas:
 
 - `importer.defaultRegistry()`: JSON + texto, fallback `raw`.
-- `assets.engineRegistry()`: cenas + JSON + texto, fallback `raw` (registro
-  padrão da engine).
+- `assets.engineRegistry()`: texturas (BMP/TGA/QOI) + cenas + JSON + texto,
+  fallback `raw` (registro padrão da engine).
 
 Camadas superiores podem estender o registro (por exemplo, decodificadores de
 textura/áudio/modelo) sem alterar o pipeline:
@@ -154,9 +161,10 @@ O relatório (`Report`) contém uma entrada por asset na ordem do índice, com
 
 ## Limitações
 
-- Não há decodificadores de textura/áudio/modelo/fonte; esses assets usam o
-  importer `raw` (cópia verbatim). A decodificação real é trabalho futuro do
-  renderer e será registrada como importers específicos.
+- Decodificadores de textura existem para **BMP, TGA e QOI** (ver
+  [asset-decoders.md](asset-decoders.md)). PNG, JPEG, áudio, modelo e fonte ainda
+  não têm decodificador e usam o importer `raw` (cópia verbatim); serão
+  registrados como importers específicos quando existirem.
 - O importer `json` preserva a ordem de chaves da origem (minifica, não ordena
   chaves); a determinismo é por conteúdo de origem, o que é suficiente para o
   cache endereçado por conteúdo.
@@ -182,6 +190,7 @@ O relatório (`Report`) contém uma entrada por asset na ordem do índice, com
 ## Links relacionados
 
 - [architecture.md](architecture.md) — mapa de subsistemas e estado.
+- [asset-decoders.md](asset-decoders.md) — decodificadores de textura e artefato CXTX.
 - [scene-format.md](scene-format.md) — formato de cena validado pelo importer.
 - [versioning.md](versioning.md) — política de versionamento de formatos.
 - [launch-contract.md](launch-contract.md) — contrato de startup (inalterado).
