@@ -11,8 +11,10 @@ const std = @import("std");
 /// Local transform of an entity relative to its parent (or the scene root).
 ///
 /// `rotation` is a quaternion `[x, y, z, w]`. The default is the identity
-/// transform. World-space transform propagation is a renderer/scene-system
-/// extension; this component stores the authored local value.
+/// transform. This component stores the authored local value; world-space
+/// propagation is computed at runtime by `Scene.computeWorldTransforms` /
+/// `Scene.worldMatrix` (see `src/scene/transform.zig` and
+/// `docs/scene-transforms.md`) and is never serialized into `.scene` files.
 pub const Transform = struct {
     position: [3]f32 = .{ 0, 0, 0 },
     rotation: [4]f32 = .{ 0, 0, 0, 1 },

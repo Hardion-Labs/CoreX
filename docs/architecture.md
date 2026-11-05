@@ -68,6 +68,7 @@ src/
 ├── scene.zig             # Scene public module; EngineScene schema
 ├── scene/
 │   ├── components.zig    # Built-in plain-data scene components        [implemented]
+│   ├── transform.zig     # Column-major Mat4 + quaternion math         [implemented]
 │   └── scene.zig         # Versioned scene document + ECS/hierarchy    [implemented]
 ├── assets.zig            # Asset public module; index + cache + importers + pipeline
 └── assets/
@@ -182,9 +183,18 @@ currently contains `Transform`; the startup pipeline loads the initial scene in
 Implemented guarantees: unknown/duplicate JSON fields rejected, duplicate/zero
 entity IDs rejected, missing parents/self-parenting/cycles rejected, non-finite
 transform values rejected, stale generational handles cannot reach recycled
-entities, and allocation-failure paths are tested. Prefabs, scene streaming,
-world-space transform propagation, change tracking and multi-scene management
-are planned extensions.
+entities, and allocation-failure paths are tested.
+
+World-space transform propagation is implemented (`src/scene/transform.zig`,
+`docs/scene-transforms.md`): `Scene.computeWorldTransforms` builds a deterministic
+snapshot in one O(n) iterative pass (parents before children, no recursion, safe
+for arbitrarily deep hierarchies), and `Scene.worldMatrix` computes a single
+entity by walking its parent chain. Matrices are column-major `Mat4` (`M = T*R*S`,
+`world_child = world_parent * local_child`); entities without a `Transform` use
+the identity local transform. Snapshots are generation-safe (a recycled slot's
+new handle cannot read the previous entity's matrix). The `.scene` format is
+unchanged — only local TRS values are serialized. Prefabs, scene streaming,
+change tracking and multi-scene management remain planned extensions.
 
 ### Sistema de assets — implemented (indexing + import/cache), planned (decoders)
 `core.assets.indexDirectories` builds a kind/size index at startup (unchanged).
