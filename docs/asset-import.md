@@ -157,7 +157,46 @@ Opções (`Options`):
 O relatório (`Report`) contém uma entrada por asset na ordem do índice, com
 `status` (`imported`, `cached`, `failed`), `importer_id`, `key`, `output_size` e
 `error_name`, além dos totais (`imported`, `cached`, `failed`,
-`total_output_bytes`).
+`total_output_bytes`). `Report.liveKeys(gpa)` coleta as chaves de todos os assets
+importados/cacheados com sucesso — o conjunto `live` para a coleta de lixo.
+
+## Coleta de lixo (GC)
+
+`Cache.gc(gpa, live)` faz uma varredura **mark-and-sweep**: apaga toda entrada
+cuja chave **não** está em `live` e mantém o restante. É o complemento do ciclo
+import → cache: quando uma origem muda, é removida ou um importer é
+versionado, a entrada antiga vira órfã e o GC a reclaima.
+
+```zig
+var report = try corex.assets.pipeline.run(gpa, io, root, idx, &cache, .{
+    .registry = corex.assets.engineRegistry(),
+});
+defer report.deinit();
+
+const live = try report.liveKeys(gpa); // chaves válidas do índice atual
+defer gpa.free(live);
+
+const stats = try cache.gc(gpa, live);
+// stats.scanned / .kept / .removed / .bytes_freed
+```
+
+Garantias e comportamento:
+
+- `live` deve ser o conjunto **completo** de chaves a reter — tipicamente de uma
+  execução do pipeline sobre o índice inteiro. Entradas fora desse conjunto são
+  removidas; o GC não "adivinha" o que ainda é referenciado.
+- Entradas são identificadas estritamente pelo nome de arquivo (64 dígitos
+  hexadecimais minúsculos). Arquivos temporários (`.tmp.N`) e arquivos estranhos
+  **não** são tocados.
+- Complexidade O(entradas + live), com um hash set para pertinência; a iteração
+  de diretório usa buffer fixo. `bytes_freed` soma o tamanho em disco das
+  entradas removidas.
+- É uma operação de **manutenção**: execute quando não houver `put` concorrente
+  em andamento (não faz parte do caminho de importação por frame). É idempotente:
+  uma segunda varredura com o mesmo `live` nada remove.
+- Assets que falharam na importação não contribuem com chave; seu artefato antigo
+  (se existir) é tratado como órfão e removido, o que é correto pois a origem
+  atual é inválida.
 
 ## Limitações
 
@@ -170,8 +209,10 @@ O relatório (`Report`) contém uma entrada por asset na ordem do índice, com
   cache endereçado por conteúdo.
 - O pipeline ainda não está ligado ao startup/editor; é uma API pública
   independente. A integração com o startup e o hot-reload são próximos passos.
-- Não há rastreamento de dependências entre assets nem coleta de lixo (GC) de
-  entradas órfãs do cache; ambos são extensões planejadas.
+- A coleta de lixo (GC) de entradas órfãs do cache está **implementada**
+  (`Cache.gc`, ver acima). Ainda não há rastreamento de dependências entre assets
+  nem limpeza de arquivos temporários deixados por escritas interrompidas
+  (crash); ambos são extensões planejadas.
 - `run` paralelo exige allocator thread-safe; caso contrário use
   `runSequential`.
 
