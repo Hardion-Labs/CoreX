@@ -130,10 +130,13 @@ var report = try A.pipeline.run(gpa, io, root, idx, &cache, .{
 - Sem mipmaps, compressão de textura (BC/ASTC) ou conversão de espaço de cor;
   o artefato é sempre RGBA8 linear.
 - O pipeline ainda não está ligado ao startup/editor; a integração e o
-  hot-reload são próximos passos, assim como decodificadores de áudio/modelo.
+  hot-reload são próximos passos, assim como decodificadores de áudio e de
+  outros formatos de modelo (o importador de malha OBJ já existe — ver
+  [mesh-import.md](mesh-import.md)).
 
 ## Relacionados
 
 - Importação e cache: [asset-import.md](asset-import.md)
+- Importação de malhas (OBJ) / CXMH: [mesh-import.md](mesh-import.md)
 - Arquitetura: [architecture.md](architecture.md)
 - Versionamento: [versioning.md](versioning.md)

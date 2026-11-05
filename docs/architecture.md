@@ -76,6 +76,7 @@ src/
 │   ├── importer.zig      # Importer framework + raw/text/json          [implemented]
 │   ├── image.zig         # BMP/TGA/QOI decoders -> RGBA8               [implemented]
 │   ├── texture.zig       # CXTX texture artifact + texture importers   [implemented]
+│   ├── mesh.zig          # OBJ decoder + CXMH mesh artifact/importer   [implemented]
 │   └── pipeline.zig      # Parallel import orchestration + report      [implemented]
 ├── render.zig            # Render public module; backend-independent extraction
 └── render/
@@ -213,17 +214,20 @@ new handle cannot read the previous entity's matrix). The `.scene` format is
 unchanged — only local TRS values are serialized. Prefabs, scene streaming,
 change tracking and multi-scene management remain planned extensions.
 
-### Sistema de assets — implemented (indexing + import/cache + texture decoders), planned (more decoders)
+### Sistema de assets — implemented (indexing + import/cache + texture/mesh decoders), planned (more decoders)
 `core.assets.indexDirectories` builds a kind/size index at startup (unchanged).
 The asset subsystem (`corex.assets`, `src/assets/`) adds a content-addressed
 import cache, an importer framework (raw/text/json + a scene importer that reuses
-the scene system), a parallel import pipeline over `std.Io`, and dependency-free
+the scene system), a parallel import pipeline over `std.Io`, dependency-free
 **texture decoders** (BMP/TGA/QOI) that normalize to RGBA8 and serialize a
-self-describing `CXTX` artifact (`src/assets/image.zig`, `src/assets/texture.zig`).
+self-describing `CXTX` artifact (`src/assets/image.zig`, `src/assets/texture.zig`),
+and an **OBJ mesh importer** that decodes the geometry subset to an indexed
+triangle mesh and serializes a `CXMH` artifact (`src/assets/mesh.zig`).
 A mark-and-sweep **cache GC** (`Cache.gc` + `Report.liveKeys`) reclaims orphan
-entries. PNG/JPEG/audio/model/font decoders, dependency tracking, temp-file
-cleanup and hot-reload are planned extensions. See
-[asset-import.md](asset-import.md) and [asset-decoders.md](asset-decoders.md).
+entries. PNG/JPEG/audio/font and other model-format (glTF/FBX/DAE) decoders,
+dependency tracking, temp-file cleanup and hot-reload are planned extensions. See
+[asset-import.md](asset-import.md), [asset-decoders.md](asset-decoders.md) and
+[mesh-import.md](mesh-import.md).
 
 ### Importação e cache — implemented
 `assets.pipeline` imports an indexed asset set into derived artifacts stored in a
