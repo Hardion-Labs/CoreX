@@ -59,11 +59,12 @@ src/
 │   ├── splash.zig        # Splash screen contract + headless impl      [implemented]
 │   ├── diagnostics.zig   # Timers + stage profiling                    [implemented]
 │   └── startup.zig       # The 7-step startup pipeline                 [implemented]
-├── ecs.zig               # ECS public module; re-exports entity/pool/world
+├── ecs.zig               # ECS public module; re-exports entity/pool/world/schedule
 ├── ecs/
 │   ├── entity.zig        # Generational entity handles + lifecycle     [implemented]
 │   ├── pool.zig          # Sparse-set component storage                [implemented]
-│   └── world.zig         # Type-safe world + multi-component views     [implemented]
+│   ├── world.zig         # Type-safe world + multi-component views     [implemented]
+│   └── schedule.zig      # Comptime stages + parallel system dispatch  [implemented]
 ├── scene.zig             # Scene public module; EngineScene schema
 └── scene/
     ├── components.zig    # Built-in plain-data scene components        [implemented]
@@ -128,7 +129,7 @@ The project selects a tier via `settings.json` (`config.RendererTier`). The
 backend-independent render API, the Low/Medium implementations and the Advanced
 contract will be specified before implementation. No GPU backend is chosen yet.
 
-### ECS — implemented (storage + queries), planned (scheduling)
+### ECS — implemented (storage + queries + scheduling), planned (extensions)
 A data-oriented ECS in `src/ecs/`, re-exported as `corex.ecs`:
 
 - **`Entity`** — a generational handle (`index: u32`, `generation: u32`, packed
@@ -150,10 +151,19 @@ A data-oriented ECS in `src/ecs/`, re-exported as `corex.ecs`:
   pool. `view(.{ A, B, ... })` iterates entities having all listed components and
   yields `{ Entity, *A, *B, ... }` for system-style passes.
 
-Storage and queries are implemented and tested (including under `ReleaseSafe`
-and `ReleaseFast`). System scheduling across the job system, change detection,
-and relation/graph components are planned extensions. The world depends only on
-`entity.zig` and `pool.zig` (low coupling); scenes and scripting build on it.
+- **`schedule`** — comptime schedules of systems grouped into ordered stages.
+  Systems declare read/write component access; the scheduler rejects conflicting
+  systems in the same stage at comptime and dispatches non-conflicting systems
+  concurrently through `std.Io` (e.g. `JobSystem.io()`). Exclusive systems occupy
+  a stage alone. `runSequential` provides a no-Io fallback. See
+  [ecs-scheduling.md](ecs-scheduling.md).
+
+Storage, queries and scheduling are implemented and tested (including under
+`ReleaseSafe` and `ReleaseFast`). Automatic dependency-graph scheduling, frame
+budgeting, change detection and relation/graph components are planned
+extensions. The world depends only on `entity.zig` and `pool.zig`; the scheduler
+depends only on the world and `std.Io` (low coupling). Scenes and scripting build
+on these layers.
 
 ### Sistema de cenas — implemented (format v1 + ECS load/save), planned (extensions)
 Scenes are versioned JSON documents (`docs/scene-format.md`) backed by the ECS.
@@ -201,8 +211,9 @@ as a C header under `include/corex/` before any module loads. See
 
 ### Sistema de jobs e carregamento assíncrono — implemented (foundation)
 `jobs.JobSystem` wraps `std.Io` concurrency with a configurable worker pool,
-`spawn` (future-based) and `Batch` (group-based). Used by the startup pipeline.
-Priorities, dependencies and a frame-budget scheduler are planned.
+`spawn` (future-based) and `Batch` (group-based). Used by the startup pipeline
+and by ECS system scheduling (`Schedule.run(js.io(), ...)`). Priorities,
+dependencies and a frame-budget scheduler are planned.
 
 ### Splash screen — implemented (contract + headless), planned (graphical)
 `splash.SplashScreen` is the interface; `HeadlessSplash` is the current
@@ -235,8 +246,9 @@ profiling, memory tracking, a metrics overlay and trace export are planned.
 ## Current status
 
 The startup spine, the ECS (generational entities, sparse-set component pools,
-type-safe world and multi-component views) and the scene system (versioned JSON
-scenes, stable IDs, hierarchy, ECS load/save) are implemented and tested, and
-the executable builds and runs on Zig 0.17.0. The remaining larger subsystems
-(renderers, GUI, editor, Lua, export, native modules) are in scope and either
-contract-defined or planned, as marked above.
+type-safe world, multi-component views and comptime system scheduling over the
+job system) and the scene system (versioned JSON scenes, stable IDs, hierarchy,
+ECS load/save) are implemented and tested, and the executable builds and runs on
+Zig 0.17.0. The remaining larger subsystems (renderers, GUI, editor, Lua, export,
+native modules) are in scope and either contract-defined or planned, as marked
+above.
