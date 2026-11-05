@@ -37,6 +37,10 @@ pub const cache = @import("assets/cache.zig");
 pub const importer = @import("assets/importer.zig");
 /// Import orchestration over the job system.
 pub const pipeline = @import("assets/pipeline.zig");
+/// Pure image decoders (BMP/TGA/QOI) normalizing to RGBA8.
+pub const image = @import("assets/image.zig");
+/// Engine-ready `CXTX` texture artifact and texture importers.
+pub const texture = @import("assets/texture.zig");
 
 const scene_mod = @import("scene.zig");
 
@@ -52,6 +56,8 @@ pub const ImportError = importer.ImportError;
 pub const Report = pipeline.Report;
 pub const Options = pipeline.Options;
 pub const Status = pipeline.Status;
+pub const Image = image.Image;
+pub const Texture = texture.Texture;
 
 /// Scene importer: validate a `.scene` document with the scene system and
 /// re-serialize it canonically (deterministic, sorted by stable ID). Invalid
@@ -70,12 +76,13 @@ pub fn importScene(gpa: std.mem.Allocator, source: []const u8) ImportError![]u8 
 
 pub const scene_importer = Importer{ .id = "scene", .version = 1, .importFn = importScene };
 
-const engine_bindings = [_]Registry.Binding{
+const engine_bindings = texture.bindings ++ [_]Registry.Binding{
     .{ .extensions = &[_][]const u8{ ".scene", ".corexscene" }, .importer = scene_importer },
 } ++ importer.builtin_bindings;
 
-/// The engine's default import registry: scene + JSON + text importers, with
-/// `raw` as the fallback for binary/unknown extensions.
+/// The engine's default import registry: texture (BMP/TGA/QOI) + scene + JSON +
+/// text importers, with `raw` as the fallback for binary/unknown extensions
+/// (e.g. PNG/JPEG/audio/model, which have no decoder yet).
 pub fn engineRegistry() Registry {
     return .{ .bindings = &engine_bindings, .fallback = importer.raw_importer };
 }
@@ -86,6 +93,8 @@ test {
     _ = cache;
     _ = importer;
     _ = pipeline;
+    _ = image;
+    _ = texture;
 }
 
 test "scene importer canonicalizes a valid scene" {
@@ -108,13 +117,77 @@ test "scene importer rejects an invalid scene" {
     try std.testing.expectError(error.InvalidAsset, importScene(std.testing.allocator, bad));
 }
 
-test "engine registry selects the scene importer for .scene" {
+test "engine registry selects importers by extension" {
     const reg = engineRegistry();
     try std.testing.expectEqualStrings("scene", reg.select(".scene").id);
     try std.testing.expectEqualStrings("scene", reg.select(".corexscene").id);
+    try std.testing.expectEqualStrings("bmp", reg.select(".bmp").id);
+    try std.testing.expectEqualStrings("tga", reg.select(".TGA").id);
+    try std.testing.expectEqualStrings("qoi", reg.select(".qoi").id);
     try std.testing.expectEqualStrings("json", reg.select(".json").id);
     try std.testing.expectEqualStrings("text", reg.select(".lua").id);
+    // Formats without a decoder yet still fall back to a verbatim raw copy.
     try std.testing.expectEqualStrings("raw", reg.select(".png").id);
+    try std.testing.expectEqualStrings("raw", reg.select(".wav").id);
+}
+
+test "pipeline imports a texture to a CXTX artifact and caches it" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.createDirPath(io, "assets");
+    try tmp.dir.createDirPath(io, "cache");
+
+    // Encode a known 2x2 RGBA8 image as the QOI source asset.
+    const pixels = [_]u8{
+        255, 0,   0,   255,
+        0,   255, 0,   255,
+        0,   0,   255, 255,
+        255, 255, 255, 255,
+    };
+    const src_img = image.Image{ .width = 2, .height = 2, .pixels = @constCast(&pixels) };
+    const qoi = try image.encodeQoi(std.testing.allocator, src_img);
+    defer std.testing.allocator.free(qoi);
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/tex.qoi", .data = qoi });
+
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buf);
+    const root_path = buf[0..n];
+
+    var idx = try indexDirectories(std.testing.allocator, io, root_path, &.{"assets"});
+    defer idx.deinit();
+    var root = try Io.Dir.openDirAbsolute(io, root_path, .{});
+    defer root.close(io);
+    var cache_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const cache_path = try std.fmt.bufPrint(&cache_buf, "{s}/cache", .{root_path});
+    var store = try Cache.open(io, cache_path);
+    defer store.deinit();
+
+    var report = try pipeline.runSequential(std.testing.allocator, io, root, idx, &store, .{
+        .registry = engineRegistry(),
+    });
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 1), report.imported);
+    try std.testing.expectEqualStrings("qoi", report.entries[0].importer_id.?);
+    try std.testing.expectEqual(AssetKind.texture, report.entries[0].kind);
+
+    // Read the cached artifact back and verify it is a valid CXTX texture whose
+    // pixels match the original image exactly.
+    const key = report.entries[0].key.?;
+    const artifact = (try store.get(std.testing.allocator, key)).?;
+    defer std.testing.allocator.free(artifact);
+    const tex = try texture.parse(artifact);
+    try std.testing.expectEqual(@as(u32, 2), tex.width);
+    try std.testing.expectEqual(@as(u32, 2), tex.height);
+    try std.testing.expectEqualSlices(u8, &pixels, tex.pixels);
+
+    // A second run is a cache hit (no re-import).
+    var report2 = try pipeline.runSequential(std.testing.allocator, io, root, idx, &store, .{
+        .registry = engineRegistry(),
+    });
+    defer report2.deinit();
+    try std.testing.expectEqual(@as(usize, 0), report2.imported);
+    try std.testing.expectEqual(@as(usize, 1), report2.cached);
 }
 
 test "pipeline imports a scene through the engine registry" {
