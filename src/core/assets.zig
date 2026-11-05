@@ -27,7 +27,7 @@ pub const AssetKind = enum {
     /// Classify by file extension (case-insensitive). `ext` includes the dot.
     pub fn fromExtension(ext: []const u8) AssetKind {
         const table = .{
-            .{ AssetKind.texture, &[_][]const u8{ ".png", ".jpg", ".jpeg", ".bmp", ".tga", ".gif", ".webp", ".hdr", ".exr", ".ktx", ".ktx2", ".dds" } },
+            .{ AssetKind.texture, &[_][]const u8{ ".png", ".jpg", ".jpeg", ".bmp", ".tga", ".qoi", ".gif", ".webp", ".hdr", ".exr", ".ktx", ".ktx2", ".dds" } },
             .{ AssetKind.audio, &[_][]const u8{ ".wav", ".ogg", ".mp3", ".flac", ".opus", ".aiff" } },
             .{ AssetKind.model, &[_][]const u8{ ".gltf", ".glb", ".obj", ".fbx", ".dae" } },
             .{ AssetKind.script, &[_][]const u8{".lua"} },
@@ -147,6 +147,9 @@ fn lessThan(_: void, a: AssetEntry, b: AssetEntry) bool {
 test "AssetKind.fromExtension classifies common types" {
     try std.testing.expectEqual(AssetKind.texture, AssetKind.fromExtension(".png"));
     try std.testing.expectEqual(AssetKind.texture, AssetKind.fromExtension(".PNG"));
+    try std.testing.expectEqual(AssetKind.texture, AssetKind.fromExtension(".qoi"));
+    try std.testing.expectEqual(AssetKind.texture, AssetKind.fromExtension(".bmp"));
+    try std.testing.expectEqual(AssetKind.texture, AssetKind.fromExtension(".tga"));
     try std.testing.expectEqual(AssetKind.audio, AssetKind.fromExtension(".ogg"));
     try std.testing.expectEqual(AssetKind.script, AssetKind.fromExtension(".lua"));
     try std.testing.expectEqual(AssetKind.scene, AssetKind.fromExtension(".scene"));
