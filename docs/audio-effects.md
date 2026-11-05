@@ -5,11 +5,11 @@ This document describes CoreXEngine's insert effects: the pure DSP module in
 routes buses through it.
 
 > Status: **implemented and tested**. Biquad filters, a stereo-linked
-> compressor, a feedback delay, a Freeverb-style reverb and a lookahead brickwall
-> limiter, on per-bus and master insert chains, allocation-free at render time.
-> **Convolution, modulated delays (chorus/flanger), oversampled saturation and
-> side-chain input are planned** — they are not described here as existing
-> capabilities. The mixer itself is
+> compressor, a feedback delay, a Freeverb-style reverb, a lookahead brickwall
+> limiter with optional true-peak detection, and an oversampled saturator, on
+> per-bus and master insert chains, allocation-free at render time.
+> **Convolution, modulated delays (chorus/flanger) and side-chain input are
+> planned** — they are not described here as existing capabilities. The mixer itself is
 > documented in [audio-mixer.md](audio-mixer.md).
 
 ## Overview
@@ -322,6 +322,100 @@ A `master_gain` above 1 can therefore still push the signal past the ceiling.
 Keep it at or below 1, or lower the ceiling to match. `latencyFrames()` reports
 the delay so a caller can compensate; nothing does it automatically yet.
 
+## Oversampled saturation
+
+A waveshaper creates harmonics far above the input bandwidth. At the base rate
+those fold back as **inharmonic** aliasing — the harsh, "digital" edge of naive
+distortion. Running the shaper at a higher rate and filtering on the way down
+moves the fold-back point out of the audible band.
+
+| Parameter | Default | Range | Meaning |
+| --- | --- | --- | --- |
+| `drive` | 1.0 | `[0.01, 100]` | Gain into the shaper |
+| `mix` | 1.0 | `[0, 1]` | 0 is bit-exact dry, 1 is fully shaped |
+| `oversample` | 2 | 1, 2, 4 | Rate the shaper runs at |
+
+```zig
+var saturator = try A.Saturator.init(48_000, 2, .{ .drive = 6, .oversample = 2 });
+try mixer.setBusEffect(2, 0, A.Effect.saturator(&saturator));   // no buffer to allocate
+const latency = saturator.latencyFrames();                      // 11 frames, or 0 at 1x
+```
+
+The shaper is `tanh(drive * x)`: odd, monotonic, and bounded by 1 however hard it
+is driven. Unlike every other delay-based effect here, the saturator needs **no
+borrowed buffer** — all its state is fixed-size and inline (1120 bytes), so memory
+is independent of the block size and there is nothing to keep alive except the
+instance itself.
+
+### Measured: what oversampling actually buys
+
+A 5 kHz tone at 0.9, driven at 12, for one second at 48 kHz. `tanh` is odd, so it
+produces odd harmonics; at the base rate the 7th (35 kHz) and 9th (45 kHz) fold
+back to 13 kHz and 3 kHz, neither of which is a harmonic of the tone:
+
+| | 3 kHz + 13 kHz (far aliases) | 23 kHz (5th harmonic, near cutoff) |
+| --- | --- | --- |
+| 1x | 0.259 | 0.233 |
+| 2x | **0.0017** | 0.092 |
+| 4x | **0.0018** | 0.092 |
+
+Two honest conclusions, both pinned by tests:
+
+- The far aliases drop by **43 dB** measured (the test pins a conservative 34 dB
+  floor so it does not fail on libm rounding). That is the real win.
+- The 5th harmonic lands at 25 kHz, one kHz above the 24 kHz decimation cutoff.
+  No practical filter separates those, so it is only partly suppressed (~8 dB).
+- **4x is not better than 2x here** — it measures within a few percent while
+  costing ~40% more. That is why 2x is the default. Reach for 4x only when the
+  drive puts real energy above twice the base Nyquist.
+
+### How the filters are built
+
+Both kernels come from `resample.prototype`, the same Blackman-windowed sinc the
+band-limited resampler uses, so the two can never drift apart. They are computed
+at **comptime** — no table allocation, no init cost, and the coefficients live in
+read-only memory.
+
+- **Interpolation** is polyphase: phase `p` of `F` holds `taps` coefficients, each
+  normalized to unity DC gain. Phase 0 is exactly a delta, so it reproduces the
+  input sample; it is built as one rather than evaluated, because `sin(pi*k)` is
+  only ~1e-35 in floating point.
+- **Decimation** uses an **odd** length (`F * taps + 1`). An even-length kernel is
+  symmetric about a half-sample, which at an even factor is a fractional delay at
+  the base rate; the odd one is symmetric about a real tap, so the filter is
+  exactly linear-phase and its group delay is a whole number of base frames. A
+  test asserts the symmetry — it is what caught the even-length version.
+
+The round trip costs **11 frames** of latency, independent of the factor. The dry
+path is tapped out of the input history at exactly that delay, so a `mix` below 1
+never comb-filters.
+
+### The history trick
+
+Every dot product reads the whole history window, so the window has to be
+contiguous or the inner loop pays for modular indexing. Each write is therefore
+**mirrored** into a second copy of the buffer: two stores per sample buy a plain
+slice the compiler can vectorize. A test checks the window against a reference
+shift register over 500 pushes.
+
+## True-peak limiting
+
+`LimiterParams.true_peak` (default `false`) makes the detector measure the
+**reconstructed** waveform instead of the samples, using the same 4x interpolator
+— the approach ITU-R BS.1770 specifies.
+
+The canonical case: a quarter-rate sine at 45° puts every sample on ±0.7071 while
+the waveform it describes peaks at 1.0. A sample-peak limiter sees nothing wrong
+and passes it; the analogue output is 3 dB over. With `true_peak = true` the
+detector sees the real peak and pulls the gain down by exactly the ratio needed.
+A test drives precisely this signal and checks both behaviours.
+
+Interpolation needs future samples, so the detector reports the peak of a sample
+`taps/2 - 1 = 5` frames back. The audio is delayed by that same extra amount,
+which keeps the emitted sample inside the detector window — so the **ceiling
+guarantee is unchanged**, including at zero lookahead. `latencyFrames()` reports
+the total. With the flag off, output is bit-identical to before.
+
 ## Routing, order and tails
 
 - **Per bus:** slots run in index order, `0 → effect_slots - 1`. Order matters —
@@ -353,6 +447,7 @@ With `effect_slots > 0` the mixer reserves, once, at `init`:
 | Master inserts | `effect_slots × sizeof(Effect)` |
 | Submix scratch | `max_buses × block_frames × channels × 4` bytes |
 | Delay / reverb / limiter memory | **zero** — the caller owns it (`requiredSamples`) |
+| Saturator memory | **zero** — 1120 bytes of inline state, no buffer at all |
 
 The default `max_buses = 8`, `block_frames = 256`, stereo gives **16 KiB** of
 scratch. The scratch is reserved for every bus, not only the processed ones,
@@ -410,14 +505,14 @@ var room = try A.Reverb.init(48_000, 2, .{ .room_size = 0.8 }, memory);
 try mixer.setMasterEffect(0, A.Effect.reverb(&room));   // borrows &room + memory
 ```
 
-`Effect.delay(*Delay)`, `Effect.reverb(*Reverb)` and `Effect.limiter(*Limiter)`
-are infallible — the instance already validated its parameters and buffer in
-`init`. Three extra rules are enforced by the setters:
+`Effect.delay(*Delay)`, `Effect.reverb(*Reverb)`, `Effect.limiter(*Limiter)` and
+`Effect.saturator(*Saturator)` are infallible — the instance already validated its
+parameters and buffer in `init`. Three extra rules are enforced by the setters:
 
 | Rule | Why |
 | --- | --- |
 | The layout must match (`channelCount()`) | Delay lines are allocated per channel and cannot be reinterpreted |
-| No two slots may hold the same instance | Its cursors would advance twice per sample |
+| No two slots may hold the same instance | Its cursors would advance twice per sample, even when it borrows no buffer |
 | No two slots' buffers may overlap (even partially) | They would overwrite each other's history |
 
 Queries: `effectSlots() u8`, `busEffect(bus, slot) ?Effect`,
@@ -484,6 +579,24 @@ The cost is **flat in the lookahead**: 0 ms and 20 ms measure the same, which is
 the amortized bound showing up in practice — a longer window means more memory,
 not more work per sample. A master limiter costs about the same as a biquad.
 
+Oversampled processing, again measured in its own session (same 64 voices /
+512 frames / 48 kHz shape):
+
+| Configuration | Time per render | Real-time factor | vs. baseline |
+| --- | --- | --- | --- |
+| No effects | **28.6 µs** | **373×** | — |
+| Master saturator, 1x | **41.9 µs** | **254×** | +47% |
+| Master saturator, 2x | **84.7 µs** | **126×** | +196% |
+| Master saturator, 4x | **120.4 µs** | **89×** | +321% |
+| Master limiter, sample-peak | **35.6 µs** | **299×** | +24% |
+| Master limiter, true-peak | **47.8 µs** | **223×** | +67% |
+| Saturator 4x + low pass + true-peak limiter | **143.2 µs** | **74×** | +401% |
+
+The saturator is the most expensive effect here — it runs a `tanh` and two dot
+products per sub-sample — but even the full drive chain stays at **74× real time**.
+True-peak detection adds about a third to the limiter's cost, which is the price
+of the 4x interpolator.
+
 - Reserving slots and leaving them bypassed costs **about 1%**: the blocked path
   adds a per-block loop, not per-sample work, and no bus is isolated.
 - Effects are cheap relative to mixing: a biquad is 5 multiply-adds per sample
@@ -545,6 +658,22 @@ not more work per sample. A master limiter costs about the same as a biquad.
   the shortest comb delay; the tail is bounded, finite and decaying; one second
   at `room_size = 1` with no damping stays bounded; identical impulses still
   produce decorrelated channels; reset silences every line; NaN/inf recover.
+- **Oversampling kernels**: unity DC gain on every phase and factor, phase 0 is
+  an exact delta, and the decimator is exactly symmetric (linear phase).
+- **Mirrored history**: the window matches a reference shift register over 500
+  pushes and stays in bounds.
+- **Saturator**: parameter validation; a constant input survives the round trip
+  as exactly `shape(constant)` at 1x, 2x and 4x (an end-to-end check of the tap
+  alignment); `mix = 0` is bit-exact at exactly the reported latency; the measured
+  aliasing table above; bounded output under 20x overdrive with NaN/inf mixed in;
+  reset; channel independence; block-size invariance.
+- **True-peak**: the quarter-rate sine case above, in both modes; the extra
+  latency is exactly the interpolation delay; the ceiling still holds at 0, 0.5
+  and 5 ms lookahead under loud random audio; reset clears the interpolators;
+  the default flag leaves output bit-identical.
+- **Saturator in the mixer**: saturation into a true-peak limiter produces zero
+  clipped samples on four summed full-scale voices; the instance cannot be
+  inserted twice even though it borrows no buffer, and the layout must match.
 - **Sliding maximum**: matches a naive O(n·window) scan over random, rising,
   falling and constant sequences at window sizes 1, 2, 3, 7, 64 and 241, and the
   two stacks never exceed the shared capacity.
@@ -593,11 +722,15 @@ not more work per sample. A master limiter costs about the same as a biquad.
   result past the ceiling. Keep the gain at or below 1, or lower the ceiling to
   match. It also adds latency (`latencyFrames()`), which nothing compensates for
   automatically yet.
-- **No true-peak / inter-sample detection**: the limiter is sample-peak only, so
-  a reconstructed analogue waveform can still exceed the ceiling between samples.
-  True-peak limiting needs oversampling, which is not offered yet.
-- **No oversampling**: saturation/waveshaping would alias and is deliberately not
-  offered yet.
+- **True-peak is 4x, not infinite**: the detector reconstructs the waveform at
+  four times the base rate, which is what ITU-R BS.1770 specifies. A pathological
+  signal can still peak slightly higher between those points.
+- **The oversampling filter is short**: 12 taps per phase. Harmonics landing far
+  above the base Nyquist are suppressed by ~43 dB, but one landing just
+  above the cutoff is only partly removed — no practical filter separates 25 kHz
+  from 24 kHz. See the measured numbers below.
+- **No automatic latency compensation**: the saturator and the true-peak limiter
+  both report `latencyFrames()`, but nothing lines up parallel paths for you.
 - **No side-chain input, no per-voice inserts**: effects are per bus and on the
   master. A voice reaches them through its bus.
 - **No parameter smoothing**: changing coefficients takes effect immediately,
