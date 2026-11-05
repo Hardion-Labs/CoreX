@@ -98,7 +98,7 @@ src/
     ├── spatial.zig       # Listener, attenuation, pan, Doppler math    [implemented]
     ├── system.zig        # AudioSource component + scene reconciler    [implemented]
     ├── resample.zig      # Windowed-sinc prototype + polyphase bank    [implemented]
-    └── effects.zig       # Biquads, compressor, delay, reverb, chains  [implemented]
+    └── effects.zig       # Biquads, comp, delay, reverb, limiter, chains [impl]
 ```
 
 Planned subsystems will be added as sibling modules (e.g. `src/render/`,
@@ -178,8 +178,8 @@ request — mixed into an interleaved float32 buffer by an **allocation-free**
 `render`. A full voice pool either fails (default) or recycles the
 lowest-priority voice, with per-generation termination reasons. Opt-in insert
 chains (`src/audio/effects.zig`, `docs/audio-effects.md`) add RBJ biquad filters,
-a stereo-linked compressor, a feedback delay and a Freeverb-style reverb per bus
-and on the master; only buses with an active chain are isolated into a
+a stereo-linked compressor, a feedback delay, a Freeverb-style reverb and a
+lookahead brickwall limiter per bus and on the master; only buses with an active chain are isolated into a
 preallocated submix, so an all-bypass configuration stays bit-identical and
 allocation-free. Delay-based effects borrow their memory from the caller (like
 clips), so they add no mixer allocation, and the mixer rejects two slots claiming
@@ -388,7 +388,7 @@ mark-and-sweep GC, change detection with incremental re-import), the
 backend-independent render extraction layer (camera,
 frustum culling, sorted draw lists) and the device-independent audio runtime
 (mixer with voices/buses/pan/pitch, linear and band-limited resampling, priority
-voice stealing, biquad/compressor/delay/reverb insert chains, plus spatialization
+voice stealing, biquad/compressor/delay/reverb/limiter insert chains, plus spatialization
 and the `AudioSource` scene bridge) are implemented and tested, and the executable
 builds
 and runs on Zig 0.17.0. The remaining larger subsystems (GPU renderer
