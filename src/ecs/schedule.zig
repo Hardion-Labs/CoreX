@@ -19,6 +19,12 @@
 //! `Io` implementation (for example `JobSystem.io()`); error slots and the group
 //! live on the caller's stack for the duration of a stage.
 //!
+//! Optional observer hooks (`runObserved`, `runSequentialObserved`, `runSystem`,
+//! `runLayer`) let higher layers profile or budget systems without changing the
+//! plain `run`/`runSequential` contracts. `NoopObserver{}` compiles the hooks
+//! away. See `graph.zig` (automatic dependency graphs) and `frame.zig` (frame
+//! budgets and system profiling).
+//!
 //! Example:
 //! ```zig
 //! const Movement = ecs.schedule.system(World, Context, "movement", move, .{
@@ -127,14 +133,14 @@ fn intersects(comptime A: anytype, comptime B: anytype) bool {
     return false;
 }
 
-fn conflicts(comptime A: type, comptime B: type) bool {
+pub fn conflicts(comptime A: type, comptime B: type) bool {
     if (A.exclusive or B.exclusive) return true;
     return intersects(A.writes, B.writes) or
         intersects(A.writes, B.reads) or
         intersects(A.reads, B.writes);
 }
 
-fn validateSystem(comptime S: type, comptime W: type, comptime C: type) void {
+pub fn validateSystem(comptime S: type, comptime W: type, comptime C: type) void {
     if (!@hasDecl(S, "world_type") or S.world_type != W)
         @compileError("system world type does not match schedule world type");
     if (!@hasDecl(S, "context_type") or S.context_type != C)
@@ -179,24 +185,21 @@ pub fn Schedule(comptime W: type, comptime C: type, comptime stages: anytype) ty
         /// system error in declaration order, or `error.Canceled` if the Io group
         /// is canceled. All dispatched systems finish before this returns.
         pub fn run(io: Io, world: *W, ctx: *C) anyerror!void {
-            inline for (stages) |stage| {
-                if (stage.len == 0) continue;
-                if (stage.len == 1) {
-                    const S = stage[0];
-                    try S.run(world, ctx);
-                    continue;
-                }
+            return runObserved(io, world, ctx, NoopObserver{});
+        }
 
-                var errors: [stage.len]?anyerror = undefined;
-                for (&errors) |*slot| slot.* = null;
-                var group: Io.Group = .init;
-                inline for (stage, 0..) |S, i| {
-                    group.async(io, invoke, .{ S.erased, world, ctx, &errors[i] });
+        /// Like `run`, but notifies `observer` before/after each system. The
+        /// observer is a comptime duck-typed value: if its type declares
+        /// `before(io, index)` and `after(io, index, result)`, those are called
+        /// around the system run. `NoopObserver{}` compiles the hooks away.
+        pub fn runObserved(io: Io, world: *W, ctx: *C, observer: anytype) anyerror!void {
+            comptime var base_index: usize = 0;
+            inline for (stages) |stage| {
+                if (stage.len != 0) {
+                    const depths = comptime std.mem.zeroes([stage.len]usize);
+                    try runLayer(stage, depths, 0, base_index, io, world, ctx, observer);
                 }
-                try group.await(io);
-                for (errors) |slot| {
-                    if (slot) |err| return err;
-                }
+                base_index += stage.len;
             }
         }
 
@@ -205,19 +208,137 @@ pub fn Schedule(comptime W: type, comptime C: type, comptime stages: anytype) ty
         /// whose allocator is not thread-safe. Stage boundaries are still respected
         /// as ordering points, but no parallelism is used.
         pub fn runSequential(world: *W, ctx: *C) anyerror!void {
+            return runSequentialObserved(null, world, ctx, NoopObserver{});
+        }
+
+        /// Like `runSequential`, but with optional observer hooks. When an
+        /// observer is supplied, `io` must be non-null so it can time systems.
+        pub fn runSequentialObserved(io: ?Io, world: *W, ctx: *C, observer: anytype) anyerror!void {
+            comptime var index: usize = 0;
             inline for (stages) |stage| {
                 inline for (stage) |S| {
-                    try S.run(world, ctx);
+                    try runSystem(S, io, world, ctx, observer, index);
+                    index += 1;
                 }
             }
         }
+    };
+}
 
-        fn invoke(sys: Erased(W, C), world: *W, ctx: *C, err_slot: *?anyerror) void {
-            sys.run(world, ctx) catch |err| {
+/// An observer that compiles to no hooks. Used by the plain `run` paths.
+pub const NoopObserver = struct {};
+
+fn observerType(comptime T: type) type {
+    return switch (@typeInfo(T)) {
+        .pointer => |p| p.child,
+        else => T,
+    };
+}
+
+/// Run one system, optionally notifying an observer. The observer interface is
+/// duck-typed: `before(io: Io, index: usize) void` and
+/// `after(io: Io, index: usize, result: anyerror!void) void`. Supplying an
+/// observer requires a non-null `io`. Returns the system's own result.
+pub fn runSystem(
+    comptime S: type,
+    io: ?Io,
+    world: anytype,
+    ctx: anytype,
+    observer: anytype,
+    index: usize,
+) anyerror!void {
+    return runErasedSystem(S.erased, io, world, ctx, observer, index);
+}
+
+fn runErasedSystem(
+    sys: anytype,
+    io: ?Io,
+    world: anytype,
+    ctx: anytype,
+    observer: anytype,
+    index: usize,
+) anyerror!void {
+    const Obs = observerType(@TypeOf(observer));
+    const has_before = @hasDecl(Obs, "before");
+    const has_after = @hasDecl(Obs, "after");
+    if (has_before != has_after)
+        @compileError("schedule observer must declare both before() and after(), or neither");
+    if (!has_before) return sys.run(world, ctx);
+
+    const io_val = io orelse return error.MissingIo;
+    observer.before(io_val, index);
+    const result = sys.run(world, ctx);
+    observer.after(io_val, index, result);
+    return result;
+}
+
+/// Run one comptime layer of a system tuple. `depths[i]` is the layer of system
+/// `i`; only systems whose depth equals `layer` run. `base_index` is added to the
+/// tuple index to produce the observer's global system index. Single-system
+/// layers run directly; larger layers dispatch through one `Io.Group` and await
+/// all tasks before returning the first error in declaration order.
+pub fn runLayer(
+    comptime systems: anytype,
+    comptime depths: anytype,
+    comptime layer: usize,
+    comptime base_index: usize,
+    io: Io,
+    world: anytype,
+    ctx: anytype,
+    observer: anytype,
+) anyerror!void {
+    const count = comptime blk: {
+        var n: usize = 0;
+        for (depths) |d| {
+            if (d == layer) n += 1;
+        }
+        break :blk n;
+    };
+    if (count == 0) return;
+
+    if (count == 1) {
+        inline for (systems, 0..) |S, i| {
+            if (depths[i] == layer) {
+                try runSystem(S, io, world, ctx, observer, base_index + i);
+            }
+        }
+        return;
+    }
+
+    var errors: [count]?anyerror = undefined;
+    for (&errors) |*slot| slot.* = null;
+    var group: Io.Group = .init;
+
+    const W = @TypeOf(world.*);
+    const C = @TypeOf(ctx.*);
+    const Obs = @TypeOf(observer);
+    const Task = struct {
+        fn start(
+            sys: Erased(W, C),
+            w: *W,
+            c: *C,
+            err_slot: *?anyerror,
+            io_arg: Io,
+            obs: Obs,
+            index: usize,
+        ) void {
+            runErasedSystem(sys, io_arg, w, c, obs, index) catch |err| {
                 err_slot.* = err;
             };
         }
     };
+
+    comptime var slot_index: usize = 0;
+    inline for (systems, 0..) |S, i| {
+        if (depths[i] == layer) {
+            group.async(io, Task.start, .{ S.erased, world, ctx, &errors[slot_index], io, observer, base_index + i });
+            slot_index += 1;
+        }
+    }
+    try group.await(io);
+    for (errors) |slot| {
+        if (slot) |err| return err;
+    }
 }
 
 // --- tests -----------------------------------------------------------------
@@ -443,5 +564,61 @@ test "schedule: runSequential propagates errors and stops" {
     defer world.deinit();
     var ctx = Context{};
     try std.testing.expectError(error.Boom, S.runSequential(&world, &ctx));
+    try std.testing.expect(!ctx.ran);
+}
+
+test "schedule: observer hooks use global indices across stages" {
+    const Obs = struct {
+        indices: [3]usize = undefined,
+        count: usize = 0,
+        errors: usize = 0,
+        pub fn before(self: *@This(), io: Io, index: usize) void {
+            _ = io;
+            self.indices[self.count] = index;
+            self.count += 1;
+        }
+        pub fn after(self: *@This(), io: Io, index: usize, result: anyerror!void) void {
+            _ = io;
+            _ = index;
+            if (result) |_| {} else |_| self.errors += 1;
+        }
+    };
+    const S = Schedule(TestWorld, Context, .{ .{ MoveSys, TagSys }, .{CopySys} });
+    var world = TestWorld.init(std.testing.allocator);
+    defer world.deinit();
+    var ctx = Context{};
+    var obs = Obs{};
+    try S.runSequentialObserved(std.testing.io, &world, &ctx, &obs);
+    try std.testing.expectEqual(@as(usize, 3), obs.count);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 2 }, &obs.indices);
+    try std.testing.expectEqual(@as(usize, 0), obs.errors);
+}
+
+test "schedule: observer receives errors and requires Io when present" {
+    const Obs = struct {
+        last_error: ?anyerror = null,
+        pub fn before(self: *@This(), io: Io, index: usize) void {
+            _ = self;
+            _ = io;
+            _ = index;
+        }
+        pub fn after(self: *@This(), io: Io, index: usize, result: anyerror!void) void {
+            _ = io;
+            _ = index;
+            if (result) |_| {} else |err| self.last_error = err;
+        }
+    };
+    var world = TestWorld.init(std.testing.allocator);
+    defer world.deinit();
+    var ctx = Context{};
+    var obs = Obs{};
+
+    const Failing = Schedule(TestWorld, Context, .{ .{FailSys}, .{MarkSys} });
+    try std.testing.expectError(error.Boom, Failing.runSequentialObserved(std.testing.io, &world, &ctx, &obs));
+    try std.testing.expectEqual(@as(?anyerror, error.Boom), obs.last_error);
+    try std.testing.expect(!ctx.ran);
+
+    const Mark = Schedule(TestWorld, Context, .{.{MarkSys}});
+    try std.testing.expectError(error.MissingIo, Mark.runSequentialObserved(null, &world, &ctx, &obs));
     try std.testing.expect(!ctx.ran);
 }

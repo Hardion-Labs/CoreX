@@ -24,6 +24,10 @@ pub const entity = @import("ecs/entity.zig");
 pub const pool = @import("ecs/pool.zig");
 pub const world = @import("ecs/world.zig");
 pub const schedule = @import("ecs/schedule.zig");
+/// Automatic dependency-graph scheduling inferred from component access.
+pub const graph = @import("ecs/graph.zig");
+/// Frame-level scheduling: system profiling and cooperative frame budgets.
+pub const frame = @import("ecs/frame.zig");
 
 pub const Entity = entity.Entity;
 pub const Entities = entity.Entities;
@@ -32,6 +36,13 @@ pub const World = world.World;
 pub const AddError = world.AddError;
 pub const Schedule = schedule.Schedule;
 pub const system = schedule.system;
+pub const AutoSchedule = graph.AutoSchedule;
+pub const FrameSchedule = frame.FrameSchedule;
+pub const FrameBudget = frame.FrameBudget;
+pub const FrameCursor = frame.FrameCursor;
+pub const FrameResult = frame.FrameResult;
+pub const StopReason = frame.StopReason;
+pub const SystemStats = frame.SystemStats;
 
 test {
     std.testing.refAllDecls(@This());
@@ -39,4 +50,6 @@ test {
     _ = pool;
     _ = world;
     _ = schedule;
+    _ = graph;
+    _ = frame;
 }
