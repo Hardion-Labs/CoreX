@@ -19,9 +19,12 @@
 //! normalizes to the same RGBA8 `Image`, so the artifact and pipeline layers do
 //! not care which decoder produced the pixels.
 //!
-//! Not yet supported (honest limitations, rejected rather than faked): JPEG,
-//! compressed BMP, palette/indexed TGA and HDR. These remain `raw` imports until
-//! dedicated decoders exist.
+//! JPEG lives in `jpeg.zig` for the same reason: it needs its own Huffman,
+//! bit-reader and IDCT machinery, and normalizes to the same RGBA8 `Image`.
+//!
+//! Not yet supported (honest limitations, rejected rather than faked): compressed
+//! BMP, palette/indexed TGA and HDR. These remain `raw` imports until dedicated
+//! decoders exist.
 
 const std = @import("std");
 

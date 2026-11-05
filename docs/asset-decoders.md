@@ -7,8 +7,8 @@ artifact (`CXTX`). The code lives in `src/assets/image.zig` (BMP/TGA/QOI),
 `corex.assets.image`, `corex.assets.png`, `corex.assets.inflate` and
 `corex.assets.texture` (types `corex.assets.Image` and `corex.assets.Texture`).
 
-> Status: **implemented and tested** for **PNG, BMP, TGA and QOI**. JPEG and
-> fonts still have no decoder and continue to be imported as `raw` (verbatim
+> Status: **implemented and tested** for **PNG, JPEG, BMP, TGA and QOI**.
+> Fonts still have no decoder and continue to be imported as `raw` (verbatim
 > copy). Other model formats also fall back to `raw`; the OBJ mesh importer does
 > exist (see [mesh-import.md](mesh-import.md)), as does the WAV audio importer
 > (see [asset-audio.md](asset-audio.md)). This is documented as a limitation, not
@@ -31,6 +31,7 @@ source (.png/.bmp/.tga/.qoi) → decode → RGBA8 Image → serialize → CXTX �
 | Format | Extension | Modes | Depth | Notes |
 |---|---|---|---|---|
 | PNG | `.png` | Grayscale, truecolor, indexed, grayscale+alpha, truecolor+alpha; non-interlaced and Adam7 | 1, 2, 4, 8, 16 bit | All five row filters; `tRNS` (palette alpha and color keys); multiple IDAT chunks; Adam7 interlacing; chunk CRC-32 and zlib Adler-32 verified. |
+| JPEG | `.jpg`, `.jpeg` | Sequential Huffman (`SOF0`/`SOF1`), 8-bit; grayscale and YCbCr | 8 bit | 4:4:4, 4:4:0, 4:2:2, 4:2:0, 4:1:1 and any legal 1..4 sampling factors; restart markers; 8/16-bit quant tables; arbitrary Huffman tables; libjpeg-exact colour conversion and chroma upsampling. |
 | BMP | `.bmp` | `BI_RGB` (uncompressed) | 24, 32 bpp | Bottom-up and top-down; row padding at 24 bpp; BGR→RGB; alpha from the 4th byte at 32 bpp. |
 | TGA | `.tga` | Uncompressed true-color (type 2) and RLE (type 10) | 24, 32 bpp | Descriptor bit 5 selects top-down; BGR(A)→RGBA(A). |
 | QOI | `.qoi` | Decode **and** encode | 3/4 channels | Quite OK Image; encode enables lossless roundtrips and a future export path. |
@@ -146,6 +147,77 @@ The third argument is a hard bound: the decoder never produces more than
 instead of growing without limit. PNG passes the exact scanline size implied by
 `IHDR`, so a decompression bomb cannot exceed the image's own declared size.
 
+## JPEG
+
+### What is supported
+
+- **Coding process**: sequential DCT with Huffman coding — `SOF0` (baseline) and
+  `SOF1` (extended sequential). They share one entropy-coded structure, so both
+  decode through the same path.
+- **Precision**: 8 bits per sample.
+- **Components**: grayscale (1) and YCbCr (3). Single-component scans are
+  non-interleaved, one block per MCU, as the specification requires.
+- **Sampling**: any legal factors in 1..4 whose h·v sums to at most 10, which
+  covers 4:4:4, 4:4:0, 4:2:2, 4:2:0 and 4:1:1. Factors must divide the frame
+  maximum, or the file is rejected.
+- **Tables**: 8-bit and 16-bit quantization tables, arbitrary Huffman tables
+  (standard or optimized), up to four of each class.
+- **Restart markers**: `DRI` plus `RSTn` at the declared interval. DC predictors
+  and the bit buffer reset at every interval, and a missing or out-of-sequence
+  marker is an error rather than a silently smeared image.
+- **Segments**: any number of `APPn`/`COM` and other payload-bearing ancillary
+  markers, including the Adobe and EXIF wrappers real cameras emit.
+
+### Fidelity, and why it is not bit-exact
+
+JPEG does not normatively specify the inverse DCT, so two conforming decoders may
+legitimately differ by a sample value. Everything *around* the IDCT here is
+reproduced exactly from libjpeg:
+
+- **Colour conversion** uses libjpeg's fixed-point constants (91881, 22554,
+  46802, 116130 with a 16-bit scale), so YCbCr→RGB is bit-identical.
+- **Chroma upsampling** reproduces libjpeg's "fancy" triangle filters, including
+  the details that are easy to get wrong: the upper output row of a 2× vertical
+  pair blends with the row *above* and the lower with the row *below*; the fused
+  2×2 filter rounds left taps with +8 and right taps with +7; and the fancy
+  horizontal path is only taken when the component row is wider than two samples,
+  below which libjpeg replicates.
+- **The IDCT** is a full-precision separable transform, where libjpeg uses a
+  13-bit fixed-point one. This is the only source of divergence.
+
+Measured over the 36-vector corpus, the worst channel differs by **3** levels
+(at quality 10, where coarse quantization amplifies the difference) and the worst
+per-image mean error is **0.199**. The suite pins a ceiling of 4 on the worst
+channel (one level of headroom for floating-point contraction differing between
+optimization modes) and 0.25 on the mean. The mean bound is the one that matters:
+a structurally wrong filter shifts it by whole levels, not fractions.
+
+### What is rejected
+
+Progressive (`SOF2`), lossless (`SOF3`), hierarchical, arithmetic-coded
+(`SOF9`/`SOF10`/`SOF11`) and 12-bit frames, and 4-component CMYK/YCCK files. Also
+rejected: over-subscribed Huffman code spaces, a zero quantizer, out-of-range
+table indices, duplicate component ids, non-baseline spectral selection, a
+truncated scan, and dimensions beyond the shared image limits. None of these are
+approximated or partially decoded.
+
+### Implementation notes
+
+- **Bit reader**: pulls bytes only as far as the current symbol needs, never far
+  ahead, so a restart marker can be found by discarding the padding bits of the
+  current byte. `0xFF00` un-stuffs to `0xFF`, repeated `0xFF` are fill bytes, and
+  any other marker stops the stream *without consuming it*. Running out of bytes
+  with no marker is a truncated scan, not a grey fill.
+- **Huffman**: codes up to 10 bits resolve with one lookup in a 1024-entry table;
+  longer codes walk the canonical code space. The fast path matters less than it
+  looks — the standard AC luminance table has 125 codes of length 16.
+- **IDCT**: coefficient rows that are entirely zero are skipped in both passes,
+  and a DC-only block becomes a constant fill with the 2D gain of 1/8. The two
+  transform passes are 8-wide vector products against a comptime basis.
+- **Conversion**: one output-resolution row per component is expanded into a
+  single `3 * width` scratch allocation, then a branch-free loop converts to
+  RGBA8. No per-pixel dispatch on the sampling ratio.
+
 ## The `CXTX` artifact
 
 Little-endian layout, total size `20 + width*height*4`:
@@ -175,9 +247,11 @@ const A = corex.assets;
 var img = try A.image.decodeBmp(gpa, source); // or decodeTga / decodeQoi
 defer img.deinit(gpa);
 
-// PNG lives in its own module and returns the same Image type:
+// PNG and JPEG live in their own modules and return the same Image type:
 var png_img = try A.png.decode(gpa, png_source);
 defer png_img.deinit(gpa);
+var jpg_img = try A.jpeg.decode(gpa, jpg_source);
+defer jpg_img.deinit(gpa);
 
 // Lossless QOI encode (roundtrip / future export):
 const qoi_bytes = try A.image.encodeQoi(gpa, img);
@@ -258,6 +332,36 @@ var report = try A.pipeline.run(gpa, io, root, idx, &cache, .{
 - **Inflate**: a 200 KiB multi-block dynamic-Huffman stream, fixed-Huffman and
   stored streams, crafted over-subscribed/illegal-code streams, truncation at
   several offsets, and the output bound for literals, matches and stored blocks.
+- **JPEG vectors**: `src/assets/jpeg_vectors.zig`, generated by
+  `tools/gen_jpeg_vectors.py` (needs Pillow, for libjpeg; CI compiles the
+  committed vectors and does not run generators). Every JPEG is encoded by
+  libjpeg and every reference is libjpeg's own decode, so the engine is compared
+  against an independent implementation. The 36 vectors cover grayscale and all
+  three subsamplings libjpeg can emit, sizes from 1×1 to 17×13 including
+  non-block-aligned ones, quality 10/50/85/90/100, standard and optimized Huffman
+  tables, restart intervals of 1/2/3/5 blocks, and flat/hard-edged/ramped content
+  that exercises the DC-only and sparse IDCT paths. Each is checked against the
+  tolerance documented above.
+- **JPEG rejection vectors**: 19 malformed files (truncation at three points, bad
+  quant/Huffman table ids and classes, a zero quantizer, over-subscribed Huffman
+  counts, a sampling factor out of range, a duplicate component id, and a declared
+  restart interval whose markers are absent) plus 7 unsupported ones (progressive,
+  the `SOF3`/`SOF9`/`SOF11` coding processes, 12-bit precision and four
+  components). The `progressive` vector is a
+  genuinely valid progressive JPEG that libjpeg reads and the engine must refuse;
+  the generator asserts that, so "unsupported" is proven to be a real format case
+  rather than a corrupt file. Two rejection vectors are deliberately stricter
+  than libjpeg, which clamps a zero quantizer and renders a truncated scan as far
+  as it got.
+- **JPEG paths the corpus cannot reach**: 4:4:0 is not something Pillow can emit,
+  so `h1v2` upsampling is pinned directly against hand-computed libjpeg output,
+  as are the 2×2 rounding biases, the two-sample replication fallback, odd-width
+  expansion, the 1/8 DC gain, byte un-stuffing and fill bytes, marker stops,
+  magnitude sign extension, Huffman over-subscription, and the colour-conversion
+  clamp extremes.
+- **JPEG allocation failures**: `checkAllAllocationFailures` over the decoder and
+  the importer, including a colour image so a failure after one or two component
+  planes have been allocated must unwind exactly those planes.
 - **QOI roundtrip**: `encodeQoi` → `decodeQoi` preserves pixels exactly (a
   gradient with alpha and a case exercising RUN/INDEX/DIFF/LUMA/RGBA chunks).
 - **Known fixtures**: 24 bpp bottom-up BMP with padding, 32 bpp top-down BMP with
@@ -286,6 +390,25 @@ var report = try A.pipeline.run(gpa, io, root, idx, &cache, .{
   entirely, so it disappears into the inflate/unfilter cost. Both files decoded
   to byte-identical 4 MiB buffers. Absolute milliseconds are container-specific;
   only the ratio within a run is meaningful.
+- JPEG: measured on a 1024×1024 image in `ReleaseFast`, best of 10 — **30.6 ms**
+  at 4:4:4 and **20.5 ms** at 4:2:0, against **17.1 ms** for a lossless PNG of the
+  same pixels. Splitting the 4:2:0 case into phases: entropy decode plus IDCT
+  11.0 ms, upsampling plus colour conversion 4.8 ms, and the remainder is
+  allocating and first-touching the buffers. Within the scan, Huffman decoding
+  accounts for 7.6 ms and the IDCT only 3.4 ms, so the entropy reader is the
+  bottleneck, not the transform. Marking the bit-reader helpers `inline` was
+  measured and **rejected**: it made the scan slower (8.1 ms vs 7.6 ms for the
+  entropy phase) through register pressure. A wider bit accumulator is the
+  obvious next win but needs source-position tracking to keep restart markers
+  locatable through `0xFF00` stuffing, so it is left as future work rather than
+  risked here.
+- JPEG memory: one plane per component at MCU-padded size, plus the RGBA8 output.
+  For 1024×1024 4:2:0 that is 1536 KiB of planes against 4096 KiB of output. The
+  planes are bounded by `max_plane_bytes` (= `image.max_pixel_bytes`) and checked
+  with overflow-guarded arithmetic *before* any allocation, so a hostile header
+  cannot make the decoder allocate one huge plane before rejecting the next. For
+  the densest accepted layout (4:4:4) the planes need 3 bytes per pixel against
+  the output's 4, so the bound never rejects an image whose output would fit.
 - `encodeQoi` pre-reserves the maximum capacity (`14 + w*h*5 + 8`) and uses
   `appendAssumeCapacity`, avoiding reallocations during encoding.
 - The `CXTX` artifact is self-describing: the renderer does not re-parse the
@@ -295,8 +418,11 @@ var report = try A.pipeline.run(gpa, io, root, idx, &cache, .{
 
 - No APNG animation and no 16-bit output artifact
   (`CXTX` is RGBA8, so 16-bit sources lose their low byte).
-- No JPEG, compressed BMP, indexed TGA or HDR; those cases are rejected or fall
-  back to `raw`, never "guessed".
+- No progressive, arithmetic-coded, lossless or 12-bit JPEG, and no CMYK/YCCK;
+  those are rejected, never "guessed". No EXIF orientation is applied and no ICC
+  profile is honoured — the pixels are decoded as stored.
+- No compressed BMP, indexed TGA or HDR; those cases are rejected or fall back to
+  `raw`.
 - No mipmaps, texture compression (BC/ASTC) or color-space conversion; the
   artifact is always linear RGBA8. `gAMA`/`sRGB`/`iCCP` chunks are skipped, not
   applied.

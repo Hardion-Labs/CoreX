@@ -1,7 +1,7 @@
 //! Engine-ready texture artifact (`CXTX`) and texture importers.
 //!
 //! The importers decode a source image (BMP/TGA/QOI in `image.zig`, PNG in
-//! `png.zig`) to RGBA8 and serialize it into a self-describing `CXTX` container
+//! `png.zig`, JPEG in `jpeg.zig`) to RGBA8 and serialize it into a self-describing `CXTX` container
 //! that the renderer can upload directly without re-parsing the source format. The container is
 //! the derived artifact stored in the content-addressed cache; its identity is
 //! the importer `id` + `version`, so changing the layout and bumping the version
@@ -22,6 +22,7 @@
 const std = @import("std");
 const image = @import("image.zig");
 const png = @import("png.zig");
+const jpeg = @import("jpeg.zig");
 const importer = @import("importer.zig");
 
 const Allocator = std.mem.Allocator;
@@ -127,14 +128,22 @@ pub fn importPng(gpa: Allocator, source: []const u8) ImportError![]u8 {
     return importImage(gpa, source, png.decode);
 }
 
+/// Decode a sequential JPEG (see `jpeg.zig`) and serialize it to a `CXTX`
+/// artifact. JPEG has no alpha channel, so the artifact is fully opaque.
+pub fn importJpeg(gpa: Allocator, source: []const u8) ImportError![]u8 {
+    return importImage(gpa, source, jpeg.decode);
+}
+
 pub const bmp_importer = Importer{ .id = "bmp", .version = 1, .importFn = importBmp };
 pub const tga_importer = Importer{ .id = "tga", .version = 1, .importFn = importTga };
 pub const qoi_importer = Importer{ .id = "qoi", .version = 1, .importFn = importQoi };
 pub const png_importer = Importer{ .id = "png", .version = 1, .importFn = importPng };
+pub const jpeg_importer = Importer{ .id = "jpeg", .version = 1, .importFn = importJpeg };
 
 /// Extension bindings for the engine registry (prepended by `assets.zig`).
 pub const bindings = [_]importer.Registry.Binding{
     .{ .extensions = &[_][]const u8{".png"}, .importer = png_importer },
+    .{ .extensions = &[_][]const u8{ ".jpg", ".jpeg" }, .importer = jpeg_importer },
     .{ .extensions = &[_][]const u8{".bmp"}, .importer = bmp_importer },
     .{ .extensions = &[_][]const u8{".tga"}, .importer = tga_importer },
     .{ .extensions = &[_][]const u8{".qoi"}, .importer = qoi_importer },
@@ -245,7 +254,9 @@ test "texture: bindings select the right importer by extension" {
     try testing.expectEqualStrings("qoi", reg.select(".qoi").id);
     try testing.expectEqualStrings("png", reg.select(".png").id);
     try testing.expectEqualStrings("png", reg.select(".PNG").id);
-    try testing.expectEqualStrings("raw", reg.select(".jpg").id);
+    try testing.expectEqualStrings("jpeg", reg.select(".jpg").id);
+    try testing.expectEqualStrings("jpeg", reg.select(".JPEG").id);
+    try testing.expectEqualStrings("raw", reg.select(".gif").id);
 }
 
 test "texture: serialize and import survive allocation failure" {
@@ -289,6 +300,57 @@ test "texture: importPng survives allocation failure" {
     try testing.checkAllAllocationFailures(gpa, struct {
         fn f(alloc: Allocator, bytes_in: []const u8) !void {
             const bytes = try importPng(alloc, bytes_in);
+            alloc.free(bytes);
+        }
+    }.f, .{source});
+}
+
+test "texture: importJpeg produces an opaque CXTX artifact" {
+    const gpa = testing.allocator;
+    const vectors = @import("jpeg_vectors.zig");
+    for (vectors.valid) |vector| {
+        const source = try gpa.alloc(u8, vector.jpg_hex.len / 2);
+        defer gpa.free(source);
+        _ = try std.fmt.hexToBytes(source, vector.jpg_hex);
+
+        const bytes = try importJpeg(gpa, source);
+        defer gpa.free(bytes);
+        const tex = try parse(bytes);
+        try testing.expectEqual(vector.width, tex.width);
+        try testing.expectEqual(vector.height, tex.height);
+        try testing.expectEqual(PixelFormat.rgba8, tex.pixel_format);
+        try testing.expectEqual(@as(usize, vector.width) * @as(usize, vector.height) * 4, tex.pixels.len);
+        // The artifact must round-trip through the container unchanged, and
+        // JPEG's lack of a colour key means every alpha byte is opaque.
+        var direct = try jpeg.decode(gpa, source);
+        defer direct.deinit(gpa);
+        try testing.expectEqualSlices(u8, direct.pixels, tex.pixels);
+        var i: usize = 3;
+        while (i < tex.pixels.len) : (i += 4) try testing.expectEqual(@as(u8, 255), tex.pixels[i]);
+    }
+}
+
+test "texture: importJpeg rejects malformed and unsupported sources" {
+    const gpa = testing.allocator;
+    try testing.expectError(error.InvalidAsset, importJpeg(gpa, "not a jpeg"));
+    const vectors = @import("jpeg_vectors.zig");
+    for (vectors.unsupported) |vector| {
+        const source = try gpa.alloc(u8, vector.jpg_hex.len / 2);
+        defer gpa.free(source);
+        _ = try std.fmt.hexToBytes(source, vector.jpg_hex);
+        try testing.expectError(error.InvalidAsset, importJpeg(gpa, source));
+    }
+}
+
+test "texture: importJpeg survives allocation failure" {
+    const gpa = testing.allocator;
+    const vectors = @import("jpeg_vectors.zig");
+    const source = try gpa.alloc(u8, vectors.valid[8].jpg_hex.len / 2);
+    defer gpa.free(source);
+    _ = try std.fmt.hexToBytes(source, vectors.valid[8].jpg_hex);
+    try testing.checkAllAllocationFailures(gpa, struct {
+        fn f(alloc: Allocator, bytes_in: []const u8) !void {
+            const bytes = try importJpeg(alloc, bytes_in);
             alloc.free(bytes);
         }
     }.f, .{source});
