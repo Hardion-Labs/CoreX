@@ -27,9 +27,11 @@ control, and maintainable code.
 > scenes, stable entity IDs, hierarchy, ECS load/save, world-space transform
 > propagation) and the asset import
 > pipeline + content-addressed cache (raw/text/json/scene importers, BMP/TGA/QOI
-> texture decoders, atomic verified storage, parallel import over the job system)
-> are implemented and tested. The larger subsystems (renderers, GUI, editor, Lua, export, native
-> modules) are in scope and either contract-defined or planned. See
+> texture decoders, atomic verified storage, parallel import over the job system,
+> mark-and-sweep GC), and the backend-independent render extraction layer (camera
+> math, frustum culling, sorted draw lists) are implemented and tested. The larger
+> subsystems (GPU renderer backends, GUI, editor, Lua, export, native modules) are
+> in scope and either contract-defined or planned. See
 > [`docs/architecture.md`](docs/architecture.md) for the per-subsystem status.
 
 ## Overview
@@ -228,6 +230,34 @@ documented in [`docs/asset-import.md`](docs/asset-import.md); the texture
 decoders and `CXTX` artifact are documented in
 [`docs/asset-decoders.md`](docs/asset-decoders.md).
 
+## Render
+
+The render subsystem (`corex.render`) currently provides the **backend-independent
+extraction layer** — the CPU foundation every GPU tier will consume. It builds
+camera view/projection matrices, frustum-culls renderables, and produces a sorted
+draw list from a scene. It has no GPU dependency, so it runs and is fully tested
+headlessly. The Low/Medium GPU backends are planned.
+
+```zig
+const corex = @import("corex");
+const R = corex.render;
+const MyScene = corex.scene.Scene(.{
+    corex.scene.Component(corex.scene.Transform, "transform"),
+    corex.scene.Component(R.Renderable, "renderable"),
+});
+var scene = try MyScene.init(allocator, "main");
+defer scene.deinit();
+// ... add entities with Transform + Renderable ...
+
+const cam = R.Camera.perspectiveLookAt(.{ 0, 0, 10 }, .{ 0, 0, 0 }, .{ 0, 1, 0 }, 1.0, 1.6, 0.1, 500);
+var frame = try R.extractDrawList(&scene, cam, .front_to_back, allocator);
+defer frame.deinit();
+// frame.commands: culled + sorted DrawCommands; frame.culled: how many were rejected
+```
+
+The design, math conventions and guarantees are documented in
+[`docs/render-extraction.md`](docs/render-extraction.md).
+
 ## Project Structure
 
 ```text
@@ -243,6 +273,7 @@ CoreX/
 │   ├── project-format.md       # .corex manifest format
 │   ├── scene-format.md         # Versioned .scene format
 │   ├── scene-transforms.md     # World-space transform propagation
+│   ├── render-extraction.md    # Backend-independent render extraction
 │   ├── versioning.md           # Versioning and compatibility policy
 │   ├── native-module-api.md    # C++ native module ABI contract
 │   ├── development/            # Coding standards, commit guidelines
@@ -258,7 +289,9 @@ CoreX/
 │   ├── scene.zig               # Scene public module (EngineScene)
 │   ├── scene/                  # Scene components + versioned documents
 │   ├── assets.zig              # Asset public module (index + import + cache)
-│   └── assets/                 # Import cache, importers, parallel pipeline
+│   ├── assets/                 # Import cache, importers, parallel pipeline
+│   ├── render.zig              # Render public module (extraction layer)
+│   └── render/                 # Camera, frustum culling, draw-list extraction
 ├── build.zig                   # Build configuration
 └── CHANGELOG.md, CONTRIBUTING.md, LICENSE, README.md, ...
 ```
@@ -283,7 +316,8 @@ Indicative; subject to change as technical decisions are validated.
 - [x] Texture decoders (BMP/TGA/QOI → RGBA8 `CXTX` artifact).
 - [x] Asset cache garbage collection (mark-and-sweep of orphan entries).
 - [ ] Asset decoders (PNG/JPEG/audio/model), hot-reload, startup integration.
-- [ ] Renderer Low / Medium; Advanced contract.
+- [x] Backend-independent render extraction (camera, frustum culling, sorted draw lists).
+- [ ] Renderer Low / Medium GPU backends; Advanced contract.
 - [ ] GUI library and graphical editor.
 - [ ] Lua VM and gameplay scripting.
 - [ ] Native Module API loader (C++).
