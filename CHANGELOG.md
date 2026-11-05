@@ -34,6 +34,18 @@ declared yet.
   comptime ordered stages, read/write access declarations with compile-time
   conflict rejection, exclusive systems, concurrent dispatch through `std.Io` /
   `JobSystem`, deterministic error propagation, and a `runSequential` fallback.
+- ECS scheduling extensions (`src/ecs/graph.zig`, `src/ecs/frame.zig`,
+  re-exported as `corex.ecs.graph`/`corex.ecs.frame` and
+  `AutoSchedule`/`FrameSchedule`/`FrameBudget`/`FrameCursor`/`FrameResult`/
+  `StopReason`/`SystemStats`): automatic comptime dependency-graph scheduling
+  inferred from component access (declaration-order edges, parallel layers,
+  exclusive barriers, no runtime graph allocation); allocation-free per-system
+  profiling (`FrameProfiler`: runs/errors/monotonic timings, parallel-safe
+  per-index slots, text report); cooperative frame budgets (`runBudgeted` +
+  resumable `FrameCursor`, time/system-count limits checked between systems,
+  never preempting a running system). Additive observer hooks
+  (`runObserved`/`runSequentialObserved`, `NoopObserver`) on both `Schedule` and
+  `AutoSchedule`; the plain `run`/`runSequential` contracts are unchanged.
 - Scene system and versioned scene serialization (`src/scene/`, re-exported as
   `corex.scene`, `docs/scene-format.md`): strict JSON `format_version = 1`,
   stable entity IDs, parent hierarchy with cycle rejection, plain-data component
@@ -102,14 +114,16 @@ declared yet.
   `include/corex/native_module.h`); the loader is not implemented yet.
 - A minimal example project (`examples/hello-project/`) with a valid versioned
   initial scene.
-- Test suite covering the startup spine, ECS, scheduling, scenes, asset
-  import/cache, world-space transforms, texture decoders, cache GC, render
-  extraction and OBJ mesh import (267 tests), including allocation-failure
+- Test suite covering the startup spine, ECS, scheduling (manual stages,
+  automatic dependency graphs, observers, frame budgets and profiling), scenes,
+  asset import/cache, world-space transforms, texture decoders, cache GC, render
+  extraction and OBJ mesh import (290 tests), including allocation-failure
   probes, cache corruption/truncation probes, a deep-hierarchy stress test, QOI
   encode/decode roundtrips, end-to-end texture-import-and-cache, OBJ-import-and-
   cache and import-then-GC tests, camera/frustum/culling and draw-list extraction
   tests, OBJ decode/artifact roundtrip and malformed-input tests, and job-system
-  integration tests, validated in Debug, ReleaseSafe and ReleaseFast.
+  integration tests (including parallel graph/frame profiling over `JobSystem`
+  workers), validated in Debug, ReleaseSafe and ReleaseFast.
 
 ### Changed
 
@@ -117,7 +131,8 @@ declared yet.
 - README and architecture documentation now reflect the definitive scope and the
   per-subsystem implementation status.
 - The public module `src/corex.zig` re-exports the implemented core, ECS
-  (including scheduling), scene (including transform math as `corex.scene.transform`,
+  (including scheduling, automatic dependency graphs and frame budgets/profiling),
+  scene (including transform math as `corex.scene.transform`,
   `Mat4`/`Vec3`/`Quat`), asset (import/cache with GC, image decoders and the
   `CXTX` texture artifact as `corex.assets.image`/`corex.assets.texture`, the OBJ
   mesh importer and `CXMH` artifact as `corex.assets.mesh`,

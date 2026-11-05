@@ -22,8 +22,9 @@ control, and maintainable code.
 > **Status:** early development. The startup spine (CLI, project manifest,
 > compatibility, jobs, configuration, asset indexing, splash contract,
 > diagnostics, and the project-open pipeline), the ECS (generational entities,
-> sparse-set component pools, type-safe world, multi-component views and comptime
-> system scheduling over the job system), the scene system (versioned JSON
+> sparse-set component pools, type-safe world, multi-component views, comptime
+> system scheduling over the job system, automatic dependency graphs, cooperative
+> frame budgets and system profiling), the scene system (versioned JSON
 > scenes, stable entity IDs, hierarchy, ECS load/save, world-space transform
 > propagation) and the asset import
 > pipeline + content-addressed cache (raw/text/json/scene importers, BMP/TGA/QOI
@@ -148,8 +149,27 @@ defer js.deinit();
 try Schedule.run(js.io(), &world, &context);
 ```
 
+`AutoSchedule` infers the parallel layers automatically from the same access
+declarations (conflicting systems get declaration-order edges; exclusive systems
+become barriers), and `FrameSchedule` adds allocation-free per-system profiling
+plus cooperative frame budgets that stop between systems and resume via a cursor:
+
+```zig
+const Auto = corex.ecs.AutoSchedule(World, Context, .{ Movement, Animation });
+try Auto.run(js.io(), &world, &context);
+
+const Frame = corex.ecs.FrameSchedule(World, Context, .{ Movement, Animation });
+var profiler = Frame.Profiler.init();
+var cursor = corex.ecs.FrameCursor{};
+const r = try Frame.runBudgeted(js.io(), &world, &context, &profiler, &cursor, .{
+    .max_nanoseconds = 2_000_000,
+});
+// r.completed == false -> call again next frame to resume from cursor.
+```
+
 See [`docs/ecs-scheduling.md`](docs/ecs-scheduling.md) for the safety model,
-exclusive systems, error semantics and the sequential fallback.
+exclusive systems, error semantics, observers, dependency graphs, frame budgets
+and the sequential fallback.
 
 ## Scenes
 
@@ -288,7 +308,7 @@ CoreX/
 │   ├── corex.zig               # Public module
 │   ├── core/                   # Implemented startup-spine subsystems
 │   ├── ecs.zig                 # ECS public module
-│   ├── ecs/                    # Entities, pools, world/views, scheduling
+│   ├── ecs/                    # Entities, pools, world/views, scheduling, frame budgets
 │   ├── scene.zig               # Scene public module (EngineScene)
 │   ├── scene/                  # Scene components + versioned documents
 │   ├── assets.zig              # Asset public module (index + import + cache)
@@ -311,7 +331,7 @@ Indicative; subject to change as technical decisions are validated.
 - [x] Diagnostics and profiling foundation.
 - [x] ECS: generational entities, sparse-set components, type-safe world + views.
 - [x] ECS system scheduling over the job system (comptime stages, access validation).
-- [ ] ECS scheduling extensions: dependency graph, frame budget, profiling.
+- [x] ECS scheduling extensions: dependency graph, frame budget, profiling.
 - [x] Scene system and versioned scene serialization (format v1, ECS load/save).
 - [x] Scene world-space transforms (column-major Mat4 propagation, deterministic, iterative).
 - [ ] Scene extensions: prefabs, streaming.
