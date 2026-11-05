@@ -372,7 +372,9 @@ pub fn parse(bytes: []const u8) error{InvalidAsset}!AudioView {
     };
 }
 
-fn mapDecodeError(err: DecodeError) ImportError {
+/// Map a decode failure to the importer error set. Shared with `flac.zig` so
+/// the mapping has exactly one definition.
+pub fn mapDecodeError(err: DecodeError) ImportError {
     return switch (err) {
         error.InvalidAudio => error.InvalidAsset,
         error.OutOfMemory => error.OutOfMemory,

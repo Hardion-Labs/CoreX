@@ -164,6 +164,46 @@ declared yet.
   replication fallback, odd widths, the DC gain, byte un-stuffing, marker stops,
   sign extension, Huffman over-subscription and colour clamping, plus
   allocation-failure probes over the decoder and the importer.
+- FLAC decoder (`src/assets/flac.zig`, re-exported as `corex.assets.flac`) and a
+  `flac` importer (v1) bound to `.flac`, producing the existing `CXAW` artifact
+  from the same `Audio` type as the WAV path (`docs/asset-flac.md`). Covers the
+  whole baseline format: `CONSTANT`/`VERBATIM`/`FIXED` (orders 0..4) and `LPC`
+  (orders 1..32) subframes, wasted-bit flags, both Rice residual methods with any
+  partition order and escaped raw partitions, 1..8 independent channels plus
+  left/side, right/side and mid/side decorrelation, sample sizes 4..32 bits, fixed
+  and variable block sizes, every block-size and sample-rate code including the
+  explicit forms, UTF-8 coded numbers up to 36 bits, and CRC-8/CRC-16
+  verification. `audio.zig` keeps its contract; the only change there is that
+  `mapDecodeError` is now public so both decoders share one error mapping.
+  `flac.zig` imports `audio.zig` in one direction only and `assets.zig` composes
+  `audio.bindings ++ flac.bindings`, so there is no import cycle.
+- FLAC memory safety and performance: every field is read through a
+  bounds-checked bit reader over the frame's own slice; `i64` sample storage makes
+  every predictor and decorrelation step overflow-free by construction, including
+  `mid * 2` at 32 bits. Frame boundaries are proved by decoding the subframes and
+  checking the CRC-16, never by scanning for the next sync code. One block buffer
+  is allocated once and reused, the residual decodes straight into its final
+  sample slots, and fixed predictors are comptime-specialized per order. Measured
+  7.14 ms for 10 s of 44.1 kHz stereo 16-bit in ReleaseFast (123.5 Msamples/s,
+  471 MiB/s of output), about 6.1x a WAV decode of the same PCM. A fused
+  unary-plus-remainder bit window was measured and rejected: slower with a byte
+  loop, parity with a single load, so the simpler reader was kept.
+- FLAC test corpus (`tools/gen_flac_vectors.py`, `src/assets/flac_vectors.zig`):
+  72 valid streams with libFLAC's own float32 decode as the reference, compared
+  **bit-exactly** because FLAC is lossless, plus 16 malformed streams. The
+  generator parses every frame it emits and reports which features the corpus
+  actually reaches; that report drove 25 hand-built vectors for paths libFLAC's
+  encoder never chooses (mid/side, Rice method 1, partition orders up to 5,
+  escaped partitions, LPC orders up to 32, maximum coefficient precision,
+  variable block size, rate codes 0/12/13/14). Each crafted stream is decoded
+  back by libFLAC before it is emitted. The 12/20/32-bit vectors are anchored to
+  power-of-two-scaled 16/24-bit streams because libsndfile only exposes 8/16/24.
+  Unit tests pin the CRC check values, UTF-8 widths and over-long rejections, bit
+  reader bounds, sign extension, bounded unary runs, all fixed predictors, all
+  decorrelation modes, 32-bit mid/side extremes, wasted-bit `k-1` coding and the
+  header tables; a sweep decodes every proper prefix of a valid stream to prove
+  no truncation can trap. Allocation-failure probes and an end-to-end
+  pipeline/registry/cache/snapshot-key test complete the coverage.
 - Asset change detection (`src/assets/changes.zig`, re-exported as
   `corex.assets.changes` with `Snapshot`/`ChangeSet`/`ChangeKind`,
   `docs/asset-change-detection.md`): a path-sorted snapshot of every indexed
@@ -228,7 +268,8 @@ declared yet.
   `max_sample_rate` (384 kHz) and `max_sample_bytes` (256 MiB); conversion is
   specialized at comptime per bit width. No resampling/downmixing/channel
   reordering, and no playback device or mixer yet; ADPCM/µ-law/A-law/GSM, 64-bit
-  float and Ogg/MP3/FLAC/Opus/AIFF remain unsupported (rejected or `raw`).
+  float and Ogg/MP3/Opus/AIFF remain unsupported (rejected or `raw`); FLAC is
+  supported by its own decoder.
 - Reproducible audio test vectors (`tools/gen_wav_vectors.py`,
   `src/assets/audio_vectors.zig`): 15 valid WAVs with their expected interleaved
   f32 output (compared as bit patterns) plus 23 malformed/unsupported WAVs, all
@@ -422,8 +463,8 @@ declared yet.
   asset import/cache, world-space transforms, texture decoders, cache GC, render
   extraction, OBJ mesh import, scene prefabs, DEFLATE/zlib, PNG, asset change
   detection, WAV audio import, audio mixing, spatial audio, voice stealing,
-  band-limited resampling, insert DSP including delay/reverb/limiter/saturator
-  Adam7 interlaced PNG and sequential JPEG (535 tests),
+  band-limited resampling, insert DSP including delay/reverb/limiter/saturator,
+  Adam7 interlaced PNG, sequential JPEG and FLAC (556 tests),
   including allocation-failure
   probes, cache corruption/truncation probes, a deep-hierarchy stress test, QOI
   encode/decode roundtrips, end-to-end texture-import-and-cache, OBJ-import-and-

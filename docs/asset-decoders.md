@@ -10,9 +10,10 @@ artifact (`CXTX`). The code lives in `src/assets/image.zig` (BMP/TGA/QOI),
 > Status: **implemented and tested** for **PNG, JPEG, BMP, TGA and QOI**.
 > Fonts still have no decoder and continue to be imported as `raw` (verbatim
 > copy). Other model formats also fall back to `raw`; the OBJ mesh importer does
-> exist (see [mesh-import.md](mesh-import.md)), as does the WAV audio importer
-> (see [asset-audio.md](asset-audio.md)). This is documented as a limitation, not
-> as an existing capability.
+> exist (see [mesh-import.md](mesh-import.md)), as do the WAV and FLAC audio
+> importers (see [asset-audio.md](asset-audio.md) and
+> [asset-flac.md](asset-flac.md)). This is documented as a limitation, not as an
+> existing capability.
 
 ## Overview
 
