@@ -33,8 +33,9 @@ control, and maintainable code.
 > the job system, mark-and-sweep GC, change detection with incremental re-import),
 > the backend-independent render extraction
 > layer (camera math, frustum culling, sorted draw lists) and the
-> device-independent audio mixer (voices, buses, pan, pitch, resampling,
-> allocation-free render) are implemented and tested. The larger
+> device-independent audio runtime (mixer with voices, buses, pan, pitch and
+> resampling, plus spatialization and the `AudioSource` scene bridge) are
+> implemented and tested. The larger
 > subsystems (GPU renderer backends, GUI, editor, Lua, export, native modules) are
 > in scope and either contract-defined or planned. See
 > [`docs/architecture.md`](docs/architecture.md) for the per-subsystem status.
@@ -381,6 +382,38 @@ Clips come from the asset pipeline: a `CXAW` artifact parsed with
 imports the asset layer. The mixing contract, channel/pan rules, metering and
 limitations are documented in [`docs/audio-mixer.md`](docs/audio-mixer.md).
 
+On top of the mixer, the **spatial layer** (`corex.audio.spatial` +
+`corex.audio.AudioSystem`) bridges the scene to the voices, exactly like the
+render extraction layer does for draw calls. `AudioSource` is a plain-data scene
+component; `AudioSystem.update` computes the world-transform snapshot once,
+spatializes each emitter against a `Listener` (distance attenuation, azimuth pan,
+Doppler, 2D/3D blend) and reconciles voices: start, refresh, restart on clip
+change, stop, cull silent sources and sweep vanished entities. It never writes to
+the scene.
+
+```zig
+const A = corex.audio;
+const Scene = corex.scene.Scene(.{
+    corex.scene.Component(corex.scene.Transform, "transform"),
+    corex.scene.Component(A.AudioSource, "audio_source"),
+});
+var world = try Scene.init(allocator, "world");
+defer world.deinit();
+var audio_system = try A.AudioSystem.init(allocator, &mixer, .{});
+defer audio_system.deinit(); // stops the voices it started
+
+const e = try world.createEntity("emitter", null);
+try world.addComponent(e, corex.scene.Transform{ .position = .{ 0, 0, -2 } });
+try world.addComponent(e, A.AudioSource{ .playing = true, .looping = true });
+
+const listener = A.Listener.fromMatrix(try world.worldMatrix(allocator, camera));
+const stats = try audio_system.update(&world, listener, &clips);
+// stats.started / .updated / .stopped / .finished / .culled / .unplayed
+```
+
+Attenuation models, the pan law, Doppler clamping, transport semantics and
+guarantees are documented in [`docs/audio-spatial.md`](docs/audio-spatial.md).
+
 ## Project Structure
 
 ```text
@@ -402,6 +435,7 @@ CoreX/
 │   ├── scene-prefabs.md        # Reusable single-root prefabs (.prefab)
 │   ├── render-extraction.md    # Backend-independent render extraction
 │   ├── audio-mixer.md          # Device-independent audio mixer (voices/buses)
+│   ├── audio-spatial.md        # Spatial audio + AudioSource/AudioSystem
 │   ├── versioning.md           # Versioning and compatibility policy
 │   ├── native-module-api.md    # C++ native module ABI contract
 │   ├── development/            # Coding standards, commit guidelines
@@ -421,7 +455,7 @@ CoreX/
 │   ├── render.zig              # Render public module (extraction layer)
 │   ├── render/                 # Camera, frustum culling, draw-list extraction
 │   ├── audio.zig               # Audio public module (mixing runtime)
-│   └── audio/                  # Clip descriptors, voice pool, buses, mixer
+│   └── audio/                  # Clips, voice pool/mixer, spatialization, scene bridge
 ├── tools/                      # Reproducible test-vector generators
 ├── build.zig                   # Build configuration
 └── CHANGELOG.md, CONTRIBUTING.md, LICENSE, README.md, ...
@@ -453,7 +487,8 @@ Indicative; subject to change as technical decisions are validated.
 - [x] Audio decoder (WAV/PCM + IEEE float32 → interleaved f32 `CXAW` artifact).
 - [ ] Asset decoders (JPEG, compressed audio, other model formats), Adam7 PNG.
 - [x] Audio mixer (voices, buses, gain/pan, pitch, resampling, allocation-free render).
-- [ ] Audio device backends (ALSA/WASAPI/CoreAudio), 3D audio, effects, streaming.
+- [x] Spatial audio (listener, attenuation models, Doppler) + `AudioSource` scene bridge.
+- [ ] Audio device backends (ALSA/WASAPI/CoreAudio), HRTF/occlusion, effects, streaming.
 - [ ] Hot-reload event watcher (inotify/FSEvents), dependency graph, startup/editor integration.
 - [x] Backend-independent render extraction (camera, frustum culling, sorted draw lists).
 - [ ] Renderer Low / Medium GPU backends; Advanced contract.

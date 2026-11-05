@@ -201,6 +201,26 @@ declared yet.
   fast path at unit step. Consumes `CXAW` artifacts without importing the asset
   layer, so both stay independently testable. No device backend, 3D audio,
   effects, voice stealing or streaming yet (planned).
+- Spatial audio and the scene audio bridge (`src/audio/spatial.zig`,
+  `src/audio/system.zig`, re-exported as `corex.audio.spatial` /
+  `corex.audio.system` with `Listener`/`Attenuation`/`Doppler`/`SpatialParams`/
+  `SpatialResult`/`AudioSource`/`AudioSystem`, `docs/audio-spatial.md`): a
+  right-handed listener basis derived from world matrices (scale normalized,
+  re-orthogonalized, degenerate matrices fall back safely), four distance
+  attenuation models (none/linear/inverse/exponential) with the distance clamped
+  to `[min, max]`, azimuth amplitude panning, Doppler with a floored denominator
+  and a symmetric pitch clamp, and a 2D/3D `spatial_blend`. `AudioSource` is a
+  plain-data scene component (opaque clip handle, bus, gain, pitch, looping,
+  transport, attenuation, Doppler factor, velocity) that serializes like
+  `Renderable`. `AudioSystem.update` reuses the scene's O(n) world-transform
+  snapshot and reconciles voices: start on the `playing` request, refresh
+  gain/pan/pitch/bus/looping, restart on clip-handle change, stop on transport
+  off, cull fully attenuated sources before starting, and mark-and-sweep entities
+  whose entity or component disappeared. It never writes to the scene, reports
+  finished one-shots exactly once without restarting them, and reports pool
+  exhaustion as `unplayed` instead of hiding it. The system borrows the mixer and
+  stops the voices it started on `deinit`. No HRTF, occlusion, reverb, voice
+  stealing or automatic velocity derivation yet (planned).
 - Shared display-name validation (`src/core/validation.zig`) used by both the
   `.corex` manifest and scene documents.
 - Native Module ABI contract for C++ (`docs/native-module-api.md`,
@@ -211,7 +231,8 @@ declared yet.
   automatic dependency graphs, observers, frame budgets and profiling), scenes,
   asset import/cache, world-space transforms, texture decoders, cache GC, render
   extraction, OBJ mesh import, scene prefabs, DEFLATE/zlib, PNG, asset change
-  detection, WAV audio import and audio mixing (386 tests), including allocation-failure
+  detection, WAV audio import, audio mixing and spatial audio (416 tests),
+  including allocation-failure
   probes, cache corruption/truncation probes, a deep-hierarchy stress test, QOI
   encode/decode roundtrips, end-to-end texture-import-and-cache, OBJ-import-and-
   cache and import-then-GC tests, camera/frustum/culling and draw-list extraction
@@ -222,7 +243,9 @@ declared yet.
   tests, a full hot-reload cycle (detect, incremental re-import, GC), WAV
   reference-vector/rejection/alignment and WAV-import-and-cache tests, mixer
   exactness/resampling/looping/lifecycle/handle-safety/metering/determinism tests,
-  an exhaustive PCM16 round trip, WAV-to-mixer playback integration, and job-system
+  an exhaustive PCM16 round trip, WAV-to-mixer playback integration,
+  attenuation/Doppler/listener-basis reference tests, scene-emitter reconciliation
+  and serialization tests, a scene-to-CXAW playback integration test, and job-system
   integration tests (including parallel graph/frame profiling over `JobSystem`
   workers), validated in Debug, ReleaseSafe and ReleaseFast.
 
@@ -243,7 +266,8 @@ declared yet.
   and `CXAW` artifact as `corex.assets.audio`,
   `Image`/`Texture`/`Mesh`/`MeshView`/`Audio`/`AudioView`/`GcStats`), render
   (backend-independent extraction as `corex.render`) and audio
-  (device-independent mixing as `corex.audio`) subsystems.
+  (device-independent mixing as `corex.audio`, with spatialization as
+  `corex.audio.spatial` and the scene bridge as `corex.audio.system`) subsystems.
 - The engine import registry now decodes `.png`/`.bmp`/`.tga`/`.qoi` textures to `CXTX`
   and `.obj` meshes to `CXMH` artifacts instead of copying them verbatim; the cache
   key includes the importer identity/version, so this does not collide with
