@@ -16,13 +16,19 @@
 //! mixer itself does not import the asset layer, so the two stay independently
 //! testable and loosely coupled.
 //!
-//! Beside the mixer, `effects` is pure DSP (RBJ biquad filters and a
-//! stereo-linked compressor) with no mixer dependency. The mixer owns the
-//! chains: `Config.effect_slots` reserves insert slots per bus plus a master
-//! chain, and `render` stays allocation-free — buses with an active chain are
-//! mixed into a preallocated submix, processed, then summed. With
-//! `effect_slots = 0` (the default) none of that exists and the output is
-//! bit-identical to the effect-free path. See `docs/audio-effects.md`.
+//! Beside the mixer, `effects` is pure DSP (RBJ biquad filters, a stereo-linked
+//! compressor, a feedback delay and a Freeverb-style reverb) with no mixer
+//! dependency. The mixer owns the chains: `Config.effect_slots` reserves insert
+//! slots per bus plus a master chain, and `render` stays allocation-free — buses
+//! with an active chain are mixed into a preallocated submix, processed, then
+//! summed. With `effect_slots = 0` (the default) none of that exists and the
+//! output is bit-identical to the effect-free path.
+//!
+//! The delay-based effects **borrow their memory from the caller**, like clips
+//! do: `Reverb.requiredSamples` says how much to allocate, `Reverb.init` carves
+//! the lines out of it, and `Effect.reverb(&instance)` inserts it. The mixer
+//! allocates nothing for them and rejects two slots claiming the same instance
+//! or overlapping buffers. See `docs/audio-effects.md`.
 //!
 //! Two layers sit on top of the mixer:
 //! - `spatial` is pure math (listener basis, distance attenuation, azimuth pan,
@@ -70,7 +76,7 @@ pub const spatial = @import("audio/spatial.zig");
 pub const system = @import("audio/system.zig");
 /// Band-limited (windowed-sinc) resampling prototype and kernels.
 pub const resample = @import("audio/resample.zig");
-/// Insert DSP: biquad filters, compressor, effects and chains.
+/// Insert DSP: biquads, compressor, feedback delay, reverb, chains.
 pub const effects = @import("audio/effects.zig");
 
 pub const Mixer = mixer.Mixer;
@@ -92,6 +98,10 @@ pub const Coefficients = effects.Coefficients;
 pub const Compressor = effects.Compressor;
 pub const CompressorParams = effects.CompressorParams;
 pub const biquadCoefficients = effects.biquadCoefficients;
+pub const Delay = effects.Delay;
+pub const DelayParams = effects.DelayParams;
+pub const Reverb = effects.Reverb;
+pub const ReverbParams = effects.ReverbParams;
 
 pub const AudioSource = system.AudioSource;
 pub const AudioSystem = system.AudioSystem;

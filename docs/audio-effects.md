@@ -4,12 +4,12 @@ This document describes CoreXEngine's insert effects: the pure DSP module in
 `src/audio/effects.zig` (exposed as `corex.audio.effects`) and how the mixer
 routes buses through it.
 
-> Status: **implemented and tested**. Biquad filters and a stereo-linked
-> compressor, on per-bus and master insert chains, allocation-free at render
-> time. **Reverb, delay, convolution, lookahead limiting and oversampled
-> saturation are planned** — they need delay lines and are not described here as
-> existing capabilities. The mixer itself is documented in
-> [audio-mixer.md](audio-mixer.md).
+> Status: **implemented and tested**. Biquad filters, a stereo-linked
+> compressor, a feedback delay and a Freeverb-style reverb, on per-bus and master
+> insert chains, allocation-free at render time. **Convolution, modulated delays
+> (chorus/flanger), lookahead limiting and oversampled saturation are planned** —
+> they are not described here as existing capabilities. The mixer itself is
+> documented in [audio-mixer.md](audio-mixer.md).
 
 ## Overview
 
@@ -36,9 +36,18 @@ submix buffer per bus so a processed bus can be isolated from the rest.
   compute coefficients and reject invalid parameters. A constructed `Effect` is
   always valid, so the per-sample loop carries no parameter validation and no
   coefficient transcendentals.
-- **No allocation, ever.** Filter history is a fixed `[2]` array inside the
-  effect, so an effect is a plain value in a preallocated slot. `render` still
-  takes no allocator.
+- **No allocation, ever.** Inline effects (biquad, compressor) keep their history
+  in a fixed `[2]` array, so they are plain values in a preallocated slot.
+  Delay-based effects **borrow their memory from the caller**, exactly like a
+  `Clip` borrows its samples: `requiredSamples` says how much to allocate, `init`
+  carves the lines out of it, and the effect keeps a slice. The mixer allocates
+  **nothing** for a reverb, and `render` still takes no allocator.
+- **Borrowed memory cannot be claimed twice.** Two slots sharing one instance
+  would advance its cursors twice per sample; two instances sharing one buffer
+  would overwrite each other. Both are silent corruption rather than a crash, so
+  the mixer rejects them at insert time — by instance address and by buffer
+  range, including partial overlap. Replacing the slot that already holds the
+  claim is allowed, and clearing a bus releases it.
 - **Bit-exact when bypassed.** A bus whose chain is all `.bypass` is *not*
   isolated: its voices write straight into the output in slot order, exactly as
   they do without the feature. A test drives two mixers — one with slots
@@ -133,6 +142,96 @@ gain     = 10^((envelope + makeup_db)/20)
 - `reductionFor(level_db)` exposes the static curve, which is what the tests
   check (including monotonicity and continuity across both knee edges).
 
+## Feedback delay
+
+A circular delay line per channel with feedback, a wet/dry mix and an optional
+one-pole low pass **inside the feedback path**, so repeats darken naturally
+instead of staying metallic.
+
+| Parameter | Default | Range | Meaning |
+| --- | --- | --- | --- |
+| `delay_ms` | 250 | >0..10000 | Delay time, rounded **up** to whole samples |
+| `feedback` | 0.35 | `[0, 1)` | Must be below 1 so the echo always decays |
+| `mix` | 0.3 | `[0, 1]` | 0 = dry only (bit-exact), 1 = wet only |
+| `damping_hz` | 0 | `[0, Nyquist)` | Feedback low pass; 0 disables it |
+
+```zig
+const A = corex.audio;
+const params = A.DelayParams{ .delay_ms = 120, .feedback = 0.4, .mix = 0.25, .damping_hz = 4000 };
+const memory = try gpa.alloc(f32, try A.Delay.requiredSamples(48_000, 2, params));
+defer gpa.free(memory);                       // must outlive the insert
+var echo = try A.Delay.init(48_000, 2, params, memory);
+try mixer.setBusEffect(3, 0, A.Effect.delay(&echo));
+```
+
+Delays are **integer-sample**: `delay_ms` is rounded up, and there is no
+fractional interpolation. That is exact and cheap, and it is what makes the
+behaviour testable — an impulse with `feedback = 0.5` returns at exactly `D`,
+`2D`, `3D` with amplitudes `1`, `0.5`, `0.25`, and nowhere else.
+
+## Reverb
+
+A Freeverb-style network: **eight parallel damped comb filters** feeding **four
+series diffusion sections**, per channel, with a 23-sample stereo spread on the
+right channel so the two tails decorrelate.
+
+```
+        ┌─ comb 1 (damped feedback) ─┐
+input ──┼─ ...                       ├─► sum × 1/8 ─► AP1 ─► AP2 ─► AP3 ─► AP4 ─► wet
+        └─ comb 8 (damped feedback) ─┘
+```
+
+| Parameter | Default | Range | Meaning |
+| --- | --- | --- | --- |
+| `room_size` | 0.7 | `[0, 1]` | Maps to comb feedback 0.70..0.98 |
+| `damping` | 0.5 | `[0, 1]` | Low pass in the comb feedback; 1 is a soft room |
+| `wet` | 0.35 | `[0, 1]` | Level of the reverberated signal |
+| `dry` | 1.0 | `[0, 1]` | Level of the dry signal |
+
+```zig
+const memory = try gpa.alloc(f32, try A.Reverb.requiredSamples(48_000, 2)); // 108 KiB
+defer gpa.free(memory);
+var room = try A.Reverb.init(48_000, 2, .{ .room_size = 0.85, .damping = 0.4 }, memory);
+try mixer.setMasterEffect(0, A.Effect.reverb(&room));
+```
+
+- The diffusion sections use Freeverb's form, `y[n] = v[n-N] - v[n]` with
+  `v[n] = x[n] + g*v[n-N]`, i.e. `H(z) = (z^-N - 1)/(1 - g*z^-N)`. That is **not** a
+  textbook all pass: it has a null at DC and rises to `2/(1+g) ≈ 1.33` where
+  `z^N = -1`. The null is the point. The combs have a DC gain of `1/(1-feedback)`
+  — over 13× at `room_size = 1` — so a flat-magnitude all pass would let an impulse
+  build a low-frequency rumble that takes seconds to decay. Both properties are
+  asserted in tests rather than left as a claim.
+- The comb and diffusion lengths are Freeverb's 44.1 kHz tunings scaled to the
+  running rate. They are mutually prime-ish, which spreads the resonances out
+  instead of stacking them into a metallic ring.
+- Comb outputs are summed and normalized by `1/8`, so `wet` means roughly the
+  same thing at any `room_size`.
+- `feedback <= 0.98` keeps the network **bounded even with damping at 0** — a
+  test drives a one-second impulse response at `room_size = 1` and checks every
+  sample stays finite and bounded.
+- `dry = 1, wet = 0` is bit-exact passthrough; `dry = 0, wet = 0` is silence.
+- Nothing is heard before the shortest comb delay (~1215 samples at 48 kHz),
+  which is a test assertion rather than a claim.
+
+### Why the memory is borrowed
+
+A reverb carries 752 bytes of line cursors and damping state plus ~108 KiB of
+delay memory. Inlining that into `Effect` would inflate **every** insert slot on
+**every** bus, including the ones only running a biquad. So `Effect.Kind` holds a
+`*Delay` / `*Reverb` and the union stays **48 bytes** (the pointer variants raise its alignment to 8, costing 4 bytes of padding over the inline-only layout — a test pins that). The caller owns both the struct
+and its buffer, which also means a reverb can be shared across mixers deliberately
+(one instance, one insert) or moved between buses without reallocating.
+
+### Denormals in long tails
+
+A reverb tail decays for seconds. Flushing only at block boundaries (what the
+biquad does) would leave values crawling through the denormal range for a long
+time, so the delay lines **flush on write**: once a value is below ~1e-15,
+feedback below 1 keeps it there, so it becomes an exact zero instead. The cost is
+one comparison per write, and it is what makes a long tail cheap rather than
+pathologically slow.
+
 ## Routing, order and tails
 
 - **Per bus:** slots run in index order, `0 → effect_slots - 1`. Order matters —
@@ -163,11 +262,16 @@ With `effect_slots > 0` the mixer reserves, once, at `init`:
 | Bus inserts | `max_buses × effect_slots × sizeof(Effect)` |
 | Master inserts | `effect_slots × sizeof(Effect)` |
 | Submix scratch | `max_buses × block_frames × channels × 4` bytes |
+| Delay / reverb memory | **zero** — the caller owns it (`requiredSamples`) |
 
 The default `max_buses = 8`, `block_frames = 256`, stereo gives **16 KiB** of
 scratch. The scratch is reserved for every bus, not only the processed ones,
 because an insert can be added at any time and `render` must never allocate.
 Lower `block_frames` to shrink it; the output does not change.
+
+Delay-based effects add nothing to that table: their memory is allocated by the
+caller. For reference, at 48 kHz a stereo reverb needs **108 KiB** and a 120 ms
+stereo delay needs **45 KiB**; both scale linearly with the sample rate.
 
 ## API
 
@@ -206,6 +310,25 @@ try mixer.clearBusEffects(1);    // back to the direct path
 mixer.resetEffects();            // keep settings, drop history
 ```
 
+Delay-based inserts follow the same API, with the caller owning the memory:
+
+```zig
+const memory = try gpa.alloc(f32, try A.Reverb.requiredSamples(48_000, 2));
+defer gpa.free(memory);
+var room = try A.Reverb.init(48_000, 2, .{ .room_size = 0.8 }, memory);
+try mixer.setMasterEffect(0, A.Effect.reverb(&room));   // borrows &room + memory
+```
+
+`Effect.delay(*Delay)` and `Effect.reverb(*Reverb)` are infallible — the instance
+already validated its parameters and buffer in `init`. Three extra rules are
+enforced by the setters:
+
+| Rule | Why |
+| --- | --- |
+| The layout must match (`channelCount()`) | Delay lines are allocated per channel and cannot be reinterpreted |
+| No two slots may hold the same instance | Its cursors would advance twice per sample |
+| No two slots' buffers may overlap (even partially) | They would overwrite each other's history |
+
 Queries: `effectSlots() u8`, `busEffect(bus, slot) ?Effect`,
 `masterEffect(slot) ?Effect`.
 Errors: every setter returns `error.InvalidValue` for an out-of-range bus or
@@ -234,6 +357,24 @@ voices** into a 512-frame stereo buffer at 48 kHz (10.7 ms of audio per render):
 | Biquad on all 8 buses | **96.2 µs** | **111×** | +77% |
 | Master compressor | **74.6 µs** | **143×** | +37% |
 | Master shelf + compressor | **79.4 µs** | **134×** | +46% |
+
+Delay-based effects, measured separately with **unity-rate clips** (the copy fast
+path, so the baseline is lower and the effect cost is not hidden behind
+resampling):
+
+| Configuration | Time per render | Real-time factor | vs. baseline |
+| --- | --- | --- | --- |
+| No effects | **27.0 µs** | **395×** | — |
+| 120 ms delay on 1 of 8 buses | **31.1 µs** | **343×** | +15% |
+| 120 ms delay on all 8 buses | **48.3 µs** | **221×** | +79% |
+| Reverb on the master | **44.9 µs** | **238×** | +66% |
+| Reverb on 1 bus | **44.2 µs** | **241×** | +64% |
+| 8 delays + 8 high passes + master reverb + compressor | **103.2 µs** | **103×** | +282% |
+
+A full reverb is 12 delay reads and 12 writes per sample per channel, so it costs
+about the same as a handful of biquads — the whole eight-bus chain above still
+runs at **103× real time**. Reverb on a bus is slightly cheaper than on the master
+because only that bus is isolated.
 
 - Reserving slots and leaving them bypassed costs **about 1%**: the blocked path
   adds a per-block loop, not per-sample work, and no bus is isolated.
@@ -281,14 +422,48 @@ voices** into a 512-frame stereo buffer at 48 kHz (10.7 ms of audio per render):
   `render` + `resetEffects` with `.sinc` also enabled — no leaks, no swallowed
   `OutOfMemory`. (This probe caught a real bug: the cleanup was registered after
   the allocations, so a mid-sequence failure leaked the earlier ones.)
+- **Delay**: parameter and buffer-size validation (including one sample short);
+  dry-only is bit-exact; a wet impulse with feedback 0.5 returns at exactly 48,
+  96, 144 and 192 samples with amplitudes 1, 0.5, 0.25, 0.125 and is zero
+  everywhere else; damping leaves the first repeat intact and cuts the second by
+  more than 5×; the tail lands on exact zero; channels are independent; reset
+  replays identically; NaN/inf do not circulate.
+- **Diffusion sections**: a constant input decays to below 1e-4 (the DC null that
+  keeps the combs from rumbling), and the mid/high-band gain stays inside the
+  documented 0.5..1.4 shelving band at five frequencies — no resonant peak.
+- **Reverb**: parameter and buffer-size validation, stereo needs more than twice
+  mono (the spread), a stereo instance cannot be carved from a mono buffer;
+  `dry=1/wet=0` is bit-exact and `dry=0/wet=0` is silence; nothing is heard before
+  the shortest comb delay; the tail is bounded, finite and decaying; one second
+  at `room_size = 1` with no damping stays bounded; identical impulses still
+  produce decorrelated channels; reset silences every line; NaN/inf recover.
+- **Borrowed memory**: the same instance is rejected in another bus slot and on
+  the master; a *different* instance over the same buffer is rejected; a
+  partially overlapping buffer is rejected; replacing the holding slot is
+  allowed; clearing a bus or the master releases the claim; a disjoint buffer is
+  accepted; a stereo delay/reverb is rejected on a mono mixer while inline
+  effects still adapt.
+- **Integration**: a delay insert echoes across 16-frame blocks with a 48-sample
+  delay; `resetEffects` reaches through the borrowed pointer; a master reverb
+  tails after the last voice finished and keeps tailing into the next render;
+  `checkAllAllocationFailures` proves the mixer allocates nothing for a reverb at
+  insert time or during render.
 - **Determinism**: two identically driven mixers agree bit for bit over five
   buffers; a chain processed in one pass equals the same chain processed in
-  64-sample chunks.
+  64-sample chunks, and a delay+reverb chain in one pass equals the same chain in
+  97-sample chunks.
 
 ## Limitations and next steps
 
-- **No delay-based effects**: no reverb, echo, chorus, flanger or convolution.
-  They need delay lines, which is a separate allocation and a separate stage.
+- **No modulated or convolved delays**: no chorus, flanger, pitch shifting or
+  impulse-response convolution. The delay taps are static and integer-sample;
+  there is no fractional-delay interpolation, so `delay_ms` is rounded up.
+- **One reverb algorithm**: the Freeverb-style network is fixed (8 combs, 4
+  diffusion sections, 23-sample spread). There is no early-reflection design, no
+  modulation to break up metallic tails, and no per-room presets yet.
+- **Borrowed memory is the caller's responsibility**: the mixer rejects double
+  claims, but it cannot know if you free the buffer while an insert still
+  references it — the same contract as borrowed clip samples.
 - **No lookahead limiter**: the compressor reacts after the fact, so a fast
   transient can overshoot before the envelope catches it. The output clamp is
   still the last line of defence.
