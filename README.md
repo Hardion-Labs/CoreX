@@ -30,7 +30,8 @@ control, and maintainable code.
 > pipeline + content-addressed cache (raw/text/json/scene importers, PNG/BMP/TGA/QOI
 > texture decoders over a dependency-free DEFLATE/zlib inflater, OBJ mesh decoder,
 > atomic verified storage, parallel import over
-> the job system, mark-and-sweep GC), and the backend-independent render extraction
+> the job system, mark-and-sweep GC, change detection with incremental re-import),
+> and the backend-independent render extraction
 > layer (camera math, frustum culling, sorted draw lists) are implemented and tested. The larger
 > subsystems (GPU renderer backends, GUI, editor, Lua, export, native modules) are
 > in scope and either contract-defined or planned. See
@@ -273,6 +274,33 @@ defer report.deinit();
 // report.imported / report.cached / report.failed / report.total_output_bytes
 ```
 
+**Change detection** (`corex.assets.changes`) is the hot-reload foundation: a
+path-sorted `Snapshot` records each asset's size, mtime and BLAKE3 hash, and
+`detect` reports added/modified/removed paths. An unchanged size+mtime fingerprint
+skips the read entirely; candidates are hashed so a mere touch or identical
+re-save is *not* reported as a change (`verify_all` forces hashing when timestamps
+cannot be trusted). `pipeline.Options.only` then re-imports just the changed
+paths, and `Snapshot.cacheKeys` derives the **complete** live key set for
+`Cache.gc` — a filtered report alone would delete every other artifact.
+
+```zig
+var baseline = try A.changes.capture(gpa, io, root, idx, .{});
+defer baseline.deinit();
+// ... later, after re-indexing ...
+var detected = try A.changes.detect(gpa, io, root, &baseline, idx, .{});
+defer detected.deinit();
+const only = try detected.changes.changedPaths(gpa); // added + modified
+defer gpa.free(only);
+var report = try A.pipeline.run(gpa, io, root, idx, &cache, .{
+    .registry = A.engineRegistry(),
+    .only = only,
+});
+defer report.deinit();
+const live = try detected.snapshot.cacheKeys(gpa, A.engineRegistry(), "");
+defer gpa.free(live);
+_ = try cache.gc(gpa, live);
+```
+
 `pipeline.run` imports concurrently over the job system; `runSequential` is a
 single-threaded fallback. The cache format, importer contract and limits are
 documented in [`docs/asset-import.md`](docs/asset-import.md); the texture
@@ -318,6 +346,7 @@ CoreX/
 │   ├── architecture.md         # Subsystem map and implementation status
 │   ├── ecs-scheduling.md       # ECS system scheduling guide
 │   ├── asset-import.md         # Asset import pipeline + cache
+│   ├── asset-change-detection.md # Change detection + incremental import (hot-reload)
 │   ├── asset-decoders.md       # Image decoders (PNG/BMP/TGA/QOI) + CXTX artifact
 │   ├── mesh-import.md          # OBJ mesh importer + CXMH artifact
 │   ├── launch-contract.md      # Stable startup contract (CLI, exit codes)
@@ -341,7 +370,7 @@ CoreX/
 │   ├── scene.zig               # Scene public module (EngineScene)
 │   ├── scene/                  # Scene components, versioned documents, prefabs
 │   ├── assets.zig              # Asset public module (index + import + cache)
-│   ├── assets/                 # Import cache, importers, decoders (PNG/inflate), pipeline
+│   ├── assets/                 # Import cache, importers, decoders, change detection, pipeline
 │   ├── render.zig              # Render public module (extraction layer)
 │   └── render/                 # Camera, frustum culling, draw-list extraction
 ├── tools/                      # Reproducible test-vector generators
@@ -370,8 +399,10 @@ Indicative; subject to change as technical decisions are validated.
 - [x] Texture decoders (PNG/BMP/TGA/QOI → RGBA8 `CXTX` artifact).
 - [x] DEFLATE/zlib inflate (dependency-free, bounded output).
 - [x] Asset cache garbage collection (mark-and-sweep of orphan entries).
+- [x] Asset change detection + incremental import (hot-reload foundation).
 - [x] Mesh decoder (OBJ → indexed triangle mesh, `CXMH` artifact).
-- [ ] Asset decoders (JPEG/audio, other model formats), Adam7 PNG, hot-reload, startup integration.
+- [ ] Asset decoders (JPEG/audio, other model formats), Adam7 PNG.
+- [ ] Hot-reload event watcher (inotify/FSEvents), dependency graph, startup/editor integration.
 - [x] Backend-independent render extraction (camera, frustum culling, sorted draw lists).
 - [ ] Renderer Low / Medium GPU backends; Advanced contract.
 - [ ] GUI library and graphical editor.
