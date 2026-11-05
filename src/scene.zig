@@ -23,9 +23,12 @@ pub const components = @import("scene/components.zig");
 /// Transform math (column-major Mat4 + quaternion helpers) used to propagate
 /// local transforms into world space. Reusable by the renderer/editor.
 pub const transform = @import("scene/transform.zig");
+/// Reusable single-root entity subtrees (`.prefab`) built on the scene format.
+pub const prefab = @import("scene/prefab.zig");
 
 pub const Scene = scene.Scene;
 pub const Component = scene.Component;
+pub const Prefab = prefab.Prefab;
 pub const Transform = components.Transform;
 pub const Mat4 = transform.Mat4;
 pub const Vec3 = transform.Vec3;
@@ -41,8 +44,12 @@ pub const max_entities = scene.max_entities;
 /// `Scene(.{ Component(MyComponent, "my_component"), ... })`.
 pub const EngineScene = Scene(.{Component(Transform, "transform")});
 
+/// The engine's default prefab schema (matches `EngineScene`).
+pub const EnginePrefab = Prefab(.{Component(Transform, "transform")});
+
 test {
     std.testing.refAllDecls(@This());
     _ = scene;
     _ = components;
+    _ = prefab;
 }

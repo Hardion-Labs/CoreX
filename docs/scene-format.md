@@ -110,6 +110,13 @@ do arquivo ficam em um mapeamento separado. Use `createEntity`/`destroyEntity` d
 cena (não o mundo ECS bruto) para manter IDs e hierarquia consistentes. Destruir
 uma entidade reparenta seus filhos diretos para o pai dela (ou para a raiz).
 
+## Prefabs
+
+Arquivos `.prefab` usam a mesma forma deste documento, mas exigem **exatamente
+uma entidade raiz** (sem `parent`). Prefabs são subárvores reutilizáveis que
+podem ser capturadas de uma cena e instanciadas com remapeamento de IDs. Ver
+[scene-prefabs.md](scene-prefabs.md).
+
 ## Relacionados
 
 - Arquitetura: [architecture.md](architecture.md)
@@ -117,3 +124,4 @@ uma entidade reparenta seus filhos diretos para o pai dela (ou para a raiz).
 - Versionamento: [versioning.md](versioning.md)
 - Contrato de inicialização: [launch-contract.md](launch-contract.md)
 - Transforms world-space: [scene-transforms.md](scene-transforms.md)
+- Prefabs: [scene-prefabs.md](scene-prefabs.md)

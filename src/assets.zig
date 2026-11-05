@@ -81,14 +81,32 @@ pub fn importScene(gpa: std.mem.Allocator, source: []const u8) ImportError![]u8 
 
 pub const scene_importer = Importer{ .id = "scene", .version = 1, .importFn = importScene };
 
+/// Prefab importer: validate a single-root `.prefab` document with the scene
+/// prefab system and re-serialize it canonically. Invalid prefabs (including
+/// documents with zero or multiple roots) are rejected at import time.
+pub fn importPrefab(gpa: std.mem.Allocator, source: []const u8) ImportError![]u8 {
+    var p = scene_mod.EnginePrefab.parse(gpa, source) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidAsset,
+    };
+    defer p.deinit();
+    return p.serialize(gpa) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidAsset,
+    };
+}
+
+pub const prefab_importer = Importer{ .id = "prefab", .version = 1, .importFn = importPrefab };
+
 const engine_bindings = texture.bindings ++ mesh.bindings ++ [_]Registry.Binding{
     .{ .extensions = &[_][]const u8{ ".scene", ".corexscene" }, .importer = scene_importer },
+    .{ .extensions = &[_][]const u8{ ".prefab", ".corexprefab" }, .importer = prefab_importer },
 } ++ importer.builtin_bindings;
 
 /// The engine's default import registry: texture (BMP/TGA/QOI) + mesh (OBJ) +
-/// scene + JSON + text importers, with `raw` as the fallback for binary/unknown
-/// extensions (e.g. PNG/JPEG/audio and other model formats, which have no
-/// decoder yet).
+/// scene + prefab + JSON + text importers, with `raw` as the fallback for
+/// binary/unknown extensions (e.g. PNG/JPEG/audio and other model formats, which
+/// have no decoder yet).
 pub fn engineRegistry() Registry {
     return .{ .bindings = &engine_bindings, .fallback = importer.raw_importer };
 }
@@ -124,10 +142,38 @@ test "scene importer rejects an invalid scene" {
     try std.testing.expectError(error.InvalidAsset, importScene(std.testing.allocator, bad));
 }
 
+test "prefab importer canonicalizes a valid single-root prefab" {
+    const src =
+        \\{ "format_version": 1, "name": "enemy", "entities": [
+        \\  { "id": 2, "name": "Child", "parent": 1 },
+        \\  { "id": 1, "name": "Root", "components": { "transform": { "position": [1, 2, 3] } } }
+        \\] }
+    ;
+    const out = try importPrefab(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    var p = try scene_mod.EnginePrefab.parse(std.testing.allocator, out);
+    defer p.deinit();
+    try std.testing.expectEqual(@as(usize, 2), p.count());
+    try std.testing.expectEqual(@as(u64, 1), p.root_id);
+}
+
+test "prefab importer rejects empty and multi-root documents" {
+    const empty = "{ \"format_version\": 1, \"name\": \"empty\", \"entities\": [] }";
+    try std.testing.expectError(error.InvalidAsset, importPrefab(std.testing.allocator, empty));
+    const multi =
+        \\{ "format_version": 1, "name": "multi", "entities": [
+        \\  { "id": 1 }, { "id": 2 }
+        \\] }
+    ;
+    try std.testing.expectError(error.InvalidAsset, importPrefab(std.testing.allocator, multi));
+}
+
 test "engine registry selects importers by extension" {
     const reg = engineRegistry();
     try std.testing.expectEqualStrings("scene", reg.select(".scene").id);
     try std.testing.expectEqualStrings("scene", reg.select(".corexscene").id);
+    try std.testing.expectEqualStrings("prefab", reg.select(".prefab").id);
+    try std.testing.expectEqualStrings("prefab", reg.select(".PREFAB").id);
     try std.testing.expectEqualStrings("bmp", reg.select(".bmp").id);
     try std.testing.expectEqualStrings("tga", reg.select(".TGA").id);
     try std.testing.expectEqualStrings("qoi", reg.select(".qoi").id);
@@ -293,6 +339,48 @@ test "pipeline imports a scene through the engine registry" {
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 1), report.imported);
     try std.testing.expectEqualStrings("scene", report.entries[0].importer_id.?);
+}
+
+test "pipeline imports a prefab through the engine registry" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.createDirPath(io, "assets");
+    try tmp.dir.createDirPath(io, "cache");
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/enemy.prefab", .data =
+        \\{ "format_version": 1, "name": "enemy", "entities": [
+        \\  { "id": 1, "name": "Root", "components": { "transform": { "position": [0, 1, 0] } } },
+        \\  { "id": 2, "name": "Child", "parent": 1 }
+        \\] }
+    });
+
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buf);
+    const root_path = buf[0..n];
+
+    var idx = try indexDirectories(std.testing.allocator, io, root_path, &.{"assets"});
+    defer idx.deinit();
+    var root = try Io.Dir.openDirAbsolute(io, root_path, .{});
+    defer root.close(io);
+    var cache_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const cache_path = try std.fmt.bufPrint(&cache_buf, "{s}/cache", .{root_path});
+    var store = try Cache.open(io, cache_path);
+    defer store.deinit();
+
+    var report = try pipeline.runSequential(std.testing.allocator, io, root, idx, &store, .{
+        .registry = engineRegistry(),
+    });
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 1), report.imported);
+    try std.testing.expectEqualStrings("prefab", report.entries[0].importer_id.?);
+    try std.testing.expectEqual(AssetKind.prefab, report.entries[0].kind);
+
+    const key = report.entries[0].key.?;
+    const artifact = (try store.get(std.testing.allocator, key)).?;
+    defer std.testing.allocator.free(artifact);
+    var p = try scene_mod.EnginePrefab.parse(std.testing.allocator, artifact);
+    defer p.deinit();
+    try std.testing.expectEqual(@as(usize, 2), p.count());
 }
 
 test "pipeline + gc: orphan entries are reclaimed while live artifacts survive" {

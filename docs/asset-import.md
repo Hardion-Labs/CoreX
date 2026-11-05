@@ -77,7 +77,7 @@ fallback para extensões não casadas:
 
 - `importer.defaultRegistry()`: JSON + texto, fallback `raw`.
 - `assets.engineRegistry()`: texturas (BMP/TGA/QOI) + malhas (OBJ) + cenas +
-  JSON + texto, fallback `raw` (registro padrão da engine).
+  prefabs (`.prefab`) + JSON + texto, fallback `raw` (registro padrão da engine).
 
 Camadas superiores podem estender o registro (por exemplo, decodificadores de
 áudio ou outros formatos de modelo) sem alterar o pipeline:
