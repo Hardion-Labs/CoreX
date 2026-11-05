@@ -1,6 +1,6 @@
 //! PNG (Portable Network Graphics) decoding, normalizing to RGBA8.
 //!
-//! Supported, dependency-free subset (the format's full non-interlaced range):
+//! Supported, dependency-free subset (the format's full range, interlaced or not):
 //! - Color types: grayscale (0), truecolor (2), indexed (3), grayscale+alpha (4)
 //!   and truecolor+alpha (6).
 //! - Bit depths: 1/2/4/8 for grayscale and indexed, 8/16 for the other types,
@@ -16,8 +16,9 @@
 //!   source bit depth, so transparency is exact.
 //! - Sub-byte grayscale samples are scaled to the full 0..255 range (bit
 //!   replication), so a 1-bit white pixel becomes 255 rather than 1.
-//! - Adam7 interlacing is **not** supported and is rejected with
-//!   `error.InvalidImage`; it is a documented limitation, not a faked decode.
+//! - Adam7 interlacing is decoded properly: the seven passes are unfiltered
+//!   independently and scattered to their final positions, so an interlaced file
+//!   produces exactly the same pixels as its non-interlaced equivalent.
 //!
 //! Memory safety and performance: chunk parsing is bounds-checked, the inflated
 //! scanline buffer is bounded by the dimensions declared in `IHDR` (so a
@@ -82,9 +83,58 @@ const Header = struct {
     row_bytes: usize,
     /// Bytes per complete pixel, rounded up, minimum 1 (the filter offset).
     bpp: usize,
-    /// Exact expected size of the inflated scanline data.
+    /// Exact expected size of the inflated scanline data. For an interlaced
+    /// image this is the sum over the non-empty Adam7 passes.
     raw_bytes: usize,
+    /// Adam7 interlacing. Each pass is an independent sub-image with its own
+    /// filter history.
+    interlaced: bool,
 };
+
+/// Adam7 pass geometry: where the pass starts and how far apart its pixels are.
+const adam7 = [7][4]u32{
+    .{ 0, 0, 8, 8 },
+    .{ 4, 0, 8, 8 },
+    .{ 0, 4, 4, 8 },
+    .{ 2, 0, 4, 4 },
+    .{ 0, 2, 2, 4 },
+    .{ 1, 0, 2, 2 },
+    .{ 0, 1, 1, 2 },
+};
+
+const Pass = struct {
+    x0: u32,
+    y0: u32,
+    dx: u32,
+    dy: u32,
+    width: u32,
+    height: u32,
+    row_bytes: usize,
+    /// Bytes this pass occupies in the inflated stream, filter bytes included.
+    raw_bytes: usize,
+
+    fn empty() Pass {
+        return .{ .x0 = 0, .y0 = 0, .dx = 1, .dy = 1, .width = 0, .height = 0, .row_bytes = 0, .raw_bytes = 0 };
+    }
+};
+
+/// Geometry of one pass, or a zero-sized pass when the image is too small to
+/// reach its starting offset. Such passes contribute **no** bytes at all -- not
+/// even a filter byte -- which is the detail most easily got wrong.
+fn passGeometry(header: Header, index: usize) DecodeError!Pass {
+    const g = adam7[index];
+    const x0 = g[0];
+    const y0 = g[1];
+    const dx = g[2];
+    const dy = g[3];
+    if (header.width <= x0 or header.height <= y0) return Pass.empty();
+    const pw = (header.width - x0 + dx - 1) / dx;
+    const ph = (header.height - y0 + dy - 1) / dy;
+    const bits: usize = @as(usize, channelsOf(header.color)) * header.depth;
+    const row_bytes = (@as(usize, pw) * bits + 7) / 8;
+    const total = std.math.mul(usize, row_bytes + 1, ph) catch return error.InvalidImage;
+    return .{ .x0 = x0, .y0 = y0, .dx = dx, .dy = dy, .width = pw, .height = ph, .row_bytes = row_bytes, .raw_bytes = total };
+}
 
 const Transparency = struct {
     /// Grayscale color key at the source bit depth.
@@ -162,7 +212,11 @@ fn parseHeader(data: []const u8) DecodeError!Header {
     };
     if (data[10] != 0) return error.InvalidImage; // compression method: deflate
     if (data[11] != 0) return error.InvalidImage; // filter method: adaptive
-    if (data[12] != 0) return error.InvalidImage; // Adam7 interlacing unsupported
+    const interlaced = switch (data[12]) {
+        0 => false,
+        1 => true,
+        else => return error.InvalidImage, // only None and Adam7 are defined
+    };
     if (width == 0 or height == 0) return error.InvalidImage;
     if (width > image.max_dimension or height > image.max_dimension) return error.InvalidImage;
     if (!depthAllowed(color, depth)) return error.InvalidImage;
@@ -171,22 +225,31 @@ fn parseHeader(data: []const u8) DecodeError!Header {
     const bits_per_pixel = channels * depth;
     const row_bytes = (@as(usize, width) * bits_per_pixel + 7) / 8;
     const bpp = @max(1, (bits_per_pixel + 7) / 8);
-    const raw_bytes = std.math.mul(usize, row_bytes + 1, height) catch return error.InvalidImage;
-    if (raw_bytes > max_raw_bytes) return error.InvalidImage;
-
-    // Reject images whose RGBA8 output could not be allocated before inflating.
-    const pixels = std.math.mul(usize, @as(usize, width) * @as(usize, height), 4) catch return error.InvalidImage;
-    if (pixels > image.max_pixel_bytes) return error.InvalidImage;
-
-    return .{
+    var header = Header{
         .width = width,
         .height = height,
         .depth = depth,
         .color = color,
         .row_bytes = row_bytes,
         .bpp = bpp,
-        .raw_bytes = raw_bytes,
+        .raw_bytes = 0,
+        .interlaced = interlaced,
     };
+    header.raw_bytes = if (interlaced) blk: {
+        var total: usize = 0;
+        for (0..adam7.len) |i| {
+            const pass = try passGeometry(header, i);
+            total = std.math.add(usize, total, pass.raw_bytes) catch return error.InvalidImage;
+        }
+        break :blk total;
+    } else std.math.mul(usize, row_bytes + 1, height) catch return error.InvalidImage;
+    if (header.raw_bytes == 0 or header.raw_bytes > max_raw_bytes) return error.InvalidImage;
+
+    // Reject images whose RGBA8 output could not be allocated before inflating.
+    const pixels = std.math.mul(usize, @as(usize, width) * @as(usize, height), 4) catch return error.InvalidImage;
+    if (pixels > image.max_pixel_bytes) return error.InvalidImage;
+
+    return header;
 }
 
 /// Collects IDAT payload without copying when there is a single chunk (the
@@ -470,26 +533,116 @@ pub fn decode(gpa: Allocator, source: []const u8) DecodeError!Image {
     defer gpa.free(raw);
     if (raw.len != header.raw_bytes) return error.InvalidImage;
 
-    try unfilter(raw, header);
-
     const pixels = try image.allocPixels(gpa, header.width, header.height);
     errdefer gpa.free(pixels);
     const img = Image{ .width = header.width, .height = header.height, .pixels = pixels };
 
-    switch (header.color) {
-        .grayscale => try convertDepth(1, false, pixels, raw, header, palette, palette_count, trns),
-        .palette => try convertDepth(1, true, pixels, raw, header, palette, palette_count, trns),
-        .grayscale_alpha => try convertDepth(2, false, pixels, raw, header, palette, palette_count, trns),
-        .rgb => try convertDepth(3, false, pixels, raw, header, palette, palette_count, trns),
-        .rgba => try convertDepth(4, false, pixels, raw, header, palette, palette_count, trns),
+    if (header.interlaced) {
+        try deinterlace(gpa, pixels, raw, header, palette, palette_count, trns);
+        return img;
     }
+
+    try unfilter(raw, header);
+    try convertInto(pixels, raw, header, palette, palette_count, trns);
     return img;
+}
+
+/// The colour-type dispatch, shared by the whole-image and per-pass paths so the
+/// comptime specialization has exactly one call site to keep correct.
+fn convertInto(
+    dst: []u8,
+    raw: []const u8,
+    header: Header,
+    palette: []const u8,
+    palette_count: usize,
+    trns: Transparency,
+) DecodeError!void {
+    switch (header.color) {
+        .grayscale => try convertDepth(1, false, dst, raw, header, palette, palette_count, trns),
+        .palette => try convertDepth(1, true, dst, raw, header, palette, palette_count, trns),
+        .grayscale_alpha => try convertDepth(2, false, dst, raw, header, palette, palette_count, trns),
+        .rgb => try convertDepth(3, false, dst, raw, header, palette, palette_count, trns),
+        .rgba => try convertDepth(4, false, dst, raw, header, palette, palette_count, trns),
+    }
+}
+
+/// Reconstruct an Adam7 image.
+///
+/// Each pass is an independent sub-image: it is unfiltered with its **own**
+/// predictor history, then its pixels are scattered to the full image at the
+/// pass stride. Empty passes contribute nothing and are skipped.
+///
+/// Only one scratch row is allocated, reused across every pass. Passes whose
+/// x-step is 1 write straight into the output row and skip the copy entirely --
+/// that is the last pass, which carries half the image.
+fn deinterlace(
+    gpa: Allocator,
+    pixels: []u8,
+    raw: []u8,
+    header: Header,
+    palette: []const u8,
+    palette_count: usize,
+    trns: Transparency,
+) DecodeError!void {
+    const width: usize = header.width;
+    const scratch = try gpa.alloc(u8, width * 4);
+    defer gpa.free(scratch);
+
+    var offset: usize = 0;
+    for (0..adam7.len) |i| {
+        const pass = try passGeometry(header, i);
+        if (pass.width == 0 or pass.height == 0) continue;
+        // parseHeader already proved the sizes sum to raw.len.
+        const region = raw[offset..][0..pass.raw_bytes];
+        offset += pass.raw_bytes;
+
+        const pass_header = Header{
+            .width = pass.width,
+            .height = pass.height,
+            .depth = header.depth,
+            .color = header.color,
+            .row_bytes = pass.row_bytes,
+            .bpp = header.bpp,
+            .raw_bytes = pass.raw_bytes,
+            .interlaced = false,
+        };
+        try unfilter(region, pass_header);
+
+        const stride = pass.row_bytes + 1;
+        const pw: usize = pass.width;
+        // A single-row view lets the existing converter run unchanged.
+        var row_header = pass_header;
+        row_header.height = 1;
+
+        var r: usize = 0;
+        while (r < pass.height) : (r += 1) {
+            const y: usize = @as(usize, pass.y0) + r * @as(usize, pass.dy);
+            std.debug.assert(y < header.height);
+            const src_row = region[r * stride ..][0..stride];
+            const out_row = pixels[y * width * 4 ..][0 .. width * 4];
+            if (pass.dx == 1) {
+                // Contiguous: convert directly into the destination, no copy.
+                std.debug.assert(pass.x0 == 0 and pw == width);
+                try convertInto(out_row, src_row, row_header, palette, palette_count, trns);
+                continue;
+            }
+            try convertInto(scratch[0 .. pw * 4], src_row, row_header, palette, palette_count, trns);
+            var x: usize = 0;
+            while (x < pw) : (x += 1) {
+                const dx_idx: usize = @as(usize, pass.x0) + x * @as(usize, pass.dx);
+                std.debug.assert(dx_idx < width);
+                @memcpy(out_row[dx_idx * 4 ..][0..4], scratch[x * 4 ..][0..4]);
+            }
+        }
+    }
+    std.debug.assert(offset == raw.len);
 }
 
 // --- tests -----------------------------------------------------------------
 
 const testing = std.testing;
 const vectors = @import("png_vectors.zig");
+const adam7_vectors = @import("png_adam7_vectors.zig");
 
 fn unhex(gpa: Allocator, hex: []const u8) ![]u8 {
     const bytes = try gpa.alloc(u8, hex.len / 2);
@@ -523,18 +676,6 @@ test "png: malformed files are rejected" {
         errdefer std.debug.print("vector accepted but should fail: {s}\n", .{vector.name});
         try testing.expectError(error.InvalidImage, decode(gpa, source));
     }
-}
-
-test "png: Adam7 interlacing is rejected, not approximated" {
-    const gpa = testing.allocator;
-    for (vectors.invalid) |vector| {
-        if (!std.mem.eql(u8, vector.name, "interlaced_adam7")) continue;
-        const source = try unhex(gpa, vector.png_hex);
-        defer gpa.free(source);
-        try testing.expectError(error.InvalidImage, decode(gpa, source));
-        return;
-    }
-    return error.MissingVector;
 }
 
 test "png: truncation at any chunk boundary is rejected" {
@@ -601,5 +742,182 @@ test "png: survives allocation failure" {
                 img.deinit(alloc);
             }
         }.f, .{source});
+    }
+}
+
+// --- Adam7 interlacing ------------------------------------------------------
+
+test "png: every libpng-verified Adam7 vector decodes exactly" {
+    const gpa = testing.allocator;
+    for (adam7_vectors.valid) |vector| {
+        const source = try unhex(gpa, vector.png_hex);
+        defer gpa.free(source);
+        const expected = try unhex(gpa, vector.rgba_hex);
+        defer gpa.free(expected);
+        var img = decode(gpa, source) catch |err| {
+            std.debug.print("adam7 vector {s} failed: {s}\n", .{ vector.name, @errorName(err) });
+            return err;
+        };
+        defer img.deinit(gpa);
+        try testing.expectEqual(vector.width, img.width);
+        try testing.expectEqual(vector.height, img.height);
+        testing.expectEqualSlices(u8, expected, img.pixels) catch |err| {
+            std.debug.print("adam7 vector {s} pixels differ\n", .{vector.name});
+            return err;
+        };
+    }
+}
+
+test "png: Adam7 inflated size is the sum over the non-empty passes" {
+    const gpa = testing.allocator;
+    for (adam7_vectors.valid) |vector| {
+        const source = try unhex(gpa, vector.png_hex);
+        defer gpa.free(source);
+        // Walk the chunks by hand and confirm the header predicted the exact
+        // inflated size, independently of `decode`.
+        var idat = Idat{};
+        defer idat.deinit(gpa);
+        var pos: usize = signature.len;
+        const first = try nextChunk(source, &pos);
+        try testing.expect(first.is("IHDR"));
+        const header = try parseHeader(first.data);
+        try testing.expect(header.interlaced);
+        try testing.expectEqual(vector.raw_len, header.raw_bytes);
+        while (true) {
+            const ch = try nextChunk(source, &pos);
+            if (ch.is("IDAT")) try idat.push(gpa, ch.data);
+            if (ch.is("IEND")) break;
+        }
+        const raw = try inflate.zlibInflate(gpa, idat.bytes(), header.raw_bytes);
+        defer gpa.free(raw);
+        try testing.expectEqual(vector.raw_len, raw.len);
+    }
+}
+
+test "png: malformed Adam7 files are rejected" {
+    const gpa = testing.allocator;
+    for (adam7_vectors.invalid) |vector| {
+        const source = try unhex(gpa, vector.png_hex);
+        defer gpa.free(source);
+        _ = decode(gpa, source) catch |err| {
+            try testing.expectEqual(error.InvalidImage, err);
+            continue;
+        };
+        std.debug.print("adam7 invalid vector {s} was accepted\n", .{vector.name});
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "png: the seven passes tile the image exactly, with no overlap" {
+    // Independent of the decoder: the pass areas must sum to width * height for
+    // every size, including ones that leave several passes empty.
+    for (1..40) |w| {
+        for (1..40) |h| {
+            const header = Header{
+                .width = @intCast(w),
+                .height = @intCast(h),
+                .depth = 8,
+                .color = .rgba,
+                .row_bytes = w * 4,
+                .bpp = 4,
+                .raw_bytes = 0,
+                .interlaced = true,
+            };
+            var covered: usize = 0;
+            for (0..adam7.len) |i| {
+                const pass = try passGeometry(header, i);
+                covered += @as(usize, pass.width) * @as(usize, pass.height);
+            }
+            try testing.expectEqual(w * h, covered);
+        }
+    }
+}
+
+test "png: Adam7 pass sizes match the specification for an 8x8 image" {
+    const header = Header{
+        .width = 8,
+        .height = 8,
+        .depth = 8,
+        .color = .rgb,
+        .row_bytes = 24,
+        .bpp = 3,
+        .raw_bytes = 0,
+        .interlaced = true,
+    };
+    const expected = [7][2]u32{
+        .{ 1, 1 }, .{ 1, 1 }, .{ 2, 1 }, .{ 2, 2 }, .{ 4, 2 }, .{ 4, 4 }, .{ 8, 4 },
+    };
+    for (0..adam7.len) |i| {
+        const pass = try passGeometry(header, i);
+        try testing.expectEqual(expected[i][0], pass.width);
+        try testing.expectEqual(expected[i][1], pass.height);
+    }
+}
+
+test "png: an image smaller than a pass start contributes no bytes for it" {
+    const header = Header{
+        .width = 1,
+        .height = 1,
+        .depth = 8,
+        .color = .rgb,
+        .row_bytes = 3,
+        .bpp = 3,
+        .raw_bytes = 0,
+        .interlaced = true,
+    };
+    const first = try passGeometry(header, 0);
+    try testing.expectEqual(@as(u32, 1), first.width);
+    try testing.expectEqual(@as(usize, 4), first.raw_bytes); // one row + filter
+    for (1..adam7.len) |i| {
+        const pass = try passGeometry(header, i);
+        try testing.expectEqual(@as(u32, 0), pass.width);
+        try testing.expectEqual(@as(u32, 0), pass.height);
+        try testing.expectEqual(@as(usize, 0), pass.raw_bytes);
+    }
+}
+
+test "png: Adam7 decoding propagates allocation failures without leaking" {
+    const gpa = testing.allocator;
+    const vector = adam7_vectors.valid[0];
+    const source = try unhex(gpa, vector.png_hex);
+    defer gpa.free(source);
+    const Probe = struct {
+        fn run(alloc: Allocator, bytes: []const u8) !void {
+            var img = try decode(alloc, bytes);
+            img.deinit(alloc);
+        }
+    };
+    try testing.checkAllAllocationFailures(gpa, Probe.run, .{source});
+}
+
+test "png: a large interlaced image matches its non-interlaced twin exactly" {
+    const gpa = testing.allocator;
+    const inter = try unhex(gpa, adam7_vectors.large_interlaced_hex);
+    defer gpa.free(inter);
+    const plain = try unhex(gpa, adam7_vectors.large_plain_hex);
+    defer gpa.free(plain);
+
+    var a = try decode(gpa, inter);
+    defer a.deinit(gpa);
+    var b = try decode(gpa, plain);
+    defer b.deinit(gpa);
+
+    const w = adam7_vectors.large_width;
+    const h = adam7_vectors.large_height;
+    try testing.expectEqual(w, a.width);
+    try testing.expectEqual(h, a.height);
+    // Both paths must agree with each other and with the documented formula,
+    // at a size where every pass ends mid-stride.
+    try testing.expectEqualSlices(u8, b.pixels, a.pixels);
+    var y: usize = 0;
+    while (y < h) : (y += 1) {
+        var x: usize = 0;
+        while (x < w) : (x += 1) {
+            var c: usize = 0;
+            while (c < 4) : (c += 1) {
+                const want: u8 = @intCast((x * 3 + y * 5 + c * 17) % 256);
+                try testing.expectEqual(want, a.pixels[(y * w + x) * 4 + c]);
+            }
+        }
     }
 }
