@@ -94,7 +94,9 @@ src/
 ├── audio.zig             # Audio public module; device-independent mixing
 └── audio/
     ├── clip.zig          # Clip descriptor, channel maps, pan, PCM16   [implemented]
-    └── mixer.zig         # Voice pool, buses, allocation-free render   [implemented]
+    ├── mixer.zig         # Voice pool, buses, allocation-free render   [implemented]
+    ├── spatial.zig       # Listener, attenuation, pan, Doppler math    [implemented]
+    └── system.zig        # AudioSource component + scene reconciler    [implemented]
 ```
 
 Planned subsystems will be added as sibling modules (e.g. `src/render/`,
@@ -165,7 +167,7 @@ CPU work with no GPU dependency, so it is fully tested headlessly and is the
 contract the Low/Medium/Advanced GPU backends will consume. The GPU backends
 themselves remain planned.
 
-### Audio runtime — mixing implemented; device backends planned
+### Audio runtime — mixing + spatialization implemented; device backends planned
 The device-independent playback layer is implemented (`src/audio/`, re-exported
 as `corex.audio`, `docs/audio-mixer.md`): a fixed-capacity voice pool with
 generational handles, buses and master gain, stereo pan (linear or equal-power),
@@ -175,7 +177,14 @@ non-finite sanitizing and peak metering are explicit and documented; `toPcm16`
 converts the mix for a device. It consumes `CXAW` artifacts without importing the
 asset layer, so both stay independently testable. Pure CPU work with no device
 dependency — the contract the OS backends (ALSA/WASAPI/CoreAudio) will consume.
-The backends themselves, 3D spatialization, effects/DSP, voice stealing and
+The **spatial layer** is implemented too (`src/audio/spatial.zig`,
+`src/audio/system.zig`, `docs/audio-spatial.md`): a listener basis derived from
+world matrices, four distance-attenuation models, azimuth amplitude panning,
+Doppler with supersonic clamping, a 2D/3D blend, and an `AudioSource` plain-data
+scene component reconciled into mixer voices by `AudioSystem.update` (start,
+refresh, clip-change restart, stop, silent-source culling, stale-entity sweep).
+It mirrors the render extraction bridge and never writes to the scene. The
+backends themselves, HRTF/occlusion/reverb, effects/DSP, voice stealing and
 streaming remain planned.
 
 ### ECS — implemented (storage + queries + scheduling + graph/frame budgets), planned (extensions)
@@ -364,8 +373,9 @@ dependency-free DEFLATE/zlib inflater, OBJ mesh
 importer, WAV audio importer, atomic verified storage, parallel import over the job system,
 mark-and-sweep GC, change detection with incremental re-import), the
 backend-independent render extraction layer (camera,
-frustum culling, sorted draw lists) and the device-independent audio mixer
-(voices, buses, pan, pitch, resampling, allocation-free render) are implemented
-and tested, and the executable builds and runs on Zig 0.17.0. The remaining larger subsystems (GPU renderer
+frustum culling, sorted draw lists) and the device-independent audio runtime
+(mixer with voices/buses/pan/pitch/resampling, plus spatialization and the
+`AudioSource` scene bridge) are implemented and tested, and the executable builds
+and runs on Zig 0.17.0. The remaining larger subsystems (GPU renderer
 backends, GUI, editor, Lua, export, native modules) are in scope and either
 contract-defined or planned, as marked above.
