@@ -19,6 +19,8 @@ const std = @import("std");
 const ecs = @import("../ecs.zig");
 const paths = @import("../core/paths.zig");
 const validation = @import("../core/validation.zig");
+const components_mod = @import("components.zig");
+const transform = @import("transform.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -146,6 +148,15 @@ pub fn Scene(comptime schemas: anytype) type {
         entity: ecs.Entity,
         name: ?[]const u8,
         parent: ?u64,
+    };
+
+    // World-space transform helpers are only available when the schema includes
+    // the built-in Transform component.
+    const has_transform = blk: {
+        for (schemas) |S| {
+            if (S.component_type == components_mod.Transform) break :blk true;
+        }
+        break :blk false;
     };
 
     return struct {
@@ -334,6 +345,153 @@ pub fn Scene(comptime schemas: anytype) type {
         /// stable IDs and hierarchy stay consistent.
         pub fn ecsWorld(self: *Self) *WorldType {
             return &self.world;
+        }
+
+        /// A snapshot of world-space matrices for every live entity, computed in
+        /// topological (parent-before-child) order. It is valid until the
+        /// hierarchy or local transforms change; recompute to refresh. Lookup is
+        /// by generational entity handle, so a stale handle returns null.
+        /// Entities are stored in ascending stable-ID order for determinism.
+        pub const WorldTransforms = struct {
+            gpa: Allocator,
+            matrices: []transform.Mat4,
+            entities: []ecs.Entity,
+            index: std.AutoHashMap(u64, usize),
+
+            pub fn deinit(self: *WorldTransforms) void {
+                self.gpa.free(self.matrices);
+                self.gpa.free(self.entities);
+                self.index.deinit();
+                self.* = undefined;
+            }
+
+            pub fn count(self: WorldTransforms) usize {
+                return self.matrices.len;
+            }
+
+            /// World matrix for a handle present in the snapshot (live at compute
+            /// time), or null for a handle that is absent — notably a recycled
+            /// slot's new generation, which can never read the previous entity's
+            /// matrix. The snapshot is frozen; recompute after the scene changes.
+            pub fn get(self: WorldTransforms, entity: ecs.Entity) ?transform.Mat4 {
+                const idx = self.index.get(entity.key()) orelse return null;
+                return self.matrices[idx];
+            }
+        };
+
+        /// Compute world-space matrices for all live entities in a single O(n)
+        /// iterative pass (parents before children). No recursion is used, so
+        /// arbitrarily deep hierarchies are safe. Entities without a Transform
+        /// component use the identity local transform. Requires a Transform in
+        /// the schema. The caller owns the returned snapshot; call `deinit`.
+        ///
+        /// This is the per-frame-friendly API: compute once after transforms
+        /// change, then look up many entities via `WorldTransforms.get`.
+        pub fn computeWorldTransforms(self: *Self, gpa: Allocator) Error!WorldTransforms {
+            if (!has_transform)
+                @compileError("computeWorldTransforms requires a Transform component in the scene schema");
+
+            const n = self.records.count();
+            // Initialize with empty storage and register cleanup before any
+            // fallible allocation, so a partial failure frees what was allocated.
+            var wt = WorldTransforms{
+                .gpa = gpa,
+                .matrices = &.{},
+                .entities = &.{},
+                .index = std.AutoHashMap(u64, usize).init(gpa),
+            };
+            errdefer wt.deinit();
+            wt.matrices = try gpa.alloc(transform.Mat4, n);
+            wt.entities = try gpa.alloc(ecs.Entity, n);
+
+            // Scratch space, freed before return.
+            const local = try gpa.alloc(transform.Mat4, n);
+            defer gpa.free(local);
+            const parent_idx = try gpa.alloc(usize, n);
+            defer gpa.free(parent_idx);
+            const computed = try gpa.alloc(bool, n);
+            defer gpa.free(computed);
+            const stack = try gpa.alloc(usize, n);
+            defer gpa.free(stack);
+            const ids = try gpa.alloc(u64, n);
+            defer gpa.free(ids);
+            var id_to_idx = std.AutoHashMap(u64, usize).init(gpa);
+            defer id_to_idx.deinit();
+
+            // Deterministic dense order: ascending stable ID.
+            var i: usize = 0;
+            var it = self.records.iterator();
+            while (it.next()) |entry| : (i += 1) ids[i] = entry.key_ptr.*;
+            std.mem.sort(u64, ids, {}, struct {
+                fn less(_: void, a: u64, b: u64) bool {
+                    return a < b;
+                }
+            }.less);
+
+            const root_sentinel = std.math.maxInt(usize);
+            for (ids, 0..) |id, idx| {
+                const rec = self.records.get(id).?;
+                wt.entities[idx] = rec.entity;
+                try wt.index.put(rec.entity.key(), idx);
+                try id_to_idx.put(id, idx);
+                const local_t: components_mod.Transform = if (self.world.get(components_mod.Transform, rec.entity)) |p| p.* else components_mod.Transform.identity;
+                local[idx] = transform.fromTransform(local_t);
+            }
+            // Resolve parents in a second pass so forward references work.
+            for (ids, 0..) |id, idx| {
+                const rec = self.records.get(id).?;
+                parent_idx[idx] = if (rec.parent) |pid| (id_to_idx.get(pid) orelse root_sentinel) else root_sentinel;
+            }
+
+            // Iterative topological evaluation: walk up to a computed ancestor
+            // (or the root), then compose back down. Each entity is visited once.
+            @memset(computed, false);
+            for (0..n) |start| {
+                if (computed[start]) continue;
+                var sp: usize = 0;
+                var cur = start;
+                while (cur != root_sentinel and !computed[cur]) {
+                    stack[sp] = cur;
+                    sp += 1;
+                    cur = parent_idx[cur];
+                }
+                var base: transform.Mat4 = if (cur == root_sentinel) transform.identity() else wt.matrices[cur];
+                while (sp > 0) {
+                    sp -= 1;
+                    const j = stack[sp];
+                    wt.matrices[j] = transform.multiply(base, local[j]);
+                    base = wt.matrices[j];
+                    computed[j] = true;
+                }
+            }
+            return wt;
+        }
+
+        /// World matrix for a single entity by walking up its parent chain.
+        /// Allocates a temporary chain buffer; for per-frame use over many
+        /// entities prefer `computeWorldTransforms`. Requires a Transform in the
+        /// schema. Returns `error.EntityNotAlive` for a dead handle.
+        pub fn worldMatrix(self: *Self, gpa: Allocator, entity: ecs.Entity) Error!transform.Mat4 {
+            if (!has_transform)
+                @compileError("worldMatrix requires a Transform component in the scene schema");
+            if (!self.alive(entity)) return error.EntityNotAlive;
+
+            var chain: std.ArrayList(transform.Mat4) = .empty;
+            defer chain.deinit(gpa);
+            var cur: ?ecs.Entity = entity;
+            while (cur) |e| {
+                const local_t: components_mod.Transform = if (self.world.get(components_mod.Transform, e)) |p| p.* else components_mod.Transform.identity;
+                try chain.append(gpa, transform.fromTransform(local_t));
+                cur = self.parent(e);
+            }
+
+            var result = transform.identity();
+            var i = chain.items.len;
+            while (i > 0) {
+                i -= 1;
+                result = transform.multiply(result, chain.items[i]);
+            }
+            return result;
         }
 
         /// Parse a strict, versioned scene document. On success the caller owns
@@ -689,4 +847,172 @@ test "scene: create/add survives every allocation failure without leaking" {
 
 test "scene: serialize survives every allocation failure without leaking" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, serializeAllocationProbe, .{});
+}
+
+// --- world-space transforms ------------------------------------------------
+
+test "world transforms: single entity world equals its local matrix" {
+    var s = try TestScene.init(std.testing.allocator, "main");
+    defer s.deinit();
+    const e = try s.createEntity("E", null);
+    const local = Transform{ .position = .{ 1, 2, 3 }, .scale = .{ 2, 2, 2 } };
+    try s.addComponent(e, local);
+
+    var wt = try s.computeWorldTransforms(std.testing.allocator);
+    defer wt.deinit();
+    try std.testing.expectEqual(@as(usize, 1), wt.count());
+    try std.testing.expect(transform.approxEqual(wt.get(e).?, transform.fromTransform(local), 1e-5));
+}
+
+test "world transforms: child world is parent world times child local" {
+    var s = try TestScene.init(std.testing.allocator, "main");
+    defer s.deinit();
+    const root = try s.createEntity("Root", null);
+    try s.addComponent(root, Transform{ .position = .{ 10, 0, 0 }, .scale = .{ 2, 2, 2 } });
+    const child = try s.createEntity("Child", s.idOf(root));
+    try s.addComponent(child, Transform{ .position = .{ 1, 0, 0 } });
+
+    var wt = try s.computeWorldTransforms(std.testing.allocator);
+    defer wt.deinit();
+    // Child origin in world = root * child * (0,0,0) = (12, 0, 0).
+    const p = transform.transformPoint(wt.get(child).?, .{ 0, 0, 0 });
+    try std.testing.expectApproxEqAbs(@as(f32, 12), p[0], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), p[1], 1e-4);
+
+    const expected = transform.multiply(transform.fromTransform(s.getComponent(Transform, root).?.*), transform.fromTransform(s.getComponent(Transform, child).?.*));
+    try std.testing.expect(transform.approxEqual(wt.get(child).?, expected, 1e-4));
+}
+
+test "world transforms: entity without a Transform uses identity local" {
+    var s = try TestScene.init(std.testing.allocator, "main");
+    defer s.deinit();
+    const root = try s.createEntity("Root", null);
+    try s.addComponent(root, Transform{ .position = .{ 5, 5, 5 } });
+    const bare = try s.createEntity("Bare", s.idOf(root)); // no Transform component
+
+    var wt = try s.computeWorldTransforms(std.testing.allocator);
+    defer wt.deinit();
+    // The bare entity passes through its parent's world transform unchanged.
+    try std.testing.expect(transform.approxEqual(wt.get(bare).?, wt.get(root).?, 1e-5));
+}
+
+test "world transforms: deep hierarchy does not recurse or overflow" {
+    var s = try TestScene.init(std.testing.allocator, "main");
+    defer s.deinit();
+    const depth = 2000;
+    var prev: ?ecs.Entity = null;
+    var last: ecs.Entity = undefined;
+    var i: usize = 0;
+    while (i < depth) : (i += 1) {
+        const parent_id = if (prev) |p| s.idOf(p) else null;
+        const e = try s.createEntity(null, parent_id);
+        try s.addComponent(e, Transform{ .position = .{ 1, 0, 0 } });
+        prev = e;
+        last = e;
+    }
+
+    var wt = try s.computeWorldTransforms(std.testing.allocator);
+    defer wt.deinit();
+    try std.testing.expectEqual(@as(usize, depth), wt.count());
+    // Each level adds (1,0,0); the deepest entity sits at (depth, 0, 0).
+    const p = transform.transformPoint(wt.get(last).?, .{ 0, 0, 0 });
+    try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(depth)), p[0], 1e-2);
+}
+
+test "world transforms: forward parent references resolve (parse)" {
+    const src =
+        \\{ "format_version": 1, "name": "main", "entities": [
+        \\  { "id": 1, "name": "Child", "parent": 2, "components": { "transform": { "position": [1, 0, 0] } } },
+        \\  { "id": 2, "name": "Root", "components": { "transform": { "position": [10, 0, 0] } } }
+        \\] }
+    ;
+    var s = try TestScene.parse(std.testing.allocator, src);
+    defer s.deinit();
+    const child = s.entityById(1).?;
+    var wt = try s.computeWorldTransforms(std.testing.allocator);
+    defer wt.deinit();
+    const p = transform.transformPoint(wt.get(child).?, .{ 0, 0, 0 });
+    try std.testing.expectApproxEqAbs(@as(f32, 11), p[0], 1e-4);
+}
+
+test "world transforms: worldMatrix convenience matches the batch snapshot" {
+    var s = try TestScene.init(std.testing.allocator, "main");
+    defer s.deinit();
+    const root = try s.createEntity("Root", null);
+    try s.addComponent(root, Transform{ .position = .{ 1, 2, 3 }, .rotation = transform.quatFromAxisAngle(.{ 0, 1, 0 }, 0.6) });
+    const child = try s.createEntity("Child", s.idOf(root));
+    try s.addComponent(child, Transform{ .position = .{ 4, 5, 6 }, .scale = .{ 2, 1, 3 } });
+    const grand = try s.createEntity("Grand", s.idOf(child));
+    try s.addComponent(grand, Transform{ .position = .{ 0, 1, 0 } });
+
+    var wt = try s.computeWorldTransforms(std.testing.allocator);
+    defer wt.deinit();
+    const single = try s.worldMatrix(std.testing.allocator, grand);
+    try std.testing.expect(transform.approxEqual(single, wt.get(grand).?, 1e-4));
+}
+
+test "world transforms: snapshot is generation-safe across slot recycle" {
+    var s = try TestScene.init(std.testing.allocator, "main");
+    defer s.deinit();
+    const a = try s.createEntity("A", null);
+    try s.addComponent(a, Transform{ .position = .{ 1, 1, 1 } });
+    var wt = try s.computeWorldTransforms(std.testing.allocator);
+    try std.testing.expect(wt.get(a) != null);
+
+    s.destroyEntity(a);
+    const b = try s.createEntity("B", null); // recycles the slot, new generation
+    // The recycled handle must not read the previous entity's frozen matrix.
+    try std.testing.expect(wt.get(b) == null);
+    wt.deinit();
+
+    // A fresh snapshot reflects the current scene: a is gone, b is present.
+    var wt2 = try s.computeWorldTransforms(std.testing.allocator);
+    defer wt2.deinit();
+    try std.testing.expect(wt2.get(a) == null);
+    try std.testing.expect(wt2.get(b) != null);
+}
+
+test "world transforms: dead handle rejected by worldMatrix" {
+    var s = try TestScene.init(std.testing.allocator, "main");
+    defer s.deinit();
+    const a = try s.createEntity("A", null);
+    s.destroyEntity(a);
+    try std.testing.expectError(error.EntityNotAlive, s.worldMatrix(std.testing.allocator, a));
+}
+
+test "world transforms: empty scene yields an empty snapshot" {
+    var s = try TestScene.init(std.testing.allocator, "main");
+    defer s.deinit();
+    var wt = try s.computeWorldTransforms(std.testing.allocator);
+    defer wt.deinit();
+    try std.testing.expectEqual(@as(usize, 0), wt.count());
+}
+
+test "world transforms: snapshot entities are sorted by stable ID" {
+    var s = try TestScene.init(std.testing.allocator, "main");
+    defer s.deinit();
+    const a = try s.createEntity("A", null);
+    const b = try s.createEntity("B", null);
+    const c = try s.createEntity("C", null);
+    var wt = try s.computeWorldTransforms(std.testing.allocator);
+    defer wt.deinit();
+    try std.testing.expectEqual(s.idOf(a).?, s.idOf(wt.entities[0]).?);
+    try std.testing.expectEqual(s.idOf(b).?, s.idOf(wt.entities[1]).?);
+    try std.testing.expectEqual(s.idOf(c).?, s.idOf(wt.entities[2]).?);
+}
+
+fn worldTransformsAllocationProbe(allocator: Allocator) !void {
+    var s = try TestScene.init(std.testing.allocator, "main");
+    defer s.deinit();
+    const root = try s.createEntity("Root", null);
+    try s.addComponent(root, Transform{ .position = .{ 1, 2, 3 } });
+    const child = try s.createEntity("Child", s.idOf(root));
+    try s.addComponent(child, Transform{ .position = .{ 4, 5, 6 }, .scale = .{ 2, 2, 2 } });
+    var wt = try s.computeWorldTransforms(allocator);
+    wt.deinit();
+    _ = try s.worldMatrix(allocator, child);
+}
+
+test "world transforms: compute survives every allocation failure without leaking" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, worldTransformsAllocationProbe, .{});
 }

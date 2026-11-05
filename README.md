@@ -25,7 +25,8 @@ control, and maintainable code.
 > diagnostics, and the project-open pipeline), the ECS (generational entities,
 > sparse-set component pools, type-safe world, multi-component views and comptime
 > system scheduling over the job system), the scene system (versioned JSON
-> scenes, stable entity IDs, hierarchy, ECS load/save) and the asset import
+> scenes, stable entity IDs, hierarchy, ECS load/save, world-space transform
+> propagation) and the asset import
 > pipeline + content-addressed cache (raw/text/json/scene importers, atomic
 > verified storage, parallel import over the job system) are implemented and
 > tested. The larger subsystems (renderers, GUI, editor, Lua, export, native
@@ -172,6 +173,22 @@ defer allocator.free(bytes);
 The file format, validation rules and limits are documented in
 [`docs/scene-format.md`](docs/scene-format.md).
 
+Local transforms are propagated into world space on demand. `computeWorldTransforms`
+returns a deterministic snapshot (one O(n) iterative pass, safe for arbitrarily
+deep hierarchies); `worldMatrix` computes a single entity by walking its parent
+chain. The `.scene` format keeps storing only local TRS values.
+
+```zig
+var wt = try scene.computeWorldTransforms(allocator);
+defer wt.deinit();
+if (wt.get(child)) |world| {
+    // world is a column-major Mat4 = parent_world * child_local
+}
+```
+
+See [`docs/scene-transforms.md`](docs/scene-transforms.md) for the math
+conventions, API and performance notes.
+
 ## Assets
 
 The asset subsystem (`corex.assets`) indexes source assets and imports them into
@@ -218,6 +235,7 @@ CoreX/
 │   ├── launch-contract.md      # Stable startup contract (CLI, exit codes)
 │   ├── project-format.md       # .corex manifest format
 │   ├── scene-format.md         # Versioned .scene format
+│   ├── scene-transforms.md     # World-space transform propagation
 │   ├── versioning.md           # Versioning and compatibility policy
 │   ├── native-module-api.md    # C++ native module ABI contract
 │   ├── development/            # Coding standards, commit guidelines
@@ -252,7 +270,8 @@ Indicative; subject to change as technical decisions are validated.
 - [x] ECS system scheduling over the job system (comptime stages, access validation).
 - [ ] ECS scheduling extensions: dependency graph, frame budget, profiling.
 - [x] Scene system and versioned scene serialization (format v1, ECS load/save).
-- [ ] Scene extensions: prefabs, streaming, world-space transforms.
+- [x] Scene world-space transforms (column-major Mat4 propagation, deterministic, iterative).
+- [ ] Scene extensions: prefabs, streaming.
 - [x] Asset import pipeline and content-addressed cache (raw/text/json/scene).
 - [ ] Asset decoders (texture/audio/model), cache GC, hot-reload, startup integration.
 - [ ] Renderer Low / Medium; Advanced contract.
