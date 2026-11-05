@@ -34,8 +34,8 @@ control, and maintainable code.
 > the backend-independent render extraction
 > layer (camera math, frustum culling, sorted draw lists) and the
 > device-independent audio runtime (mixer with voices, buses, pan, pitch,
-> linear/band-limited resampling and priority voice stealing, plus
-> spatialization and the `AudioSource` scene bridge) are
+> linear/band-limited resampling, priority voice stealing and biquad/compressor
+> insert chains, plus spatialization and the `AudioSource` scene bridge) are
 > implemented and tested. The larger
 > subsystems (GPU renderer backends, GUI, editor, Lua, export, native modules) are
 > in scope and either contract-defined or planned. See
@@ -358,7 +358,22 @@ its slot was reused. `render` takes no allocator: it cannot allocate, and it is
 deterministic (bit-identical output for the same call sequence). Voices are
 addressed by generational handles, so a stale handle is inert instead of aliasing
 a recycled voice. It has no device dependency, so it runs and is fully tested
-headlessly; ALSA/WASAPI/CoreAudio backends and effects are planned.
+headlessly; ALSA/WASAPI/CoreAudio backends and delay-based effects are planned.
+
+Buses and the master accept **insert chains** (`.effect_slots > 0`): RBJ biquad
+filters (low/high pass, band pass, notch, peaking, shelves) and a stereo-linked
+soft-knee compressor. Only buses with an active chain are isolated into a
+preallocated submix, so an all-bypass configuration is bit-identical to the
+effect-free path and `render` still never allocates. Parameters, measured costs
+and limits are in [`docs/audio-effects.md`](docs/audio-effects.md).
+
+```zig
+var mixer = try A.Mixer.init(allocator, .{ .effect_slots = 4 });
+defer mixer.deinit();
+// Muffle the world bus, then glue the master.
+try mixer.setBusEffect(1, 0, try A.Effect.biquad(48_000, .{ .kind = .low_pass, .cutoff_hz = 600 }));
+try mixer.setMasterEffect(0, try A.Effect.compressor(48_000, .{ .threshold_db = -6, .ratio = 2 }));
+```
 
 ```zig
 const corex = @import("corex");
@@ -440,6 +455,7 @@ CoreX/
 │   ├── scene-prefabs.md        # Reusable single-root prefabs (.prefab)
 │   ├── render-extraction.md    # Backend-independent render extraction
 │   ├── audio-mixer.md          # Device-independent audio mixer (voices/buses)
+│   ├── audio-effects.md        # Insert DSP: biquads, compressor, chains
 │   ├── audio-spatial.md        # Spatial audio + AudioSource/AudioSystem
 │   ├── versioning.md           # Versioning and compatibility policy
 │   ├── native-module-api.md    # C++ native module ABI contract
@@ -460,7 +476,7 @@ CoreX/
 │   ├── render.zig              # Render public module (extraction layer)
 │   ├── render/                 # Camera, frustum culling, draw-list extraction
 │   ├── audio.zig               # Audio public module (mixing runtime)
-│   └── audio/                  # Clips, mixer, spatialization, scene bridge, resampler
+│   └── audio/                  # Clips, mixer, spatialization, bridge, resampler, DSP
 ├── tools/                      # Reproducible test-vector generators
 ├── build.zig                   # Build configuration
 └── CHANGELOG.md, CONTRIBUTING.md, LICENSE, README.md, ...
@@ -494,6 +510,8 @@ Indicative; subject to change as technical decisions are validated.
 - [x] Audio mixer (voices, buses, gain/pan, pitch, resampling, allocation-free render).
 - [x] Spatial audio (listener, attenuation models, Doppler) + `AudioSource` scene bridge.
 - [x] Voice stealing with priorities + band-limited (windowed-sinc) resampling.
+- [x] Insert effects: biquad filters + compressor on per-bus and master chains.
+- [ ] Delay-based effects (reverb/echo/chorus), lookahead limiting, side-chain.
 - [ ] Audio device backends (ALSA/WASAPI/CoreAudio), HRTF/occlusion, effects, streaming.
 - [ ] Hot-reload event watcher (inotify/FSEvents), dependency graph, startup/editor integration.
 - [x] Backend-independent render extraction (camera, frustum culling, sorted draw lists).
