@@ -35,6 +35,10 @@ pub const ecs = @import("ecs.zig");
 /// ECS-backed components.
 pub const scene = @import("scene.zig");
 
+/// Asset subsystem: indexing, content-addressed import cache, importers and
+/// the parallel import pipeline.
+pub const assets = @import("assets.zig");
+
 // Pull every submodule's tests into the test build.
 test {
     std.testing.refAllDecls(@This());
@@ -51,5 +55,7 @@ test {
     _ = core.validation;
     _ = ecs;
     _ = scene;
+    _ = assets;
     _ = @import("ecs/schedule_jobs_test.zig");
+    _ = @import("assets/pipeline_jobs_test.zig");
 }

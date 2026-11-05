@@ -39,15 +39,23 @@ declared yet.
   stable entity IDs, parent hierarchy with cycle rejection, plain-data component
   schemas, deterministic serialize/parse, file load/save, and ECS-backed startup
   scene loading. The default `EngineScene` schema ships a `Transform` component.
+- Asset import pipeline and content-addressed cache (`src/assets/`, re-exported
+  as `corex.assets`, `docs/asset-import.md`): incremental, reproducible imports
+  keyed by source content hash + importer identity/version + options; atomic
+  cache writes with hash-verified, self-healing reads; raw/text/json importers
+  plus a scene importer that reuses the scene system; concurrent import over
+  `std.Io` / `JobSystem` with a `runSequential` fallback and a per-asset report.
+  The startup asset index (`src/core/assets.zig`) is unchanged.
 - Shared display-name validation (`src/core/validation.zig`) used by both the
   `.corex` manifest and scene documents.
 - Native Module ABI contract for C++ (`docs/native-module-api.md`,
   `include/corex/native_module.h`); the loader is not implemented yet.
 - A minimal example project (`examples/hello-project/`) with a valid versioned
   initial scene.
-- Test suite covering the startup spine, ECS, scheduling and scenes (128 tests),
-  including allocation-failure probes and job-system integration tests,
-  validated in Debug, ReleaseSafe and ReleaseFast.
+- Test suite covering the startup spine, ECS, scheduling, scenes and asset
+  import/cache (166 tests), including allocation-failure probes, cache
+  corruption/truncation probes and job-system integration tests, validated in
+  Debug, ReleaseSafe and ReleaseFast.
 
 ### Changed
 
@@ -55,7 +63,7 @@ declared yet.
 - README and architecture documentation now reflect the definitive scope and the
   per-subsystem implementation status.
 - The public module `src/corex.zig` re-exports the implemented core, ECS
-  (including scheduling) and scene subsystems.
+  (including scheduling), scene and asset (import/cache) subsystems.
 - Startup `editor`/`runtime` now validates and loads the initial scene into the
   ECS (or prepares an empty scene). `validate` mode and the stable CLI/exit-code
   contract are unchanged; scene failures map to exit code 6.
@@ -87,5 +95,9 @@ declared yet.
   zero entity IDs, missing parents, self-parenting, parent cycles, unknown
   components and non-finite transform values are rejected; scene paths stay
   project-relative and scene size/entity counts are bounded.
+- The asset import cache writes artifacts atomically (temp + rename) and verifies
+  the payload hash and size on read, so corrupt or truncated entries are rejected
+  and re-imported rather than trusted. Source reads and cache files are
+  size-bounded; importers reject invalid UTF-8 and malformed/duplicate-field JSON.
 - Added guidance for responsible vulnerability reporting and secure
   contributions.
