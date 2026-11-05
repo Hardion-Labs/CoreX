@@ -195,7 +195,9 @@ a content-addressed cache. The cache key derives from the source content hash +
 importer identity/version + options, so imports are incremental and reproducible:
 unchanged sources are reused, and bumping an importer version invalidates its
 entries. Writes are atomic and reads verify the payload hash (corrupt entries
-self-heal). Built-in importers cover raw binary, text (UTF-8 + line-ending
+self-heal). A mark-and-sweep garbage collector (`Cache.gc` + `Report.liveKeys`)
+reclaims orphan entries when sources change or are removed. Built-in importers
+cover raw binary, text (UTF-8 + line-ending
 normalization), JSON (strict validation + lossless minification) and scenes
 (validated and canonicalized via the scene system). Texture sources in **BMP,
 TGA and QOI** are decoded to RGBA8 and stored as a self-describing `CXTX`
@@ -279,7 +281,8 @@ Indicative; subject to change as technical decisions are validated.
 - [ ] Scene extensions: prefabs, streaming.
 - [x] Asset import pipeline and content-addressed cache (raw/text/json/scene).
 - [x] Texture decoders (BMP/TGA/QOI → RGBA8 `CXTX` artifact).
-- [ ] Asset decoders (PNG/JPEG/audio/model), cache GC, hot-reload, startup integration.
+- [x] Asset cache garbage collection (mark-and-sweep of orphan entries).
+- [ ] Asset decoders (PNG/JPEG/audio/model), hot-reload, startup integration.
 - [ ] Renderer Low / Medium; Advanced contract.
 - [ ] GUI library and graphical editor.
 - [ ] Lua VM and gameplay scripting.

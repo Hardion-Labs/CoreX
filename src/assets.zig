@@ -50,6 +50,7 @@ pub const AssetIndex = index.AssetIndex;
 pub const indexDirectories = index.indexDirectories;
 
 pub const Cache = cache.Cache;
+pub const GcStats = cache.GcStats;
 pub const Importer = importer.Importer;
 pub const Registry = importer.Registry;
 pub const ImportError = importer.ImportError;
@@ -221,4 +222,103 @@ test "pipeline imports a scene through the engine registry" {
     defer report.deinit();
     try std.testing.expectEqual(@as(usize, 1), report.imported);
     try std.testing.expectEqualStrings("scene", report.entries[0].importer_id.?);
+}
+
+test "pipeline + gc: orphan entries are reclaimed while live artifacts survive" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.createDirPath(io, "assets");
+    try tmp.dir.createDirPath(io, "cache");
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/a.txt", .data = "alpha" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/b.txt", .data = "beta" });
+
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buf);
+    const root_path = buf[0..n];
+    var idx = try indexDirectories(std.testing.allocator, io, root_path, &.{"assets"});
+    defer idx.deinit();
+    var root = try Io.Dir.openDirAbsolute(io, root_path, .{});
+    defer root.close(io);
+    var cache_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const cache_path = try std.fmt.bufPrint(&cache_buf, "{s}/cache", .{root_path});
+    var store = try Cache.open(io, cache_path);
+    defer store.deinit();
+
+    var report = try pipeline.runSequential(std.testing.allocator, io, root, idx, &store, .{
+        .registry = engineRegistry(),
+    });
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 2), report.imported);
+
+    const live = try report.liveKeys(std.testing.allocator);
+    defer std.testing.allocator.free(live);
+    try std.testing.expectEqual(@as(usize, 2), live.len);
+
+    // Inject an orphan entry that no live key references.
+    const orphan_key = cache.deriveKey(cache.hashBytes("orphan"), "raw", 1, cache.hashBytes(""));
+    try store.put(std.testing.allocator, orphan_key, .{
+        .path = "gone.bin",
+        .source_hash = cache.hashBytes("orphan"),
+        .importer_id = "raw",
+        .importer_version = 1,
+        .kind = "unknown",
+    }, "orphan-payload", 0);
+
+    const stats = try store.gc(std.testing.allocator, live);
+    try std.testing.expectEqual(@as(usize, 3), stats.scanned);
+    try std.testing.expectEqual(@as(usize, 2), stats.kept);
+    try std.testing.expectEqual(@as(usize, 1), stats.removed);
+    try std.testing.expect(!try store.has(std.testing.allocator, orphan_key));
+    for (live) |k| try std.testing.expect(try store.has(std.testing.allocator, k));
+}
+
+test "pipeline + gc: removing a source lets gc reclaim its stale artifact" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.createDirPath(io, "assets");
+    try tmp.dir.createDirPath(io, "cache");
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/a.txt", .data = "alpha" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/b.txt", .data = "beta" });
+
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buf);
+    const root_path = buf[0..n];
+    var root = try Io.Dir.openDirAbsolute(io, root_path, .{});
+    defer root.close(io);
+    var cache_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const cache_path = try std.fmt.bufPrint(&cache_buf, "{s}/cache", .{root_path});
+    var store = try Cache.open(io, cache_path);
+    defer store.deinit();
+
+    var idx = try indexDirectories(std.testing.allocator, io, root_path, &.{"assets"});
+    defer idx.deinit();
+    var report = try pipeline.runSequential(std.testing.allocator, io, root, idx, &store, .{
+        .registry = engineRegistry(),
+    });
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 2), report.imported);
+
+    // Remove one source asset, then re-index and re-import.
+    try tmp.dir.deleteFile(io, "assets/b.txt");
+    var idx2 = try indexDirectories(std.testing.allocator, io, root_path, &.{"assets"});
+    defer idx2.deinit();
+    var report2 = try pipeline.runSequential(std.testing.allocator, io, root, idx2, &store, .{
+        .registry = engineRegistry(),
+    });
+    defer report2.deinit();
+    try std.testing.expectEqual(@as(usize, 1), report2.count());
+    try std.testing.expectEqual(@as(usize, 1), report2.cached); // a.txt is a cache hit
+
+    const live2 = try report2.liveKeys(std.testing.allocator);
+    defer std.testing.allocator.free(live2);
+    try std.testing.expectEqual(@as(usize, 1), live2.len);
+
+    // Both artifacts are still on disk; GC reclaims only b's.
+    const stats = try store.gc(std.testing.allocator, live2);
+    try std.testing.expectEqual(@as(usize, 2), stats.scanned);
+    try std.testing.expectEqual(@as(usize, 1), stats.kept);
+    try std.testing.expectEqual(@as(usize, 1), stats.removed);
+    try std.testing.expect(try store.has(std.testing.allocator, live2[0]));
 }

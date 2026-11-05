@@ -80,6 +80,18 @@ pub const Report = struct {
     pub fn count(self: Report) usize {
         return self.entries.len;
     }
+
+    /// Collect the cache keys of every successfully imported/cached asset — the
+    /// `live` set to pass to `Cache.gc`. Failed assets contribute no key. The
+    /// caller frees the returned slice with the same allocator.
+    pub fn liveKeys(self: Report, gpa: Allocator) Allocator.Error![]cache_mod.Key {
+        var list: std.ArrayList(cache_mod.Key) = .empty;
+        errdefer list.deinit(gpa);
+        for (self.entries) |e| {
+            if (e.key) |k| try list.append(gpa, k);
+        }
+        return list.toOwnedSlice(gpa);
+    }
 };
 
 pub const Options = struct {
