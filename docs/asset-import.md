@@ -7,12 +7,13 @@ contract is unchanged.
 
 > Status: **implemented and tested**. **Texture** decoders for **PNG, BMP, TGA
 > and QOI** exist and produce a `CXTX` artifact (RGBA8) — see
-> [asset-decoders.md](asset-decoders.md) — and an **OBJ mesh** decoder produces a
-> `CXMH` artifact — see [mesh-import.md](mesh-import.md). Other binary formats
-> (JPEG, audio, other models such as glTF/FBX/DAE, fonts) still have no
-> decoder and use the `raw` importer (verbatim copy) until decoders are
-> registered. This is documented below and is not described as an existing
-> capability.
+> [asset-decoders.md](asset-decoders.md) — an **OBJ mesh** decoder produces a
+> `CXMH` artifact — see [mesh-import.md](mesh-import.md) — and a **WAV audio**
+> decoder produces a `CXAW` artifact (interleaved f32) — see
+> [asset-audio.md](asset-audio.md). Other binary formats (JPEG, compressed audio,
+> other models such as glTF/FBX/DAE, fonts) still have no decoder and use the
+> `raw` importer (verbatim copy) until decoders are registered. This is documented
+> below and is not described as an existing capability.
 
 ## Overview
 
@@ -58,6 +59,13 @@ importer is backed by the dependency-free DEFLATE/zlib inflater in
 `corex.assets.inflate`. See [asset-decoders.md](asset-decoders.md) for supported
 formats, the artifact layout and limitations.
 
+The audio importer (`corex.assets.audio`, ID `wav`, version 1) decodes the
+uncompressed RIFF/WAVE subset (PCM 8/16/24/32-bit and IEEE float32, including
+`WAVE_FORMAT_EXTENSIBLE`) into interleaved float32 and serializes it into the
+`CXAW` artifact. Compressed codecs are rejected rather than approximated. See
+[asset-audio.md](asset-audio.md) for the supported subset, normalization rules,
+the artifact layout and limitations.
+
 Importer contract:
 
 ```zig
@@ -77,12 +85,12 @@ pub const ImportError = error{ InvalidAsset, OutOfMemory };
 with a fallback for unmatched extensions:
 
 - `importer.defaultRegistry()`: JSON + text, `raw` fallback.
-- `assets.engineRegistry()`: textures (PNG/BMP/TGA/QOI) + meshes (OBJ) + scenes +
-  prefabs (`.prefab`/`.corexprefab`) + JSON + text, `raw` fallback (the engine's
-  default registry).
+- `assets.engineRegistry()`: textures (PNG/BMP/TGA/QOI) + meshes (OBJ) + audio
+  (WAV) + scenes + prefabs (`.prefab`/`.corexprefab`) + JSON + text, `raw` fallback
+  (the engine's default registry).
 
-Higher layers can extend the registry (for example, audio decoders or other model
-formats) without changing the pipeline:
+Higher layers can extend the registry (for example, compressed-audio decoders or
+other model formats) without changing the pipeline:
 
 ```zig
 const reg = corex.assets.Registry{
@@ -219,11 +227,14 @@ Guarantees and behavior:
 ## Limitations
 
 - Texture decoders exist for **PNG, BMP, TGA and QOI** (see
-  [asset-decoders.md](asset-decoders.md)) and a mesh decoder for **OBJ** (see
-  [mesh-import.md](mesh-import.md)). JPEG, audio, other model formats
-  (glTF/FBX/DAE) and fonts still have no decoder and use the `raw` importer
-  (verbatim copy); they will be registered as dedicated importers once they exist.
-  Adam7-interlaced PNG is rejected rather than approximated.
+  [asset-decoders.md](asset-decoders.md)), a mesh decoder for **OBJ** (see
+  [mesh-import.md](mesh-import.md)) and an audio decoder for **uncompressed WAV**
+  (see [asset-audio.md](asset-audio.md)). JPEG, compressed audio
+  (ADPCM/µ-law/Ogg/MP3/FLAC/Opus), other model formats (glTF/FBX/DAE) and fonts
+  still have no decoder and use the `raw` importer (verbatim copy); they will be
+  registered as dedicated importers once they exist. Adam7-interlaced PNG and
+  compressed WAV codecs are rejected rather than approximated. There is no audio
+  playback device or mixer yet — only the decode/artifact half of the audio path.
 - The `json` importer preserves the source key order (it minifies, it does not sort
   keys); determinism is by source content, which is sufficient for a
   content-addressed cache.
@@ -257,6 +268,7 @@ Guarantees and behavior:
 - [asset-decoders.md](asset-decoders.md) — image decoders (PNG/BMP/TGA/QOI), the
   DEFLATE/zlib inflater and the CXTX artifact.
 - [mesh-import.md](mesh-import.md) — OBJ mesh importer and the CXMH artifact.
+- [asset-audio.md](asset-audio.md) — WAV audio importer and the CXAW artifact.
 - [scene-format.md](scene-format.md) — scene format validated by the importer.
 - [versioning.md](versioning.md) — format versioning policy.
 - [launch-contract.md](launch-contract.md) — startup contract (unchanged).
