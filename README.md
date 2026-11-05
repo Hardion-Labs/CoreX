@@ -1,4 +1,3 @@
-# CoreXEngine
 
 <p align="center">
   <img
