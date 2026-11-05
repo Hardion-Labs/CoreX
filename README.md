@@ -255,13 +255,14 @@ float32) is decoded to interleaved float32 stored as a `CXAW` artifact; other
 binary formats (JPEG, compressed audio, glTF/FBX) still import as `raw` until
 decoders exist.
 
-PNG support covers every non-interlaced color type and bit depth (1/2/4/8/16),
-all five row filters, palette and color-key transparency, and multi-chunk IDAT,
-with chunk CRC-32 and zlib Adler-32 verification. It is backed by a
+PNG support covers every color type and bit depth (1/2/4/8/16), all five row
+filters, palette and color-key transparency, multi-chunk IDAT and Adam7
+interlacing, with chunk CRC-32 and zlib Adler-32 verification. It is backed by a
 dependency-free DEFLATE/zlib inflater (`corex.assets.inflate`) whose output is
 bounded by the caller, so a decompression bomb cannot exceed the size declared by
 the image header. 16-bit samples are reduced to their high byte (the artifact is
-RGBA8) and Adam7-interlaced files are rejected rather than approximated.
+RGBA8). Interlaced files decode to exactly the same pixels as their
+non-interlaced equivalent.
 
 ```zig
 const corex = @import("corex");
@@ -526,7 +527,7 @@ Indicative; subject to change as technical decisions are validated.
 - [x] Asset change detection + incremental import (hot-reload foundation).
 - [x] Mesh decoder (OBJ → indexed triangle mesh, `CXMH` artifact).
 - [x] Audio decoder (WAV/PCM + IEEE float32 → interleaved f32 `CXAW` artifact).
-- [ ] Asset decoders (JPEG, compressed audio, other model formats), Adam7 PNG.
+- [ ] Asset decoders (JPEG, compressed audio, other model formats).
 - [x] Audio mixer (voices, buses, gain/pan, pitch, resampling, allocation-free render).
 - [x] Spatial audio (listener, attenuation models, Doppler) + `AudioSource` scene bridge.
 - [x] Voice stealing with priorities + band-limited (windowed-sinc) resampling.

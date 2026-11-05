@@ -99,21 +99,40 @@ declared yet.
   and back-references before the start of output are rejected.
 - PNG decoder (`src/assets/png.zig`, re-exported as `corex.assets.png`) and a
   `png` importer (v1) registered for `.png` in the engine registry, producing the
-  existing `CXTX` artifact: all non-interlaced color types (grayscale, truecolor,
+  existing `CXTX` artifact: every color type (grayscale, truecolor,
   indexed, grayscale+alpha, truecolor+alpha) at every legal bit depth
   (1/2/4/8/16), all five row filters, `tRNS` palette alpha and grayscale/RGB color
   keys (compared at source depth), multiple consecutive IDAT chunks (single
   chunks inflated without copying), ancillary chunks skipped and unknown
   critical chunks rejected, with every chunk CRC-32 and the zlib Adler-32
   verified. 16-bit samples keep their high byte and sub-byte grayscale is bit
-  replicated, because `CXTX` is RGBA8; Adam7 interlacing is rejected, not
-  approximated. Scanline inflation is bounded by the size implied by `IHDR`, and
+  replicated, because `CXTX` is RGBA8. Scanline inflation is bounded by the
+  size implied by `IHDR`, and
   images whose RGBA8 output would exceed `max_pixel_bytes` are rejected before
   inflating. Pixel conversion is specialized at comptime per (depth, channels).
 - Reproducible decoder test vectors (`tools/gen_png_vectors.py`,
   `src/assets/png_vectors.zig`): 24 valid PNGs with reference RGBA8 output plus
-  20 malformed PNGs and four DEFLATE/zlib streams, all generated with Python's
+  19 malformed PNGs and four DEFLATE/zlib streams, all generated with Python's
   zlib so the tests compare against an independent encoder.
+- Adam7 interlaced PNG decoding (`src/assets/png.zig`): the seven passes are
+  unfiltered as independent sub-images, each with its own row padding and its own
+  filter history, then scattered to their final positions. Empty passes
+  contribute no bytes, the inflated size is predicted from `IHDR` as the sum over
+  the non-empty passes and must match exactly, and interlace methods other than 0
+  and 1 are rejected. The existing unfilter and comptime pixel converter are
+  reused unchanged; one scratch row (`width * 4` bytes) is allocated and reused
+  across all passes, and the final pass (x-step 1, half the image) converts
+  straight into the output row with no copy. Measured at parity with the
+  non-interlaced path on a 1024×1024 pair, which decodes to byte-identical output.
+- Adam7 test corpus (`tools/gen_png_adam7_vectors.py`,
+  `src/assets/png_adam7_vectors.zig`): 34 valid interlaced PNGs, 5 malformed ones
+  and a 257×259 interlaced/plain pair. The generator **decodes every file back
+  with libpng** before emitting it, so the pass layout is confirmed by an
+  independent implementation rather than by this repository's own understanding
+  of Adam7. Coverage includes every color type and depth, sizes from 1×1 to 17×13
+  that leave passes empty, odd dimensions, per-pass filter rotation, and an
+  illegal filter byte in a later pass. Two rejection vectors are deliberately
+  stricter than libpng (exact inflated size, interlace method 2).
 - Asset change detection (`src/assets/changes.zig`, re-exported as
   `corex.assets.changes` with `Snapshot`/`ChangeSet`/`ChangeKind`,
   `docs/asset-change-detection.md`): a path-sorted snapshot of every indexed
@@ -372,8 +391,8 @@ declared yet.
   asset import/cache, world-space transforms, texture decoders, cache GC, render
   extraction, OBJ mesh import, scene prefabs, DEFLATE/zlib, PNG, asset change
   detection, WAV audio import, audio mixing, spatial audio, voice stealing,
-  band-limited resampling and insert DSP including delay/reverb/limiter/saturator
-  (509 tests),
+  band-limited resampling, insert DSP including delay/reverb/limiter/saturator
+  and Adam7 interlaced PNG (516 tests),
   including allocation-failure
   probes, cache corruption/truncation probes, a deep-hierarchy stress test, QOI
   encode/decode roundtrips, end-to-end texture-import-and-cache, OBJ-import-and-
