@@ -40,7 +40,8 @@ selection, and installation management belong to the CoreXHub (separate repo).
 ## Module layout
 
 The public surface is concentrated in `src/corex.zig`. Implemented modules live
-under `src/core/` (startup spine) and `src/ecs/` (entity-component-system):
+under `src/core/` (startup spine), `src/ecs/` (entity-component-system) and
+`src/scene/` (scene documents):
 
 ```text
 src/
@@ -51,6 +52,7 @@ src/
 │   ├── cli.zig           # Launch argument parsing (the Hub contract)  [implemented]
 │   ├── manifest.zig      # .corex manifest parsing + validation        [implemented]
 │   ├── paths.zig         # Safe relative-path validation + resolution  [implemented]
+│   ├── validation.zig    # Shared display-name validation rules        [implemented]
 │   ├── jobs.zig          # Job system / async loading foundation       [implemented]
 │   ├── config.zig        # Project configuration loading               [implemented]
 │   ├── assets.zig        # Asset indexing                              [implemented]
@@ -58,16 +60,19 @@ src/
 │   ├── diagnostics.zig   # Timers + stage profiling                    [implemented]
 │   └── startup.zig       # The 7-step startup pipeline                 [implemented]
 ├── ecs.zig               # ECS public module; re-exports entity/pool/world
-└── ecs/
-    ├── entity.zig        # Generational entity handles + lifecycle     [implemented]
-    ├── pool.zig          # Sparse-set component storage                [implemented]
-    └── world.zig         # Type-safe world + multi-component views     [implemented]
+├── ecs/
+│   ├── entity.zig        # Generational entity handles + lifecycle     [implemented]
+│   ├── pool.zig          # Sparse-set component storage                [implemented]
+│   └── world.zig         # Type-safe world + multi-component views     [implemented]
+├── scene.zig             # Scene public module; EngineScene schema
+└── scene/
+    ├── components.zig    # Built-in plain-data scene components        [implemented]
+    └── scene.zig         # Versioned scene document + ECS/hierarchy    [implemented]
 ```
 
-Planned subsystems will be added as sibling modules (e.g. `src/scene/`,
-`src/render/`, `src/gui/`, `src/editor/`, `src/script/`, `src/export/`) once an
-approved change gives them meaningful content. Empty placeholder modules are not
-created.
+Planned subsystems will be added as sibling modules (e.g. `src/render/`,
+`src/gui/`, `src/editor/`, `src/script/`, `src/export/`) once an approved change
+gives them meaningful content. Empty placeholder modules are not created.
 
 ## The startup spine (implemented)
 
@@ -83,8 +88,9 @@ The engine opens a project through a fixed sequence (see
 4. **Configuration in workers** — `config.load` dispatched on the job system.
 5. **Asset indexing** — `assets.indexDirectories` dispatched concurrently with
    configuration.
-6. **Initial scene** — resolve and verify the scene path (manifest or
-   `--scene`). Skipped in `validate` mode.
+6. **Initial scene** — resolve the scene path (manifest or `--scene`), validate
+   and load the versioned scene document into the ECS. When no scene is
+   requested, an empty scene is prepared. Skipped in `validate` mode.
 7. **Editor / runtime** — open the session. Headless until the GUI/editor exist.
    Skipped in `validate` mode.
 
@@ -149,10 +155,21 @@ and `ReleaseFast`). System scheduling across the job system, change detection,
 and relation/graph components are planned extensions. The world depends only on
 `entity.zig` and `pool.zig` (low coupling); scenes and scripting build on it.
 
-### Sistema de cenas — contract defined (entry), planned (full)
-A scene is referenced by the manifest (`initial_scene`) and resolved at startup.
-The full scene format, entity/component serialization, prefab and scene graph
-are planned. The example project ships a minimal `scenes/main.scene`.
+### Sistema de cenas — implemented (format v1 + ECS load/save), planned (extensions)
+Scenes are versioned JSON documents (`docs/scene-format.md`) backed by the ECS.
+`scene.Scene(schema)` owns a typed ECS world, stable monotonic entity IDs and a
+parent hierarchy. It supports strict parse/serialize, file load/save,
+create/destroy with child reparenting, cycle-safe `setParent`, and plain-data
+component schemas (`Component(T, "name")`). The default `EngineScene` schema
+currently contains `Transform`; the startup pipeline loads the initial scene in
+`editor`/`runtime` and prepares an empty scene when none is requested.
+
+Implemented guarantees: unknown/duplicate JSON fields rejected, duplicate/zero
+entity IDs rejected, missing parents/self-parenting/cycles rejected, non-finite
+transform values rejected, stale generational handles cannot reach recycled
+entities, and allocation-failure paths are tested. Prefabs, scene streaming,
+world-space transform propagation, change tracking and multi-scene management
+are planned extensions.
 
 ### Sistema de assets — implemented (indexing), planned (import/cache)
 `assets.indexDirectories` builds a kind/size index at startup. Importing,
@@ -163,9 +180,13 @@ extensions.
 Asset import pipeline and a derived-data cache keyed by source content +
 importer version. Will integrate with the asset system and the job system.
 
-### Serialização — planned
-Versioned (de)serialization for scenes, assets and project data, aligned with
-the format-version policy in [versioning.md](versioning.md).
+### Serialização — implemented (scenes), planned (assets/export)
+Scene (de)serialization is versioned (`format_version = 1`), strict and
+deterministic (entities sorted by stable ID, optional null fields omitted). It
+uses the standard-library JSON parser/stringifier with duplicate-field and
+unknown-field rejection, and enforces plain-data components at comptime so ECS
+copies cannot dangle. Asset/import-cache and export-template serialization are
+planned, aligned with the format-version policy in [versioning.md](versioning.md).
 
 ### VM Lua / Gameplay scripting — planned
 An embedded Lua VM and a gameplay scripting API. The example project ships a
@@ -213,8 +234,9 @@ profiling, memory tracking, a metrics overlay and trace export are planned.
 
 ## Current status
 
-The startup spine and the ECS (generational entities, sparse-set component
-pools, type-safe world and multi-component views) are implemented and tested,
-and the executable builds and runs on Zig 0.17.0. The remaining larger
-subsystems (scenes, renderers, GUI, editor, Lua, export, native modules) are in
-scope and either contract-defined or planned, as marked above.
+The startup spine, the ECS (generational entities, sparse-set component pools,
+type-safe world and multi-component views) and the scene system (versioned JSON
+scenes, stable IDs, hierarchy, ECS load/save) are implemented and tested, and
+the executable builds and runs on Zig 0.17.0. The remaining larger subsystems
+(renderers, GUI, editor, Lua, export, native modules) are in scope and either
+contract-defined or planned, as marked above.

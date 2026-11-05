@@ -22,11 +22,12 @@ control, and maintainable code.
 
 > **Status:** early development. The startup spine (CLI, project manifest,
 > compatibility, jobs, configuration, asset indexing, splash contract,
-> diagnostics, and the project-open pipeline) and the ECS (generational entities,
-> sparse-set component pools, type-safe world and multi-component views) are
-> implemented and tested. The larger subsystems (scenes, renderers, GUI, editor,
-> Lua, export, native modules) are in scope and either contract-defined or
-> planned. See [`docs/architecture.md`](docs/architecture.md) for the
+> diagnostics, and the project-open pipeline), the ECS (generational entities,
+> sparse-set component pools, type-safe world and multi-component views) and the
+> scene system (versioned JSON scenes, stable entity IDs, hierarchy, ECS
+> load/save) are implemented and tested. The larger subsystems (renderers, GUI,
+> editor, Lua, export, native modules) are in scope and either contract-defined
+> or planned. See [`docs/architecture.md`](docs/architecture.md) for the
 > per-subsystem status.
 
 ## Overview
@@ -124,6 +125,29 @@ while (it.next()) |entry| {
 
 See [`docs/architecture.md`](docs/architecture.md) for the design and status.
 
+## Scenes
+
+Scenes are versioned JSON documents (`.scene`, `format_version = 1`) backed by
+the ECS. They carry stable entity IDs, a parent hierarchy and plain-data
+components. The startup pipeline loads the initial scene in `editor`/`runtime`;
+`validate` still checks only the project manifest, config and asset index.
+
+```zig
+const corex = @import("corex");
+var scene = try corex.scene.EngineScene.init(allocator, "main");
+defer scene.deinit();
+
+const root = try scene.createEntity("Root", null);
+try scene.addComponent(root, corex.scene.Transform{ .position = .{ 0, 0, 0 } });
+const child = try scene.createEntity("Child", scene.idOf(root));
+
+const bytes = try scene.serialize(allocator); // deterministic JSON
+defer allocator.free(bytes);
+```
+
+The file format, validation rules and limits are documented in
+[`docs/scene-format.md`](docs/scene-format.md).
+
 ## Project Structure
 
 ```text
@@ -134,6 +158,7 @@ CoreX/
 │   ├── architecture.md         # Subsystem map and implementation status
 │   ├── launch-contract.md      # Stable startup contract (CLI, exit codes)
 │   ├── project-format.md       # .corex manifest format
+│   ├── scene-format.md         # Versioned .scene format
 │   ├── versioning.md           # Versioning and compatibility policy
 │   ├── native-module-api.md    # C++ native module ABI contract
 │   ├── development/            # Coding standards, commit guidelines
@@ -145,7 +170,9 @@ CoreX/
 │   ├── corex.zig               # Public module
 │   ├── core/                   # Implemented startup-spine subsystems
 │   ├── ecs.zig                 # ECS public module
-│   └── ecs/                    # Entities, component pools, world + views
+│   ├── ecs/                    # Entities, component pools, world + views
+│   ├── scene.zig               # Scene public module (EngineScene)
+│   └── scene/                  # Scene components + versioned documents
 ├── build.zig                   # Build configuration
 └── CHANGELOG.md, CONTRIBUTING.md, LICENSE, README.md, ...
 ```
@@ -162,7 +189,8 @@ Indicative; subject to change as technical decisions are validated.
 - [x] Diagnostics and profiling foundation.
 - [x] ECS: generational entities, sparse-set components, type-safe world + views.
 - [ ] ECS system scheduling over the job system.
-- [ ] Scene system and serialization.
+- [x] Scene system and versioned scene serialization (format v1, ECS load/save).
+- [ ] Scene extensions: prefabs, streaming, world-space transforms.
 - [ ] Asset import pipeline and cache.
 - [ ] Renderer Low / Medium; Advanced contract.
 - [ ] GUI library and graphical editor.
