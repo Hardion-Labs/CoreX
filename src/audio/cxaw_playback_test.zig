@@ -8,6 +8,8 @@
 const std = @import("std");
 const assets = @import("../assets.zig");
 const audio = @import("../audio.zig");
+const scene_mod = @import("../scene/scene.zig");
+const components = @import("../scene/components.zig");
 const vectors = @import("../assets/audio_vectors.zig");
 
 const testing = std.testing;
@@ -158,4 +160,78 @@ test "audio integration: a mixed buffer converts to PCM16 within one LSB" {
         const back = @as(f32, @floatFromInt(quantized)) / 32768.0;
         try testing.expectApproxEqAbs(value, back, 1.0 / 32768.0);
     }
+}
+
+test "audio integration: a scene emitter plays a CXAW clip with spatial gain" {
+    const gpa = testing.allocator;
+    const vector = try findVector("pcm16_mono");
+    const artifact = try importFixture(gpa, vector);
+    defer gpa.free(artifact);
+    const view = try assets.audio.parse(artifact);
+    const samples = try samplesOf(gpa, view);
+    defer gpa.free(samples);
+
+    const clips = [_]audio.Clip{.{
+        .sample_rate = view.sample_rate,
+        .channels = view.channels,
+        .frames = view.frames,
+        .samples = samples,
+    }};
+
+    const Scene = scene_mod.Scene(.{
+        scene_mod.Component(components.Transform, "transform"),
+        scene_mod.Component(audio.AudioSource, "audio_source"),
+    });
+    var scene = try Scene.init(gpa, "world");
+    defer scene.deinit();
+    var mixer = try audio.Mixer.init(gpa, .{
+        .sample_rate = view.sample_rate,
+        .channels = 2,
+        .pan_law = .linear,
+    });
+    defer mixer.deinit();
+    var system = try audio.AudioSystem.init(gpa, &mixer, .{});
+    defer system.deinit();
+
+    // Two units straight ahead: inverse attenuation gives exactly 0.5 and the
+    // pan is centered, so both output channels are the source scaled by 0.5.
+    const emitter = try scene.createEntity("emitter", null);
+    try scene.addComponent(emitter, components.Transform{ .position = .{ 0, 0, -2 } });
+    try scene.addComponent(emitter, audio.AudioSource{
+        .playing = true,
+        .looping = true,
+        .attenuation = .{ .model = .inverse, .min_distance = 1, .max_distance = 100 },
+    });
+
+    const stats = try system.update(&scene, audio.Listener{}, &clips);
+    try testing.expectEqual(@as(usize, 1), stats.started);
+    const voice = system.voiceFor(emitter).?;
+    try testing.expect(mixer.isLive(voice));
+
+    const out = try gpa.alloc(f32, view.frames * 2);
+    defer gpa.free(out);
+    _ = try mixer.render(out);
+    for (0..view.frames) |frame| {
+        const expected = samples[frame] * 0.5;
+        try testing.expectEqual(expected, out[frame * 2]);
+        try testing.expectEqual(expected, out[frame * 2 + 1]);
+    }
+
+    // Moving the emitter to the listener's left at 4 units quarters the gain and
+    // pans hard left, all driven by the scene transform.
+    scene.getComponent(components.Transform, emitter).?.position = .{ -4, 0, 0 };
+    _ = try system.update(&scene, audio.Listener{}, &clips);
+    try mixer.seek(voice, 0);
+    _ = try mixer.render(out);
+    for (0..view.frames) |frame| {
+        try testing.expectEqual(samples[frame] * 0.25, out[frame * 2]);
+        try testing.expectEqual(@as(f32, 0), out[frame * 2 + 1]);
+    }
+
+    // Clearing the transport flag silences the emitter on the next update.
+    scene.getComponent(audio.AudioSource, emitter).?.playing = false;
+    const stopped = try system.update(&scene, audio.Listener{}, &clips);
+    try testing.expectEqual(@as(usize, 1), stopped.stopped);
+    const silence = try mixer.render(out);
+    try testing.expectEqual(@as(f32, 0), silence.peak);
 }

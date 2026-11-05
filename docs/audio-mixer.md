@@ -289,8 +289,10 @@ voices** into a 512-frame stereo buffer at 48 kHz (10.7 ms of audio per render):
 - **No device backend.** Nothing here opens an audio device; `render` fills a
   buffer and `toPcm16` prepares it. ALSA/WASAPI/CoreAudio backends, the callback
   thread and the command queue from the game thread are planned.
-- **No 3D audio**: no listener, distance attenuation, Doppler or HRTF. Stereo pan
-  only.
+- **No spatialization inside the mixer**: distance attenuation, listener-relative
+  panning and Doppler live one layer up, in `corex.audio.spatial` /
+  `AudioSystem` (see [audio-spatial.md](audio-spatial.md)), which feed this
+  mixer's gain/pan/pitch. There is no HRTF or binaural rendering anywhere yet.
 - **No effects/DSP**: no filters, reverb, compression or per-bus inserts.
 - **Linear resampling only** — no band-limited (polyphase/sinc) conversion, so
   large downsampling ratios can alias.
@@ -300,11 +302,14 @@ voices** into a 512-frame stereo buffer at 48 kHz (10.7 ms of audio per render):
 - **No loop points**: `smpl`/`cue ` markers are not carried by `CXAW` yet, so
   looping is whole-clip only.
 - **Mono/stereo output only**; multichannel output layouts are not implemented.
-- Not wired into startup, the scene system or an `AudioSource` component yet; it
-  is an independent public API, like the render extraction layer.
+- The scene bridge **is** implemented one layer up (`AudioSource` +
+  `AudioSystem`, see [audio-spatial.md](audio-spatial.md)); the mixer itself
+  remains scene-agnostic. Neither is wired into startup or the frame loop yet —
+  the caller drives them, like the render extraction layer.
 
 ## Related
 
+- Spatial audio and scene integration: [audio-spatial.md](audio-spatial.md)
 - Audio import / `CXAW`: [asset-audio.md](asset-audio.md)
 - Import and cache: [asset-import.md](asset-import.md)
 - Render extraction (the same device-independent pattern): [render-extraction.md](render-extraction.md)

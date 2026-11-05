@@ -13,6 +13,14 @@
 //! mixer itself does not import the asset layer, so the two stay independently
 //! testable and loosely coupled.
 //!
+//! Two layers sit on top of the mixer:
+//! - `spatial` is pure math (listener basis, distance attenuation, azimuth pan,
+//!   Doppler, 2D/3D blend) with no mixer or ECS dependency.
+//! - `system` bridges a scene to the mixer: `AudioSource` is a plain-data
+//!   component and `AudioSystem.update` reconciles emitters into voices using
+//!   the scene's world-transform snapshot. Coupling is one-way — the mixer and
+//!   the scene know nothing about it. See `docs/audio-spatial.md`.
+//!
 //! Example:
 //! ```zig
 //! const corex = @import("corex");
@@ -36,7 +44,8 @@
 //! ```
 //!
 //! See `docs/audio-mixer.md` for the mixing contract, channel/pan rules,
-//! guarantees and limitations.
+//! guarantees and limitations, and `docs/audio-spatial.md` for the spatial layer
+//! and the scene bridge.
 
 const std = @import("std");
 
@@ -44,6 +53,10 @@ const std = @import("std");
 pub const clip = @import("audio/clip.zig");
 /// The voice pool, buses and the allocation-free mixing core.
 pub const mixer = @import("audio/mixer.zig");
+/// Spatialization math: listener basis, distance attenuation, pan and Doppler.
+pub const spatial = @import("audio/spatial.zig");
+/// Scene-driven audio: the `AudioSource` component and the voice reconciler.
+pub const system = @import("audio/system.zig");
 
 pub const Mixer = mixer.Mixer;
 pub const VoiceHandle = mixer.VoiceHandle;
@@ -51,6 +64,20 @@ pub const State = mixer.State;
 pub const Config = mixer.Config;
 pub const PlayOptions = mixer.PlayOptions;
 pub const RenderStats = mixer.RenderStats;
+
+pub const AudioSource = system.AudioSource;
+pub const AudioSystem = system.AudioSystem;
+pub const AudioSystemConfig = system.Config;
+pub const AudioUpdateStats = system.Stats;
+
+pub const Listener = spatial.Listener;
+pub const Attenuation = spatial.Attenuation;
+pub const Doppler = spatial.Doppler;
+pub const SpatialParams = spatial.Params;
+pub const SpatialResult = spatial.SpatialResult;
+pub const spatialize = spatial.spatialize;
+pub const dopplerScale = spatial.dopplerScale;
+pub const panFor = spatial.panFor;
 
 pub const Clip = clip.Clip;
 pub const ChannelMap = clip.ChannelMap;
@@ -66,4 +93,6 @@ test {
     std.testing.refAllDecls(@This());
     _ = clip;
     _ = mixer;
+    _ = spatial;
+    _ = system;
 }
