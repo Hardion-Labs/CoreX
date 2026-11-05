@@ -29,7 +29,7 @@ control, and maintainable code.
 > propagation, reusable single-root prefabs) and the asset import
 > pipeline + content-addressed cache (raw/text/json/scene importers, PNG/BMP/TGA/QOI
 > texture decoders over a dependency-free DEFLATE/zlib inflater, OBJ mesh decoder,
-> atomic verified storage, parallel import over
+> WAV audio decoder, atomic verified storage, parallel import over
 > the job system, mark-and-sweep GC, change detection with incremental re-import),
 > and the backend-independent render extraction
 > layer (camera math, frustum culling, sorted draw lists) are implemented and tested. The larger
@@ -245,8 +245,10 @@ normalization), JSON (strict validation + lossless minification) and scenes
 (validated and canonicalized via the scene system). Texture sources in **PNG,
 BMP, TGA and QOI** are decoded to RGBA8 and stored as a self-describing `CXTX`
 artifact, and **OBJ** meshes are decoded to indexed triangle meshes stored as a
-`CXMH` artifact; other binary formats (JPEG/audio, glTF/FBX) still import as
-`raw` until decoders exist.
+`CXMH` artifact, and **WAV** audio (uncompressed PCM 8/16/24/32-bit and IEEE
+float32) is decoded to interleaved float32 stored as a `CXAW` artifact; other
+binary formats (JPEG, compressed audio, glTF/FBX) still import as `raw` until
+decoders exist.
 
 PNG support covers every non-interlaced color type and bit depth (1/2/4/8/16),
 all five row filters, palette and color-key transparency, and multi-chunk IDAT,
@@ -306,7 +308,9 @@ single-threaded fallback. The cache format, importer contract and limits are
 documented in [`docs/asset-import.md`](docs/asset-import.md); the texture
 decoders and `CXTX` artifact are documented in
 [`docs/asset-decoders.md`](docs/asset-decoders.md); the OBJ mesh importer and
-`CXMH` artifact are documented in [`docs/mesh-import.md`](docs/mesh-import.md).
+`CXMH` artifact are documented in [`docs/mesh-import.md`](docs/mesh-import.md); the
+WAV audio importer and `CXAW` artifact are documented in
+[`docs/asset-audio.md`](docs/asset-audio.md).
 
 ## Render
 
@@ -349,6 +353,7 @@ CoreX/
 │   ├── asset-change-detection.md # Change detection + incremental import (hot-reload)
 │   ├── asset-decoders.md       # Image decoders (PNG/BMP/TGA/QOI) + CXTX artifact
 │   ├── mesh-import.md          # OBJ mesh importer + CXMH artifact
+│   ├── asset-audio.md          # WAV audio importer + CXAW artifact
 │   ├── launch-contract.md      # Stable startup contract (CLI, exit codes)
 │   ├── project-format.md       # .corex manifest format
 │   ├── scene-format.md         # Versioned .scene format
@@ -401,7 +406,9 @@ Indicative; subject to change as technical decisions are validated.
 - [x] Asset cache garbage collection (mark-and-sweep of orphan entries).
 - [x] Asset change detection + incremental import (hot-reload foundation).
 - [x] Mesh decoder (OBJ → indexed triangle mesh, `CXMH` artifact).
-- [ ] Asset decoders (JPEG/audio, other model formats), Adam7 PNG.
+- [x] Audio decoder (WAV/PCM + IEEE float32 → interleaved f32 `CXAW` artifact).
+- [ ] Asset decoders (JPEG, compressed audio, other model formats), Adam7 PNG.
+- [ ] Audio playback (device backend, mixer, voices/buses, streaming).
 - [ ] Hot-reload event watcher (inotify/FSEvents), dependency graph, startup/editor integration.
 - [x] Backend-independent render extraction (camera, frustum culling, sorted draw lists).
 - [ ] Renderer Low / Medium GPU backends; Advanced contract.

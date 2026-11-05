@@ -5,7 +5,9 @@
 //! the import pipeline (`assets/pipeline.zig`) and change detection
 //! (`assets/changes.zig`, the hot-reload foundation). It also registers the
 //! engine's scene importer, which reuses the scene system to validate and
-//! canonicalize `.scene` documents at import time.
+//! canonicalize `.scene` documents at import time, and the format decoders:
+//! textures (PNG/BMP/TGA/QOI -> `CXTX`), meshes (OBJ -> `CXMH`) and audio
+//! (WAV -> `CXAW`).
 //!
 //! Example:
 //! ```zig
@@ -50,6 +52,8 @@ pub const png = @import("assets/png.zig");
 pub const texture = @import("assets/texture.zig");
 /// Engine-ready `CXMH` mesh artifact and the OBJ mesh importer.
 pub const mesh = @import("assets/mesh.zig");
+/// WAV audio decoder and the engine-ready `CXAW` audio artifact.
+pub const audio = @import("assets/audio.zig");
 
 const scene_mod = @import("scene.zig");
 
@@ -73,6 +77,8 @@ pub const Image = image.Image;
 pub const Texture = texture.Texture;
 pub const Mesh = mesh.Mesh;
 pub const MeshView = mesh.MeshView;
+pub const Audio = audio.Audio;
+pub const AudioView = audio.AudioView;
 
 /// Scene importer: validate a `.scene` document with the scene system and
 /// re-serialize it canonically (deterministic, sorted by stable ID). Invalid
@@ -108,15 +114,15 @@ pub fn importPrefab(gpa: std.mem.Allocator, source: []const u8) ImportError![]u8
 
 pub const prefab_importer = Importer{ .id = "prefab", .version = 1, .importFn = importPrefab };
 
-const engine_bindings = texture.bindings ++ mesh.bindings ++ [_]Registry.Binding{
+const engine_bindings = texture.bindings ++ mesh.bindings ++ audio.bindings ++ [_]Registry.Binding{
     .{ .extensions = &[_][]const u8{ ".scene", ".corexscene" }, .importer = scene_importer },
     .{ .extensions = &[_][]const u8{ ".prefab", ".corexprefab" }, .importer = prefab_importer },
 } ++ importer.builtin_bindings;
 
 /// The engine's default import registry: texture (PNG/BMP/TGA/QOI) + mesh (OBJ)
-/// + scene + prefab + JSON + text importers, with `raw` as the fallback for
-/// binary/unknown extensions (e.g. JPEG/audio and other model formats, which have
-/// no decoder yet).
+/// + audio (WAV) + scene + prefab + JSON + text importers, with `raw` as the
+/// fallback for binary/unknown extensions (e.g. JPEG, compressed audio and other
+/// model formats, which have no decoder yet).
 pub fn engineRegistry() Registry {
     return .{ .bindings = &engine_bindings, .fallback = importer.raw_importer };
 }
@@ -133,6 +139,7 @@ test {
     _ = png;
     _ = texture;
     _ = mesh;
+    _ = audio;
 }
 
 test "scene importer canonicalizes a valid scene" {
@@ -194,11 +201,14 @@ test "engine registry selects importers by extension" {
     try std.testing.expectEqualStrings("png", reg.select(".PNG").id);
     try std.testing.expectEqualStrings("obj", reg.select(".obj").id);
     try std.testing.expectEqualStrings("obj", reg.select(".OBJ").id);
+    try std.testing.expectEqualStrings("wav", reg.select(".wav").id);
+    try std.testing.expectEqualStrings("wav", reg.select(".WAV").id);
     try std.testing.expectEqualStrings("json", reg.select(".json").id);
     try std.testing.expectEqualStrings("text", reg.select(".lua").id);
     // Formats without a decoder yet still fall back to a verbatim raw copy.
     try std.testing.expectEqualStrings("raw", reg.select(".jpg").id);
-    try std.testing.expectEqualStrings("raw", reg.select(".wav").id);
+    try std.testing.expectEqualStrings("raw", reg.select(".ogg").id);
+    try std.testing.expectEqualStrings("raw", reg.select(".mp3").id);
     try std.testing.expectEqualStrings("raw", reg.select(".gltf").id);
 }
 
@@ -632,4 +642,72 @@ test "hot-reload: detect, re-import only changes, then gc with the full live set
     defer again.deinit();
     try std.testing.expectEqual(@as(usize, 0), again.imported);
     try std.testing.expectEqual(@as(usize, 3), again.cached);
+}
+
+test "pipeline imports a WAV to a CXAW artifact and hits the cache on re-run" {
+    const vectors = @import("assets/audio_vectors.zig");
+    const gpa = std.testing.allocator;
+    var selected: ?vectors.Wav = null;
+    for (vectors.valid) |vector| {
+        if (std.mem.eql(u8, vector.name, "pcm16_stereo")) selected = vector;
+    }
+    const vector = selected orelse return error.MissingVector;
+    const source = try gpa.alloc(u8, vector.wav_hex.len / 2);
+    defer gpa.free(source);
+    _ = try std.fmt.hexToBytes(source, vector.wav_hex);
+    const expected = try gpa.alloc(u8, vector.f32_hex.len / 2);
+    defer gpa.free(expected);
+    _ = try std.fmt.hexToBytes(expected, vector.f32_hex);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.createDirPath(io, "assets");
+    try tmp.dir.createDirPath(io, "cache");
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/theme.wav", .data = source });
+
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buf);
+    const root_path = buf[0..n];
+    var idx = try indexDirectories(gpa, io, root_path, &.{"assets"});
+    defer idx.deinit();
+    var root = try Io.Dir.openDirAbsolute(io, root_path, .{});
+    defer root.close(io);
+    var cache_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const cache_path = try std.fmt.bufPrint(&cache_buf, "{s}/cache", .{root_path});
+    var store = try Cache.open(io, cache_path);
+    defer store.deinit();
+
+    var report = try pipeline.runSequential(gpa, io, root, idx, &store, .{
+        .registry = engineRegistry(),
+    });
+    defer report.deinit();
+    try std.testing.expectEqual(@as(usize, 1), report.imported);
+    try std.testing.expectEqualStrings("wav", report.entries[0].importer_id.?);
+    try std.testing.expectEqual(AssetKind.audio, report.entries[0].kind);
+
+    const key = report.entries[0].key.?;
+    const artifact = (try store.get(gpa, key)).?;
+    defer gpa.free(artifact);
+    const view = try audio.parse(artifact);
+    try std.testing.expectEqual(vector.channels, view.channels);
+    try std.testing.expectEqual(vector.sample_rate, view.sample_rate);
+    try std.testing.expectEqual(vector.frames, view.frames);
+    try std.testing.expectEqualSlices(u8, expected, view.sample_bytes);
+
+    // The snapshot's derived key must match what the pipeline stored, so an
+    // incremental hot-reload pass can GC audio assets correctly too.
+    var snap = try changes.capture(gpa, io, root, idx, .{});
+    defer snap.deinit();
+    const keys = try snap.cacheKeys(gpa, engineRegistry(), "");
+    defer gpa.free(keys);
+    try std.testing.expectEqual(@as(usize, 1), keys.len);
+    try std.testing.expectEqualSlices(u8, &key, &keys[0]);
+
+    var second = try pipeline.runSequential(gpa, io, root, idx, &store, .{
+        .registry = engineRegistry(),
+    });
+    defer second.deinit();
+    try std.testing.expectEqual(@as(usize, 0), second.imported);
+    try std.testing.expectEqual(@as(usize, 1), second.cached);
 }
