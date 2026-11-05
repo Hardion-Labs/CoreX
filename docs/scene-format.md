@@ -69,9 +69,12 @@ campos são opcionais e usam os valores identidade quando ausentes:
 | `rotation` | `[f32, f32, f32, f32]` | `[0, 0, 0, 1]` | Quaternion `[x, y, z, w]`. |
 | `scale` | `[f32, f32, f32]` | `[1, 1, 1]` | Escala local. |
 
-Valores não finitos (NaN/Infinity) são rejeitados. A propagação de transform
-world-space é uma extensão futura do sistema de cenas/renderização; o formato
-armazena o transform local autoral.
+Valores não finitos (NaN/Infinity) são rejeitados. O formato armazena apenas o
+transform **local** autoral (TRS). A propagação para **world-space** é calculada
+em runtime por `Scene.computeWorldTransforms` / `Scene.worldMatrix` e **nunca** é
+serializada no arquivo `.scene` — manter o formato local evita redundância e
+preserva o contrato `format_version = 1`. Ver
+[scene-transforms.md](scene-transforms.md) para a matemática, a API e as garantias.
 
 ## Regras de validação
 
@@ -113,3 +116,4 @@ uma entidade reparenta seus filhos diretos para o pai dela (ou para a raiz).
 - Formato de projeto: [project-format.md](project-format.md)
 - Versionamento: [versioning.md](versioning.md)
 - Contrato de inicialização: [launch-contract.md](launch-contract.md)
+- Transforms world-space: [scene-transforms.md](scene-transforms.md)

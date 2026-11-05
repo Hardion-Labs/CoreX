@@ -1,0 +1,288 @@
+//! Transform math for the scene system: column-major 4x4 matrices and
+//! quaternion helpers used to propagate local transforms into world space.
+//!
+//! Conventions:
+//! - `Mat4` is a column-major `[16]f32`; element (row r, column c) is `m[c*4+r]`.
+//!   This matches the layout GPUs expect, so the renderer can upload it directly.
+//! - A `Transform` is local TRS (translation, rotation quaternion `[x,y,z,w]`,
+//!   scale). `fromTransform` builds `M = T * R * S`.
+//! - World composition is `world_child = world_parent * local_child`, which is
+//!   fully correct under non-uniform scale and rotation (no shear is lost,
+//!   unlike a naive component-wise TRS compose).
+//!
+//! This module is pure math (depends only on `std` and the `Transform`
+//! component). It is reusable by the renderer/editor and is independently
+//! testable.
+
+const std = @import("std");
+const components = @import("components.zig");
+
+pub const Transform = components.Transform;
+pub const Vec3 = [3]f32;
+pub const Quat = [4]f32;
+/// Column-major 4x4 matrix. Element (row r, col c) = `m[c * 4 + r]`.
+pub const Mat4 = [16]f32;
+
+pub const identity_quat: Quat = .{ 0, 0, 0, 1 };
+
+/// The identity matrix.
+pub fn identity() Mat4 {
+    return .{
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1,
+    };
+}
+
+/// Matrix product `a * b` (column-major).
+pub fn multiply(a: Mat4, b: Mat4) Mat4 {
+    var out: Mat4 = undefined;
+    inline for (0..4) |c| {
+        inline for (0..4) |r| {
+            var sum: f32 = 0;
+            inline for (0..4) |k| {
+                sum += a[k * 4 + r] * b[c * 4 + k];
+            }
+            out[c * 4 + r] = sum;
+        }
+    }
+    return out;
+}
+
+/// Build a local TRS matrix `T * R * S` from a `Transform`. The rotation
+/// quaternion is normalized first; a zero-length quaternion becomes identity.
+pub fn fromTransform(t: Transform) Mat4 {
+    const q = quatNormalize(t.rotation);
+    const x = q[0];
+    const y = q[1];
+    const z = q[2];
+    const w = q[3];
+
+    const x2 = x + x;
+    const y2 = y + y;
+    const z2 = z + z;
+    const xx = x * x2;
+    const xy = x * y2;
+    const xz = x * z2;
+    const yy = y * y2;
+    const yz = y * z2;
+    const zz = z * z2;
+    const wx = w * x2;
+    const wy = w * y2;
+    const wz = w * z2;
+
+    const sx = t.scale[0];
+    const sy = t.scale[1];
+    const sz = t.scale[2];
+
+    return .{
+        (1 - (yy + zz)) * sx, (xy + wz) * sx,       (xz - wy) * sx,       0,
+        (xy - wz) * sy,       (1 - (xx + zz)) * sy, (yz + wx) * sy,       0,
+        (xz + wy) * sz,       (yz - wx) * sz,       (1 - (xx + yy)) * sz, 0,
+        t.position[0],        t.position[1],        t.position[2],        1,
+    };
+}
+
+/// Transform a point (applies rotation, scale and translation).
+pub fn transformPoint(m: Mat4, p: Vec3) Vec3 {
+    return .{
+        m[0] * p[0] + m[4] * p[1] + m[8] * p[2] + m[12],
+        m[1] * p[0] + m[5] * p[1] + m[9] * p[2] + m[13],
+        m[2] * p[0] + m[6] * p[1] + m[10] * p[2] + m[14],
+    };
+}
+
+/// Transform a direction vector (rotation and scale only; no translation).
+/// Note: for normals under non-uniform scale, use the inverse-transpose instead.
+pub fn transformDirection(m: Mat4, d: Vec3) Vec3 {
+    return .{
+        m[0] * d[0] + m[4] * d[1] + m[8] * d[2],
+        m[1] * d[0] + m[5] * d[1] + m[9] * d[2],
+        m[2] * d[0] + m[6] * d[1] + m[10] * d[2],
+    };
+}
+
+/// Component-wise approximate equality (absolute epsilon).
+pub fn approxEqual(a: Mat4, b: Mat4, epsilon: f32) bool {
+    inline for (0..16) |i| {
+        if (@abs(a[i] - b[i]) > epsilon) return false;
+    }
+    return true;
+}
+
+// --- quaternion helpers ----------------------------------------------------
+
+/// Normalize a quaternion; a near-zero quaternion becomes identity.
+pub fn quatNormalize(q: Quat) Quat {
+    const len = @sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+    if (len < 1e-8) return identity_quat;
+    const inv = 1.0 / len;
+    return .{ q[0] * inv, q[1] * inv, q[2] * inv, q[3] * inv };
+}
+
+/// Hamilton product `a * b`.
+pub fn quatMultiply(a: Quat, b: Quat) Quat {
+    return .{
+        a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+        a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+        a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+        a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
+    };
+}
+
+/// Rotate a vector by a quaternion (normalized internally).
+pub fn quatRotateVec3(q: Quat, v: Vec3) Vec3 {
+    const n = quatNormalize(q);
+    const u = Vec3{ n[0], n[1], n[2] };
+    const t = cross(u, v);
+    const tx = 2 * t[0];
+    const ty = 2 * t[1];
+    const tz = 2 * t[2];
+    const c = cross(u, .{ tx, ty, tz });
+    return .{
+        v[0] + n[3] * tx + c[0],
+        v[1] + n[3] * ty + c[1],
+        v[2] + n[3] * tz + c[2],
+    };
+}
+
+/// Unit quaternion for a rotation of `angle` radians about `axis` (normalized
+/// internally; a zero axis yields identity).
+pub fn quatFromAxisAngle(axis: Vec3, angle: f32) Quat {
+    const len = @sqrt(axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]);
+    if (len < 1e-8) return identity_quat;
+    const inv = 1.0 / len;
+    const half = angle * 0.5;
+    const s = @sin(half);
+    return .{ axis[0] * inv * s, axis[1] * inv * s, axis[2] * inv * s, @cos(half) };
+}
+
+fn cross(a: Vec3, b: Vec3) Vec3 {
+    return .{
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    };
+}
+
+// --- tests -----------------------------------------------------------------
+
+const testing = std.testing;
+const eps = 1e-5;
+
+fn expectVec3(expected: Vec3, actual: Vec3) !void {
+    inline for (0..3) |i| {
+        try testing.expectApproxEqAbs(expected[i], actual[i], eps);
+    }
+}
+
+test "identity matrix is the multiplicative identity" {
+    const i = identity();
+    const m = fromTransform(.{ .position = .{ 1, 2, 3 }, .scale = .{ 2, 3, 4 } });
+    try testing.expect(approxEqual(multiply(i, m), m, eps));
+    try testing.expect(approxEqual(multiply(m, i), m, eps));
+}
+
+test "fromTransform identity yields identity matrix" {
+    try testing.expect(approxEqual(fromTransform(Transform.identity), identity(), eps));
+}
+
+test "fromTransform translation moves a point" {
+    const m = fromTransform(.{ .position = .{ 5, -2, 7 } });
+    try expectVec3(.{ 5, -2, 7 }, transformPoint(m, .{ 0, 0, 0 }));
+    try expectVec3(.{ 6, 0, 10 }, transformPoint(m, .{ 1, 2, 3 }));
+}
+
+test "fromTransform scale scales a point and direction" {
+    const m = fromTransform(.{ .scale = .{ 2, 3, 4 } });
+    try expectVec3(.{ 2, 6, 12 }, transformPoint(m, .{ 1, 2, 3 }));
+    try expectVec3(.{ 2, 6, 12 }, transformDirection(m, .{ 1, 2, 3 }));
+}
+
+test "fromTransform rotation 90deg about Z maps X to Y" {
+    const q = quatFromAxisAngle(.{ 0, 0, 1 }, std.math.pi / 2.0);
+    const m = fromTransform(.{ .rotation = q });
+    try expectVec3(.{ 0, 1, 0 }, transformPoint(m, .{ 1, 0, 0 }));
+    try expectVec3(.{ -1, 0, 0 }, transformPoint(m, .{ 0, 1, 0 }));
+}
+
+test "transformDirection ignores translation" {
+    const m = fromTransform(.{ .position = .{ 100, 100, 100 }, .scale = .{ 2, 2, 2 } });
+    try expectVec3(.{ 2, 0, 0 }, transformDirection(m, .{ 1, 0, 0 }));
+}
+
+test "multiply composes translation then scale correctly" {
+    // parent scales by 2, child translates by (1,0,0): world point of child
+    // origin = parent * child applied to (0,0,0) = (2,0,0).
+    const parent = fromTransform(.{ .scale = .{ 2, 2, 2 } });
+    const child = fromTransform(.{ .position = .{ 1, 0, 0 } });
+    const world = multiply(parent, child);
+    try expectVec3(.{ 2, 0, 0 }, transformPoint(world, .{ 0, 0, 0 }));
+    try expectVec3(.{ 4, 0, 0 }, transformPoint(world, .{ 1, 0, 0 }));
+}
+
+test "multiply is associative" {
+    const a = fromTransform(.{ .position = .{ 1, 2, 3 }, .rotation = quatFromAxisAngle(.{ 0, 1, 0 }, 0.7) });
+    const b = fromTransform(.{ .scale = .{ 2, 1, 3 }, .position = .{ -1, 0, 4 } });
+    const c = fromTransform(.{ .rotation = quatFromAxisAngle(.{ 1, 0, 0 }, -0.4), .position = .{ 0, 5, 0 } });
+    try testing.expect(approxEqual(multiply(multiply(a, b), c), multiply(a, multiply(b, c)), 1e-4));
+}
+
+test "fromTransform applies scale before rotation (M = T * R * S)" {
+    // Scale X by 2 in local space, then rotate 45deg about Z. The local X axis
+    // (1,0,0) becomes (2,0,0) after scale, then R*(2,0,0) = (2cos45, 2sin45, 0).
+    const q = quatFromAxisAngle(.{ 0, 0, 1 }, std.math.pi / 4.0);
+    const m = fromTransform(.{ .rotation = q, .scale = .{ 2, 1, 1 } });
+    const p = transformPoint(m, .{ 1, 0, 0 });
+    try expectVec3(.{ 2 * @cos(std.math.pi / 4.0), 2 * @sin(std.math.pi / 4.0), 0 }, p);
+}
+
+test "matrix composition preserves shear under rotated non-uniform scale" {
+    // A parent rotated 45deg about Z with non-uniform scale, composed with a
+    // child translation, must agree with an independent sequential point
+    // transform (a naive component-wise TRS compose would lose the shear).
+    const q = quatFromAxisAngle(.{ 0, 0, 1 }, std.math.pi / 4.0);
+    const parent = fromTransform(.{ .rotation = q, .scale = .{ 2, 1, 1 } });
+    const child = fromTransform(.{ .position = .{ 1, 1, 0 } });
+    const world = multiply(parent, child);
+    // child origin (0,0,0) -> child local (1,1,0) -> parent R*S*(1,1,0).
+    const expected = transformPoint(parent, .{ 1, 1, 0 });
+    try expectVec3(expected, transformPoint(world, .{ 0, 0, 0 }));
+    // And a point offset in the child agrees with sequential application.
+    const expected2 = transformPoint(parent, transformPoint(child, .{ 0.5, -0.25, 2 }));
+    try expectVec3(expected2, transformPoint(world, .{ 0.5, -0.25, 2 }));
+}
+
+test "quatNormalize scales to unit length and handles zero" {
+    const n = quatNormalize(.{ 0, 0, 0, 5 });
+    try testing.expectApproxEqAbs(@as(f32, 1), n[3], eps);
+    const z = quatNormalize(.{ 0, 0, 0, 0 });
+    try testing.expectEqualSlices(f32, &identity_quat, &z);
+}
+
+test "quatMultiply by identity is unchanged" {
+    const q = quatFromAxisAngle(.{ 0, 1, 0 }, 1.1);
+    const r = quatMultiply(q, identity_quat);
+    try testing.expectApproxEqAbs(q[0], r[0], eps);
+    try testing.expectApproxEqAbs(q[3], r[3], eps);
+}
+
+test "quatRotateVec3 matches matrix rotation" {
+    const q = quatFromAxisAngle(.{ 0, 0, 1 }, std.math.pi / 2.0);
+    try expectVec3(.{ 0, 1, 0 }, quatRotateVec3(q, .{ 1, 0, 0 }));
+    const m = fromTransform(.{ .rotation = q });
+    try expectVec3(transformPoint(m, .{ 1, 0, 0 }), quatRotateVec3(q, .{ 1, 0, 0 }));
+}
+
+test "quatFromAxisAngle zero axis yields identity" {
+    try testing.expectEqualSlices(f32, &identity_quat, &quatFromAxisAngle(.{ 0, 0, 0 }, 1.0));
+}
+
+test "fromTransform normalizes a non-unit quaternion" {
+    const q = quatFromAxisAngle(.{ 0, 0, 1 }, std.math.pi / 2.0);
+    const scaled = Quat{ q[0] * 3, q[1] * 3, q[2] * 3, q[3] * 3 };
+    const a = fromTransform(.{ .rotation = q });
+    const b = fromTransform(.{ .rotation = scaled });
+    try testing.expect(approxEqual(a, b, eps));
+}

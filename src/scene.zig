@@ -20,10 +20,16 @@ const std = @import("std");
 
 pub const scene = @import("scene/scene.zig");
 pub const components = @import("scene/components.zig");
+/// Transform math (column-major Mat4 + quaternion helpers) used to propagate
+/// local transforms into world space. Reusable by the renderer/editor.
+pub const transform = @import("scene/transform.zig");
 
 pub const Scene = scene.Scene;
 pub const Component = scene.Component;
 pub const Transform = components.Transform;
+pub const Mat4 = transform.Mat4;
+pub const Vec3 = transform.Vec3;
+pub const Quat = transform.Quat;
 pub const Error = scene.Error;
 pub const format_version = scene.format_version;
 pub const max_scene_bytes = scene.max_scene_bytes;
