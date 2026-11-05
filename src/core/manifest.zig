@@ -7,6 +7,7 @@
 const std = @import("std");
 const version = @import("version.zig");
 const paths = @import("paths.zig");
+const validation = @import("validation.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -78,7 +79,7 @@ pub fn parse(gpa: Allocator, bytes: []const u8) ParseError!Manifest {
     const raw = parsed.value;
 
     if (raw.format_version != version.manifest_format) return error.UnsupportedFormatVersion;
-    try validateName(raw.name);
+    validation.validateDisplayName(raw.name) catch return error.InvalidName;
     const eng = version.Version.parse(raw.engine_version) catch return error.InvalidEngineVersion;
 
     if (raw.initial_scene) |scene| try validateRelPath(scene);
@@ -109,13 +110,6 @@ fn dupePaths(a: Allocator, dir_paths: []const []const u8) ParseError![]const []c
         out[i] = try a.dupe(u8, p);
     }
     return out;
-}
-
-fn validateName(name: []const u8) ParseError!void {
-    if (name.len == 0 or name.len > 128) return error.InvalidName;
-    for (name) |c| {
-        if (c < 0x20 or c == '/' or c == '\\') return error.InvalidName;
-    }
 }
 
 /// Reject absolute paths, traversal (`..`), self-reference (`.`), empty

@@ -55,6 +55,8 @@ Formatos de arquivo (manifesto `.corex`, cenas, assets, export templates) têm
 versão própria, independente da versão da engine:
 
 - O manifesto `.corex` usa `format_version` (atualmente `1`).
+- Cenas `.scene` usam `format_version` próprio (atualmente `1`), independente do
+  manifesto e da versão da engine ([scene-format.md](scene-format.md)).
 - Versões de formato desconhecidas são rejeitadas.
 - Mudanças incompatíveis de formato incrementam a versão do formato.
 
@@ -65,6 +67,7 @@ Fazem parte do contrato estável de integração:
 - Os argumentos de linha de comando e seus significados ([launch-contract.md](launch-contract.md)).
 - Os códigos de saída ([launch-contract.md](launch-contract.md)).
 - O formato do manifesto `.corex` e sua `format_version` ([project-format.md](project-format.md)).
+- O formato de cena `.scene` e sua `format_version` ([scene-format.md](scene-format.md)).
 - A política de compatibilidade deste documento.
 
 Mudanças nesses contratos exigem incremento de versão apropriado e nota no
