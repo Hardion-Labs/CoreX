@@ -29,4 +29,17 @@ pub fn build(b: *std.Build) void {
 
     const tests = b.addTest(.{ .root_module = corex_module });
     b.step("test", "Run CoreXEngine tests").dependOn(&b.addRunArtifact(tests).step);
+
+    // Optional microbenchmark for the rasterizer (best run with
+    // `-Doptimize=ReleaseFast`). Not executed by CI or `zig build`.
+    const bench = b.addExecutable(.{
+        .name = "bench-raster",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/bench_raster.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "corex", .module = corex_module }},
+        }),
+    });
+    b.step("bench", "Run the rasterizer benchmark (use -Doptimize=ReleaseFast)").dependOn(&b.addRunArtifact(bench).step);
 }
