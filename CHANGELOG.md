@@ -8,6 +8,32 @@ declared yet.
 
 ### Added
 
+- Edge antialiasing in the software rasterizer (`Options.antialias`,
+  `corex.render.Antialias` = `none`/`edge`, `docs/render-raster.md`): `edge`
+  supersamples each pixel with a 4x4 grid of 16 **exact integer** sub-samples at
+  offsets 2/6/10/14 sixteenths, evaluated from the same `i64` edge functions as the
+  one-sample path and with the top-left fill rule applied to the sub-samples — so
+  two triangles sharing an edge partition its samples (coverage sums to 16, no
+  seam) and coverage stays bit-exactly reproducible in every optimization mode.
+  Coverage is accumulated **per draw command** in `AccumBuffers` (per-fragment
+  compositing was rejected: it seams on shared edges) and resolved once per touched
+  pixel, with the fraction folded into the source alpha of a straight-alpha
+  source-over; fully covered pixels take the un-antialiased path and are
+  byte-identical to it, and partial pixels never write depth but bump the new
+  `Stats.antialiased_pixels`. A pixel provably farther than one sub-sample spacing
+  from every edge takes a two-comparison full/empty path instead of the grid. The
+  scratch is sized from the mesh's conservative screen reach (`reachRect`) and
+  comes from the caller's allocator, so `DrawError` gains `OutOfMemory` and the new
+  `rasterizeAlloc` / `drawMeshAlloc` entry points are the only ones that
+  antialias — `rasterize`, `drawMesh` and `rasterTriangle` force `antialias = .none`
+  and keep their exact previous signatures and behaviour. Verified by area
+  conservation against the shoelace screen area of a slanted quad (167.40 px vs
+  167.04 px, 0.2%), a from-scratch sub-sample cross-check of `coverageCount`, the
+  quad-partition property, byte-identity for grid-aligned geometry, the
+  no-depth-from-partial-pixels rule, the translucent-composite formula,
+  `checkAllAllocationFailures` over the scratch sites, and the four reference
+  corpora (206 cases) staying byte-identical. Benchmark at 1024x1024 (1024 sampled
+  tiles): one sample 27.3 ms, `.edge` 40.9 ms.
 - Framebuffer blending in the software rasterizer (`Options.blend`,
   `corex.render.Blend` = `none`/`alpha`/`premultiplied`/`additive`,
   `docs/render-raster.md`): the shaded fragment is composited with the target as

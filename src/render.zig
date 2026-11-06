@@ -68,6 +68,8 @@ pub const RasterStats = raster.Stats;
 pub const CullMode = raster.CullMode;
 pub const FrontFace = raster.FrontFace;
 pub const rasterize = raster.rasterize;
+pub const rasterizeAlloc = raster.rasterizeAlloc;
+pub const drawMeshAlloc = raster.drawMeshAlloc;
 pub const drawMesh = raster.drawMesh;
 pub const rasterTriangle = raster.rasterTriangle;
 /// RGBA8 texture sampled by the software rasterizer (top-down rows).
@@ -77,6 +79,9 @@ pub const TextureFilter = raster.Filter;
 /// Framebuffer blend mode (`Options.blend`): `none`, `alpha`,
 /// `premultiplied` or `additive`.
 pub const Blend = raster.Blend;
+/// Edge antialiasing mode (`Options.antialias`): `none` (one sample, default)
+/// or `edge` (16 sub-samples per pixel, translucent edge fragments).
+pub const Antialias = raster.Antialias;
 /// Single directional Lambert light for the rasterizer (`Options.light`).
 pub const RasterLight = raster.Light;
 
