@@ -386,7 +386,9 @@ so it is bit-exactly reproducible and shared edges are watertight — no cracks 
 no double-drawn pixels. The pixel path takes no allocator. Materials shade flat or
 sample a borrowed RGBA8 texture with repeat wrap and nearest/bilinear magnification;
 UVs interpolate perspective-correctly and the texel multiplies the material tint.
-Lighting, blending and antialiasing are not implemented yet.
+A single directional Lambert light (`Options.light`) and framebuffer blending
+(`Options.blend`: `.none`, straight-alpha, premultiplied, additive) are
+supported; antialiasing is not implemented yet.
 
 The extraction design and math conventions are documented in
 [`docs/render-extraction.md`](docs/render-extraction.md); the rasterizer, its
@@ -593,7 +595,8 @@ Indicative; subject to change as technical decisions are validated.
 - [x] CPU software rasterizer (fixed-point watertight coverage, depth buffer, textured shading).
 - [x] Rasterizer lighting: single directional Lambert (face normals, CPU reference path).
 - [ ] Renderer Low / Medium GPU backends; Advanced contract.
-- [ ] Rasterizer shading: blending, antialiasing, mipmaps.
+- [x] Rasterizer blending: `.none`, straight-alpha source-over, premultiplied, additive.
+- [ ] Rasterizer shading: antialiasing, mipmaps.
 - [ ] GUI library and graphical editor.
 - [ ] Lua VM and gameplay scripting.
 - [ ] Native Module API loader (C++).
@@ -605,7 +608,9 @@ Indicative; subject to change as technical decisions are validated.
 Before contributing, read [`CONTRIBUTING.md`](CONTRIBUTING.md),
 [`docs/architecture.md`](docs/architecture.md),
 [`docs/development/coding-standards.md`](docs/development/coding-standards.md),
-and [`docs/policies/AI_POLICY.md`](docs/policies/AI_POLICY.md). Keep code in Zig,
+[`docs/policies/AI_POLICY.md`](docs/policies/AI_POLICY.md). For the durable record of
+current progress, decisions, pending items and the next priority task, see
+[`docs/development/progress.md`](docs/development/progress.md). Keep code in Zig,
 minimize dependencies, and include tests for new or changed behavior.
 
 Local checks:
