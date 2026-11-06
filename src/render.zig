@@ -74,6 +74,9 @@ pub const rasterTriangle = raster.rasterTriangle;
 pub const RasterTexture = raster.Texture;
 /// Texture minification filter (`nearest` or `bilinear`).
 pub const TextureFilter = raster.Filter;
+/// Framebuffer blend mode (`Options.blend`): `none`, `alpha`,
+/// `premultiplied` or `additive`.
+pub const Blend = raster.Blend;
 /// Single directional Lambert light for the rasterizer (`Options.light`).
 pub const RasterLight = raster.Light;
 

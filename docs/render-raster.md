@@ -28,7 +28,8 @@ Per triangle, in order:
    material tint or a texture sample (nearest or bilinear, perspective-correct)
    multiplied by that tint. When a light is configured, a per-channel Lambert
    multiplier is applied to the albedo first (RGB only) — see
-   [Lighting](#lighting).
+   [Lighting](#lighting). The fragment is then written as-is (`.blend = .none`,
+   the default) or composited with the target — see [Blending](#blending).
 
 A clipped triangle stays convex, so the resulting polygon (at most nine vertices)
 is covered exactly by a triangle fan. Both clip buffers are fixed 12-slot arrays
@@ -108,7 +109,8 @@ const stats = try R.rasterize(&target, frame.commands, cam.view_projection, reso
 | `Texture` | `width`/`height`, borrowed `pixels` RGBA8 (row-major, top-down), `filter`. `validate()` rejects zero/oversized dims and length mismatches with `InvalidTexture`. |
 | `Filter` | `nearest` or `bilinear`. |
 | `Light` | Directional light for the Lambert path: `direction` (toward the light, world space, normalized internally), `color`, `ambient`. `validate()` rejects malformed lights with `InvalidLight`. |
-| `Options` | `cull` (`.none`/`.back`/`.front`), `front_face`, `depth_test`, `depth_write`, `light` (optional directional Lambert light; beats a `resources.directionalLight()` provider). |
+| `Blend` | `.none` (default, verbatim write), `.alpha` (straight-alpha source-over), `.premultiplied`, `.additive`. |
+| `Options` | `cull` (`.none`/`.back`/`.front`), `front_face`, `depth_test`, `depth_write`, `light` (optional directional Lambert light; beats a `resources.directionalLight()` provider), `blend`. |
 | `Stats` | `skipped_draws`, `submitted`, `clipped`, `culled`, `rasterized`, `pixels`. |
 | `rasterize` | Whole draw list, resolving handles through `resources`. |
 | `drawMesh` | One mesh, one world matrix, one flat RGBA8 tint, optional texture and light. |
@@ -205,6 +207,58 @@ the material tint is the shade color exactly as before.
 Because `resources` is a comptime parameter there is no vtable and no indirect
 call per vertex.
 
+## Blending
+
+`Options.blend` selects how each shaded fragment is combined with what the target
+already holds. `Blend` has four modes:
+
+| Mode | RGB | Use |
+| --- | --- | --- |
+| `.none` (default) | `src` written verbatim | Opaque geometry. Bit-identical to the behaviour before blending existed. |
+| `.alpha` | `(src·sa + (dst·da)·keep) / out.a` | Straight-alpha source-over — the "normal" 2D/UI/transparency compositing mode. |
+| `.premultiplied` | `src·sa + dst·keep` | Compositing into a target that already stores premultiplied RGB. |
+| `.additive` | `dst + src·sa` | Glow, particles, light accumulation. |
+
+Every mode composites alpha the same way, so a transparent destination keeps its
+coverage:
+
+```
+sa = src.a / 255        da = dst.a / 255        keep = 1 - sa
+out.a = sa + da * keep
+```
+
+Each channel is then clamped to `[0, 1]` and quantized **once**:
+`floor(clamp(v, 0, 1) * 255 + 0.5)` — the same single-rounding rule the shading
+path uses. All arithmetic is `f64` with a pinned operation order, so blended
+frames are reproducible bit for bit across Debug, ReleaseSafe and ReleaseFast.
+
+Two degenerate cases are defined rather than left to the FPU:
+
+- `.alpha` with `out.a == 0` (both sides fully transparent) cannot divide out the
+  alpha, so the pixel becomes transparent black `{0, 0, 0, 0}`.
+- A fully transparent source (`sa == 0`) is an exact no-op in every mode: the
+  fragment contributes no RGB, and the surviving alpha, RGB and depth are the
+  destination's. (`.premultiplied` multiplies the fragment by `sa` for exactly
+  this reason.)
+
+Depth is untouched by blending: the depth test and `depth_write` keep their
+independent meanings, so a translucent surface still occludes what is *behind*
+it. There is no depth pre-pass, no order-independent transparency and no
+per-fragment sorting. Correct transparency therefore depends on submission order:
+draw back to front. The extraction layer already provides the sort for this
+(`SortMode.back_to_front`) — the rasterizer does not reorder draws on its own,
+because doing so would require buffering and then sorting every fragment.
+
+```zig
+// Translucent pass: extraction sorted back_to_front, straight-alpha blending.
+var frame = try R.extractDrawList(&scene, cam, .back_to_front, gpa);
+defer frame.deinit();
+const stats = try R.rasterize(&target, frame.commands, cam.view_projection, resources, .{
+    .blend = .alpha,
+    .depth_write = false, // translucent surfaces do not occlude each other
+});
+```
+
 ## Textures
 
 `Texture` is a borrowed RGBA8 buffer — `width * height * 4` bytes, row-major,
@@ -233,8 +287,9 @@ Sampling:
   `top`/`bottom` mix the two columns with `fx`. A single final rounding, never
   intermediate rounding.
 - **Tint:** the sampled texel is multiplied per channel (including alpha) by the
-  material tint: `out = floor(t * tint / 255 + 0.5)`. No premultiply, no blending —
-  alpha is written verbatim.
+  material tint: `out = floor(t * tint / 255 + 0.5)`. No premultiply: the shading
+  result is straight (non-premultiplied) alpha, which is what the `.alpha` blend
+  mode expects — see [Blending](#blending).
 
 Texture and material resolution happen **once per draw command**, before any
 pixel is written: a malformed texture (`validate()` rejects zero dimensions,
@@ -243,7 +298,7 @@ dimensions above `max_dimension`, or a pixel-buffer length mismatch with
 without usable `uvs` skips the command (`skipped_draws`), also before any draw.
 
 Not implemented: mipmaps/LOD selection, anisotropic filtering, sRGB transfer,
-wrap modes other than repeat, or premultiplied alpha. Minified textures will
+or wrap modes other than repeat. Minified textures will
 alias — generate small enough mip images offline. The sampling math is pinned
 to the reference in `tools/gen_raster_texture_vectors.py`; changing any
 expression there requires regenerating
@@ -321,6 +376,23 @@ and the tests will fail loudly until both sides agree bit for bit.
   `lm = ambient + dot * color` with pinned operation order, and clamp only at
   the final byte quantize. Full RGBA8 frames plus coverage bit-match — 670
   covered pixels across the corpus.
+- **49 blend reference frames** in `src/render/raster_blend_vectors.zig`,
+  generated by [`tools/gen_raster_blend_vectors.py`](../tools/gen_raster_blend_vectors.py)
+  (same brute-force coverage). Each case starts from a **non-empty target**, shades
+  one triangle with the flat/textured/Lambert rules above, and composites it with
+  one of the four modes; the Python reference recomputes the blend from first
+  principles in the pinned `f64` order. Full RGBA8 frames plus coverage must match
+  bit for bit — 801 covered pixels across the corpus, covering every mode, opaque
+  and transparent sources and destinations, saturation, and textured/lit sources.
+- **Blending unit tests.** Per-mode math is pinned by hand (half-alpha red over
+  opaque blue gives `{128, 0, 127, 255}` in `.alpha` and `.premultiplied`, and
+  `{128, 0, 255, 255}` in `.additive`); a fully transparent source is an exact
+  no-op in every mode; `.alpha` over a fully transparent destination yields
+  transparent black instead of dividing by zero; alpha accumulates to full
+  coverage over a partly transparent target; `.additive` saturates at 255;
+  a test proves the default `.none` path is byte-identical to the pre-blending
+  write (color *and* depth) for a transparent tint; and `rasterize` applies the
+  mode to every command.
 - **Lighting unit tests.** `Light.validate()` rejects zero-length/non-finite
   directions and negative/non-finite channels (HDR accepted); an invalid light
   fails in `drawMesh` before any draw; a facing-away face renders ambient-only;
@@ -336,6 +408,11 @@ and the tests will fail loudly until both sides agree bit for bit.
   pinned per channel; a 180-degree world rotation faces the quad away from the
   light (culled by default, ambient-only with culling off); an explicit
   `Options.light` wins over the provider through the full path.
+- **Cross-layer blended integration test** (same composition root): a scene with an
+  opaque far quad and a half-transparent near quad goes through
+  `extractDrawList(.back_to_front)` → `rasterize(.blend = .alpha)`, asserting the
+  near quad is composited last and the center pixel is exactly `{128, 0, 127, 255}`,
+  then round-trips through the QOI codec byte for byte.
 - **Watertightness property test.** A quad split into triangles is rasterized
   piecewise into separate targets; the coverage counts must sum to the quad area
   (no overlap) and their union must cover it (no gap). Repeated over ten
@@ -377,6 +454,23 @@ break bit-exact reproducibility. When a light is configured, its multiplier is
 computed once per surviving triangle (one normalize + one dot); per pixel it
 adds only one `f64` multiply per RGB channel. The lit path has not been
 benchmarked separately — no fill-rate claim is made for it.
+
+Blending adds a fixed per-pixel cost and no per-triangle cost. Measured with the
+same harness on the same machine (Intel Xeon @ 2.60GHz, 2 vCPU, 1024 quads, full
+coverage, 50%-alpha tint, `.none` re-measured for scale):
+
+| Target | `.none` | `.alpha` | `.additive` | `.alpha` vs `.none` |
+| --- | --- | --- | --- | --- |
+| 256×256 | 0.662 ms | 1.540 ms | 1.330 ms | ~2.3× |
+| 512×512 | 1.965 ms | 5.848 ms | 4.795 ms | ~3.0× |
+| 1024×1024 | 6.601 ms | 20.836 ms | 17.437 ms | ~3.2× |
+
+The cost is the `f64` normalization of both pixels, the composite itself and the
+second quantization. `.none` keeps a branch on the mode *outside* the arithmetic
+and returns the shaded fragment untouched, so callers that do not opt in pay only
+that branch. Both sides of every operation are kept in the reference generator —
+tightening the arithmetic requires regenerating
+[`src/render/raster_blend_vectors.zig`](../src/render/raster_blend_vectors.zig).
 
 ### Textured path
 
@@ -424,11 +518,15 @@ See [asset-decoders.md](asset-decoders.md) for the codec.
   or a `resources.directionalLight()` provider), applied with the geometric
   (face) normal — no per-vertex normals, vertex colors, specular terms,
   point/spot lights, shadow mapping or multiple lights.
-- **No blending or transparency.** Alpha is written to the framebuffer verbatim,
-  not composited. `back_to_front` sorting exists in the extraction layer but has
-  nothing to blend against here.
+- **Blending is per-fragment, in submission order.** Four modes exist (`.none`,
+  `.alpha`, `.premultiplied`, `.additive`) but there is no order-independent
+  transparency, no depth pre-pass, no per-command sort inside the rasterizer and
+  no separate blend function for RGB vs alpha. Correct transparency is the
+  caller's responsibility: sort `back_to_front` (extraction already can) and, for
+  multi-surface transparency, disable `depth_write`.
 - **No antialiasing, mipmaps or LOD selection.** One sample per pixel, no MSAA.
-  Minification aliases.
+  Minification aliases, and blended edges are hard-edged because coverage is
+  binary.
 - **No GPU backend.** This is a CPU reference path, not a Renderer Low tier.
 - **Single-threaded.** No tile parallelism or binning; a frame is rasterized in
   submission order on the calling thread.

@@ -179,8 +179,8 @@ culling and flat or texture-mapped, optionally Lambert-lit, shading. Coverage
 is bit-exactly reproducible and shared edges are watertight. Geometry and
 materials arrive through a duck-typed provider, so `render` has no dependency
 on the asset layer, and the pixel path takes no allocator. It is a CPU
-reference path, **not** a renderer tier: blending and antialiasing are absent,
-and the GPU backends remain planned. Texture-mapped shading: perspective-correct
+reference path, **not** a renderer tier: antialiasing, mipmaps and the GPU
+backends remain planned. Texture-mapped shading: perspective-correct
 UVs, repeat wrap, nearest/bilinear sampling of borrowed RGBA8 textures, tint
 multiply; `Mesh` carries optional `uvs` and the provider's optional `texture()`
 (a `pub` decl, detected at comptime) binds the material — absent, the path
@@ -188,7 +188,13 @@ stays flat and byte-identical to before. Directional Lambert lighting:
 per-face face-normal shading of the flat and textured paths (`Options.light`,
 or an optional `pub fn directionalLight()` on the provider — explicit options
 win), alpha never lit, bit-exact against Python reference vectors; callers
-without a light stay byte-identical to before. Cross-layer integration tests
+without a light stay byte-identical to before. Framebuffer **blending**
+(`Options.blend`) composites each shaded fragment with the target as straight-alpha
+source-over, premultiplied or additive (`.none` writes verbatim and is the
+default, byte-identical to the pre-blending path); alpha composites in every mode,
+depth is never blended, and the transparent modes pair with extraction's
+`back_to_front` sort. Blended frames are pinned against their own Python
+reference corpus. Cross-layer integration tests
 (`src/render/raster_image_test.zig`) prove the whole chain — scene, world
 transforms, extraction, rasterizer — with a world-rotated face lit
 ambient-only and the explicit-options-over-provider priority intact.
@@ -419,7 +425,9 @@ over the job system,
 mark-and-sweep GC, change detection with incremental re-import), the
 backend-independent render extraction layer (camera,
 frustum culling, sorted draw lists) with its CPU software rasterizer (watertight
-fixed-point coverage, depth buffer, textured shading), and the device-independent audio runtime
+fixed-point coverage, depth buffer, textured shading, directional Lambert
+lighting and straight-alpha/premultiplied/additive blending), and the
+device-independent audio runtime
 (mixer with voices/buses/pan/pitch, linear and band-limited resampling, priority
 voice stealing, biquad/compressor/delay/reverb/limiter/saturator insert chains,
 plus spatialization

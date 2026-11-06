@@ -23,15 +23,17 @@
 //!
 //! Textures are borrowed, decoded RGBA8 buffers (`Texture`) with repeat wrap
 //! and nearest/bilinear magnification. A sampled texel is multiplied by the
-//! material's linear RGBA tint, then both pipelines write alpha verbatim
-//! (there is no blending).
+//! material's linear RGBA tint. The resulting fragment is written verbatim by
+//! default, or composited with the target using `Options.blend` (straight-alpha
+//! source-over, premultiplied or additive) — see `Blend`.
 //!
 //! Coupling: geometry and materials arrive through a duck-typed `resources`
 //! value, so this module never imports the asset layer. A caller adapts
 //! `assets.mesh.MeshView` (or plain arrays) with a few lines; see the tests.
 //!
-//! Not implemented, and not claimed: lighting, shading, blending,
-//! transparency, MSAA, mipmaps, or any GPU path.
+//! Lighting is one optional directional Lambert term; blending is per-fragment
+//! in submission order (no order-independent transparency). Not implemented,
+//! and not claimed: MSAA, mipmaps, or any GPU path.
 
 const std = @import("std");
 const draw = @import("draw.zig");
@@ -73,6 +75,28 @@ pub const CullMode = enum { none, back, front };
 
 /// Texture magnification filter.
 pub const Filter = enum { nearest, bilinear };
+
+/// How a shaded fragment is combined with what the target already holds.
+///
+/// Every mode is evaluated in `f64` with a single pinned operation order and
+/// quantized once, so results are reproducible bit for bit:
+///
+/// ```
+/// sa = src.a / 255            da = dst.a / 255            keep = 1 - sa
+/// out.a = sa + da * keep                       (all blending modes)
+/// ```
+///
+/// `none` writes the fragment verbatim (the pre-blending behaviour) and is
+/// the default. `alpha` treats both sides as straight (non-premultiplied)
+/// alpha and does source-over — the target's RGB is read as straight, so the
+/// result is `(src*src.a + dst*dst.a*keep) / out.a`; a fully transparent
+/// result is transparent black. `premultiplied` composites into a target that
+/// already stores premultiplied RGB: the straight-alpha fragment is
+/// premultiplied here and added to `dst * keep`. `additive` adds the
+/// source scaled by its own alpha to the target (then clamps). Alpha of the
+/// target is composited in every mode, so a transparent destination keeps its
+/// coverage.
+pub const Blend = enum { none, alpha, premultiplied, additive };
 
 /// A single directional light for the Lambert shading path, set through
 /// `Options.light` (or supplied by the duck-typed `resources` via an optional
@@ -124,6 +148,12 @@ pub const Options = struct {
     /// explicit `light` set here wins over any `directionalLight` the
     /// `resources` provider may offer.
     light: ?Light = null,
+    /// How each shaded fragment is combined with the target. `none` (the
+    /// default) writes it verbatim, which is bit-identical to the behaviour
+    /// before blending existed. The transparent modes need the caller to draw
+    /// back-to-front — extraction's `back_to_front` sort is what feeds them —
+    /// because the rasterizer performs no reordering of its own.
+    blend: Blend = .none,
 };
 
 /// A triangle vertex in screen space: `x`/`y` are 28.4 fixed point pixels with
@@ -387,6 +417,55 @@ fn tintMultiply(texel: [4]u8, tint: [4]u8) [4]u8 {
     return out;
 }
 
+/// Compose one quantized source fragment over the target's current pixel.
+///
+/// Both sides are normalized to `[0, 1]` once, blending happens in `f64` with
+/// the pinned order documented on `Blend`, and each channel is quantized a
+/// single time with `floor(clamp(v, 0, 1) * 255 + 0.5)`. `none` returns the
+/// source untouched, which makes the blended path byte-identical to the
+/// pre-blending framebuffer write for every caller that does not opt in.
+fn blendPixels(src: [4]u8, dst: [4]u8, mode: Blend) [4]u8 {
+    if (mode == .none) return src;
+
+    const sa = @as(f64, @floatFromInt(src[3])) / 255.0;
+    const da = @as(f64, @floatFromInt(dst[3])) / 255.0;
+    const keep = 1.0 - sa;
+    const out_a = sa + da * keep;
+
+    var out: [4]u8 = undefined;
+    switch (mode) {
+        .none => unreachable,
+        .alpha => {
+            // A fully transparent result has no color to carry; keep it black
+            // instead of dividing by zero.
+            if (!(out_a > 0.0)) return .{ 0, 0, 0, 0 };
+            for (0..3) |channel| {
+                const s = @as(f64, @floatFromInt(src[channel])) / 255.0;
+                const d = @as(f64, @floatFromInt(dst[channel])) / 255.0;
+                out[channel] = unitByte(((s * sa) + ((d * da) * keep)) / out_a);
+            }
+        },
+        .premultiplied => for (0..3) |channel| {
+            const s = @as(f64, @floatFromInt(src[channel])) / 255.0;
+            const d = @as(f64, @floatFromInt(dst[channel])) / 255.0;
+            out[channel] = unitByte((s * sa) + (d * keep));
+        },
+        .additive => for (0..3) |channel| {
+            const s = @as(f64, @floatFromInt(src[channel])) / 255.0;
+            const d = @as(f64, @floatFromInt(dst[channel])) / 255.0;
+            out[channel] = unitByte(d + (s * sa));
+        },
+    }
+    out[3] = unitByte(out_a);
+    return out;
+}
+
+/// Quantize a `[0, 1]` blend channel: `floor(clamp(v, 0, 1) * 255 + 0.5)`.
+/// Distinct from `clampByte`, which works in byte units (`0..255`).
+fn unitByte(v: f64) u8 {
+    return @intFromFloat(@floor(@min(@max(v, 0.0), 1.0) * 255.0 + 0.5));
+}
+
 /// Shade one covered pixel: flat `rgba`, or `rgba` multiplied by the filtered
 /// texel with perspective-correct UVs (`w0`..`w2` are the already-biased
 /// coverage weights as f64, `inv_area` normalizes them). `lit`, when set, is
@@ -551,8 +630,12 @@ pub fn rasterTriangle(
                 const wgt2 = @as(f64, @floatFromInt(w2 + bias2));
                 const depth: f32 = @floatCast(((wgt0 * z0 + wgt1 * z1) + wgt2 * z2) * inv_area);
                 if (!options.depth_test or depth < target.depth[index]) {
-                    const out_rgba = shadePixel(texture, v0, v1, v2, wgt0, wgt1, wgt2, inv_area, rgba, lit);
+                    const shaded = shadePixel(texture, v0, v1, v2, wgt0, wgt1, wgt2, inv_area, rgba, lit);
                     const o = index * 4;
+                    const out_rgba = if (options.blend == .none)
+                        shaded
+                    else
+                        blendPixels(shaded, .{ target.color[o + 0], target.color[o + 1], target.color[o + 2], target.color[o + 3] }, options.blend);
                     target.color[o + 0] = out_rgba[0];
                     target.color[o + 1] = out_rgba[1];
                     target.color[o + 2] = out_rgba[2];
@@ -1856,6 +1939,180 @@ test "lit rasterizer matches the independent reference bit for bit" {
     // Guard against the vector file silently becoming empty.
     try testing.expect(light_vectors.cases.len >= 35);
     try testing.expect(total_pixels >= 600);
+}
+
+const blend_vectors = @import("raster_blend_vectors.zig");
+
+test "blended rasterizer matches the independent reference bit for bit" {
+    var s = try TestSurface.init(blend_vectors.width, blend_vectors.height);
+    defer s.deinit();
+    var total_pixels: usize = 0;
+    var blended_cases: usize = 0;
+    for (blend_vectors.cases) |case| {
+        s.target.clear(case.clear, 1.0);
+        const options = Options{
+            .cull = switch (case.cull) {
+                .none => .none,
+                .back => .back,
+                .front => .front,
+            },
+            .front_face = switch (case.front_face) {
+                .ccw => .counter_clockwise,
+                .cw => .clockwise,
+            },
+            .light = if (case.light) |l| .{ .direction = l.direction, .color = l.color, .ambient = l.ambient } else null,
+            .blend = switch (case.blend) {
+                .none => .none,
+                .alpha => .alpha,
+                .premultiplied => .premultiplied,
+                .additive => .additive,
+            },
+        };
+        var texture: ?Texture = null;
+        if (case.use_texture) {
+            texture = Texture{
+                .width = blend_vectors.width / 2,
+                .height = blend_vectors.height / 2,
+                .pixels = &blend_vectors.texture,
+                .filter = switch (case.filter) {
+                    .nearest => .nearest,
+                    .bilinear => .bilinear,
+                },
+            };
+        }
+        const tri = [3]ScreenVertex{
+            .{ .x = case.tri[0].x, .y = case.tri[0].y, .z = case.tri[0].z, .uw = case.tri[0].uw, .vw = case.tri[0].vw, .w_inv = case.tri[0].w_inv },
+            .{ .x = case.tri[1].x, .y = case.tri[1].y, .z = case.tri[1].z, .uw = case.tri[1].uw, .vw = case.tri[1].vw, .w_inv = case.tri[1].w_inv },
+            .{ .x = case.tri[2].x, .y = case.tri[2].y, .z = case.tri[2].z, .uw = case.tri[2].uw, .vw = case.tri[2].vw, .w_inv = case.tri[2].w_inv },
+        };
+        var pixels: usize = 0;
+        const drew = rasterTriangle(&s.target, tri[0], tri[1], tri[2], case.tint, options, &pixels, texture, case.world_normal);
+        std.testing.expectEqual(case.drew, drew) catch |err| {
+            std.debug.print("case {s}: drew mismatch\n", .{case.name});
+            return err;
+        };
+
+        // Coverage via depth (clear depth 1.0; every case keeps depth_write),
+        // then the full composited RGBA frame must match bit for bit.
+        for (0..s.target.pixelCount()) |i| {
+            const want = (case.mask[i / 8] >> @as(u3, @intCast(i % 8))) & 1;
+            const got: u8 = if (s.depth[i] != 1.0) 1 else 0;
+            std.testing.expectEqual(want, got) catch |err| {
+                std.debug.print("case {s}: coverage mismatch at pixel {d} ({d},{d})\n", .{
+                    case.name, i, i % blend_vectors.width, i / blend_vectors.width,
+                });
+                return err;
+            };
+            for (0..4) |c| {
+                const want_byte = case.frame[i * 4 + c];
+                const got_byte = s.target.color[i * 4 + c];
+                std.testing.expectEqual(want_byte, got_byte) catch |err| {
+                    std.debug.print("case {s}: frame mismatch at pixel {d} ({d},{d}) channel {d}: want 0x{x:0>2} got 0x{x:0>2}\n", .{
+                        case.name, i, i % blend_vectors.width, i / blend_vectors.width, c, want_byte, got_byte,
+                    });
+                    return err;
+                };
+            }
+        }
+        total_pixels += pixels;
+        if (case.blend != .none) blended_cases += 1;
+    }
+    // Guard against the vector file silently becoming empty.
+    try testing.expect(blend_vectors.cases.len >= 45);
+    try testing.expect(blended_cases >= 40);
+    try testing.expect(total_pixels >= 750);
+}
+
+// --- blending unit tests -----------------------------------------------------
+
+test "blendPixels: source-over math per mode" {
+    // Half-transparent red over opaque blue.
+    const src = [4]u8{ 255, 0, 0, 128 };
+    const dst = [4]u8{ 0, 0, 255, 255 };
+    // alpha: sa = 128/255, keep = 127/255; rgb = (255*sa)/1 -> 128, blue -> 127.
+    try testing.expectEqualSlices(u8, &.{ 128, 0, 127, 255 }, &blendPixels(src, dst, .alpha));
+    // premultiplied: src*sa + dst*keep -> (128, 0, 127), the same numbers as
+    // alpha here because the destination is fully opaque (da == 1).
+    try testing.expectEqualSlices(u8, &.{ 128, 0, 127, 255 }, &blendPixels(src, dst, .premultiplied));
+    // additive: dst + src*sa -> (128, 0, 255).
+    try testing.expectEqualSlices(u8, &.{ 128, 0, 255, 255 }, &blendPixels(src, dst, .additive));
+    // `none` ignores the destination entirely.
+    try testing.expectEqualSlices(u8, &src, &blendPixels(src, dst, .none));
+}
+
+test "blendPixels: degenerate alphas stay finite" {
+    // Fully transparent source: every mode leaves dst intact (no division by
+    // zero in `alpha`, and a premultiplied fragment of zero alpha adds nothing
+    // now that the source is premultiplied at blend time).
+    const transparent = [4]u8{ 200, 100, 50, 0 };
+    const dst = [4]u8{ 10, 20, 30, 128 };
+    try testing.expectEqualSlices(u8, &dst, &blendPixels(transparent, dst, .alpha));
+    try testing.expectEqualSlices(u8, &dst, &blendPixels(transparent, dst, .premultiplied));
+    try testing.expectEqualSlices(u8, &dst, &blendPixels(transparent, dst, .additive));
+
+    // Fully transparent source over a fully transparent destination: the
+    // straight-alpha divide is skipped and the result is transparent black.
+    const clear = [4]u8{ 0, 0, 0, 0 };
+    try testing.expectEqualSlices(u8, &clear, &blendPixels(transparent, clear, .alpha));
+    // Opaque source over a transparent destination is the source itself.
+    const solid = [4]u8{ 9, 8, 7, 255 };
+    try testing.expectEqualSlices(u8, &solid, &blendPixels(solid, clear, .alpha));
+}
+
+test "blendPixels: additive saturates and alpha composites" {
+    const src = [4]u8{ 200, 100, 60, 255 };
+    const dst = [4]u8{ 200, 20, 30, 200 };
+    // sa = 1, so additive adds the full source: 400 -> 255, 120, 90.
+    try testing.expectEqualSlices(u8, &.{ 255, 120, 90, 255 }, &blendPixels(src, dst, .additive));
+    // Alpha accumulates to full coverage even when the destination was partial.
+    const half = [4]u8{ 10, 10, 10, 128 };
+    const got = blendPixels(half, half, .premultiplied);
+    // out.a = 128/255 + (128/255)*(127/255) -> 0.7529 -> 192, and the RGB is
+    // the premultiplied sum (10/255)*sa + (10/255)*keep = 0.0392 -> 10.
+    try testing.expectEqual(@as(u8, 192), got[3]);
+    try testing.expectEqual(@as(u8, 10), got[0]);
+}
+
+test "blend defaults to none and reproduces the unblended path exactly" {
+    var blended = try TestSurface.init(8, 8);
+    defer blended.deinit();
+    var plain = try TestSurface.init(8, 8);
+    defer plain.deinit();
+    // A transparent tint still writes verbatim in the default mode.
+    blended.target.clear(.{ 3, 4, 5, 6 }, 1.0);
+    plain.target.clear(.{ 3, 4, 5, 6 }, 1.0);
+    const tint = [4]u8{ 200, 130, 40, 77 };
+    const a = try drawMesh(&blended.target, quadMesh(), transform.identity(), orthoSetup(), tint, .{}, null);
+    const b = try drawMesh(&plain.target, quadMesh(), transform.identity(), orthoSetup(), tint, .{ .blend = .none }, null);
+    try testing.expectEqual(a.pixels, b.pixels);
+    try testing.expectEqualSlices(u8, plain.target.color, blended.target.color);
+    for (blended.depth, plain.depth) |x, y| try testing.expectEqual(x, y);
+}
+
+test "alpha blending composites in submission order over a cleared target" {
+    var s = try TestSurface.init(4, 4);
+    defer s.deinit();
+    s.target.clear(.{ 0, 0, 0, 0 }, 1.0);
+    const base = [4]u8{ 0, 0, 255, 255 };
+    const over = [4]u8{ 255, 0, 0, 128 };
+    const flat = quadMesh();
+    // depth_write off: both draws must reach the same pixels regardless of depth.
+    _ = try drawMesh(&s.target, flat, transform.identity(), orthoSetup(), base, .{ .depth_write = false }, null);
+    _ = try drawMesh(&s.target, flat, transform.identity(), orthoSetup(), over, .{ .depth_write = false, .blend = .alpha }, null);
+    try testing.expectEqualSlices(u8, &.{ 128, 0, 127, 255 }, &s.target.colorAt(1, 1));
+}
+
+test "rasterize applies the blend mode to every command" {
+    var s = try TestSurface.init(4, 4);
+    defer s.deinit();
+    s.target.clear(.{ 0, 0, 255, 255 }, 1.0);
+    const meshes = [_]Mesh{quadMesh()};
+    const colors = [_][4]f32{.{ 1.0, 0.0, 0.0, 0.5 }};
+    const res = SliceResources{ .meshes = &meshes, .colors = &colors };
+    const stats = try rasterize(&s.target, &.{command(0, 0)}, orthoSetup(), res, .{ .blend = .alpha, .depth_write = false });
+    try testing.expectEqual(@as(usize, 16), stats.pixels);
+    // 0.5 * 255 = 127.5 -> round to 128 alpha; source-over over opaque blue.
+    try testing.expectEqualSlices(u8, &.{ 128, 0, 127, 255 }, &s.target.colorAt(0, 0));
 }
 
 // --- lighting unit tests ------------------------------------------------------
