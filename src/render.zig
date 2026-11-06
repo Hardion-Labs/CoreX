@@ -2,9 +2,9 @@
 //!
 //! This is the CPU-side foundation every renderer tier (Low/Medium/Advanced)
 //! consumes: camera math, frustum culling, and draw-list extraction from the
-//! scene. It has no GPU dependency, so it is fully testable headlessly. The
-//! actual GPU backends and the tier implementations are planned; this layer
-//! defines the backend-independent contract they will consume.
+//! scene. It has no GPU dependency, so it is fully testable headlessly. A CPU
+//! software rasterizer turns the extracted draw list into an RGBA8 framebuffer;
+//! GPU backends and the tier implementations are still planned.
 //!
 //! Example:
 //! ```zig
@@ -21,10 +21,15 @@
 //! const cam = R.Camera.perspectiveLookAt(.{ 0, 0, 10 }, .{ 0, 0, 0 }, .{ 0, 1, 0 }, 1.0, 1.6, 0.1, 500);
 //! var frame = try R.extractDrawList(&scene, cam, .front_to_back, gpa);
 //! defer frame.deinit();
-//! // frame.commands is a culled, sorted draw list for the GPU backend.
+//! // frame.commands is a culled, sorted draw list.
+//! // Rasterize it on the CPU (resources resolves mesh/material handles):
+//! var target = try R.Target.init(w, h, color_bytes, depth_values);
+//! target.clear(.{ 0, 0, 0, 255 }, 1.0);
+//! const stats = try R.rasterize(&target, frame.commands, cam.view_projection, resources, .{});
 //! ```
 //!
-//! See `docs/render-extraction.md` for the design and guarantees.
+//! See `docs/render-extraction.md` for extraction and `docs/render-raster.md`
+//! for the software rasterizer.
 
 const std = @import("std");
 
@@ -34,6 +39,8 @@ pub const camera = @import("render/camera.zig");
 pub const culling = @import("render/culling.zig");
 /// Draw-list extraction from a scene.
 pub const draw = @import("render/draw.zig");
+/// CPU software rasterizer (fixed-point coverage + f32 depth buffer).
+pub const raster = @import("render/raster.zig");
 
 pub const Camera = camera.Camera;
 pub const perspective = camera.perspective;
@@ -53,9 +60,21 @@ pub const RenderFrame = draw.RenderFrame;
 pub const SortMode = draw.SortMode;
 pub const extractDrawList = draw.extractDrawList;
 
+pub const Target = raster.Target;
+pub const ScreenVertex = raster.ScreenVertex;
+pub const RasterMesh = raster.Mesh;
+pub const RasterOptions = raster.Options;
+pub const RasterStats = raster.Stats;
+pub const CullMode = raster.CullMode;
+pub const FrontFace = raster.FrontFace;
+pub const rasterize = raster.rasterize;
+pub const drawMesh = raster.drawMesh;
+pub const rasterTriangle = raster.rasterTriangle;
+
 test {
     std.testing.refAllDecls(@This());
     _ = camera;
     _ = culling;
     _ = draw;
+    _ = raster;
 }

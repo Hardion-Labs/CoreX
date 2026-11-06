@@ -134,17 +134,20 @@ defer frame.deinit();
 
 ## Limitations and next steps
 
-- There is no GPU backend yet (Low/Medium/Advanced are planned); this layer only
-  produces the draw list, it does not rasterize.
+- There is no GPU backend yet (Low/Medium/Advanced are planned). Extraction itself
+  only produces the draw list; the CPU software rasterizer in
+  [render-raster.md](render-raster.md) consumes it and writes pixels.
 - No LOD, occlusion culling, instancing or automatic batching; `by_material` only
   sorts to reduce state changes.
-- `Renderable` uses opaque mesh/material handles; resolving them to GPU resources
-  and binding them to the asset cache is work for the future backend.
+- `Renderable` uses opaque mesh/material handles. The software rasterizer resolves
+  them through a caller-supplied duck-typed provider; binding them to GPU
+  resources and the asset cache is work for the future GPU backend.
 - No per-object transparency beyond `back_to_front` sorting; transparent/opaque
   materials are not yet split into sublists.
 
 ## Related
 
+- Software rasterizer: [render-raster.md](render-raster.md)
 - World-space transforms: [scene-transforms.md](scene-transforms.md)
 - Texture decoders / CXTX: [asset-decoders.md](asset-decoders.md)
 - Architecture: [architecture.md](architecture.md)
