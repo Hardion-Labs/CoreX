@@ -117,13 +117,31 @@ pub fn importPrefab(gpa: std.mem.Allocator, source: []const u8) ImportError![]u8
 
 pub const prefab_importer = Importer{ .id = "prefab", .version = 1, .importFn = importPrefab };
 
+/// Validate and canonicalize a `.corexstream` sector manifest. Sector payloads
+/// are ordinary `.scene` assets imported on their own; this only indexes them.
+pub fn importStream(gpa: std.mem.Allocator, source: []const u8) ImportError![]u8 {
+    var manifest = scene_mod.stream.Manifest.parse(gpa, source) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidAsset,
+    };
+    defer manifest.deinit();
+    return manifest.serialize(gpa) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidAsset,
+    };
+}
+
+pub const stream_importer = Importer{ .id = "stream", .version = 1, .importFn = importStream };
+
 const engine_bindings = texture.bindings ++ mesh.bindings ++ audio.bindings ++ flac.bindings ++ [_]Registry.Binding{
     .{ .extensions = &[_][]const u8{ ".scene", ".corexscene" }, .importer = scene_importer },
     .{ .extensions = &[_][]const u8{ ".prefab", ".corexprefab" }, .importer = prefab_importer },
+} ++ [_]Registry.Binding{
+    .{ .extensions = &[_][]const u8{".corexstream"}, .importer = stream_importer },
 } ++ importer.builtin_bindings;
 
 /// The engine's default import registry: texture (PNG/JPEG/BMP/TGA/QOI) + mesh
-/// (OBJ) + audio (WAV/FLAC) + scene + prefab + JSON + text importers, with `raw`
+/// (OBJ) + audio (WAV/FLAC) + scene + prefab + stream manifest + JSON + text, with `raw`
 /// as the fallback for binary/unknown extensions (e.g. lossy compressed audio
 /// and other model formats, which have no decoder yet).
 pub fn engineRegistry() Registry {
@@ -212,6 +230,8 @@ test "engine registry selects importers by extension" {
     try std.testing.expectEqualStrings("jpeg", reg.select(".JPEG").id);
     try std.testing.expectEqualStrings("flac", reg.select(".flac").id);
     try std.testing.expectEqualStrings("flac", reg.select(".FLAC").id);
+    try std.testing.expectEqualStrings("stream", reg.select(".corexstream").id);
+    try std.testing.expectEqualStrings("stream", reg.select(".COREXSTREAM").id);
     // Formats without a decoder yet still fall back to a verbatim raw copy.
     try std.testing.expectEqualStrings("raw", reg.select(".ogg").id);
     try std.testing.expectEqualStrings("raw", reg.select(".mp3").id);
@@ -791,4 +811,48 @@ test "pipeline imports a FLAC to a CXAW artifact and hits the cache on re-run" {
     defer second.deinit();
     try std.testing.expectEqual(@as(usize, 0), second.imported);
     try std.testing.expectEqual(@as(usize, 1), second.cached);
+}
+
+test "stream importer canonicalizes a valid manifest and rejects a broken one" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\{ "format_version": 1, "name": "world", "sectors": [
+        \\  { "name": "town", "scene": "scenes/town.scene", "radius": 10 },
+        \\  { "name": "cave", "scene": "scenes/cave.scene", "radius": 5, "unload_radius": 8 } ] }
+    ;
+    const artifact = try importStream(gpa, source);
+    defer gpa.free(artifact);
+    // Canonical form is sorted by sector name and is stable on re-import.
+    var m = try scene_mod.stream.Manifest.parse(gpa, artifact);
+    defer m.deinit();
+    try std.testing.expectEqualStrings("cave", m.sectors[0].name);
+    const again = try importStream(gpa, artifact);
+    defer gpa.free(again);
+    try std.testing.expectEqualSlices(u8, artifact, again);
+
+    const bad = [_][]const u8{
+        "{",
+        \\{ "format_version": 2, "name": "w", "sectors": [] }
+        ,
+        \\{ "format_version": 1, "name": "w", "sectors": [
+        \\  { "name": "a", "scene": "../escape.scene", "radius": 1 } ] }
+        ,
+        \\{ "format_version": 1, "name": "w", "sectors": [
+        \\  { "name": "a", "scene": "a.scene", "radius": 10, "unload_radius": 2 } ] }
+        ,
+    };
+    for (bad) |doc| try std.testing.expectError(error.InvalidAsset, importStream(gpa, doc));
+}
+
+fn importStreamAllocationProbe(allocator: std.mem.Allocator, source: []const u8) !void {
+    const bytes = try importStream(allocator, source);
+    allocator.free(bytes);
+}
+
+test "stream importer survives every allocation failure without leaking" {
+    const source =
+        \\{ "format_version": 1, "name": "world", "sectors": [
+        \\  { "name": "town", "scene": "scenes/town.scene", "radius": 10 } ] }
+    ;
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, importStreamAllocationProbe, .{source});
 }

@@ -7,7 +7,7 @@ copied by value.
 
 > Status: **implemented and tested**. Prefabs reuse the scene format
 > (`format_version = 1`) and the ECS; they do not duplicate serialization or
-> storage. Scene streaming, change tracking and multi-scene management remain
+> storage. Change tracking and multi-scene management remain
 > planned.
 
 ## The `.prefab` format
@@ -119,7 +119,8 @@ defer gpa.free(bytes);
   prefab with editing); instantiation is a full copy by value.
 - There are no cross-entity references through components (components are plain
   data; entity IDs stored in components are not remapped automatically).
-- Scene streaming, change tracking and multi-scene management remain planned.
+- Change tracking and multi-scene management remain planned. Sector streaming is
+  implemented separately — see [scene-streaming.md](scene-streaming.md).
 
 ## Related
 

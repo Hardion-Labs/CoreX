@@ -68,12 +68,13 @@ src/
 │   ├── schedule.zig      # Comptime stages + parallel system dispatch  [implemented]
 │   ├── graph.zig         # AutoSchedule: inferred dependency layers    [implemented]
 │   └── frame.zig         # FrameSchedule: budgets + system profiling   [implemented]
-├── scene.zig             # Scene public module; EngineScene/EnginePrefab schema
+├── scene.zig             # Scene public module; EngineScene/Prefab/Stream schema
 ├── scene/
 │   ├── components.zig    # Built-in plain-data scene components        [implemented]
 │   ├── transform.zig     # Column-major Mat4 + quaternion math         [implemented]
 │   ├── scene.zig         # Versioned scene document + ECS/hierarchy    [implemented]
-│   └── prefab.zig        # Single-root reusable subtrees (.prefab)     [implemented]
+│   ├── prefab.zig        # Single-root reusable subtrees (.prefab)     [implemented]
+│   └── stream.zig        # Sector residency streaming (.corexstream) [implemented]
 ├── assets.zig            # Asset public module; index + cache + importers + pipeline
 ├── assets/
 │   ├── cache.zig         # Content-addressed derived-data cache + GC   [implemented]
@@ -249,7 +250,7 @@ extensions. The world depends only on `entity.zig` and `pool.zig`; the scheduler
 depends only on the world and `std.Io`; `frame.zig` additionally reuses the
 diagnostics `Timer` (low coupling). Scenes and scripting build on these layers.
 
-### Scene system — implemented (format v1 + ECS load/save + prefabs), planned (streaming)
+### Scene system — implemented (format v1 + ECS load/save + prefabs + sector streaming)
 Scenes are versioned JSON documents (`docs/scene-format.md`) backed by the ECS.
 `scene.Scene(schema)` owns a typed ECS world, stable monotonic entity IDs and a
 parent hierarchy. It supports strict parse/serialize, file load/save,
@@ -280,7 +281,10 @@ instantiation into any same-schema scene (`instantiate`). `Scene.cloneSubtree`
 clones entities/components by value, remaps stable IDs and parent links
 deterministically (ascending source-ID order), and rolls back created entities
 on error. Prefabs are classified as `AssetKind.prefab` and imported/cached by the
-engine registry (`prefab` importer v1). Scene streaming, change tracking and
+engine registry (`prefab` importer v1). **Sector streaming**
+(`src/scene/stream.zig`, `docs/scene-streaming.md`, `stream` importer v1) loads and
+unloads named `.scene` sectors into a live scene by proximity or explicit request,
+with hysteresis, per-call budgets and exact, allocation-free unload. Change tracking and
 multi-scene management remain planned extensions.
 
 ### Asset system — implemented (indexing + import/cache + decoders + change detection), planned (more decoders)

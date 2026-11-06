@@ -234,7 +234,18 @@ const b = try prefab.instantiate(&scene, scene.idOf(root)); // independent copy
 ```
 
 See [`docs/scene-prefabs.md`](docs/scene-prefabs.md) for the format, API,
-guarantees and limitations. Scene streaming remains planned.
+guarantees and limitations.
+
+**Scene streaming** loads and unloads named sectors of a world into a live scene.
+A versioned `.corexstream` manifest maps each sector to an ordinary `.scene` file
+plus a spherical volume; a `Stream` brings residency in line with a listener
+position or an explicit request. A separate, larger unload radius gives hysteresis
+so a listener on a boundary cannot thrash, and per-call load/unload budgets plus a
+resident-entity ceiling keep a frame from spiking. The stream tracks exactly the
+entities it created, so an unload removes precisely that set and reparents any
+entities the caller attached underneath. Loading is all-or-nothing: the rollback
+path allocates nothing, so it is exact even when the allocator is what failed.
+See [`docs/scene-streaming.md`](docs/scene-streaming.md).
 
 ## Assets
 
@@ -488,6 +499,7 @@ CoreX/
 │   ├── mesh-import.md          # OBJ mesh importer + CXMH artifact
 │   ├── asset-audio.md          # WAV audio importer + CXAW artifact
 │   ├── asset-flac.md           # FLAC decoder + the same CXAW artifact
+│   ├── scene-streaming.md      # .corexstream sectors + residency streaming
 │   ├── launch-contract.md      # Stable startup contract (CLI, exit codes)
 │   ├── project-format.md       # .corex manifest format
 │   ├── scene-format.md         # Versioned .scene format
@@ -538,7 +550,7 @@ Indicative; subject to change as technical decisions are validated.
 - [x] Scene system and versioned scene serialization (format v1, ECS load/save).
 - [x] Scene world-space transforms (column-major Mat4 propagation, deterministic, iterative).
 - [x] Scene prefabs (single-root `.prefab`, capture/instantiate, ID remap, asset import).
-- [ ] Scene streaming.
+- [x] Scene streaming (`.corexstream` sectors, proximity + hysteresis, budgeted, exact unload).
 - [x] Asset import pipeline and content-addressed cache (raw/text/json/scene).
 - [x] Texture decoders (PNG/BMP/TGA/QOI → RGBA8 `CXTX` artifact).
 - [x] DEFLATE/zlib inflate (dependency-free, bounded output).

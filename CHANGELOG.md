@@ -61,7 +61,7 @@ declared yet.
   iterative subtree collection for deep hierarchies, and rollback of created
   entities on error. Added `AssetKind.prefab` and a `prefab` importer (v1) to the
   engine registry, so prefabs are validated (single-root), canonicalized and
-  cached like other assets. Scene streaming remains planned.
+  cached like other assets.
 - Asset import pipeline and content-addressed cache (`src/assets/`, re-exported
   as `corex.assets`, `docs/asset-import.md`): incremental, reproducible imports
   keyed by source content hash + importer identity/version + options; atomic
@@ -204,7 +204,32 @@ declared yet.
   header tables; a sweep decodes every proper prefix of a valid stream to prove
   no truncation can trap. Allocation-failure probes and an end-to-end
   pipeline/registry/cache/snapshot-key test complete the coverage.
-- Asset change detection (`src/assets/changes.zig`, re-exported as
+- Scene streaming (`src/scene/stream.zig`, re-exported as `corex.scene.stream`
+  with `corex.scene.EngineStream`, `docs/scene-streaming.md`) and a `stream`
+  importer (v1) bound to `.corexstream`. A versioned, strict manifest lists named
+  sectors, each pointing at an ordinary `.scene` document with a spherical volume
+  and a separate, larger unload radius. Sectors load and unload explicitly or from
+  a listener position, with hysteresis so a listener on the boundary cannot thrash,
+  per-call load/unload budgets, a resident-entity ceiling, pinned sectors, and a
+  `pending` flag when a budget leaves work. Manifests are canonicalized in name
+  order, so serialize and re-import are byte-stable. Sector payloads reuse
+  `Scene.load` and `Scene.cloneSubtree`; there is no second scene format.
+- Two additive scene primitives, with no change to existing behaviour:
+  `Scene.destroySet(ids)` removes a sorted ID set in one pass, reparenting
+  survivors to the nearest surviving ancestor exactly as repeated `destroyEntity`
+  would (proved by a differential test over a dozen subset shapes). It **does not
+  allocate and cannot fail**: membership is a binary search over the caller's
+  slice and ancestor resolution is memoized by path-compressing the doomed
+  records' own `parent` fields. `Scene.nextStableId()` exposes the monotonic ID
+  frontier so a bulk operation can capture the exact set it created as a
+  half-open range without allocating.
+- Streaming safety and performance: ownership is captured allocation-free from the
+  ID range, so a failed load rolls back exactly even when the allocator is what
+  failed; allocation-failure probes assert a failed load leaves the entity count,
+  residency map, ownership index and accounting untouched. Unloading 40,000 of
+  80,000 entities takes 17.8 ms versus 24.1 s for the one-at-a-time equivalent
+  (1358x), because the batch is O(records log ids) instead of O(records * ids).
+  A 10,000-entity sector loads in 15.4 ms and unloads in 1.24 ms in ReleaseFast.
   `corex.assets.changes` with `Snapshot`/`ChangeSet`/`ChangeKind`,
   `docs/asset-change-detection.md`): a path-sorted snapshot of every indexed
   asset's size, mtime and BLAKE3 hash, and a linear merge join that reports
@@ -464,7 +489,7 @@ declared yet.
   extraction, OBJ mesh import, scene prefabs, DEFLATE/zlib, PNG, asset change
   detection, WAV audio import, audio mixing, spatial audio, voice stealing,
   band-limited resampling, insert DSP including delay/reverb/limiter/saturator,
-  Adam7 interlaced PNG, sequential JPEG and FLAC (556 tests),
+  Adam7 interlaced PNG, sequential JPEG, FLAC and scene streaming (584 tests),
   including allocation-failure
   probes, cache corruption/truncation probes, a deep-hierarchy stress test, QOI
   encode/decode roundtrips, end-to-end texture-import-and-cache, OBJ-import-and-

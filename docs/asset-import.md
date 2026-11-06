@@ -54,6 +54,13 @@ system: it validates the `.scene` document (hierarchy, components, transforms)
 and re-serializes it canonically and deterministically. Invalid scenes are
 rejected at import time.
 
+The stream importer (`corex.assets.stream_importer`, ID `stream`, version 1,
+bound to `.corexstream`) does the same for sector manifests: it validates sector
+names, project-relative scene paths and load/unload volumes, then canonicalizes
+them in sector-name order. Manifests are indexed as `AssetKind.scene`; the sector
+payloads they reference remain separate `.scene` assets. See
+[scene-streaming.md](scene-streaming.md).
+
 Texture importers (`corex.assets.texture`, IDs `png`/`bmp`/`tga`/`qoi`, version 1)
 decode the image to RGBA8 and serialize it into the `CXTX` artifact. The PNG
 importer is backed by the dependency-free DEFLATE/zlib inflater in
@@ -279,6 +286,7 @@ Guarantees and behavior:
 - [mesh-import.md](mesh-import.md) — OBJ mesh importer and the CXMH artifact.
 - [asset-audio.md](asset-audio.md) — WAV audio importer and the CXAW artifact.
 - [asset-flac.md](asset-flac.md) — FLAC decoder producing the same CXAW artifact.
+- [scene-streaming.md](scene-streaming.md) — sector manifests and residency streaming.
 - [scene-format.md](scene-format.md) — scene format validated by the importer.
 - [versioning.md](versioning.md) — format versioning policy.
 - [launch-contract.md](launch-contract.md) — startup contract (unchanged).
