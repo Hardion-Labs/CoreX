@@ -398,3 +398,68 @@ test "lit integration: an explicit options.light wins over the provider's" {
     _ = try R.rasterize(&target, frame.commands, cam.view_projection, res, .{ .light = .{ .direction = .{ 0, 0, 1 }, .color = .{ 1, 1, 1 }, .ambient = .{ 0, 0, 0 } } });
     try testing.expectEqualSlices(u8, &.{ 128, 64, 255, 255 }, &target.colorAt(width / 2, height / 2));
 }
+
+test "blended integration: back_to_front extraction + alpha blending round-trips" {
+    const gpa = testing.allocator;
+    const width: u32 = 32;
+    const height: u32 = 24;
+    const count = @as(usize, width) * height;
+
+    var sc = try TestScene.init(gpa, "main");
+    defer sc.deinit();
+
+    // Two quads on the same axis: a large opaque one behind, a smaller
+    // half-transparent one in front, both facing the camera.
+    const back = try sc.createEntity("back", null);
+    try sc.addComponent(back, corex.scene.Transform{ .position = .{ 0, 0, -2 } });
+    try sc.addComponent(back, R.Renderable{
+        .mesh = 0,
+        .material = 0,
+        .bounds = R.Aabb.fromMinMax(.{ -2, -2, -0.1 }, .{ 2, 2, 0.1 }),
+    });
+    const front = try sc.createEntity("front", null);
+    try sc.addComponent(front, corex.scene.Transform{ .position = .{ 0, 0, 1 } });
+    try sc.addComponent(front, R.Renderable{
+        .mesh = 0,
+        .material = 1,
+        .bounds = R.Aabb.fromMinMax(.{ -2, -2, -0.1 }, .{ 2, 2, 0.1 }),
+    });
+
+    const aspect = @as(f32, @floatFromInt(width)) / @as(f32, @floatFromInt(height));
+    const cam = R.Camera.perspectiveLookAt(.{ 0, 0, 6 }, .{ 0, 0, 0 }, .{ 0, 1, 0 }, std.math.pi / 2.0, aspect, 0.5, 100);
+
+    // back_to_front is the sort the transparent pass needs: the near quad must
+    // be composited last, after the far one.
+    var frame = try R.extractDrawList(&sc, cam, .back_to_front, gpa);
+    defer frame.deinit();
+    try testing.expectEqual(@as(usize, 2), frame.count());
+    try testing.expectEqual(front, frame.commands[1].entity);
+
+    const big = [_][3]f32{ .{ -2, -2, 0 }, .{ 2, -2, 0 }, .{ 2, 2, 0 }, .{ -2, 2, 0 } };
+    const indices = [_]u32{ 0, 1, 2, 0, 2, 3 };
+    const meshes = [_]R.RasterMesh{.{ .positions = &big, .indices = &indices }};
+    // Opaque blue behind, half-alpha red in front.
+    const res = Resources{ .meshes = &meshes, .palette = &.{ .{ 0, 0, 1, 1 }, .{ 1, 0, 0, 0.5 } } };
+
+    const color = try gpa.alloc(u8, count * 4);
+    defer gpa.free(color);
+    const depth = try gpa.alloc(f32, count);
+    defer gpa.free(depth);
+    var target = try R.Target.init(width, height, color, depth);
+    target.clear(.{ 0, 0, 0, 255 }, 1.0);
+
+    // depth_write off on the transparent pass so the front quad composites on
+    // top instead of being occluded by its own depth.
+    _ = try R.rasterize(&target, frame.commands, cam.view_projection, res, .{ .blend = .alpha, .depth_write = false });
+
+    // sa = 128/255, keep = 127/255 over opaque blue: red -> 128, blue -> 127.
+    try testing.expectEqualSlices(u8, &.{ 128, 0, 127, 255 }, &target.colorAt(width / 2, height / 2));
+
+    // The composited frame is still plain RGBA8 and round-trips through QOI.
+    const img = A.image.Image{ .width = width, .height = height, .pixels = target.color };
+    const encoded = try A.image.encodeQoi(gpa, img);
+    defer gpa.free(encoded);
+    var decoded = try A.image.decodeQoi(gpa, encoded);
+    defer decoded.deinit(gpa);
+    try testing.expectEqualSlices(u8, target.color, decoded.pixels);
+}

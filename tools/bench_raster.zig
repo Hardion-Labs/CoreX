@@ -1,4 +1,5 @@
-//! Benchmark for the software rasterizer: flat vs textured shading.
+//! Benchmark for the software rasterizer: flat vs textured shading, and the
+//! cost of alpha compositing against an opaque write.
 //! Method: ReleaseFast, best of five runs, 1024 quads (2048 triangles) tiled
 //! across the target (full coverage, integer tile counts). Invoked manually:
 //!
@@ -22,6 +23,20 @@ const indices = [_]u32{ 0, 1, 2, 0, 2, 3 };
 const uvs = [_][2]f32{ .{ 0, 0 }, .{ 1, 0 }, .{ 1, 1 }, .{ 0, 1 } };
 const shared_mesh = R.RasterMesh{ .positions = &positions, .indices = &indices, .uvs = &uvs };
 const white = [4]f32{ 1.0, 1.0, 1.0, 1.0 };
+// 50% alpha so the blend modes do their full arithmetic in the benchmark.
+const translucent = [4]f32{ 1.0, 0.5, 0.25, 0.5 };
+
+const AlphaResources = struct {
+    pub fn mesh(self: AlphaResources, handle: u32) ?R.RasterMesh {
+        _ = self;
+        _ = handle;
+        return shared_mesh;
+    }
+    pub fn color(self: AlphaResources, handle: u32) ?[4]f32 {
+        _ = self;
+        return if (handle == 0) translucent else null;
+    }
+};
 
 // 64x64 RGBA8 gradient (per-texel variation so filtering has real work).
 var texture_pixels: [64 * 64 * 4]u8 = undefined;
@@ -85,7 +100,7 @@ fn monotonicNs() i128 {
 
 const Run = struct { ns: i128, pixels: usize };
 
-fn runOnce(gpa: std.mem.Allocator, comptime textured: bool, size: u32, filt: R.TextureFilter, cmds: []const R.DrawCommand) !Run {
+fn runOnce(gpa: std.mem.Allocator, comptime textured: bool, size: u32, filt: R.TextureFilter, blend: R.Blend, cmds: []const R.DrawCommand) !Run {
     const n = @as(usize, size) * size;
     const color = try gpa.alloc(u8, n * 4);
     defer gpa.free(color);
@@ -95,10 +110,13 @@ fn runOnce(gpa: std.mem.Allocator, comptime textured: bool, size: u32, filt: R.T
     var target = try R.Target.init(size, size, color, depth);
     target.clear(.{ 0, 0, 0, 255 }, 1.0);
     const t0 = monotonicNs();
+    const options = R.RasterOptions{ .blend = blend };
     const stats = if (comptime textured)
-        try R.rasterize(&target, cmds, vp, TexResources{ .filt = filt }, .{})
+        try R.rasterize(&target, cmds, vp, TexResources{ .filt = filt }, options)
+    else if (blend == .none)
+        try R.rasterize(&target, cmds, vp, FlatResources{}, options)
     else
-        try R.rasterize(&target, cmds, vp, FlatResources{}, .{});
+        try R.rasterize(&target, cmds, vp, AlphaResources{}, options);
     const ns = monotonicNs() - t0;
     return .{ .ns = ns, .pixels = stats.pixels };
 }
@@ -121,17 +139,22 @@ pub fn main() !void {
         var best_flat: i128 = std.math.maxInt(i128);
         var px: usize = 0;
         for (0..5) |_| {
-            const r = try runOnce(gpa, false, size, .nearest, cmds);
+            const r = try runOnce(gpa, false, size, .nearest, .none, cmds);
             px = r.pixels;
             best_flat = @min(best_flat, r.ns);
         }
         var best_bi: i128 = std.math.maxInt(i128);
-        for (0..5) |_| best_bi = @min(best_bi, (try runOnce(gpa, true, size, .bilinear, cmds)).ns);
+        for (0..5) |_| best_bi = @min(best_bi, (try runOnce(gpa, true, size, .bilinear, .none, cmds)).ns);
         var best_near: i128 = std.math.maxInt(i128);
-        for (0..5) |_| best_near = @min(best_near, (try runOnce(gpa, true, size, .nearest, cmds)).ns);
-        std.debug.print("{d}x{d} covered={d} flat={d:.3}ms bilinear={d:.3}ms nearest={d:.3}ms\n", .{
-            size,                                     size,                                   px,
-            @as(f64, @floatFromInt(best_flat)) / 1e6, @as(f64, @floatFromInt(best_bi)) / 1e6, @as(f64, @floatFromInt(best_near)) / 1e6,
+        for (0..5) |_| best_near = @min(best_near, (try runOnce(gpa, true, size, .nearest, .none, cmds)).ns);
+        var best_alpha: i128 = std.math.maxInt(i128);
+        for (0..5) |_| best_alpha = @min(best_alpha, (try runOnce(gpa, false, size, .nearest, .alpha, cmds)).ns);
+        var best_add: i128 = std.math.maxInt(i128);
+        for (0..5) |_| best_add = @min(best_add, (try runOnce(gpa, false, size, .nearest, .additive, cmds)).ns);
+        std.debug.print("{d}x{d} covered={d} flat={d:.3}ms bilinear={d:.3}ms nearest={d:.3}ms alpha={d:.3}ms additive={d:.3}ms\n", .{
+            size,                                      size,                                    px,
+            @as(f64, @floatFromInt(best_flat)) / 1e6,  @as(f64, @floatFromInt(best_bi)) / 1e6,  @as(f64, @floatFromInt(best_near)) / 1e6,
+            @as(f64, @floatFromInt(best_alpha)) / 1e6, @as(f64, @floatFromInt(best_add)) / 1e6,
         });
     }
 }
