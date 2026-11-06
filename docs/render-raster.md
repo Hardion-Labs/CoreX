@@ -24,7 +24,9 @@ Per triangle, in order:
 4. **Cull.** The signed screen area decides front-facing; degenerate (zero-area)
    triangles are dropped.
 5. **Rasterize.** Integer edge functions with a top-left fill rule over a clamped
-   bounding box, with a depth test and flat-color write per pixel.
+   bounding box, with a depth test. Per pixel the shaded result is either the flat
+   material tint or a texture sample (nearest or bilinear, perspective-correct)
+   multiplied by that tint.
 
 A clipped triangle stays convex, so the resulting polygon (at most nine vertices)
 is covered exactly by a triangle fan. Both clip buffers are fixed 12-slot arrays
@@ -62,8 +64,10 @@ coverage. The three weights are tested with a single sign check, `(w0 | w1 | w2)
 The depth buffer holds **NDC `z` in [-1, 1]**, cleared to `1` (the far plane).
 After the perspective divide, `z` is affine in screen space, so plain barycentric
 interpolation is already perspective-correct and no per-pixel divide is needed.
-(Interpolated attributes such as UVs *would* need perspective correction; this
-backend shades flat, so there are none.)
+UVs are *not* affine that way: each vertex carries `uw = u / w`, `vw = v / w` and
+`w_inv = 1 / w` (clip space), which are interpolated linearly and divided through
+at the pixel (`u = (Σλ_i·uw_i) / (Σλ_i·w_inv_i)`). See
+[Textures](#textures).
 
 Interpolation is evaluated in `f64` with a pinned operation order and rounded
 once to `f32`, which is what makes the depth values reproducible against the
@@ -98,16 +102,21 @@ const stats = try R.rasterize(&target, frame.commands, cam.view_projection, reso
 | `Target` | Borrowed RGBA8 `color` (`w*h*4`) plus `f32` `depth` (`w*h`). `init` validates both lengths. |
 | `Target.clear` | Reset color and depth. |
 | `Target.colorAt` / `depthAt` / `pixelCount` | Accessors. |
-| `Mesh` | `positions: []const [3]f32`, `indices: []const u32` (triangle list). |
-| `Options` | `cull` (`.none`/`.back`/`.front`), `front_face`, `depth_test`, `depth_write`. |
+| `Mesh` | `positions: []const [3]f32`, `indices: []const u32` (triangle list), optional `uvs: []const [2]f32` (one per position). |
+| `Texture` | `width`/`height`, borrowed `pixels` RGBA8 (row-major, top-down), `filter`. `validate()` rejects zero/oversized dims and length mismatches with `InvalidTexture`. |
+| `Filter` | `nearest` or `bilinear`. |
+| `Light` | Directional light for the Lambert path: `direction` (toward the light, world space, normalized internally), `color`, `ambient`. `validate()` rejects malformed lights with `InvalidLight`. |
+| `Options` | `cull` (`.none`/`.back`/`.front`), `front_face`, `depth_test`, `depth_write`, `light` (optional directional Lambert light; beats a `resources.directionalLight()` provider). |
 | `Stats` | `skipped_draws`, `submitted`, `clipped`, `culled`, `rasterized`, `pixels`. |
 | `rasterize` | Whole draw list, resolving handles through `resources`. |
-| `drawMesh` | One mesh, one world matrix, one flat RGBA8 color. |
+| `drawMesh` | One mesh, one world matrix, one flat RGBA8 tint, optional texture and light. |
 | `rasterTriangle` | One screen-space triangle; the entry point the vectors target. |
 
 `max_dimension` is 16384 per side, which bounds both the fixed-point range and the
-pixel count. Errors are `InvalidTarget`, `InvalidDimension` and `InvalidIndex`
-(index past the position array, or an index count that is not a multiple of three).
+pixel count. Errors are `InvalidTarget`, `InvalidDimension`, `InvalidIndex`
+(index past the position array, or an index count that is not a multiple of
+three), `InvalidUv` (a mesh whose `uvs` are missing or shorter than its
+`positions` when a texture is bound) and `InvalidTexture` (malformed texture).
 
 `rasterTriangle` returns `false` **only** for a cull rejection or an exactly
 degenerate triangle. A triangle that survives but covers no pixel center returns
@@ -121,13 +130,24 @@ what was actually covered.
 resolves them through a **duck-typed** `resources` value that must provide:
 
 ```zig
-fn mesh(self: @This(), handle: u32) ?RasterMesh
-fn color(self: @This(), handle: u32) ?[4]f32   // linear RGBA in [0, 1]
+pub fn mesh(self: @This(), handle: u32) ?RasterMesh
+pub fn color(self: @This(), handle: u32) ?[4]f32   // linear RGBA in [0, 1]
+pub fn texture(self: @This(), handle: u32) ?Texture // optional, see below
 ```
 
 A command whose mesh or material does not resolve is counted in `skipped_draws`
 and leaves the target untouched. Colors are clamped to [0, 1] and quantized with
 round-to-nearest (`0.5` becomes 128).
+
+The `texture` method is **optional**: its presence is detected at comptime via
+`@hasDecl`, which only sees **`pub`** decls — a private `fn texture` is treated
+as absent. When the material resolves to a texture but the mesh carries no
+`uvs` (or a `uvs` slice whose length differs from `positions`), the command is
+counted in `skipped_draws` and skipped — this is a soft, data-level failure,
+mirroring unresolved handles. A texture whose pixels or dimensions are
+malformed is a hard `error.InvalidTexture` — bad asset data must not render
+silently wrong. When no texture resolves, the material shades flat and any
+`uvs` on the mesh are ignored entirely.
 
 This keeps `render` free of any dependency on the asset layer — the same boundary
 the audio mixer maintains. Adapting a decoded `CXMH` mesh is a handful of lines.
@@ -138,26 +158,129 @@ a buffer you own and cache it alongside the asset:
 const Resources = struct {
     positions: []const []const [3]f32, // per mesh handle, de-interleaved once
     indices: []const []const u32,
+    uvs: []const []const [2]f32,       // same layout, or skip if the asset has none
     palette: []const [4]f32,
+    textures: []const corex.render.RasterTexture,
 
     pub fn mesh(self: @This(), handle: u32) ?corex.render.RasterMesh {
         if (handle >= self.positions.len) return null;
-        return .{ .positions = self.positions[handle], .indices = self.indices[handle] };
+        return .{ .positions = self.positions[handle], .indices = self.indices[handle],
+                  .uvs = self.uvs[handle] };
     }
 
     pub fn color(self: @This(), handle: u32) ?[4]f32 {
         if (handle >= self.palette.len) return null;
         return self.palette[handle];
     }
+
+    pub fn texture(self: @This(), handle: u32) ?corex.render.RasterTexture {
+        if (handle >= self.textures.len) return null;
+        return self.textures[handle];
+    }
 };
 
 // One-time conversion from a parsed artifact:
 for (0..view.vertex_count) |i| positions[i] = view.vertexAt(i).position;
+for (0..view.vertex_count) |i| uvs[i] = view.vertexAt(i).uv;
 for (0..view.index_count) |i| indices[i] = view.indexAt(i);
 ```
 
+Omitting `fn texture` from the provider (or returning null) keeps the flat path;
+the material tint is the shade color exactly as before.
+
 Because `resources` is a comptime parameter there is no vtable and no indirect
 call per vertex.
+
+## Textures
+
+`Texture` is a borrowed RGBA8 buffer — `width * height * 4` bytes, row-major,
+top-down; `v = 0` is the top row of the image, matching both the framebuffer's
+top-down layout and every image codec `assets.image` decodes. `Filter` selects
+`nearest` or `bilinear` magnification. Repeat wrap is unconditional: the wrapped
+coordinate is `u - floor(u)`, so negative UVs wrap correctly too.
+
+Per pixel (`den = (Σλ_i·w_inv_i) / area`):
+
+```
+u = (Σλ_i·uw_i / area) / den,  v = (Σλ_i·vw_i / area) / den
+```
+
+evaluated in `f64` with a pinned operation order. `λ` is the perspective-correct
+barycentric weight (the same `w + bias` the fixed-point coverage uses). If `den`
+is not strictly positive and finite the pixel samples `uv = (0, 0)` — a degenerate
+`w` gradient cannot produce a NaN pixel.
+
+Sampling:
+
+- **Nearest:** `x = min(n - 1, floor(frac(u) * n))` per axis.
+- **Bilinear:** texel centers at `t = frac(u) * n - 0.5`; `fx = t - floor(t)`;
+  taps at `floor(t)` and `floor(t) + 1` wrapping mod `n`;
+  `out = floor((top * (1 - fy) + bottom * fy) + 0.5)` per channel, where
+  `top`/`bottom` mix the two columns with `fx`. A single final rounding, never
+  intermediate rounding.
+- **Tint:** the sampled texel is multiplied per channel (including alpha) by the
+  material tint: `out = floor(t * tint / 255 + 0.5)`. No premultiply, no blending —
+  alpha is written verbatim.
+
+Texture and material resolution happen **once per draw command**, before any
+pixel is written: a malformed texture (`validate()` rejects zero dimensions,
+dimensions above `max_dimension`, or a pixel-buffer length mismatch with
+`error.InvalidTexture`) aborts the command before touching the target; a mesh
+without usable `uvs` skips the command (`skipped_draws`), also before any draw.
+
+Not implemented: mipmaps/LOD selection, anisotropic filtering, sRGB transfer,
+wrap modes other than repeat, or premultiplied alpha. Minified textures will
+alias — generate small enough mip images offline. The sampling math is pinned
+to the reference in `tools/gen_raster_texture_vectors.py`; changing any
+expression there requires regenerating
+[`src/render/raster_texture_vectors.zig`](../src/render/raster_texture_vectors.zig)
+and the tests will fail loudly until both sides agree bit for bit.
+
+## Lighting
+
+A single directional light shades both the flat and the textured path with a
+Lambert term. `Light` is a plain struct:
+
+| Field | Meaning |
+| --- | --- |
+| `direction: [3]f32` | Direction **toward** the light, world space. Not normalized — the implementation normalizes in `f64`. |
+| `color: [3]f32` | Diffuse multiplier per channel. Values above 1.0 are legal (HDR). Defaults to white. |
+| `ambient: [3]f32` | Constant fill added regardless of facing, per channel. Defaults to `{0.15, 0.15, 0.15}`. |
+
+Configure it with `Options.light` (per draw), or give the `resources` object
+passed to `rasterize` an optional `pub fn directionalLight(self) ?Light` —
+resolved once per draw command, mirroring the `mesh`/`color`/`texture`
+providers. An explicit `Options.light` wins over the provider.
+
+Per surviving triangle (after culling):
+
+1. **World-space face normal.** Each winning vertex's world-space position is
+   mapped to `f64` with the `world * position` product (column-major `Mat4`),
+   and `faceNormal` returns the raw cross product `n = cross(b - a, c - a)` of
+   the world-space edge vectors.
+2. **Normalized in `f64`:** `nrm = sqrt((n0*n0 + n1*n1) + n2*n2)`. A zero or
+   non-finite length produces an ambient-only result for that triangle.
+3. `dot = max(0, n . l)` with `l` the normalized light direction; per channel
+   `lm = ambient + dot * color` — deliberately **unclamped** (HDR-legal).
+4. **Applied:** flat — `rgb = clampByte(tint * lm)`, alpha verbatim;
+   textured — texel and tint multiply first, then the light:
+   `rgb = clampByte(((t * tint) * lm) / 255)`, alpha stays the unlit
+   `floor(t*a/255 + 0.5)` rounding. `clampByte(s) = floor(min(max(s, 0), 255) + 0.5)`
+   — multipliers above 1 clamp at the final quantize, never before.
+
+Malformed lights are a hard error: `Light.validate()` runs at the `drawMesh`
+entry — every draw path funnels through `drawMesh` — and rejects a zero-length
+or non-finite direction, or any negative/non-finite color or ambient channel,
+with `error.InvalidLight` **before a single pixel or depth value is written**.
+
+This is a face-lighting (flat-shaded) model: all fragments of a triangle share
+its geometric normal. No per-vertex normals, vertex colors, specular terms,
+point/spot lights or shadows — see
+[Limitations and next steps](#limitations-and-next-steps). The lighting math is
+pinned to the reference in `tools/gen_raster_light_vectors.py`; changing any
+expression there requires regenerating
+[`src/render/raster_light_vectors.zig`](../src/render/raster_light_vectors.zig)
+and the tests will fail loudly until both sides agree bit for bit.
 
 ## Verification
 
@@ -169,6 +292,29 @@ call per vertex.
   Agreement therefore validates the stepping, the bbox clamp and the fill-rule
   bias independently. Coverage masks and `f32` depth **bit patterns** must match
   exactly — 866 covered pixels across the corpus. CI never runs the generator.
+- **44 texture reference frames** in `src/render/raster_texture_vectors.zig`,
+  generated by [`tools/gen_raster_texture_vectors.py`](../tools/gen_raster_texture_vectors.py)
+  (same brute-force coverage). UVs are carried as pre-divided `uw`/`vw`/`w_inv`
+  tuples, and the Python reference recomputes the perspective-correct
+  interpolation, both filters, repeat wrap (including negative UVs), tint
+  multiply and rounding from scratch; the tests compare the **full RGBA8 frame**
+  plus coverage, so alpha writes and tint rounding are pinned as well — 576
+  covered pixels across the corpus, all bit-exact.
+- **40 lit reference frames** in `src/render/raster_light_vectors.zig`,
+  generated by [`tools/gen_raster_light_vectors.py`](../tools/gen_raster_light_vectors.py)
+  (same brute-force coverage). The raw world-space face normal is an input per
+  case; both sides normalize it in `f64`, compute `dot = max(0, n . l)` and
+  `lm = ambient + dot * color` with pinned operation order, and clamp only at
+  the final byte quantize. Full RGBA8 frames plus coverage bit-match — 670
+  covered pixels across the corpus.
+- **Lighting unit tests.** `Light.validate()` rejects zero-length/non-finite
+  directions and negative/non-finite channels (HDR accepted); an invalid light
+  fails in `drawMesh` before any draw; a facing-away face renders ambient-only;
+  a perpendicular face contributes exactly the ambient term; a reversed-winding
+  triangle lights from the world-space normal with culling off; a translated
+  world does not bend the normal; lit+textured albedo multiplies through the
+  multiplier and rounds once; the `directionalLight()` provider shades draws and
+  an explicit `Options.light` wins over it.
 - **Watertightness property test.** A quad split into triangles is rasterized
   piecewise into separate targets; the coverage counts must sum to the quad area
   (no overlap) and their union must cover it (no gap). Repeated over ten
@@ -189,7 +335,8 @@ call per vertex.
   overlapping quads from a scene, hands the rasterizer's own buffer to
   `assets.image.encodeQoi`, decodes it back and asserts the pixels are byte-identical.
   It lives at the composition root so the rasterizer itself keeps no dependency on
-  the asset layer.
+  the asset layer. A second case does the same for a textured render (nearest
+  sampling, tint multiply on near and far quads, alpha verbatim).
 
 ## Performance
 
@@ -206,6 +353,31 @@ Small triangles are setup-bound; large ones approach the scalar fill limit. The
 per-pixel `f64` interpolation is deliberately kept rather than stepped
 incrementally in float, because incremental float accumulation would drift and
 break bit-exact reproducibility.
+
+### Textured path
+
+Measured with the committed harness (`zig build bench -Doptimize=ReleaseFast`,
+[`tools/bench_raster.zig`](../tools/bench_raster.zig); not run in CI) on an Intel
+Xeon @ 2.60GHz (2 vCPU), 1024 quads, 64×64 RGBA8 texture, repeat wrap, white
+tint, full coverage. The flat path re-measured on this machine is in the last
+column for a valid relative comparison; the absolute flat numbers are consistent
+with the table above within run-to-run variance.
+
+| Path | 256×256 | 512×512 | 1024×1024 | Relative cost @1024² |
+| --- | --- | --- | --- | --- |
+| Flat (re-measured) | 0.382 ms | 1.162 ms | 3.948 ms | 1× (265.6 Mpx/s) |
+| Nearest | 0.940 ms (69.7 Mpx/s) | 3.350 ms (78.2 Mpx/s) | 13.075 ms (80.2 Mpx/s) | ~3.3× |
+| Bilinear | 2.455 ms (26.7 Mpx/s) | 9.514 ms (27.6 Mpx/s) | 35.829 ms (29.3 Mpx/s) | ~9.1× |
+
+Bilinear is disproportionately expensive because of the per-pixel `f64`
+perspective correction: two divides by `Σλ·w_inv` per pixel. Replacing them with
+`x * (1/den)` would double-round and silently diverge from the pinned vectors,
+so it is deliberately not done — a reciprocal must be introduced in both
+references (or not at all). Nearest costs one texel fetch and a clamp; bilinear
+costs four fetches, four taps weighted in `f64` and two `f64` divides. Both
+numbers are honest scalar upper bounds of the current implementation, not
+aspirational targets: SIMD texel gathering, a reciprocal fast path guarded by
+exactness checks, and mipmaps all remain future work.
 
 The pixel path takes no allocator and uses only fixed stack scratch, so it cannot
 allocate, cannot fail with `OutOfMemory`, and is safe to call from a render thread.
@@ -224,12 +396,15 @@ See [asset-decoders.md](asset-decoders.md) for the codec.
 
 ## Limitations and next steps
 
-- **Flat color only.** No textures, UVs, vertex colors, normals, lighting,
-  shadows or shading of any kind. `Mesh` carries positions alone for that reason.
+- **Flat Lambert per-face lighting only.** One directional light (`Options.light`
+  or a `resources.directionalLight()` provider), applied with the geometric
+  (face) normal — no per-vertex normals, vertex colors, specular terms,
+  point/spot lights, shadow mapping or multiple lights.
 - **No blending or transparency.** Alpha is written to the framebuffer verbatim,
   not composited. `back_to_front` sorting exists in the extraction layer but has
   nothing to blend against here.
-- **No antialiasing.** One sample per pixel, no MSAA and no mipmap/LOD selection.
+- **No antialiasing, mipmaps or LOD selection.** One sample per pixel, no MSAA.
+  Minification aliases.
 - **No GPU backend.** This is a CPU reference path, not a Renderer Low tier.
 - **Single-threaded.** No tile parallelism or binning; a frame is rasterized in
   submission order on the calling thread.

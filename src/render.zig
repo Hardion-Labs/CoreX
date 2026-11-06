@@ -70,6 +70,12 @@ pub const FrontFace = raster.FrontFace;
 pub const rasterize = raster.rasterize;
 pub const drawMesh = raster.drawMesh;
 pub const rasterTriangle = raster.rasterTriangle;
+/// RGBA8 texture sampled by the software rasterizer (top-down rows).
+pub const RasterTexture = raster.Texture;
+/// Texture minification filter (`nearest` or `bilinear`).
+pub const TextureFilter = raster.Filter;
+/// Single directional Lambert light for the rasterizer (`Options.light`).
+pub const RasterLight = raster.Light;
 
 test {
     std.testing.refAllDecls(@This());

@@ -250,6 +250,18 @@ fn mapAssetsError(err: assets.IndexError) StartupError {
     };
 }
 
+/// Silence engine log output for the duration of a test that intentionally
+/// drives the pipeline down an expected failure path. The Zig test runner
+/// prints captured stderr (together with a stale "failed command" line) even
+/// when every test passes, which makes a green suite look broken. The
+/// warnings still fire in the real engine; they are just noise on a passing
+/// test run.
+fn suppressEngineLogs() std.log.Level {
+    const prev = std.testing.log_level;
+    std.testing.log_level = .err;
+    return prev;
+}
+
 // --- tests -----------------------------------------------------------------
 
 const TestProject = struct {
@@ -362,6 +374,9 @@ test "startup: invalid manifest -> InvalidManifest" {
 }
 
 test "startup: incompatible version -> IncompatibleVersion" {
+    const prev_log_level = suppressEngineLogs();
+    defer std.testing.log_level = prev_log_level;
+
     var proj = try TestProject.init();
     defer proj.deinit();
     try proj.write("Game.corex",
@@ -419,6 +434,9 @@ test "startup: editor without initial scene prepares an empty scene" {
 }
 
 test "startup: invalid scene content -> PreparationFailed" {
+    const prev_log_level = suppressEngineLogs();
+    defer std.testing.log_level = prev_log_level;
+
     var proj = try TestProject.init();
     defer proj.deinit();
     try proj.write("Game.corex",
