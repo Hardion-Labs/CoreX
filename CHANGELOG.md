@@ -580,6 +580,16 @@ declared yet.
 
 ### Changed
 
+- Documentation audit of `docs/render-raster.md`: the pipeline now mentions the
+  optional per-channel Lambert multiplier applied to the albedo; the provider
+  contract documents the optional `directionalLight()` method (`@hasDecl`,
+  `pub` required, explicit `Options.light` wins, validation deferred to the
+  `drawMesh` entry); the error list includes `InvalidLight`; and the
+  performance notes state the lit path is intentionally unbenchmarked. The
+  raster-vectors generator (`tools/gen_raster_vectors.py`) is now deterministic
+  byte-for-byte: empty and single-element `depths` lists emit exactly what
+  `zig fmt` produces, so regenerating the vectors reproduces the committed
+  corpus without manual formatting steps.
 - Renamed the executable to `corex-engine`.
 - README and architecture documentation now reflect the definitive scope and the
   per-subsystem implementation status.
