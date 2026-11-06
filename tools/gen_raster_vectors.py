@@ -232,7 +232,12 @@ def emit(cases):
         lines.append("        .depth_write = {0},".format(str(c["depth_write"]).lower()))
         lines.append("        .drew = {0},".format(str(c["drew"]).lower()))
         lines.append("        .mask = .{{ {0} }},".format(mask))
-        lines.append("        .depths = &.{{ {0} }},".format(depths))
+        if len(c["depths"]) == 1:
+            lines.append("        .depths = &.{{{0}}},".format(depths))
+        elif depths:
+            lines.append("        .depths = &.{{ {0} }},".format(depths))
+        else:
+            lines.append("        .depths = &.{},")
         lines.append("    },")
     lines.append("};")
     lines.append("")
