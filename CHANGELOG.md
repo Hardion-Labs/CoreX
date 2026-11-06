@@ -267,7 +267,13 @@ declared yet.
   encoding at the composition root. A second case covers a textured render
   (nearest-filtered 4x4 sample, material tint multiply on both the near and far
   quads, QOI roundtrip) so the texture path is proven across scene, extraction,
-  rasterizer and codec.
+  rasterizer and codec. A third series of cases covers the directional Lambert
+  path the same way (`raster_image_test.zig`): the `directionalLight()` provider
+  shades the extracted frame (full diffuse, ambient-only and oblique dots
+  pinned per channel), a 180-degree world rotation faces the quad away from
+  the light (ambient-only with culling off; culled under the default
+  back-face rule), and an explicit `Options.light` wins over the provider
+  through the full scene -> extraction -> rasterizer path.
 - Scene streaming (`src/scene/stream.zig`, re-exported as `corex.scene.stream`
   with `corex.scene.EngineStream`, `docs/scene-streaming.md`) and a `stream`
   importer (v1) bound to `.corexstream`. A versioned, strict manifest lists named
@@ -554,7 +560,7 @@ declared yet.
   detection, WAV audio import, audio mixing, spatial audio, voice stealing,
   band-limited resampling, insert DSP including delay/reverb/limiter/saturator,
   Adam7 interlaced PNG, sequential JPEG, scene streaming and software
-  rasterization (641 tests),
+  rasterization (644 tests),
   including allocation-failure
   probes, cache corruption/truncation probes, a deep-hierarchy stress test, QOI
   encode/decode roundtrips, end-to-end texture-import-and-cache, OBJ-import-and-
