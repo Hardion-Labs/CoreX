@@ -175,11 +175,15 @@ A **CPU software rasterizer** (`src/render/raster.zig`,
 `docs/render-raster.md`) consumes that draw list and writes an RGBA8 framebuffer
 with an `f32` depth buffer: clip-space frustum clipping, perspective divide,
 28.4 fixed-point integer edge functions with a top-left fill rule, backface
-culling and flat-color shading. Coverage is bit-exactly reproducible and shared
-edges are watertight. Geometry and materials arrive through a duck-typed provider,
-so `render` has no dependency on the asset layer, and the pixel path takes no
-allocator. It is a CPU reference path, **not** a renderer tier: textures, lighting,
+culling and flat or texture-mapped shading. Coverage is bit-exactly reproducible
+and shared edges are watertight. Geometry and materials arrive through a duck-typed
+provider, so `render` has no dependency on the asset layer, and the pixel path
+takes no allocator. It is a CPU reference path, **not** a renderer tier: lighting,
 blending and antialiasing are absent, and the GPU backends remain planned.
+Texture-mapped shading: perspective-correct UVs, repeat wrap, nearest/bilinear
+sampling of borrowed RGBA8 textures, tint multiply; `Mesh` carries optional `uvs`
+and the provider's optional `texture()` (a `pub` decl, detected at comptime)
+binds the material — absent, the path stays flat and byte-identical to before.
 
 ### Audio runtime — mixing + spatialization implemented; device backends planned
 The device-independent playback layer is implemented (`src/audio/`, re-exported
@@ -407,7 +411,7 @@ over the job system,
 mark-and-sweep GC, change detection with incremental re-import), the
 backend-independent render extraction layer (camera,
 frustum culling, sorted draw lists) with its CPU software rasterizer (watertight
-fixed-point coverage, depth buffer, flat color), and the device-independent audio runtime
+fixed-point coverage, depth buffer, textured shading), and the device-independent audio runtime
 (mixer with voices/buses/pan/pitch, linear and band-limited resampling, priority
 voice stealing, biquad/compressor/delay/reverb/limiter/saturator insert chains,
 plus spatialization
