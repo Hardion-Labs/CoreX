@@ -188,7 +188,10 @@ stays flat and byte-identical to before. Directional Lambert lighting:
 per-face face-normal shading of the flat and textured paths (`Options.light`,
 or an optional `pub fn directionalLight()` on the provider — explicit options
 win), alpha never lit, bit-exact against Python reference vectors; callers
-without a light stay byte-identical to before.
+without a light stay byte-identical to before. Cross-layer integration tests
+(`src/render/raster_image_test.zig`) prove the whole chain — scene, world
+transforms, extraction, rasterizer — with a world-rotated face lit
+ambient-only and the explicit-options-over-provider priority intact.
 
 ### Audio runtime — mixing + spatialization implemented; device backends planned
 The device-independent playback layer is implemented (`src/audio/`, re-exported
