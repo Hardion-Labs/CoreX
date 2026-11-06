@@ -95,6 +95,23 @@ fn componentIsValid(comptime T: type, value: T) bool {
     return true;
 }
 
+/// Membership test over a sorted slice, so bulk operations need no hash set.
+fn containsSorted(sorted: []const u64, value: u64) bool {
+    var lo: usize = 0;
+    var hi: usize = sorted.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (sorted[mid] < value) {
+            lo = mid + 1;
+        } else if (sorted[mid] > value) {
+            hi = mid;
+        } else {
+            return true;
+        }
+    }
+    return false;
+}
+
 fn lessU64(_: void, a: u64, b: u64) bool {
     return a < b;
 }
@@ -207,6 +224,18 @@ pub fn Scene(comptime schemas: anytype) type {
             return self.records.count();
         }
 
+        /// The stable ID the next `createEntity` will hand out.
+        ///
+        /// IDs are allocated monotonically and never reused, so a caller that
+        /// creates a batch of entities can capture the exact set afterwards as
+        /// the half-open range `[nextStableId() before, nextStableId() after)`.
+        /// Bulk operations use this to track ownership without allocating, which
+        /// keeps their rollback path working even when the allocator is failing.
+        /// Returns 0 once the ID space is exhausted.
+        pub fn nextStableId(self: Self) u64 {
+            return self.next_id;
+        }
+
         /// Create an entity with a fresh stable ID. `parent` is a stable ID, or
         /// null for a root entity. The returned handle is generational.
         pub fn createEntity(self: *Self, name: ?[]const u8, parent_id: ?u64) Error!ecs.Entity {
@@ -260,6 +289,81 @@ pub fn Scene(comptime schemas: anytype) type {
             self.world.destroy(entity);
             _ = self.records.remove(id);
             _ = self.entity_ids.remove(entity.key());
+        }
+
+        /// Destroy a set of entities in a single pass, identified by stable ID.
+        ///
+        /// `ids` must be sorted in non-decreasing order (duplicates are fine).
+        /// Surviving children of destroyed entities are reparented to the nearest
+        /// surviving ancestor, or become roots when there is none. That is
+        /// exactly the result of calling `destroyEntity` once per ID, but the
+        /// cost is O(records * log(ids)) instead of O(records * ids).
+        ///
+        /// The operation **cannot fail and does not allocate**: membership is a
+        /// binary search over the caller's sorted slice, and ancestor resolution
+        /// is memoized by path-compressing the `parent` field of the doomed
+        /// records themselves, which are about to be deleted anyway. That makes
+        /// it usable on teardown and rollback paths, where an allocator failure
+        /// must not be able to strand entities. Unknown or dead IDs are ignored.
+        ///
+        /// Returns how many entities were actually destroyed.
+        pub fn destroySet(self: *Self, ids: []const u64) usize {
+            if (ids.len == 0) return 0;
+            if (std.debug.runtime_safety) {
+                for (ids[1..], ids[0 .. ids.len - 1]) |next, prev| {
+                    std.debug.assert(next >= prev);
+                }
+            }
+
+            // Reparent survivors first, while every record is still readable.
+            var it = self.records.iterator();
+            while (it.next()) |entry| {
+                if (containsSorted(ids, entry.key_ptr.*)) continue;
+                const pid = entry.value_ptr.parent orelse continue;
+                if (!containsSorted(ids, pid)) continue;
+                entry.value_ptr.parent = self.resolveSurvivingAncestor(ids, pid);
+            }
+
+            var removed: usize = 0;
+            for (ids) |id| {
+                const record = self.records.get(id) orelse continue;
+                if (!self.world.alive(record.entity)) continue;
+                self.world.destroy(record.entity);
+                _ = self.entity_ids.remove(record.entity.key());
+                _ = self.records.remove(id);
+                removed += 1;
+            }
+            return removed;
+        }
+
+        /// Nearest ancestor of `start` that is not in `ids`, or null. `start`
+        /// itself is doomed. Each doomed record on the walked path is rewritten
+        /// to point straight at the answer, so a deep doomed chain is walked once
+        /// in total rather than once per surviving child.
+        fn resolveSurvivingAncestor(self: *Self, ids: []const u64, start: u64) ?u64 {
+            var cursor: ?u64 = start;
+            var survivor: ?u64 = null;
+            // First find the answer, remembering the head of the walked chain.
+            while (cursor) |c| {
+                if (!containsSorted(ids, c)) {
+                    survivor = c;
+                    break;
+                }
+                const rec = self.records.getPtr(c) orelse break;
+                cursor = rec.parent;
+            }
+            // Then compress: every doomed record between `start` and the answer
+            // now points directly at it.
+            var node: ?u64 = start;
+            while (node) |c| {
+                if (!containsSorted(ids, c)) break;
+                const rec = self.records.getPtr(c) orelse break;
+                const next = rec.parent;
+                if (next == survivor) break;
+                rec.parent = survivor;
+                node = next;
+            }
+            return survivor;
         }
 
         pub fn alive(self: Self, entity: ecs.Entity) bool {
@@ -1132,4 +1236,157 @@ fn worldTransformsAllocationProbe(allocator: Allocator) !void {
 
 test "world transforms: compute survives every allocation failure without leaking" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, worldTransformsAllocationProbe, .{});
+}
+
+test "scene: destroySet matches repeated destroyEntity exactly" {
+    const gpa = std.testing.allocator;
+    // A wide, deep hierarchy: root 1, chains and branches under it, plus a
+    // second independent root. Every doomed-subset shape below is exercised
+    // against the one-at-a-time reference implementation.
+    const build = struct {
+        fn make(alloc: Allocator) !TestScene {
+            var s = try TestScene.init(alloc, "main");
+            errdefer s.deinit();
+            _ = try s.createEntity("a", null); // 1
+            _ = try s.createEntity("b", 1); // 2
+            _ = try s.createEntity("c", 2); // 3
+            _ = try s.createEntity("d", 3); // 4
+            _ = try s.createEntity("e", 4); // 5
+            _ = try s.createEntity("f", 1); // 6
+            _ = try s.createEntity("g", 6); // 7
+            _ = try s.createEntity("h", null); // 8
+            _ = try s.createEntity("i", 8); // 9
+            _ = try s.createEntity("j", 2); // 10
+            return s;
+        }
+    }.make;
+
+    const subsets = [_][]const u64{
+        &.{},
+        &.{1},
+        &.{2},
+        &.{ 2, 3 },
+        &.{ 2, 3, 4 },
+        &.{ 1, 2, 3, 4, 5 },
+        &.{ 1, 6, 8 },
+        &.{ 3, 4 },
+        &.{ 2, 4 }, // sparse, non-contiguous
+        &.{ 2, 2, 2 }, // duplicates
+        &.{99}, // unknown id
+        &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 },
+    };
+
+    for (subsets) |ids| {
+        var batch = try build(gpa);
+        defer batch.deinit();
+        var one_by_one = try build(gpa);
+        defer one_by_one.deinit();
+
+        const removed = batch.destroySet(ids);
+
+        var expected: usize = 0;
+        for (ids) |id| {
+            if (one_by_one.entityById(id)) |e| {
+                one_by_one.destroyEntity(e);
+                expected += 1;
+            }
+        }
+        try std.testing.expectEqual(expected, removed);
+        try std.testing.expectEqual(one_by_one.count(), batch.count());
+
+        // Byte-identical documents prove names, components, IDs and the whole
+        // reparenting result agree, not just the entity count.
+        const a = try batch.serialize(gpa);
+        defer gpa.free(a);
+        const b = try one_by_one.serialize(gpa);
+        defer gpa.free(b);
+        try std.testing.expectEqualSlices(u8, b, a);
+    }
+}
+
+test "scene: destroySet reparents survivors to the nearest surviving ancestor" {
+    const gpa = std.testing.allocator;
+    var s = try TestScene.init(gpa, "main");
+    defer s.deinit();
+    _ = try s.createEntity("root", null); // 1 survives
+    _ = try s.createEntity("gone1", 1); // 2
+    _ = try s.createEntity("gone2", 2); // 3
+    _ = try s.createEntity("gone3", 3); // 4
+    const keep = try s.createEntity("keep", 4); // 5 survives, deep under doomed chain
+    const orphan = try s.createEntity("orphan", 3); // 6 survives under a doomed root-less chain
+
+    try std.testing.expectEqual(@as(usize, 3), s.destroySet(&.{ 2, 3, 4 }));
+    // `keep` climbs past 4, 3 and 2 to the surviving root 1.
+    try std.testing.expectEqual(@as(?u64, 1), s.records.get(5).?.parent);
+    try std.testing.expect(s.world.alive(keep));
+    // `orphan` had no surviving ancestor above 3, so it also lands on 1.
+    try std.testing.expectEqual(@as(?u64, 1), s.records.get(6).?.parent);
+    try std.testing.expect(s.world.alive(orphan));
+
+    // Removing the last ancestor turns survivors into roots.
+    try std.testing.expectEqual(@as(usize, 1), s.destroySet(&.{1}));
+    try std.testing.expectEqual(@as(?u64, null), s.records.get(5).?.parent);
+    try std.testing.expectEqual(@as(?u64, null), s.records.get(6).?.parent);
+    try std.testing.expectEqual(@as(usize, 2), s.count());
+}
+
+test "scene: destroySet on a deep doomed chain stays linear and does not recurse" {
+    const gpa = std.testing.allocator;
+    var s = try TestScene.init(gpa, "main");
+    defer s.deinit();
+    // 20k-deep chain: recursion would overflow the stack, and a per-child
+    // ancestor walk without memoization would be quadratic.
+    const depth = 20_000;
+    var parent: ?u64 = null;
+    var ids = try gpa.alloc(u64, depth);
+    defer gpa.free(ids);
+    for (0..depth) |i| {
+        const e = try s.createEntity(null, parent);
+        ids[i] = s.idOf(e).?;
+        parent = ids[i];
+    }
+    const leaf = try s.createEntity("leaf", parent);
+    const leaf_id = s.idOf(leaf).?;
+
+    try std.testing.expectEqual(@as(usize, depth), s.destroySet(ids));
+    try std.testing.expectEqual(@as(usize, 1), s.count());
+    try std.testing.expect(s.world.alive(leaf));
+    try std.testing.expectEqual(@as(?u64, null), s.records.get(leaf_id).?.parent);
+}
+
+test "scene: destroySet ignores unknown and stale IDs" {
+    const gpa = std.testing.allocator;
+    var s = try TestScene.init(gpa, "main");
+    defer s.deinit();
+    const e = try s.createEntity("gone", null);
+    const id = s.idOf(e).?;
+    s.destroyEntity(e);
+    try std.testing.expectEqual(@as(usize, 0), s.destroySet(&.{ 0, id, 12345 }));
+    try std.testing.expectEqual(@as(usize, 0), s.destroySet(&.{}));
+}
+
+test "scene: destroySet performs no allocation at all" {
+    // The no-allocation guarantee is what makes destroySet usable on teardown
+    // and rollback paths, so assert it directly rather than only probing OOM.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const alloc = failing.allocator();
+    var s = try TestScene.init(alloc, "main");
+    defer s.deinit();
+    var parent: ?u64 = null;
+    for (0..2000) |_| {
+        const e = try s.createEntity(null, parent);
+        parent = s.idOf(e).?;
+    }
+    const survivor = try s.createEntity("survivor", parent);
+    // Build the doomed ID list before measuring, so only destroySet is timed.
+    const ids = try std.testing.allocator.alloc(u64, 2000);
+    defer std.testing.allocator.free(ids);
+    for (ids, 0..) |*id, i| id.* = @intCast(i + 1);
+
+    const before = failing.alloc_index;
+    // A deep doomed chain with a surviving leaf: the worst case for ancestor
+    // resolution, and it must still not ask the allocator for anything.
+    try std.testing.expectEqual(@as(usize, 2000), s.destroySet(ids));
+    try std.testing.expectEqual(before, failing.alloc_index);
+    try std.testing.expect(s.world.alive(survivor));
 }
