@@ -591,8 +591,9 @@ Indicative; subject to change as technical decisions are validated.
 - [ ] Hot-reload event watcher (inotify/FSEvents), dependency graph, startup/editor integration.
 - [x] Backend-independent render extraction (camera, frustum culling, sorted draw lists).
 - [x] CPU software rasterizer (fixed-point watertight coverage, depth buffer, textured shading).
+- [x] Rasterizer lighting: single directional Lambert (face normals, CPU reference path).
 - [ ] Renderer Low / Medium GPU backends; Advanced contract.
-- [ ] Rasterizer shading: lighting, blending, antialiasing, mipmaps.
+- [ ] Rasterizer shading: blending, antialiasing, mipmaps.
 - [ ] GUI library and graphical editor.
 - [ ] Lua VM and gameplay scripting.
 - [ ] Native Module API loader (C++).

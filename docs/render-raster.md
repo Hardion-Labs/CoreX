@@ -315,6 +315,13 @@ and the tests will fail loudly until both sides agree bit for bit.
   world does not bend the normal; lit+textured albedo multiplies through the
   multiplier and rounds once; the `directionalLight()` provider shades draws and
   an explicit `Options.light` wins over it.
+- **Cross-layer lit integration tests** in
+  [`src/render/raster_image_test.zig`](../src/render/raster_image_test.zig)
+  (composition root): scene → extraction → rasterizer with a
+  `directionalLight()` provider — full-diffuse, ambient-only and oblique dots
+  pinned per channel; a 180-degree world rotation faces the quad away from the
+  light (culled by default, ambient-only with culling off); an explicit
+  `Options.light` wins over the provider through the full path.
 - **Watertightness property test.** A quad split into triangles is rasterized
   piecewise into separate targets; the coverage counts must sum to the quad area
   (no overlap) and their union must cover it (no gap). Repeated over ten

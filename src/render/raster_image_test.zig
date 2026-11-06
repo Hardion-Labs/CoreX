@@ -225,3 +225,176 @@ test "textured render routes through the same codec and wins depth" {
     try testing.expectEqual(height, decoded.height);
     try testing.expectEqualSlices(u8, color, decoded.pixels);
 }
+
+/// Lit variant: its `directionalLight` method makes the directional light
+/// resolve through the same duck-typed contract the rasterizer detects at
+/// comptime. Kept separate so the unlit and textured paths stay first-class
+/// supported configurations.
+const LitResources = struct {
+    meshes: []const R.RasterMesh,
+    palette: []const [4]f32,
+    light: R.RasterLight,
+
+    pub fn mesh(self: LitResources, handle: u32) ?R.RasterMesh {
+        if (handle >= self.meshes.len) return null;
+        return self.meshes[handle];
+    }
+
+    pub fn color(self: LitResources, handle: u32) ?[4]f32 {
+        if (handle >= self.palette.len) return null;
+        return self.palette[handle];
+    }
+
+    pub fn directionalLight(self: LitResources) ?R.RasterLight {
+        return self.light;
+    }
+};
+
+fn quadScene(gpa: std.mem.Allocator, name: []const u8, rotation: [4]f32) !TestScene {
+    _ = name;
+    var sc = try TestScene.init(gpa, "main");
+    errdefer sc.deinit();
+    const e = try sc.createEntity("quad", null);
+    try sc.addComponent(e, corex.scene.Transform{ .position = .{ 0, 0, -1 }, .rotation = rotation });
+    try sc.addComponent(e, R.Renderable{
+        .mesh = 0,
+        .material = 0,
+        .bounds = R.Aabb.fromMinMax(.{ -2, -2, -0.1 }, .{ 2, 2, 0.1 }),
+    });
+    return sc;
+}
+
+const lit_positions = [_][3]f32{ .{ -2, -2, 0 }, .{ 2, -2, 0 }, .{ 2, 2, 0 }, .{ -2, 2, 0 } };
+const lit_indices = [_]u32{ 0, 1, 2, 0, 2, 3 };
+const lit_mesh = R.RasterMesh{ .positions = &lit_positions, .indices = &lit_indices };
+
+test "lit integration: the provider's directional light shades the extracted frame" {
+    const gpa = testing.allocator;
+    const width: u32 = 32;
+    const height: u32 = 24;
+    const count = @as(usize, width) * height;
+
+    var sc = try quadScene(gpa, "lit", .{ 0, 0, 0, 1 });
+    defer sc.deinit();
+
+    const aspect = @as(f32, @floatFromInt(width)) / @as(f32, @floatFromInt(height));
+    const cam = R.Camera.perspectiveLookAt(.{ 0, 0, 6 }, .{ 0, 0, 0 }, .{ 0, 1, 0 }, std.math.pi / 2.0, aspect, 0.5, 100);
+
+    const meshes = [_]R.RasterMesh{lit_mesh};
+    const palette = [_][4]f32{.{ 0.5, 0.25, 1.0, 1.0 }};
+    // Quantized palette once (clamp -> *255 -> round): 0.5 -> 128, 0.25 -> 64, 1.0 -> 255.
+    const albedo = [3]u8{ 128, 64, 255 };
+
+    const color = try gpa.alloc(u8, count * 4);
+    defer gpa.free(color);
+    const depth = try gpa.alloc(f32, count);
+    defer gpa.free(depth);
+
+    // All expected values use exact binary arithmetic on the quantized albedo
+    // (x * 0.25 == exact; x * 0.8 is pinned against the f64 dot below).
+    const cases = [_]struct {
+        name: []const u8,
+        light: R.RasterLight,
+        expected: [4]u8,
+    }{
+        // Dead-on light, ambient 0: dot == 1 exactly -> tint unchanged.
+        .{ .name = "full", .light = .{ .direction = .{ 0, 0, 1 }, .color = .{ 1, 1, 1 }, .ambient = .{ 0, 0, 0 } }, .expected = .{ albedo[0], albedo[1], albedo[2], 255 } },
+        // Perpendicular light, ambient 1/4: dot == 0 -> ambient-only.
+        .{ .name = "ambient_only", .light = .{ .direction = .{ 1, 0, 0 }, .color = .{ 1, 1, 1 }, .ambient = .{ 0.25, 0.25, 0.25 } }, .expected = .{ 32, 16, 64, 255 } },
+        // Oblique light with an exact-ish unit vector: dot ~ 0.8 in f64.
+        // 128*0.8+0.5 -> 102, 64*0.8+0.5 -> 51, 255*dot+0.5 -> 204.
+        .{ .name = "oblique", .light = .{ .direction = .{ 0.6, 0, 0.8 }, .color = .{ 1, 1, 1 }, .ambient = .{ 0, 0, 0 } }, .expected = .{ 102, 51, 204, 255 } },
+    };
+
+    for (cases) |case| {
+        var frame = try R.extractDrawList(&sc, cam, .front_to_back, gpa);
+        defer frame.deinit();
+        try testing.expectEqual(@as(usize, 1), frame.count());
+
+        var target = try R.Target.init(width, height, color, depth);
+        target.clear(.{ 0, 0, 0, 255 }, 1.0);
+
+        const res = LitResources{ .meshes = &meshes, .palette = &palette, .light = case.light };
+        const stats = try R.rasterize(&target, frame.commands, cam.view_projection, res, .{});
+        try testing.expectEqual(@as(usize, 2), stats.submitted);
+        try testing.expect(stats.pixels > 0);
+        // The provider's light shaded the quad: the center is full albedo * lm.
+        std.testing.expectEqualSlices(u8, &case.expected, &target.colorAt(width / 2, height / 2)) catch |err| {
+            std.debug.print("case {s}: center mismatch\n", .{case.name});
+            return err;
+        };
+    }
+}
+
+test "lit integration: a world rotation reaches the light; culling composes with it" {
+    const gpa = testing.allocator;
+    const width: u32 = 32;
+    const height: u32 = 24;
+    const count = @as(usize, width) * height;
+
+    // 180 degrees about Y: (0, 1, 0, 0); the quaternion path builds diag(-1, 1, -1)
+    // with exact integer products, so the face normal is exactly (0, 0, -1).
+    var sc = try quadScene(gpa, "turned", .{ 0, 1, 0, 0 });
+    defer sc.deinit();
+
+    const aspect = @as(f32, @floatFromInt(width)) / @as(f32, @floatFromInt(height));
+    const cam = R.Camera.perspectiveLookAt(.{ 0, 0, 6 }, .{ 0, 0, 0 }, .{ 0, 1, 0 }, std.math.pi / 2.0, aspect, 0.5, 100);
+
+    const meshes = [_]R.RasterMesh{lit_mesh};
+    const palette = [_][4]f32{.{ 0.5, 0.25, 1.0, 1.0 }};
+    const res = LitResources{ .meshes = &meshes, .palette = &palette, .light = .{ .direction = .{ 0, 0, 1 }, .color = .{ 1, 1, 1 }, .ambient = .{ 0.25, 0.25, 0.25 } } };
+
+    const color = try gpa.alloc(u8, count * 4);
+    defer gpa.free(color);
+    const depth = try gpa.alloc(f32, count);
+    defer gpa.free(depth);
+
+    var frame = try R.extractDrawList(&sc, cam, .front_to_back, gpa);
+    defer frame.deinit();
+    try testing.expectEqual(@as(usize, 1), frame.count());
+
+    // Default cull is back-face: the rotated quad is rejected, buffer untouched.
+    var target = try R.Target.init(width, height, color, depth);
+    target.clear(.{ 9, 9, 9, 255 }, 1.0);
+    _ = try R.rasterize(&target, frame.commands, cam.view_projection, res, .{});
+    try testing.expectEqualSlices(u8, &.{ 9, 9, 9, 255 }, &target.colorAt(width / 2, height / 2));
+
+    // With culling off the world-side normal does the lighting: facing the
+    // ambient only, per channel: floor(c * 0.25 + 0.5).
+    target.clear(.{ 9, 9, 9, 255 }, 1.0);
+    _ = try R.rasterize(&target, frame.commands, cam.view_projection, res, .{ .cull = .none });
+    try testing.expectEqualSlices(u8, &.{ 32, 16, 64, 255 }, &target.colorAt(width / 2, height / 2));
+}
+
+test "lit integration: an explicit options.light wins over the provider's" {
+    const gpa = testing.allocator;
+    const width: u32 = 32;
+    const height: u32 = 24;
+    const count = @as(usize, width) * height;
+
+    var sc = try quadScene(gpa, "override", .{ 0, 0, 0, 1 });
+    defer sc.deinit();
+
+    const aspect = @as(f32, @floatFromInt(width)) / @as(f32, @floatFromInt(height));
+    const cam = R.Camera.perspectiveLookAt(.{ 0, 0, 6 }, .{ 0, 0, 0 }, .{ 0, 1, 0 }, std.math.pi / 2.0, aspect, 0.5, 100);
+
+    const meshes = [_]R.RasterMesh{lit_mesh};
+    const palette = [_][4]f32{.{ 0.5, 0.25, 1.0, 1.0 }};
+    // The provider would answer with (1, 0, 0) + ambient 1/4 ({32, 16, 64}) ...
+    const res = LitResources{ .meshes = &meshes, .palette = &palette, .light = .{ .direction = .{ 1, 0, 0 }, .color = .{ 1, 1, 1 }, .ambient = .{ 0.25, 0.25, 0.25 } } };
+
+    const color = try gpa.alloc(u8, count * 4);
+    defer gpa.free(color);
+    const depth = try gpa.alloc(f32, count);
+    defer gpa.free(depth);
+
+    var frame = try R.extractDrawList(&sc, cam, .front_to_back, gpa);
+    defer frame.deinit();
+    try testing.expectEqual(@as(usize, 1), frame.count());
+
+    // ... but the caller's explicit light (dead-on, ambient 0) must win.
+    var target = try R.Target.init(width, height, color, depth);
+    target.clear(.{ 0, 0, 0, 255 }, 1.0);
+    _ = try R.rasterize(&target, frame.commands, cam.view_projection, res, .{ .light = .{ .direction = .{ 0, 0, 1 }, .color = .{ 1, 1, 1 }, .ambient = .{ 0, 0, 0 } } });
+    try testing.expectEqualSlices(u8, &.{ 128, 64, 255, 255 }, &target.colorAt(width / 2, height / 2));
+}
