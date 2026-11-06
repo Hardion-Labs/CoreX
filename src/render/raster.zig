@@ -39,6 +39,7 @@ const std = @import("std");
 const draw = @import("draw.zig");
 const transform = @import("../scene/transform.zig");
 
+const Allocator = std.mem.Allocator;
 const Mat4 = transform.Mat4;
 const Vec3 = transform.Vec3;
 const DrawCommand = draw.DrawCommand;
@@ -60,6 +61,10 @@ pub const Error = error{
     /// color/ambient channel is negative or non-finite.
     InvalidLight,
 };
+
+/// `Error` plus the allocation failure an antialiased draw can report (`OutOfMemory`
+/// surfaces before any pixel is written, so the target is never half-rendered).
+pub const DrawError = Error || error{OutOfMemory};
 
 /// Largest framebuffer side. Bounds the fixed-point range and the pixel count.
 pub const max_dimension: u32 = 16384;
@@ -97,6 +102,43 @@ pub const Filter = enum { nearest, bilinear };
 /// target is composited in every mode, so a transparent destination keeps its
 /// coverage.
 pub const Blend = enum { none, alpha, premultiplied, additive };
+
+/// Edge antialiasing strategy.
+///
+/// `none` (the default) is the classic one-sample rasterizer: a pixel center is
+/// either inside or outside, and the whole fragment is written or not. It stays
+/// bit-identical to the behaviour before antialiasing existed.
+///
+/// `edge` turns partially covered pixels into translucent fragments. Coverage is
+/// estimated from the three fixed-point edge functions as the fraction of a
+/// 4x4 sub-sample grid (offsets `(i + 0.5) / 4`, i.e. 16 exact sample points per
+/// pixel) that lies inside the triangle, computed with integers only. The
+/// fragment is then composited the same way as any other: alpha is scaled by
+/// coverage and the destination is pulled towards it proportionally, so a
+/// triangle edge blends into whatever is already on the target — including a
+/// neighbouring triangle sharing that edge, which is what removes the staircase
+/// without erasing the geometric partition.
+///
+/// Resolution happens **once per draw command**, not per fragment: sub-sample
+/// coverage, shaded color and depth are accumulated into caller-owned scratch
+/// (`drawMesh`/`rasterize` allocate it from their allocator, so `rasterTriangle`
+/// on its own cannot antialias) and each touched pixel is composited exactly
+/// once. That is what keeps shared interior edges between two triangles of the
+/// same mesh watertight and free of a seam — the classic failure of per-fragment
+/// alpha AA.
+///
+/// Consequences worth knowing before opting in: the result is no longer
+/// bit-comparable with the reference corpora, a partially covered pixel never
+/// writes depth (`depth_write` is ignored for it, because a translucent fragment
+/// must not occlude), and the cost is 16 coverage samples for edge pixels plus an
+/// extra `w*h` accumulation pass over the draw's bounding box.
+pub const Antialias = enum { none, edge };
+
+/// Sub-samples per pixel axis used by `Antialias.edge`: a 4x4 grid, 16 exact
+/// integer sample points.
+pub const aa_grid: u5 = 4;
+/// Coverage maximum (`aa_grid * aa_grid`). Coverage is `0..=aa_samples`.
+pub const aa_samples: u16 = aa_grid * aa_grid;
 
 /// A single directional light for the Lambert shading path, set through
 /// `Options.light` (or supplied by the duck-typed `resources` via an optional
@@ -154,6 +196,11 @@ pub const Options = struct {
     /// back-to-front — extraction's `back_to_front` sort is what feeds them —
     /// because the rasterizer performs no reordering of its own.
     blend: Blend = .none,
+    /// Edge antialiasing. `none` (default) keeps the one-sample rasterizer
+    /// byte-identical to before; `.edge` composites partially covered edge
+    /// pixels as translucent fragments. See `Antialias` for the guarantees each
+    /// mode does and does not give.
+    antialias: Antialias = .none,
 };
 
 /// A triangle vertex in screen space: `x`/`y` are 28.4 fixed point pixels with
@@ -214,8 +261,12 @@ pub const Stats = struct {
     /// Triangles that survived clipping and culling. One of these may still
     /// cover no pixel center; `pixels` reports the actual coverage.
     rasterized: usize = 0,
-    /// Pixels that passed the depth test and were written.
+    /// Pixels that passed the depth test and were written (one per covered
+    /// pixel, however partially it was covered).
     pixels: usize = 0,
+    /// Of `pixels`, how many were written with partial antialiased coverage
+    /// (`antialias = .edge`). Always zero with the default one-sample path.
+    antialiased_pixels: usize = 0,
 
     pub fn add(self: *Stats, other: Stats) void {
         self.skipped_draws += other.skipped_draws;
@@ -224,6 +275,7 @@ pub const Stats = struct {
         self.culled += other.culled;
         self.rasterized += other.rasterized;
         self.pixels += other.pixels;
+        self.antialiased_pixels += other.antialiased_pixels;
     }
 };
 
@@ -460,10 +512,370 @@ fn blendPixels(src: [4]u8, dst: [4]u8, mode: Blend) [4]u8 {
     return out;
 }
 
+/// Composite a shaded fragment with the destination using fractional coverage
+/// (`coverage` in `1..=aa_samples`, `cov = coverage / aa_samples`).
+///
+/// Coverage is folded into the *source alpha*, then the ordinary straight-alpha
+/// source-over equation runs with that attenuated source:
+///
+/// ```
+/// sa = (src.a / 255) * cov          da = dst.a / 255          keep = 1 - sa
+/// out.a   = sa + da * keep
+/// out.rgb = (src.rgb*sa + dst.rgb*da*keep) / out.a    (transparent black if 0)
+/// ```
+///
+/// in `f64`, quantized once per channel — the same arithmetic as `Blend.alpha` with
+/// a scaled alpha, which is why partial coverage of a translucent fragment and full
+/// coverage of a half-alpha one agree. A fully covered pixel never reaches here (it
+/// takes the plain blend path), so coverage 16 is only used defensively.
+fn compositeCoverage(src: [4]u8, dst: [4]u8, coverage: u16) [4]u8 {
+    const cov = @as(f64, @floatFromInt(coverage)) / @as(f64, @floatFromInt(aa_samples));
+    const sa = (@as(f64, @floatFromInt(src[3])) / 255.0) * cov;
+    const da = @as(f64, @floatFromInt(dst[3])) / 255.0;
+    const keep = 1.0 - sa;
+    const out_a = sa + da * keep;
+    if (!(out_a > 0.0)) return .{ 0, 0, 0, 0 };
+    var out: [4]u8 = undefined;
+    for (0..3) |channel| {
+        const s = @as(f64, @floatFromInt(src[channel])) / 255.0;
+        const d = @as(f64, @floatFromInt(dst[channel])) / 255.0;
+        out[channel] = unitByte((s * sa + d * da * keep) / out_a);
+    }
+    out[3] = unitByte(out_a);
+    return out;
+}
+
 /// Quantize a `[0, 1]` blend channel: `floor(clamp(v, 0, 1) * 255 + 0.5)`.
 /// Distinct from `clampByte`, which works in byte units (`0..255`).
 fn unitByte(v: f64) u8 {
     return @intFromFloat(@floor(@min(@max(v, 0.0), 1.0) * 255.0 + 0.5));
+}
+
+// --- antialiasing ------------------------------------------------------------
+
+/// Sub-sample center `k` of a pixel along one axis, in 1/16-pixel units measured
+/// from the pixel's top-left corner: `(k + 0.5) / grid * 16`. With the default 4x4
+/// grid that is 2, 6, 10, 14 — the centers of the four quarter pixels.
+inline fn aaSampleOffset(comptime grid: u5, k: u5) i32 {
+    return @intCast((@as(u32, 2 * @as(u32, k) + 1) * subpixel_scale) / (@as(u32, grid) * 2));
+}
+
+/// Distance from a pixel center, in sub-pixel units, to the farthest sub-sample
+/// along one axis: 6 units on the default 4x4 grid, whose offsets are 2, 6, 10
+/// and 14 around the center at 8.
+const aa_sample_reach: i64 = subpixel_scale / 2 - aaSampleOffset(aa_grid, 0);
+
+/// `|v|` for an `i64` that cannot be `minInt` here (edge steps are coordinate
+/// differences bounded by the target size), avoiding the `u64` of `@abs`.
+inline fn absI(v: i64) i64 {
+    return if (v < 0) -v else v;
+}
+
+/// Edge-function delta per **1/16 pixel** of screen step, per axis, for the three
+/// edges of a triangle wound to positive area. These are the raw coordinate
+/// differences, so they are exact integers and one order of magnitude smaller than
+/// the per-pixel steps (`per_pixel = per_unit * subpixel_scale`).
+const EdgeSteps = struct {
+    /// Delta of edges 0..2 for a step of one sub-pixel unit along +x.
+    dx: [3]i64,
+    /// Delta of edges 0..2 for a step of one sub-pixel unit along +y.
+    dy: [3]i64,
+
+    fn fromScreen(a: ScreenVertex, b: ScreenVertex, c: ScreenVertex) EdgeSteps {
+        return .{
+            .dx = .{ @as(i64, b.y) - c.y, @as(i64, c.y) - a.y, @as(i64, a.y) - b.y },
+            .dy = .{ @as(i64, c.x) - b.x, @as(i64, a.x) - c.x, @as(i64, b.x) - a.x },
+        };
+    }
+};
+
+/// How many of `grid * grid` sub-samples of a pixel lie inside the triangle.
+/// `w` holds the pixel-center edge functions *without* the top-left bias and
+/// `steps` their per-sub-pixel-unit derivatives. Everything is `i64` with the same
+/// exactness the pixel-center test has, so coverage is reproducible bit for bit and
+/// needs no floating point and no lookup table.
+///
+/// A sub-sample counts when it is inside all three edges, with the *same* top-left
+/// rule the pixel-center test uses: an edge that is top-left at its own bias
+/// (`bias == 0`) also claims samples lying exactly on it, and every other edge only
+/// claims strictly-positive ones. This is what makes sub-samples on a shared edge
+/// belong to exactly one of the two triangles, so their coverage still sums to a
+/// full pixel and the shared edge has no seam.
+fn coverageCount(comptime grid: u5, w: [3]i64, steps: EdgeSteps, bias: [3]i64) u16 {
+    var inside: u16 = 0;
+    inline for (0..grid) |j| {
+        const dy: i64 = aaSampleOffset(grid, j) - subpixel_scale / 2;
+        const row = [3]i64{
+            w[0] + steps.dy[0] * dy,
+            w[1] + steps.dy[1] * dy,
+            w[2] + steps.dy[2] * dy,
+        };
+        inline for (0..grid) |i| {
+            const dx: i64 = aaSampleOffset(grid, i) - subpixel_scale / 2;
+            const e0 = row[0] + steps.dx[0] * dx;
+            const e1 = row[1] + steps.dx[1] * dx;
+            const e2 = row[2] + steps.dx[2] * dx;
+            if (onEdge(e0, bias[0]) and onEdge(e1, bias[1]) and onEdge(e2, bias[2])) inside += 1;
+        }
+    }
+    return inside;
+}
+
+/// Inside test for one edge at a sub-sample, honouring the top-left rule: a sample
+/// exactly on a top-left edge (`bias == 0`) counts, one exactly on any other edge
+/// does not.
+inline fn onEdge(e: i64, bias: i64) bool {
+    return e > 0 or (e == 0 and bias == 0);
+}
+
+/// One pixel accumulated during an antialiased draw: `count` of the 16 sub-samples
+/// are covered, and `rgba`/`depth` are the values of the last sub-sample that was.
+const AccSlot = struct {
+    count: u16 = 0,
+    rgba: [4]u8 = .{ 0, 0, 0, 0 },
+    depth: f32 = 0,
+};
+
+/// Caller-owned scratch for one antialiased `drawMesh`. `coverage` and `depth`
+/// hold one entry per target pixel the draw touched and `ids` lists their linear
+/// indices — so the resolve pass visits touched pixels only, never the whole
+/// target, and nothing is cleared. The buffers are sized once for the draw's
+/// bounding rectangle and reused by every triangle of that draw.
+const AccumBuffers = struct {
+    coverage: []AccSlot,
+    /// Linear indices of the touched slots, relative to `origin`.
+    ids: []u32,
+    count: usize = 0,
+    /// Top-left pixel of the box the buffers describe.
+    origin_x: i32,
+    origin_y: i32,
+    /// Box width in pixels, for the absolute->relative mapping.
+    width: usize,
+
+    /// Slot index for an absolute (target) pixel index, or null when the pixel
+    /// lies outside the box. `null` never happens for pixels this triangle is
+    /// allowed to touch (the box covers the mesh's conservative reach); it is the
+    /// safety net that keeps an unexpected pixel from indexing out of bounds.
+    fn slot(self: AccumBuffers, index: usize, target_width: usize) ?usize {
+        const y = index / target_width;
+        const x = index % target_width;
+        const rel_x = @as(i64, @intCast(x)) - self.origin_x;
+        const rel_y = @as(i64, @intCast(y)) - self.origin_y;
+        if (rel_x < 0 or rel_y < 0) return null;
+        const rx: usize = @intCast(rel_x);
+        const ry: usize = @intCast(rel_y);
+        if (rx >= self.width) return null;
+        const offset = ry * self.width + rx;
+        if (offset >= self.coverage.len) return null;
+        return offset;
+    }
+};
+
+/// Owns the antialiasing scratch for one draw. The box is computed from the mesh's
+/// conservative screen-space reach (see `reachRect`), which always contains every
+/// touched pixel; a projection that the reach cannot bound falls back to the whole
+/// target, so the buffer is never too small and the code never indexes out of
+/// bounds.
+const AccumStorage = struct {
+    slot_storage: []AccSlot,
+    id_storage: []u32,
+    origin_x: i32,
+    origin_y: i32,
+    width: usize,
+    buffers: AccumBuffers,
+
+    fn init(gpa: Allocator, target: *Target, mesh: Mesh, mvp: Mat4) DrawError!AccumStorage {
+        const rect = reachRect(target, mesh, mvp);
+        const box_w: i64 = @as(i64, rect.max_x) - rect.min_x + 1;
+        const box_h: i64 = @as(i64, rect.max_y) - rect.min_y + 1;
+        const w: usize = @intCast(@max(box_w, 1));
+        const h: usize = @intCast(@max(box_h, 1));
+        // `ids` can never need more entries than there are pixels in the box.
+        const slots = gpa.alloc(AccSlot, w * h) catch return error.OutOfMemory;
+        errdefer gpa.free(slots);
+        const ids = gpa.alloc(u32, w * h) catch return error.OutOfMemory;
+        @memset(slots, AccSlot{});
+        return .{
+            .slot_storage = slots,
+            .id_storage = ids,
+            .origin_x = rect.min_x,
+            .origin_y = rect.min_y,
+            .width = w,
+            .buffers = .{
+                .coverage = slots,
+                .ids = ids,
+                .origin_x = rect.min_x,
+                .origin_y = rect.min_y,
+                .width = w,
+            },
+        };
+    }
+
+    fn deinit(self: *AccumStorage, gpa: Allocator) void {
+        gpa.free(self.slot_storage);
+        gpa.free(self.id_storage);
+        self.* = undefined;
+    }
+};
+
+/// Screen-space rectangle (inclusive pixel bounds) that conservatively contains
+/// every pixel the mesh can touch *for axis-aligned viewing rays of a standard
+/// perspective/orthographic projection*: the projected corners of the mesh AABB are
+/// extruded by the AABB's world-space diagonal, which is exactly the screen
+/// displacement a unit change of view depth can cause under any such projection.
+/// An empty mesh, a non-finite projection or a target whose pixels the reach cannot
+/// bound falls back to the full target — correct, just less memory-efficient.
+fn reachRect(target: *Target, mesh: Mesh, mvp: Mat4) Rect {
+    const full = Rect{
+        .min_x = 0,
+        .min_y = 0,
+        .max_x = @as(i32, @intCast(target.width)) - 1,
+        .max_y = @as(i32, @intCast(target.height)) - 1,
+    };
+    if (mesh.positions.len == 0) return full;
+
+    var min_world = [3]f32{ std.math.inf(f32), std.math.inf(f32), std.math.inf(f32) };
+    var max_world = [3]f32{ -std.math.inf(f32), -std.math.inf(f32), -std.math.inf(f32) };
+    for (mesh.positions) |p| {
+        for (0..3) |axis| {
+            min_world[axis] = @min(min_world[axis], p[axis]);
+            max_world[axis] = @max(max_world[axis], p[axis]);
+        }
+    }
+    var extent: f32 = 0;
+    for (0..3) |axis| {
+        const d = max_world[axis] - min_world[axis];
+        if (!std.math.isFinite(d)) return full;
+        extent = @max(extent, d);
+    }
+    if (!std.math.isFinite(extent)) return full;
+    if (extent == 0) extent = 0; // a point cloud projects to a point
+
+    var min_ndc = [2]f32{ std.math.inf(f32), std.math.inf(f32) };
+    var max_ndc = [2]f32{ -std.math.inf(f32), -std.math.inf(f32) };
+    for (0..8) |corner| {
+        const p = [3]f32{
+            if (corner & 1 == 0) min_world[0] else max_world[0],
+            if (corner & 2 == 0) min_world[1] else max_world[1],
+            if (corner & 4 == 0) min_world[2] else max_world[2],
+        };
+        var clip: [4]f32 = undefined;
+        inline for (0..4) |r| {
+            clip[r] = mvp[0 * 4 + r] * p[0] + mvp[1 * 4 + r] * p[1] + mvp[2 * 4 + r] * p[2] + mvp[3 * 4 + r];
+        }
+        // Behind or on the eye plane: the projection is unbounded, use everything.
+        if (!(clip[3] > 1e-20) or !std.math.isFinite(clip[3])) return full;
+        const inv = 1.0 / clip[3];
+        const nx = clip[0] * inv;
+        const ny = clip[1] * inv;
+        if (!std.math.isFinite(nx) or !std.math.isFinite(ny)) return full;
+        min_ndc[0] = @min(min_ndc[0], nx);
+        max_ndc[0] = @max(max_ndc[0], nx);
+        min_ndc[1] = @min(min_ndc[1], ny);
+        max_ndc[1] = @max(max_ndc[1], ny);
+    }
+
+    // NDC -> pixel, matching `toScreen` (Y flip), plus one pixel for the AABB
+    // diagonal and one for the antialiasing halo.
+    const w: f32 = @floatFromInt(target.width);
+    const h: f32 = @floatFromInt(target.height);
+    const ndc_to_x = (1.0 / 2.0) * w;
+    const ndc_to_y = -(1.0 / 2.0) * h;
+    const pad: f32 = extent + 2.5;
+    // Y is flipped (NDC up, framebuffer down), so the two mapped Y values are in
+    // the opposite order; take their min/max rather than assuming.
+    const x_a = min_ndc[0] * ndc_to_x + 0.5 * w;
+    const x_b = max_ndc[0] * ndc_to_x + 0.5 * w;
+    const y_a = min_ndc[1] * ndc_to_y + 0.5 * h;
+    const y_b = max_ndc[1] * ndc_to_y + 0.5 * h;
+    const lo_x = @min(x_a, x_b) - pad;
+    const hi_x = @max(x_a, x_b) + pad;
+    const lo_y = @min(y_a, y_b) - pad;
+    const hi_y = @max(y_a, y_b) + pad;
+    if (!std.math.isFinite(lo_x) or !std.math.isFinite(hi_x) or !std.math.isFinite(lo_y) or !std.math.isFinite(hi_y)) return full;
+    // Clamp into the target: pixels outside it are never touched, and the box has
+    // to stay inside so a triangle cannot index past the buffers.
+    const last_x: f32 = @floatFromInt(@as(i32, @intCast(target.width)) - 1);
+    const last_y: f32 = @floatFromInt(@as(i32, @intCast(target.height)) - 1);
+    return .{
+        .min_x = @intFromFloat(std.math.clamp(lo_x, 0, last_x)),
+        .min_y = @intFromFloat(std.math.clamp(lo_y, 0, last_y)),
+        .max_x = @intFromFloat(std.math.clamp(hi_x, 0, last_x)),
+        .max_y = @intFromFloat(std.math.clamp(hi_y, 0, last_y)),
+    };
+}
+
+const Rect = struct { min_x: i32, min_y: i32, max_x: i32, max_y: i32 };
+
+/// Resolve accumulated sub-sample coverage into the target, once per touched
+/// pixel. The coverage fraction `a = count / 16` is folded into the source alpha
+/// and the ordinary straight-alpha source-over runs (`compositeCoverage`):
+///
+/// ```
+/// sa     = (shaded.a / 255) * a          da = dst.a / 255     keep = 1 - sa
+/// out.a  = sa + da * keep
+/// out.rgb = (shaded.rgb*sa + dst.rgb*da*keep) / out.a
+/// ```
+///
+/// all in `f64`, quantized once per channel — the same single-rounding rule the
+/// shading and blending paths use. This is why an antialiased edge composites
+/// correctly even over a translucent destination: coverage attenuates the source,
+/// it does not blend towards the destination linearly. Because the accumulation is
+/// per draw command and not per fragment, a pixel on a shared interior edge
+/// receives the sub-samples of *both* triangles: total coverage stays exactly 16
+/// and the edge stays seam-free.
+///
+/// A fully covered pixel skips coverage entirely and takes the plain path: the
+/// verbatim write for `.blend = .none`, `blendPixels` otherwise. Both are
+/// byte-identical to the one-sample path.
+///
+/// Partially covered pixels deliberately do **not** write depth: they are
+/// translucent, and occluding with them would erase the geometry behind.
+fn resolveAccumulated(target: *Target, accum: *AccumBuffers, options: Options, stats: *Stats) void {
+    for (accum.ids[0..accum.count]) |id| {
+        const offset: usize = id;
+        const slot = &accum.coverage[offset];
+        const rel_x = offset % accum.width;
+        const rel_y = offset / accum.width;
+        const x: i64 = @as(i64, accum.origin_x) + @as(i64, @intCast(rel_x));
+        const y: i64 = @as(i64, accum.origin_y) + @as(i64, @intCast(rel_y));
+        if (x < 0 or y < 0) continue;
+        const px: usize = @intCast(x);
+        const py: usize = @intCast(y);
+        if (px >= target.width or py >= target.height) continue;
+        const index = py * @as(usize, target.width) + px;
+        const o = index * 4;
+        const dst: [4]u8 = .{ target.color[o + 0], target.color[o + 1], target.color[o + 2], target.color[o + 3] };
+        const full = slot.count >= aa_samples;
+        if (full and options.blend == .none) {
+            // Fully covered and nothing to blend: write the shaded fragment
+            // verbatim, byte-identical to the one-sample path.
+            target.color[o + 0] = slot.rgba[0];
+            target.color[o + 1] = slot.rgba[1];
+            target.color[o + 2] = slot.rgba[2];
+            target.color[o + 3] = slot.rgba[3];
+        } else {
+            // Fully covered goes through the plain blend mode, so an antialiased
+            // draw composites exactly like an un-antialiased one; partial coverage
+            // attenuates the source's alpha instead (straight-alpha source-over).
+            const out = if (full)
+                blendPixels(slot.rgba, dst, options.blend)
+            else
+                compositeCoverage(slot.rgba, dst, slot.count);
+            target.color[o + 0] = out[0];
+            target.color[o + 1] = out[1];
+            target.color[o + 2] = out[2];
+            target.color[o + 3] = out[3];
+        }
+        stats.pixels += 1;
+        if (full) {
+            if (options.depth_write) target.depth[index] = slot.depth;
+        } else {
+            stats.antialiased_pixels += 1;
+        }
+        slot.count = 0; // leave the slot clean for the next draw that reuses it
+    }
+    accum.count = 0;
 }
 
 /// Shade one covered pixel: flat `rgba`, or `rgba` multiplied by the filtered
@@ -554,6 +966,30 @@ pub fn rasterTriangle(
     texture: ?Texture,
     world_normal: [3]f64,
 ) bool {
+    // A single triangle has nowhere to accumulate sub-sample coverage, so the
+    // antialiased modes are a no-op here; `drawMesh`/`rasterize` implement them.
+    // The flag is cleared rather than silently ignored so callers do not believe
+    // they got smoothing they did not.
+    var opts = options;
+    opts.antialias = .none;
+    return rasterTriangleCore(target, a, b, c, rgba, opts, pixels_written, texture, world_normal, null);
+}
+
+/// The shared one-sample rasterizer, plus the accumulation mode used by
+/// `drawMesh`: with `antialias = .edge` and an `accum` buffer it records
+/// sub-sample coverage and shaded color instead of writing the target.
+fn rasterTriangleCore(
+    target: *Target,
+    a: ScreenVertex,
+    b: ScreenVertex,
+    c: ScreenVertex,
+    rgba: [4]u8,
+    options: Options,
+    pixels_written: ?*usize,
+    texture: ?Texture,
+    world_normal: [3]f64,
+    accum: ?*AccumBuffers,
+) bool {
     const v0 = a;
     var v1 = b;
     var v2 = c;
@@ -594,12 +1030,16 @@ pub fn rasterTriangle(
 
     const px0 = min_x * subpixel_scale + half;
     const py0 = min_y * subpixel_scale + half;
-    var row0 = edge(v1.x, v1.y, v2.x, v2.y, px0, py0) - bias0;
-    var row1 = edge(v2.x, v2.y, v0.x, v0.y, px0, py0) - bias1;
-    var row2 = edge(v0.x, v0.y, v1.x, v1.y, px0, py0) - bias2;
+    // Un-biased edge functions at the first pixel center. The top-left fill rule
+    // is applied per pixel as `w - bias >= 0`, which keeps the coverage weights
+    // (`w`) exact for both the fill rule and the sub-sample coverage count.
+    const row0 = edge(v1.x, v1.y, v2.x, v2.y, px0, py0);
+    const row1 = edge(v2.x, v2.y, v0.x, v0.y, px0, py0);
+    const row2 = edge(v0.x, v0.y, v1.x, v1.y, px0, py0);
 
     // Stepping one pixel right/down changes each edge function by a constant,
     // so the inner loop needs no multiplications for coverage.
+    const edge_steps = EdgeSteps.fromScreen(v0, v1, v2);
     const step_x0 = (@as(i64, v1.y) - v2.y) * subpixel_scale;
     const step_x1 = (@as(i64, v2.y) - v0.y) * subpixel_scale;
     const step_x2 = (@as(i64, v0.y) - v1.y) * subpixel_scale;
@@ -614,34 +1054,126 @@ pub fn rasterTriangle(
     const width: usize = target.width;
     var written: usize = 0;
 
-    var y = min_y;
-    while (y <= max_y) : (y += 1) {
-        var w0 = row0;
-        var w1 = row1;
-        var w2 = row2;
-        var x = min_x;
+    // Antialiased accumulation: one extra pixel of bounding box on every side (a
+    // pixel whose center is outside can still be partially covered), unbiased
+    // edge functions, and per-pixel resolution deferred to `resolveAccumulated`.
+    // The one-sample path keeps the historical box and the biased accumulators
+    // untouched, byte for byte.
+    const aa = options.antialias == .edge and accum != null;
+    const clip_min_x = if (aa) @max(0, @as(i32, @intCast(@as(u32, @intCast(@max(min_x, 0))) -| 1))) else min_x;
+    const clip_min_y = if (aa) @max(0, @as(i32, @intCast(@as(u32, @intCast(@max(min_y, 0))) -| 1))) else min_y;
+    // `min_x`/`max_x` are already clamped to the target, so the halo is clamped
+    // from the inside instead of adding one to a possible overflow.
+    const clip_max_x = if (aa) max_x + @as(i32, @intFromBool(max_x < @as(i32, @intCast(target.width)) - 1)) else max_x;
+    const clip_max_y = if (aa) max_y + @as(i32, @intFromBool(max_y < @as(i32, @intCast(target.height)) - 1)) else max_y;
+    if (clip_min_x > clip_max_x or clip_min_y > clip_max_y) return true;
+
+    // Offsets of the (possibly widened) box origin from the pixel-center origin the
+    // rows were seeded at, in whole pixels — `step_x*`/`step_y*` are already
+    // per-pixel deltas. Zero on the one-sample path.
+    const shift_y: i64 = @intCast(clip_min_y - min_y);
+    const shift_x: i64 = @intCast(clip_min_x - min_x);
+    var row0c = if (aa) row0 + step_y0 * shift_y + step_x0 * shift_x else row0 - bias0;
+    var row1c = if (aa) row1 + step_y1 * shift_y + step_x1 * shift_x else row1 - bias1;
+    var row2c = if (aa) row2 + step_y2 * shift_y + step_x2 * shift_x else row2 - bias2;
+
+    // Largest edge-function contribution any sub-sample of a pixel can have:
+    // the sample offsets span +-`aa_sample_reach` units on both axes.
+    const aa_reach: [3]i64 = .{
+        aa_sample_reach * (absI(edge_steps.dx[0]) + absI(edge_steps.dy[0])),
+        aa_sample_reach * (absI(edge_steps.dx[1]) + absI(edge_steps.dy[1])),
+        aa_sample_reach * (absI(edge_steps.dx[2]) + absI(edge_steps.dy[2])),
+    };
+
+    var y = clip_min_y;
+    while (y <= clip_max_y) : (y += 1) {
+        var w0 = row0c;
+        var w1 = row1c;
+        var w2 = row2c;
+        var x = clip_min_x;
         var index = @as(usize, @intCast(y)) * width + @as(usize, @intCast(x));
-        while (x <= max_x) : (x += 1) {
-            if ((w0 | w1 | w2) >= 0) {
+        while (x <= clip_max_x) : (x += 1) {
+            // One-sample path: `w*` are already biased, so a single sign test is
+            // the watertight top-left fill rule and `wgt*` are the weights.
+            // Antialiased path: `w*` are unbiased, `> 0` on all three means the
+            // center is strictly inside, and edge pixels are counted per sub-sample.
+            var coverage: u16 = aa_samples;
+            var owned: bool = undefined;
+            var weight0: i64 = undefined;
+            var weight1: i64 = undefined;
+            var weight2: i64 = undefined;
+            if (aa) {
+                // A pixel center inside the triangle is *not* enough for full
+                // coverage: it can sit less than one sub-sample spacing from an
+                // edge while most sub-samples fall outside (the case the earlier
+                // center-only shortcut got wrong on slanted edges). The sample
+                // grid reaches at most `aa_sample_reach` units from the center on
+                // either axis, so `w > reach` proves every sub-sample is inside
+                // and `w < -reach` proves every sub-sample is outside — both
+                // decided with one comparison per edge and nothing else.
+                if (w0 > aa_reach[0] and w1 > aa_reach[1] and w2 > aa_reach[2]) {
+                    coverage = aa_samples;
+                    owned = true;
+                } else if (w0 < -aa_reach[0] or w1 < -aa_reach[1] or w2 < -aa_reach[2]) {
+                    coverage = 0;
+                    owned = false;
+                } else {
+                    coverage = coverageCount(aa_grid, .{ w0, w1, w2 }, edge_steps, .{ bias0, bias1, bias2 });
+                    owned = coverage > 0;
+                }
+                weight0 = w0;
+                weight1 = w1;
+                weight2 = w2;
+            } else {
+                owned = (w0 | w1 | w2) >= 0;
+                weight0 = w0 + bias0;
+                weight1 = w1 + bias1;
+                weight2 = w2 + bias2;
+            }
+            if (owned) {
                 // NDC z is affine in screen space after the divide, so plain
                 // barycentric interpolation is already perspective-correct.
-                const wgt0 = @as(f64, @floatFromInt(w0 + bias0));
-                const wgt1 = @as(f64, @floatFromInt(w1 + bias1));
-                const wgt2 = @as(f64, @floatFromInt(w2 + bias2));
+                const wgt0 = @as(f64, @floatFromInt(weight0));
+                const wgt1 = @as(f64, @floatFromInt(weight1));
+                const wgt2 = @as(f64, @floatFromInt(weight2));
                 const depth: f32 = @floatCast(((wgt0 * z0 + wgt1 * z1) + wgt2 * z2) * inv_area);
                 if (!options.depth_test or depth < target.depth[index]) {
                     const shaded = shadePixel(texture, v0, v1, v2, wgt0, wgt1, wgt2, inv_area, rgba, lit);
-                    const o = index * 4;
-                    const out_rgba = if (options.blend == .none)
-                        shaded
-                    else
-                        blendPixels(shaded, .{ target.color[o + 0], target.color[o + 1], target.color[o + 2], target.color[o + 3] }, options.blend);
-                    target.color[o + 0] = out_rgba[0];
-                    target.color[o + 1] = out_rgba[1];
-                    target.color[o + 2] = out_rgba[2];
-                    target.color[o + 3] = out_rgba[3];
-                    if (options.depth_write) target.depth[index] = depth;
-                    written += 1;
+                    if (aa) {
+                        // Accumulate; `resolveAccumulated` composites once the
+                        // whole mesh has been submitted. The mapping is
+                        // box-relative, and a pixel outside the box is dropped
+                        // rather than written out of bounds.
+                        const buf = accum.?;
+                        if (buf.slot(index, width)) |offset| {
+                            const slot = &buf.coverage[offset];
+                            if (slot.count == 0) {
+                                buf.ids[buf.count] = @intCast(offset);
+                                buf.count += 1;
+                            }
+                            if (slot.count < coverage) {
+                                slot.rgba = shaded;
+                                slot.depth = depth;
+                            }
+                            const total: u32 = @as(u32, slot.count) + coverage;
+                            slot.count = @intCast(@min(total, aa_samples));
+                            // `written` is not bumped here: the pixel is counted
+                            // once, when it is resolved, not once per sub-sample
+                            // contribution (shared edges touch a pixel twice).
+                        }
+                    } else {
+                        const o = index * 4;
+                        const out_rgba = if (options.blend == .none)
+                            shaded
+                        else
+                            blendPixels(shaded, .{ target.color[o + 0], target.color[o + 1], target.color[o + 2], target.color[o + 3] }, options.blend);
+                        target.color[o + 0] = out_rgba[0];
+                        target.color[o + 1] = out_rgba[1];
+                        target.color[o + 2] = out_rgba[2];
+                        target.color[o + 3] = out_rgba[3];
+                        if (options.depth_write) target.depth[index] = depth;
+                        written += 1;
+                    }
                 }
             }
             w0 += step_x0;
@@ -649,9 +1181,9 @@ pub fn rasterTriangle(
             w2 += step_x2;
             index += 1;
         }
-        row0 += step_y0;
-        row1 += step_y1;
-        row2 += step_y2;
+        row0c += step_y0;
+        row1c += step_y1;
+        row2c += step_y2;
     }
     if (pixels_written) |out| out.* += written;
     return true;
@@ -765,6 +1297,7 @@ fn drawClipTriangle(
     stats: *Stats,
     texture: ?Texture,
     world_normal: [3]f64,
+    accum: ?*AccumBuffers,
 ) void {
     var buf_a: [12]ClipVertex = undefined;
     var buf_b: [12]ClipVertex = undefined;
@@ -797,7 +1330,7 @@ fn drawClipTriangle(
     // The clipped polygon is convex, so a fan covers it exactly.
     var i: usize = 1;
     while (i + 1 < count) : (i += 1) {
-        if (rasterTriangle(target, screen[0], screen[i], screen[i + 1], rgba, options, &stats.pixels, texture, world_normal)) {
+        if (rasterTriangleCore(target, screen[0], screen[i], screen[i + 1], rgba, options, &stats.pixels, texture, world_normal, accum)) {
             stats.rasterized += 1;
         } else {
             stats.culled += 1;
@@ -831,6 +1364,33 @@ pub fn drawMesh(
     options: Options,
     texture: ?Texture,
 ) Error!Stats {
+    // No allocator, therefore nowhere to accumulate sub-sample coverage: the
+    // antialiased modes require `drawMeshAlloc`/`rasterize` and are turned off
+    // here instead of being silently approximated.
+    var opts = options;
+    opts.antialias = .none;
+    // `antialias` is cleared above, so the allocation branch is never taken and
+    // the only reachable errors are `Error`.
+    return drawMeshAlloc(undefined, target, mesh, world, view_projection, rgba, opts, texture) catch |err| switch (err) {
+        error.OutOfMemory => unreachable,
+        else => |e| e,
+    };
+}
+
+/// `drawMesh` with the allocator needed by `antialias = .edge`. The scratch is
+/// sized for the draw's bounding rectangle, used by every triangle of the mesh and
+/// freed before returning; a failed allocation fails the draw **before** any
+/// pixel is written, so the target is never left half-rendered.
+pub fn drawMeshAlloc(
+    gpa: Allocator,
+    target: *Target,
+    mesh: Mesh,
+    world: Mat4,
+    view_projection: Mat4,
+    rgba: [4]u8,
+    options: Options,
+    texture: ?Texture,
+) DrawError!Stats {
     if (mesh.indices.len % 3 != 0) return error.InvalidIndex;
     if (texture) |tex| {
         try tex.validate();
@@ -838,7 +1398,21 @@ pub fn drawMesh(
         if (uvs.len != mesh.positions.len) return error.InvalidUv;
     }
     if (options.light) |light| try light.validate();
+
+    // Antialiased draws need per-pixel accumulation across every triangle of the
+    // mesh, so the coverage buffer covers this draw's bounding rectangle only.
+    // Allocation happens before the first fragment: a failure leaves the target
+    // untouched instead of half-rendered.
     const mvp = transform.multiply(view_projection, world);
+    var accum_storage: ?AccumStorage = null;
+    defer if (accum_storage) |*storage| storage.deinit(gpa);
+    var accum: ?*AccumBuffers = null;
+    if (options.antialias == .edge) {
+        accum_storage = try AccumStorage.init(gpa, target, mesh, mvp);
+        accum = &accum_storage.?.buffers;
+    }
+    const opts = options;
+
     var stats: Stats = .{};
     var i: usize = 0;
     while (i < mesh.indices.len) : (i += 3) {
@@ -864,8 +1438,9 @@ pub fn drawMesh(
             transformVertex(mvp, mesh.positions[idx1], uv1),
             transformVertex(mvp, mesh.positions[idx2], uv2),
         };
-        drawClipTriangle(target, tri, rgba, options, &stats, texture, world_normal);
+        drawClipTriangle(target, tri, rgba, opts, &stats, texture, world_normal, accum);
     }
+    if (accum) |buf| resolveAccumulated(target, buf, opts, &stats);
     return stats;
 }
 
@@ -926,7 +1501,26 @@ pub fn rasterize(
     view_projection: Mat4,
     resources: anytype,
     options: Options,
-) Error!Stats {
+) DrawError!Stats {
+    // No allocator: antialiasing needs per-draw accumulation scratch, so the mode
+    // is turned off here rather than approximated. Use `rasterizeAlloc` for it.
+    var opts = options;
+    opts.antialias = .none;
+    return rasterizeAlloc(undefined, target, commands, view_projection, resources, opts);
+}
+
+/// `rasterize` with the allocator `antialias = .edge` needs. The scratch is
+/// allocated per draw command (sized to that draw's reach) and freed before the
+/// next one, and a failed allocation fails that command with `OutOfMemory` before
+/// any of its pixels are written.
+pub fn rasterizeAlloc(
+    gpa: Allocator,
+    target: *Target,
+    commands: []const DrawCommand,
+    view_projection: Mat4,
+    resources: anytype,
+    options: Options,
+) DrawError!Stats {
     const have_texture = comptime @hasDecl(@TypeOf(resources), "texture");
     const have_light = comptime @hasDecl(@TypeOf(resources), "directionalLight");
     var stats: Stats = .{};
@@ -962,7 +1556,7 @@ pub fn rasterize(
                 draw_options.light = light;
             }
         }
-        stats.add(try drawMesh(target, mesh, cmd.world, view_projection, rgba, draw_options, texture));
+        stats.add(try drawMeshAlloc(gpa, target, mesh, cmd.world, view_projection, rgba, draw_options, texture));
     }
     return stats;
 }
@@ -2278,4 +2872,278 @@ test "rasterize: a provider returning an invalid light is a hard error" {
         .light = .{ .direction = .{ 0.0, 0.0, 0.0 } },
     };
     try testing.expectError(error.InvalidLight, rasterize(&s.target, &.{command(0, 0)}, orthoSetup(), res, .{}));
+}
+
+// --- antialiasing tests ------------------------------------------------------
+
+test "coverageCount: the two triangles of a quad partition every pixel exactly" {
+    // The property that makes antialiasing seam-free: for two triangles sharing an
+    // edge, the sub-samples of every pixel are partitioned by the same top-left rule
+    // the pixel-center test uses, so their coverage always adds up to the full grid.
+    // A pixel of the quad is either fully owned (16 + 0, or 8 + 8) or not at all.
+    const p0 = [2]i32{ 0, 0 };
+    const p1 = [2]i32{ 4 * subpixel_scale, 0 };
+    const p2 = [2]i32{ 4 * subpixel_scale, 4 * subpixel_scale };
+    const p3 = [2]i32{ 0, 4 * subpixel_scale };
+
+    for (0..4) |py| for (0..4) |px| {
+        const cx: i32 = @intCast(px * subpixel_scale + subpixel_scale / 2);
+        const cy: i32 = @intCast(py * subpixel_scale + subpixel_scale / 2);
+        var sum: u16 = 0;
+        // Triangle list (0,1,2) and (0,2,3), exactly like `quadMesh`.
+        inline for ([_][3][2]i32{
+            .{ p0, p1, p2 },
+            .{ p0, p2, p3 },
+        }) |tri| {
+            const a = ScreenVertex{ .x = tri[0][0], .y = tri[0][1], .z = 0 };
+            const b = ScreenVertex{ .x = tri[1][0], .y = tri[1][1], .z = 0 };
+            const c = ScreenVertex{ .x = tri[2][0], .y = tri[2][1], .z = 0 };
+            // Wind to positive area exactly like the rasterizer: it keeps `b, c`
+            // when the signed area is already positive and swaps them otherwise.
+            const area = edge(a.x, a.y, b.x, b.y, c.x, c.y);
+            const s1 = if (area < 0) c else b;
+            const s2 = if (area < 0) b else c;
+            // Same edge order the rasterizer uses for the step table: edges
+            // (s1,s2), (s2,a), (a,s1) with the matching `isTopLeft` biases.
+            const steps = EdgeSteps.fromScreen(a, s1, s2);
+            const bias: [3]i64 = .{
+                if (isTopLeft(s1.x, s1.y, s2.x, s2.y)) 0 else 1,
+                if (isTopLeft(s2.x, s2.y, a.x, a.y)) 0 else 1,
+                if (isTopLeft(a.x, a.y, s1.x, s1.y)) 0 else 1,
+            };
+            sum += coverageCount(aa_grid, .{
+                edge(s1.x, s1.y, s2.x, s2.y, cx, cy),
+                edge(s2.x, s2.y, a.x, a.y, cx, cy),
+                edge(a.x, a.y, s1.x, s1.y, cx, cy),
+            }, steps, bias);
+        }
+        try testing.expectEqual(aa_samples, sum);
+    };
+}
+
+test "coverageCount: stepping agrees with evaluating every sub-sample from scratch" {
+    // `coverageCount` reaches sub-samples through the per-unit step table
+    // (`EdgeSteps`), while the pixel-center edge functions come from the pixel
+    // loop. Pinning it against a from-scratch evaluation at the absolute sub-sample
+    // position validates the steps themselves, not just their self-consistency.
+    const a = ScreenVertex{ .x = 3 * subpixel_scale, .y = 1 * subpixel_scale, .z = 0 };
+    const b = ScreenVertex{ .x = 11 * subpixel_scale + 7, .y = 4 * subpixel_scale + 3, .z = 0 };
+    const c = ScreenVertex{ .x = 5 * subpixel_scale + 9, .y = 12 * subpixel_scale + 5, .z = 0 };
+
+    const area = edge(a.x, a.y, b.x, b.y, c.x, c.y);
+    const s1 = if (area < 0) c else b;
+    const s2 = if (area < 0) b else c;
+    const steps = EdgeSteps.fromScreen(a, s1, s2);
+    const bias: [3]i64 = .{
+        if (isTopLeft(s1.x, s1.y, s2.x, s2.y)) 0 else 1,
+        if (isTopLeft(s2.x, s2.y, a.x, a.y)) 0 else 1,
+        if (isTopLeft(a.x, a.y, s1.x, s1.y)) 0 else 1,
+    };
+
+    // Every pixel of the triangle's bounding box, including the ones it misses.
+    for (1..12) |py| for (3..12) |px| {
+        const cx: i32 = @intCast(px * subpixel_scale + subpixel_scale / 2);
+        const cy: i32 = @intCast(py * subpixel_scale + subpixel_scale / 2);
+        const fast = coverageCount(aa_grid, .{
+            edge(s1.x, s1.y, s2.x, s2.y, cx, cy),
+            edge(s2.x, s2.y, a.x, a.y, cx, cy),
+            edge(a.x, a.y, s1.x, s1.y, cx, cy),
+        }, steps, bias);
+
+        var brute: u16 = 0;
+        for (0..aa_grid) |j| for (0..aa_grid) |i| {
+            const sx: i32 = cx - subpixel_scale / 2 + aaSampleOffset(aa_grid, @intCast(i));
+            const sy: i32 = cy - subpixel_scale / 2 + aaSampleOffset(aa_grid, @intCast(j));
+            if (onEdge(edge(s1.x, s1.y, s2.x, s2.y, sx, sy), bias[0]) and
+                onEdge(edge(s2.x, s2.y, a.x, a.y, sx, sy), bias[1]) and
+                onEdge(edge(a.x, a.y, s1.x, s1.y, sx, sy), bias[2])) brute += 1;
+        };
+        try testing.expectEqual(brute, fast);
+    };
+}
+
+test "antialias: a failed scratch allocation fails the draw before any write" {
+    // `drawMeshAlloc` sizes its scratch from the draw's reach, so every allocation
+    // site is reachable. A failure must surface as `OutOfMemory` and leave the
+    // target exactly as it was cleared — never half-rendered — while the run that
+    // gets all its memory must produce real pixels.
+    const Probe = struct {
+        fn run(gpa: Allocator, color: []u8, depth: []f32) !void {
+            var target = try Target.init(16, 16, color, depth);
+            target.clear(.{ 0, 0, 0, 0 }, 1.0);
+            const stats = drawMeshAlloc(gpa, &target, aaQuadMesh(), transform.identity(), orthoSetup(), red, .{ .antialias = .edge }, null) catch |err| {
+                for (target.color) |byte| try testing.expectEqual(@as(u8, 0), byte);
+                return err;
+            };
+            try testing.expect(stats.pixels > 0);
+        }
+    };
+    var color: [16 * 16 * 4]u8 = undefined;
+    var depth: [16 * 16]f32 = undefined;
+    try testing.checkAllAllocationFailures(testing.allocator, Probe.run, .{ &color, &depth });
+}
+
+test "antialias: a grid-aligned quad is unchanged and writes depth" {
+    var plain = try TestSurface.init(8, 8);
+    defer plain.deinit();
+    var smooth = try TestSurface.init(8, 8);
+    defer smooth.deinit();
+    const plain_stats = try drawMesh(&plain.target, quadMesh(), transform.identity(), orthoSetup(), red, .{}, null);
+    const smooth_stats = try drawMeshAlloc(testing.allocator, &smooth.target, quadMesh(), transform.identity(), orthoSetup(), red, .{ .antialias = .edge }, null);
+    // Every pixel of a viewport-filling quad is fully covered: identical output,
+    // identical depth, and nothing was counted as partial.
+    try testing.expectEqualSlices(u8, plain.target.color, smooth.target.color);
+    for (plain.target.depth, smooth.target.depth) |x, y| try testing.expectEqual(x, y);
+    try testing.expectEqual(plain_stats.pixels, smooth_stats.pixels);
+    try testing.expectEqual(@as(usize, 0), smooth_stats.antialiased_pixels);
+}
+
+/// A quad with no axis-aligned edge in screen space: every edge cuts pixels at a
+/// fractional position, which is exactly the case antialiasing exists for.
+const aa_quad_positions = [_][3]f32{
+    .{ -1.7, -1.9, -2 }, .{ 1.9, -1.3, -2 }, .{ 1.3, 1.7, -2 }, .{ -1.9, 1.1, -2 },
+};
+
+fn aaQuadMesh() Mesh {
+    return .{ .positions = &aa_quad_positions, .indices = &quad_indices };
+}
+
+test "antialias: slanted edges get partial coverage instead of a staircase" {
+    var plain = try TestSurface.init(16, 16);
+    defer plain.deinit();
+    var smooth = try TestSurface.init(16, 16);
+    defer smooth.deinit();
+    // `drawMesh` takes the tint as RGBA8 (`red` is 255,0,0,255), unlike the
+    // `rasterize` provider whose colors are linear floats in [0, 1].
+    const plain_stats = try drawMesh(&plain.target, aaQuadMesh(), transform.identity(), orthoSetup(), red, .{}, null);
+    const smooth_stats = try drawMeshAlloc(testing.allocator, &smooth.target, aaQuadMesh(), transform.identity(), orthoSetup(), red, .{ .antialias = .edge }, null);
+
+    // Antialiasing reaches every pixel the one-sample path reaches plus the edge
+    // pixels whose centers fall just outside but that are partly covered — exactly
+    // the pixels a one-sample rasterizer drops (and why thin geometry vanishes).
+    try testing.expect(smooth_stats.pixels >= plain_stats.pixels);
+    try testing.expect(smooth_stats.antialiased_pixels > 0);
+
+    // Interior pixels are byte-identical; edge pixels become translucent.
+    var partial: usize = 0;
+    var solid: usize = 0;
+    for (0..16) |y| for (0..16) |x| {
+        const one = plain.target.colorAt(@intCast(x), @intCast(y));
+        const aa = smooth.target.colorAt(@intCast(x), @intCast(y));
+        if (aa[3] == 0) {
+            // Untouched by both paths.
+            try testing.expectEqual(@as(u8, 0), one[3]);
+        } else if (aa[3] == 255) {
+            // Fully covered: bit-identical to the one-sample path, alpha included.
+            try testing.expectEqual(@as(u8, 255), one[3]);
+            try testing.expectEqualSlices(u8, &one, &aa);
+            solid += 1;
+        } else {
+            // Fractionally covered — either an edge pixel both paths reach or one
+            // only the sub-samples reach (the extra coverage AA adds, never a full
+            // pixel, which is why thin geometry stops disappearing).
+            try testing.expect(aa[3] < 255);
+            // Red stays saturated: only alpha was attenuated.
+            try testing.expectEqual(@as(u8, 255), aa[0]);
+            partial += 1;
+        }
+    };
+    try testing.expectEqual(smooth_stats.antialiased_pixels, partial);
+    try testing.expect(partial > 0);
+    try testing.expect(solid > 0);
+
+    // The antialiased alpha sum estimates the *exact* screen-space area of the quad,
+    // computed independently here with the shoelace formula. This is the numerical
+    // statement that coverage integrates correctly, and it is impossible to satisfy
+    // with a binary rasterizer (which rounds every pixel to fully covered).
+    var area2: f64 = 0;
+    var screen_pts: [4][2]f64 = undefined;
+    for (aa_quad_positions, 0..) |p, i| {
+        const vp = orthoSetup();
+        const clip = [4]f32{
+            vp[0] * p[0] + vp[4] * p[1] + vp[8] * p[2] + vp[12],
+            vp[1] * p[0] + vp[5] * p[1] + vp[9] * p[2] + vp[13],
+            vp[2] * p[0] + vp[6] * p[1] + vp[10] * p[2] + vp[14],
+            vp[3] * p[0] + vp[7] * p[1] + vp[11] * p[2] + vp[15],
+        };
+        const nx = @as(f64, clip[0]) / clip[3];
+        const ny = @as(f64, clip[1]) / clip[3];
+        screen_pts[i] = .{ (nx * 0.5 + 0.5) * 16.0, (0.5 - ny * 0.5) * 16.0 };
+    }
+    for (0..4) |i| {
+        const a = screen_pts[i];
+        const b = screen_pts[(i + 1) % 4];
+        area2 += a[0] * b[1] - b[0] * a[1];
+    }
+    const area = @abs(area2) * 0.5;
+    var sum_aa: f64 = 0;
+    var quantized: usize = 0;
+    for (0..16 * 16) |i| {
+        const alpha = smooth.target.color[i * 4 + 3];
+        sum_aa += @as(f64, @floatFromInt(alpha)) / 255.0;
+        if (alpha != 0) quantized += 1;
+    }
+    // Coverage integrates to the true area. Two bounded error sources remain: the
+    // 4x4 sample grid estimates a pixel's area to within one sub-cell (1/16 pixel),
+    // and 8-bit alpha stores `count/16` rounded to half an alpha unit. Measured on
+    // this quad the sum is off by 0.36 px (0.2%); the tolerance is 0.5%. The point
+    // of the assertion is that a binary rasterizer cannot meet it: its alpha sum is
+    // 165.0 px here, 2.0 px (1.2%) short, and every pixel has a staircase edge.
+    const quant_error = @as(f64, @floatFromInt(quantized)) * 0.5 / 255.0;
+    try testing.expect(@abs(sum_aa - area) <= @max(area * 0.005, quant_error));
+}
+
+test "antialias: partially covered pixels never write depth" {
+    var smooth = try TestSurface.init(16, 16);
+    defer smooth.deinit();
+    const stats = try drawMeshAlloc(testing.allocator, &smooth.target, aaQuadMesh(), transform.identity(), orthoSetup(), red, .{ .antialias = .edge }, null);
+    try testing.expect(stats.antialiased_pixels > 0);
+
+    var partial_with_depth: usize = 0;
+    var full_without_depth: usize = 0;
+    for (0..16 * 16) |i| {
+        const alpha = smooth.target.color[i * 4 + 3];
+        const wrote_depth = smooth.target.depth[i] != 1.0;
+        if (alpha > 0 and alpha < 255 and wrote_depth) partial_with_depth += 1;
+        if (alpha == 255 and !wrote_depth) full_without_depth += 1;
+    }
+    // A translucent fragment must not occlude; fully covered ones must.
+    try testing.expectEqual(@as(usize, 0), partial_with_depth);
+    try testing.expectEqual(@as(usize, 0), full_without_depth);
+}
+
+test "antialias: a translucent source composites through fractional coverage" {
+    var smooth = try TestSurface.init(16, 16);
+    defer smooth.deinit();
+    smooth.target.clear(.{ 0, 0, 255, 255 }, 1.0);
+    const over = [4]u8{ 255, 0, 0, 128 };
+    _ = try drawMeshAlloc(testing.allocator, &smooth.target, aaQuadMesh(), transform.identity(), orthoSetup(), over, .{ .antialias = .edge, .blend = .alpha }, null);
+
+    // Fully covered interior: exactly the plain `.alpha` result of a half-alpha red
+    // over opaque blue; edge pixels are weaker (less red, more blue).
+    var saw_full = false;
+    var saw_partial = false;
+    for (0..16 * 16) |i| {
+        const px = [4]u8{ smooth.target.color[i * 4], smooth.target.color[i * 4 + 1], smooth.target.color[i * 4 + 2], smooth.target.color[i * 4 + 3] };
+        if (std.mem.eql(u8, &px, &.{ 0, 0, 255, 255 })) continue; // clear
+        if (std.mem.eql(u8, &px, &.{ 128, 0, 127, 255 })) {
+            saw_full = true;
+        } else {
+            try testing.expect(px[0] < 128 and px[2] > 127 and px[3] == 255);
+            saw_partial = true;
+        }
+    }
+    try testing.expect(saw_full);
+    try testing.expect(saw_partial);
+}
+
+test "antialias: single-triangle entry point ignores the mode" {
+    var s = try TestSurface.init(4, 4);
+    defer s.deinit();
+    var pixels: usize = 0;
+    const drew = rasterTriangle(&s.target, .{ .x = 0, .y = 0, .z = 0 }, .{ .x = 4 * subpixel_scale, .y = 0, .z = 0 }, .{ .x = 0, .y = 4 * subpixel_scale, .z = 0 }, red, .{ .cull = .none, .antialias = .edge }, &pixels, null, .{ 0, 0, 0 });
+    try testing.expect(drew);
+    // No accumulator is available, so the one-sample result is written: the
+    // hypotenuse row keeps full coverage rather than a translucent edge.
+    try testing.expectEqual(@as(usize, 6), pixels);
 }

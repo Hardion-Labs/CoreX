@@ -4,8 +4,11 @@
 the first stage of the engine that produces an image: before it, the render
 subsystem only culled geometry and sorted draw commands.
 
-There is no GPU dependency, no window system and no allocator in the pixel path,
-so the whole backend runs headlessly and is covered by the normal test suite.
+There is no GPU dependency, no window system and no allocator in the pixel path —
+the only allocation in the whole backend is the scratch an antialiased draw needs,
+and it is the caller's allocator, sized once per draw and freed before the next
+(see [Antialiasing](#antialiasing)). The whole backend therefore runs headlessly
+and is covered by the normal test suite.
 This is **not** a renderer tier: the Low/Medium/Advanced tiers and GPU backends
 remain unimplemented (see [scope.md](scope.md)).
 
@@ -29,7 +32,10 @@ Per triangle, in order:
    multiplied by that tint. When a light is configured, a per-channel Lambert
    multiplier is applied to the albedo first (RGB only) — see
    [Lighting](#lighting). The fragment is then written as-is (`.blend = .none`,
-   the default) or composited with the target — see [Blending](#blending).
+   the default) or composited with the target — see [Blending](#blending). With
+   `antialias = .edge` the pixel loop instead accumulates sub-sample coverage per
+   draw command, and a resolve pass composites the touched pixels — see
+   [Antialiasing](#antialiasing).
 
 A clipped triangle stays convex, so the resulting polygon (at most nine vertices)
 is covered exactly by a triangle fan. Both clip buffers are fixed 12-slot arrays
@@ -110,11 +116,12 @@ const stats = try R.rasterize(&target, frame.commands, cam.view_projection, reso
 | `Filter` | `nearest` or `bilinear`. |
 | `Light` | Directional light for the Lambert path: `direction` (toward the light, world space, normalized internally), `color`, `ambient`. `validate()` rejects malformed lights with `InvalidLight`. |
 | `Blend` | `.none` (default, verbatim write), `.alpha` (straight-alpha source-over), `.premultiplied`, `.additive`. |
-| `Options` | `cull` (`.none`/`.back`/`.front`), `front_face`, `depth_test`, `depth_write`, `light` (optional directional Lambert light; beats a `resources.directionalLight()` provider), `blend`. |
-| `Stats` | `skipped_draws`, `submitted`, `clipped`, `culled`, `rasterized`, `pixels`. |
-| `rasterize` | Whole draw list, resolving handles through `resources`. |
-| `drawMesh` | One mesh, one world matrix, one flat RGBA8 tint, optional texture and light. |
-| `rasterTriangle` | One screen-space triangle; the entry point the vectors target. |
+| `Antialias` | `.none` (default, one sample per pixel) or `.edge` (4x4 sub-samples, see [Antialiasing](#antialiasing)). |
+| `Options` | `cull` (`.none`/`.back`/`.front`), `front_face`, `depth_test`, `depth_write`, `light` (optional directional Lambert light; beats a `resources.directionalLight()` provider), `blend`, `antialias`. |
+| `Stats` | `skipped_draws`, `submitted`, `clipped`, `culled`, `rasterized`, `pixels`, `antialiased_pixels`. |
+| `rasterize` / `rasterizeAlloc` | Whole draw list, resolving handles through `resources`. `rasterize` takes no allocator and therefore forces `antialias = .none`; `rasterizeAlloc` is the entry point that can antialias. |
+| `drawMesh` / `drawMeshAlloc` | One mesh, one world matrix, one flat RGBA8 tint, optional texture and light. Same split: only the `Alloc` variant antialiases. |
+| `rasterTriangle` | One screen-space triangle; the entry point the vectors target. Never antialiases (it has no per-draw accumulator to resolve against). |
 
 `max_dimension` is 16384 per side, which bounds both the fixed-point range and the
 pixel count. Errors are `InvalidTarget`, `InvalidDimension`, `InvalidIndex`
@@ -123,6 +130,11 @@ three), `InvalidUv` (a mesh whose `uvs` are missing or shorter than its
 `positions` when a texture is bound), `InvalidTexture` (malformed texture) and
 `InvalidLight` (zero-length or non-finite light direction, or a negative/non-finite
 `color`/`ambient` channel — raised at the `drawMesh` entry, before any draw).
+`DrawError` is that set plus `OutOfMemory`, which only the `*Alloc` entry points
+can return: an antialiased draw allocates its accumulation scratch first, so a
+failed allocation fails the draw before a single pixel is written. Passing
+`undefined` as the allocator is sound exactly when `antialias` is `.none` — which
+is what the non-alloc wrappers do.
 
 `rasterTriangle` returns `false` **only** for a cull rejection or an exactly
 degenerate triangle. A triangle that survives but covers no pixel center returns
@@ -258,6 +270,152 @@ const stats = try R.rasterize(&target, frame.commands, cam.view_projection, reso
     .depth_write = false, // translucent surfaces do not occlude each other
 });
 ```
+
+## Antialiasing
+
+`Options.antialias = .edge` switches the rasterizer from one center sample per
+pixel to a **4x4 grid of 16 sub-samples** and composites the resulting fractional
+coverage. It is the fix for two artifacts of the default path: staircase edges on
+slanted geometry, and thin geometry that disappears entirely because no pixel
+center falls inside it.
+
+```zig
+var frame = try R.extractDrawList(&scene, cam, .back_to_front, gpa);
+defer frame.deinit();
+// .edge needs scratch, so it goes through the *Alloc variants.
+const stats = try R.rasterizeAlloc(gpa, &target, frame.commands, cam.view_projection, resources, .{
+    .antialias = .edge,
+    .blend = .alpha,
+});
+```
+
+`Antialias` is `.none` (default) or `.edge`. Coverage is sampled per pixel,
+not per fragment, and resolution is deferred until the whole draw command is in —
+that is the design decision that makes shared edges work (see below).
+
+### Sub-sample positions and the top-left rule
+
+Sub-sample `k` of a pixel along one axis sits at `(k + 0.5) / 4` of the pixel, so
+in the 28.4 fixed-point grid the four offsets are **2, 6, 10 and 14** sixteenths
+from the pixel's top-left corner — i.e. `aaSampleOffset`, the exact integer
+centers of the four quarter pixels. Nothing about the grid is floating point.
+
+The three edge functions at a pixel center are already exact `i64` values, and
+moving to a sub-sample is one multiply-add per edge with the constant per-unit
+deltas (`EdgeSteps.dx`/`.dy`: raw coordinate differences, one order of magnitude
+smaller than the per-pixel steps). `coverageCount` therefore evaluates all 16
+samples with integer arithmetic only — no lookup table, no float, reproducible bit
+for bit like every other coverage decision in this file.
+
+The **top-left fill rule is applied to the sub-samples too**, with the same
+`bias` the pixel-center test uses: a sample lying exactly on an edge counts only
+when that edge is a top or left edge. Two triangles sharing an edge traverse it in
+opposite directions, so for a sub-sample on that edge exactly one of them claims
+it. Coverage of the two triangles therefore *sums* to the pixel's full 16 and the
+shared interior edge has no seam — the watertightness property of the one-sample
+path survives sub-sampling.
+
+Each pixel is first classified with two integer comparisons per edge: a center
+farther from every edge than one sub-sample spacing (`aa_sample_reach`, 6 units)
+is **provably** fully covered (16) or provably empty (0) and skips the grid
+entirely; only the pixels within one sub-sample of an edge run `coverageCount`.
+A center inside the triangle is *not* sufficient for full coverage — it can sit a
+fraction of a sub-sample from an edge while most sub-samples fall outside — so the
+earlier "center inside means 16" shortcut was removed.
+
+### Per-draw accumulation
+
+Per-fragment compositing was rejected: each triangle composites on its own, so on
+a shared edge the second triangle blends over the first triangle's already-blended
+pixels and a visible seam appears. The implemented model accumulates:
+
+1. For each triangle of the draw, every touched pixel keeps a `count` of covered
+   sub-samples plus the shaded color and depth of the *last* contributing sample.
+2. After the whole mesh is submitted, `resolveAccumulated` visits each touched
+   pixel once, writes the color and (for fully covered pixels) the depth.
+
+The scratch is a pair of caller-allocated buffers sized to the draw's bounding
+rectangle — `AccumBuffers`, exposed through `drawMeshAlloc`/`rasterizeAlloc`. It
+holds one `AccSlot` (`count`, `rgba`, `depth`) and one id per pixel of that
+rectangle, and only touched ids are visited at resolve time: nothing is cleared,
+and the resolve pass is proportional to covered pixels, not to the target. The
+rectangle comes from `reachRect`, which bounds the mesh AABB's projection
+conservatively; if it cannot, it falls back to the whole target (correct, just
+more memory). A failed allocation fails the draw **before** any pixel is written.
+
+Because the slot keeps the *last* sample's shade, a partially covered pixel is
+shaded once, not once per sub-sample. Coverage is constant across a flat or
+linearly-filtered fragment, so this costs nothing in quality.
+
+### Resolving partial coverage
+
+Fully covered pixels (`count == 16`) skip coverage arithmetic: `.blend = .none`
+writes the shaded fragment verbatim and the other modes go through
+`blendPixels`, both **byte-identical to the one-sample path**. Only the 0 <
+`count` < 16 pixels run `compositeCoverage`, which folds the coverage into the
+source alpha and then runs the ordinary straight-alpha source-over:
+
+```
+cov = count / 16
+sa  = (src.a / 255) * cov        da = dst.a / 255        keep = 1 - sa
+out.a   = sa + da * keep
+out.rgb = (src.rgb*sa + dst.rgb*da*keep) / out.a
+```
+
+in `f64` with the same single quantization per channel. Attenuating the source
+(and not interpolating linearly towards the destination) is what makes an
+antialiased edge behave correctly over a translucent target, and it makes
+"fully covered" and "partial coverage of a half-alpha source" agree.
+Two equal-area fractions of different colors therefore add up to the same result
+whichever way the edge is covered.
+
+Partially covered pixels deliberately **do not write depth**: they are
+translucent, and letting them occlude would erase the geometry behind the hairline
+they just added. `Stats.antialiased_pixels` counts them; `Stats.pixels` counts
+every resolved pixel once (not once per sub-sample contribution).
+
+### Cost
+
+Antialiasing only spends work on edge pixels — the interior of a large triangle
+takes the two-comparison fast path — but the accumulation indirection, the
+per-pixel slot bookkeeping and the deferred resolve pass are real. Measured on the
+same harness (1024 quads tiled across the target, projection shifted half a pixel
+on X so every tile has fractional edges):
+
+| Target | One sample | `.edge` | Relative |
+| --- | --- | --- | --- |
+| 256×256 | 2.3 ms | 12.6 ms | ~5.5× |
+| 512×512 | 7.5 ms | 19.6 ms | ~2.6× |
+| 1024×1024 | 27.3 ms | 40.9 ms | ~1.5× |
+
+Small tiles are dominated by the per-draw scratch sizing (1024 draws), large ones
+by fill, and the ~1024² case is the one the ratio is meaningful for. Antialiasing
+is opt-in for exactly this reason; the default path is unchanged in cost.
+
+### Verification
+
+- **Area conservation.** A slanted quad's alpha sum, converted to pixels, equals
+  the quad's exact shoelace screen area. Measured 167.40 px against 167.04 px
+  (0.2%) with a 0.5% tolerance — a binary rasterizer lands 2 px (1.2%) short here
+  and cannot pass. This is the numerical statement that coverage integrates.
+- **Coverage per pixel**, brute-force cross-checked: `coverageCount` is tested
+  against a direct sub-sample loop over the same three edge functions for the
+  pixel centers of a triangle, so the incremental stepping is pinned to the
+  definition rather than to itself.
+- **Partition.** A quad split into two triangles has its coverage sum to 16 for
+  every interior pixel: no seam and no double count.
+- **Full coverage is bit-identical.** A grid-aligned quad renders byte-identical
+  color and depth to the one-sample path, with `antialiased_pixels == 0`.
+- **Partial pixels never write depth**, fully covered ones always do.
+- **Translucent composite.** Partial coverage over a partly transparent target
+  matches the source-over formula hand-computed in the test.
+- **Allocation failure.** `checkAllAllocationFailures` sweeps every allocation
+  site of `drawMeshAlloc`/`rasterizeAlloc` and asserts a clean `OutOfMemory` with
+  no partial writes and no leaked scratch.
+- **No regression on the default path.** The four reference corpora
+  ([`raster_vectors.zig`](../src/render/raster_vectors.zig) and the blend, texture
+  and light corpora, 206 cases) are byte-identical with the feature present,
+  because `antialias = .none` is the default and the AA code is not on that path.
 
 ## Textures
 
@@ -497,8 +655,11 @@ numbers are honest scalar upper bounds of the current implementation, not
 aspirational targets: SIMD texel gathering, a reciprocal fast path guarded by
 exactness checks, and mipmaps all remain future work.
 
-The pixel path takes no allocator and uses only fixed stack scratch, so it cannot
-allocate, cannot fail with `OutOfMemory`, and is safe to call from a render thread.
+The one-sample pixel path takes no allocator and uses only fixed stack scratch, so
+it cannot allocate and cannot fail with `OutOfMemory`. The only allocation in the
+rasterizer is the per-draw scratch of `antialias = .edge`, made through the
+caller's allocator by `rasterizeAlloc` / `drawMeshAlloc` — the allocator-free
+entry points never reach it.
 The caller's `color` slice is plain RGBA8 — exactly `assets.image.Image.pixels` —
 so a rendered frame can be written as an image with no copy and no reformat:
 
@@ -524,9 +685,13 @@ See [asset-decoders.md](asset-decoders.md) for the codec.
   no separate blend function for RGB vs alpha. Correct transparency is the
   caller's responsibility: sort `back_to_front` (extraction already can) and, for
   multi-surface transparency, disable `depth_write`.
-- **No antialiasing, mipmaps or LOD selection.** One sample per pixel, no MSAA.
-  Minification aliases, and blended edges are hard-edged because coverage is
-  binary.
+- **Edge antialiasing is 16x coverage supersampling, and it is opt-in.**
+  `antialias = .edge` fixes staircase edges and vanishing thin geometry, but it
+  costs 1.5x to 5.5x depending on how much of the frame is edge (see
+  [Cost](#cost)), needs per-draw scratch and therefore an allocator. It does not
+  antialias *within* a pixel for textured minification — that is mipmapping's job.
+- **No mipmaps or LOD selection.** Minification aliases; the 4x4 grid only helps
+  geometric edges, not texture detail.
 - **No GPU backend.** This is a CPU reference path, not a Renderer Low tier.
 - **Single-threaded.** No tile parallelism or binning; a frame is rasterized in
   submission order on the calling thread.
