@@ -16,14 +16,21 @@
 //!
 //! Depth is NDC `z` in [-1, 1]. After the perspective divide, `z` is affine in
 //! screen space, so it interpolates linearly from the barycentric weights with no
-//! per-pixel perspective correction. (Attributes such as UVs would need that
-//! correction; this backend shades flat, so there are none.)
+//! per-pixel perspective correction. Attributes such as UVs are interpolated
+//! with a full perspective correction: each vertex stores `uw = u / w`,
+//! `vw = v / w` and `w_inv = 1 / w` (clip space), which are linearly interpolated
+//! and divided through at the end of the pixel.
+//!
+//! Textures are borrowed, decoded RGBA8 buffers (`Texture`) with repeat wrap
+//! and nearest/bilinear magnification. A sampled texel is multiplied by the
+//! material's linear RGBA tint, then both pipelines write alpha verbatim
+//! (there is no blending).
 //!
 //! Coupling: geometry and materials arrive through a duck-typed `resources`
 //! value, so this module never imports the asset layer. A caller adapts
 //! `assets.mesh.MeshView` (or plain arrays) with a few lines; see the tests.
 //!
-//! Not implemented, and not claimed: textures, lighting, shading, blending,
+//! Not implemented, and not claimed: lighting, shading, blending,
 //! transparency, MSAA, mipmaps, or any GPU path.
 
 const std = @import("std");
@@ -41,6 +48,12 @@ pub const Error = error{
     InvalidDimension,
     /// A mesh index points past its position array.
     InvalidIndex,
+    /// The UV array is missing or does not hold one entry per position while
+    /// a textured draw was requested.
+    InvalidUv,
+    /// A texture's dimensions are zero, exceed `max_dimension`, or its pixel
+    /// slice does not hold exactly `width * height * 4` bytes.
+    InvalidTexture,
 };
 
 /// Largest framebuffer side. Bounds the fixed-point range and the pixel count.
@@ -55,6 +68,9 @@ pub const FrontFace = enum { counter_clockwise, clockwise };
 
 pub const CullMode = enum { none, back, front };
 
+/// Texture magnification filter.
+pub const Filter = enum { nearest, bilinear };
+
 pub const Options = struct {
     cull: CullMode = .back,
     front_face: FrontFace = .counter_clockwise,
@@ -63,19 +79,49 @@ pub const Options = struct {
 };
 
 /// A triangle vertex in screen space: `x`/`y` are 28.4 fixed point pixels with
-/// the origin at the top-left, `z` is NDC depth in [-1, 1].
+/// the origin at the top-left, `z` is NDC depth in [-1, 1]. `uw`/`vw` are the
+/// UV coordinates already divided by the clip-space `w` and `w_inv` is its
+/// reciprocal (all three as f64) — both are needed for perspective-correct
+/// attribute interpolation. They default to pass-through values so callers
+/// shading flat colors never need to set them.
 pub const ScreenVertex = struct {
     x: i32,
     y: i32,
     z: f32,
+    uw: f64 = 0.0,
+    vw: f64 = 0.0,
+    w_inv: f64 = 1.0,
 };
 
 /// Borrowed geometry. Positions and indices are plain typed slices, so this
-/// module carries no knowledge of any artifact byte layout.
+/// module carries no knowledge of any artifact byte layout. `uvs` is optional:
+/// it is only required when the material samples a texture, in which case it
+/// must hold exactly one entry per position.
 pub const Mesh = struct {
     positions: []const [3]f32,
     /// Triangle list; length must be a multiple of three.
     indices: []const u32,
+    uvs: ?[]const [2]f32 = null,
+};
+
+/// A borrowed, decoded texture: RGBA8, row-major, top-down — exactly the
+/// layout of `assets.texture`'s `CXTX` pixel payload. `v = 0` samples the
+/// first (top) row. Coordinates wrap with repeat addressing (any value maps
+/// into the texture). No mipmap level or LOD selection exists; `filter`
+/// magnifies.
+pub const Texture = struct {
+    width: u32,
+    height: u32,
+    /// `width * height * 4` bytes, row-major, 4 bytes per pixel (RGBA).
+    pixels: []const u8,
+    filter: Filter = .bilinear,
+
+    pub fn validate(self: Texture) Error!void {
+        if (self.width == 0 or self.height == 0) return error.InvalidTexture;
+        if (self.width > max_dimension or self.height > max_dimension) return error.InvalidTexture;
+        const expected = @as(usize, self.width) * @as(usize, self.height) * 4;
+        if (self.pixels.len != expected) return error.InvalidTexture;
+    }
 };
 
 pub const Stats = struct {
@@ -175,11 +221,121 @@ fn floorDiv(v: i64) i32 {
     return @intCast(v >> subpixel_bits);
 }
 
+// --- texture sampling --------------------------------------------------------
+
+/// Fractional part with floor semantics; works for negative coordinates too.
+fn repeatFrac(t: f64) f64 {
+    return t - @floor(t);
+}
+
+/// Wrap a fractional coordinate into `[0, len)` with repeat addressing.
+fn wrapIndex(t: f64, len: u32) u32 {
+    return @intFromFloat(@mod(@floor(t), @as(f64, @floatFromInt(len))));
+}
+
+fn texelOffset(tex: Texture, ix: u32, iy: u32) usize {
+    return (@as(usize, iy) * tex.width + ix) * 4;
+}
+
+fn nearestTexel(tex: Texture, u: f64, v: f64) [4]u8 {
+    const uf = repeatFrac(u);
+    const vf = repeatFrac(v);
+    const x: u32 = @min(tex.width - 1, @as(u32, @intFromFloat(@floor(uf * @as(f64, @floatFromInt(tex.width))))));
+    const y: u32 = @min(tex.height - 1, @as(u32, @intFromFloat(@floor(vf * @as(f64, @floatFromInt(tex.height))))));
+    const off = texelOffset(tex, x, y);
+    return tex.pixels[off..][0..4].*;
+}
+
+fn fetch(tex: Texture, ix: u32, iy: u32, channel: usize) f64 {
+    const off = texelOffset(tex, ix, iy);
+    return @floatFromInt(tex.pixels[off + channel]);
+}
+
+/// Bilinear magnification pinned to a single evaluation order: fractions as
+/// f64, four taps summed as `(c00 * (1 - fx) + c10 * fx) * (1 - fy) +
+/// (c01 * (1 - fx) + c11 * fx) * fy`, one final round to u8. The reference
+/// vectors recompute this exact expression.
+fn bilinearTexel(tex: Texture, u: f64, v: f64) [4]u8 {
+    const uf = repeatFrac(u);
+    const vf = repeatFrac(v);
+    const tx = uf * @as(f64, @floatFromInt(tex.width)) - 0.5;
+    const ty = vf * @as(f64, @floatFromInt(tex.height)) - 0.5;
+    const fx = tx - @floor(tx);
+    const fy = ty - @floor(ty);
+    const x0 = wrapIndex(tx, tex.width);
+    const x1 = (x0 + 1) % tex.width;
+    const y0 = wrapIndex(ty, tex.height);
+    const y1 = (y0 + 1) % tex.height;
+    var out: [4]u8 = undefined;
+    for (0..4) |channel| {
+        const c00 = fetch(tex, x0, y0, channel);
+        const c10 = fetch(tex, x1, y0, channel);
+        const c01 = fetch(tex, x0, y1, channel);
+        const c11 = fetch(tex, x1, y1, channel);
+        const top = (c00 * (1.0 - fx) + c10 * fx) * (1.0 - fy);
+        const bottom = (c01 * (1.0 - fx) + c11 * fx) * fy;
+        out[channel] = @intFromFloat(@floor(top + bottom + 0.5));
+    }
+    return out;
+}
+
+fn sampleTexture(tex: Texture, u: f64, v: f64) [4]u8 {
+    return switch (tex.filter) {
+        .nearest => nearestTexel(tex, u, v),
+        .bilinear => bilinearTexel(tex, u, v),
+    };
+}
+
+/// Multiply the sampled texel by the material tint, one rounding per channel.
+fn tintMultiply(texel: [4]u8, tint: [4]u8) [4]u8 {
+    var out: [4]u8 = undefined;
+    for (0..4) |channel| {
+        out[channel] = @intFromFloat(@floor(
+            @as(f64, @floatFromInt(texel[channel])) *
+                @as(f64, @floatFromInt(tint[channel])) / 255.0 + 0.5,
+        ));
+    }
+    return out;
+}
+
+/// Shade one covered pixel: flat `rgba`, or `rgba` multiplied by the filtered
+/// texel with perspective-correct UVs (`w0`..`w2` are the already-biased
+/// coverage weights as f64, `inv_area` normalizes them).
+fn shadePixel(
+    texture: ?Texture,
+    v0: ScreenVertex,
+    v1: ScreenVertex,
+    v2: ScreenVertex,
+    w0: f64,
+    w1: f64,
+    w2: f64,
+    inv_area: f64,
+    rgba: [4]u8,
+) [4]u8 {
+    const tex = texture orelse return rgba;
+    const den = ((w0 * v0.w_inv + w1 * v1.w_inv) + w2 * v2.w_inv) * inv_area;
+    var u: f64 = 0.0;
+    var v: f64 = 0.0;
+    // The real pipeline clips to w > 1e-20 upstream; direct callers can still
+    // hand in degenerate weights. Fall back to the affine answer rather than
+    // emit NaN.
+    if (den > 0.0 and std.math.isFinite(den)) {
+        u = (((w0 * v0.uw + w1 * v1.uw) + w2 * v2.uw) * inv_area) / den;
+        v = (((w0 * v0.vw + w1 * v1.vw) + w2 * v2.vw) * inv_area) / den;
+    }
+    return tintMultiply(sampleTexture(tex, u, v), rgba);
+}
+
 /// Rasterize one screen-space triangle. Returns false only when the triangle was
 /// rejected by the cull mode or is exactly degenerate (zero area); a triangle
 /// that survives but covers no pixel center still returns true, so the result
 /// depends on the triangle and cull mode alone, never on the target size.
 /// This is the exact entry point the reference vectors target.
+///
+/// When `texture` is set, UVs are interpolated perspective-correctly from the
+/// vertices' `uw`/`vw`/`w_inv` (bypassing them with the defaults yields a
+/// plain affine mapping), sampled with the texture's filter, and multiplied
+/// by the `rgba` tint. When it is null the triangle is shaded flat.
 pub fn rasterTriangle(
     target: *Target,
     a: ScreenVertex,
@@ -188,6 +344,7 @@ pub fn rasterTriangle(
     rgba: [4]u8,
     options: Options,
     pixels_written: ?*usize,
+    texture: ?Texture,
 ) bool {
     const v0 = a;
     var v1 = b;
@@ -255,15 +412,17 @@ pub fn rasterTriangle(
             if ((w0 | w1 | w2) >= 0) {
                 // NDC z is affine in screen space after the divide, so plain
                 // barycentric interpolation is already perspective-correct.
-                const depth: f32 = @floatCast(((@as(f64, @floatFromInt(w0 + bias0)) * z0 +
-                    @as(f64, @floatFromInt(w1 + bias1)) * z1) +
-                    @as(f64, @floatFromInt(w2 + bias2)) * z2) * inv_area);
+                const wgt0 = @as(f64, @floatFromInt(w0 + bias0));
+                const wgt1 = @as(f64, @floatFromInt(w1 + bias1));
+                const wgt2 = @as(f64, @floatFromInt(w2 + bias2));
+                const depth: f32 = @floatCast(((wgt0 * z0 + wgt1 * z1) + wgt2 * z2) * inv_area);
                 if (!options.depth_test or depth < target.depth[index]) {
+                    const out_rgba = shadePixel(texture, v0, v1, v2, wgt0, wgt1, wgt2, inv_area, rgba);
                     const o = index * 4;
-                    target.color[o + 0] = rgba[0];
-                    target.color[o + 1] = rgba[1];
-                    target.color[o + 2] = rgba[2];
-                    target.color[o + 3] = rgba[3];
+                    target.color[o + 0] = out_rgba[0];
+                    target.color[o + 1] = out_rgba[1];
+                    target.color[o + 2] = out_rgba[2];
+                    target.color[o + 3] = out_rgba[3];
                     if (options.depth_write) target.depth[index] = depth;
                     written += 1;
                 }
@@ -283,25 +442,40 @@ pub fn rasterTriangle(
 
 // --- clip space -------------------------------------------------------------
 
-const ClipVertex = [4]f32;
+/// A clip-space vertex carrying affine-in-t attributes. UVs travel alongside
+/// the position from `transformVertex` through Sutherland-Hodgman clipping
+/// (attribute interpolation at the clip parameter `t` is exact, the same way
+/// position interpolation is), and are divided by `w` only at `toScreen`.
+const ClipVertex = struct {
+    /// Clip-space position: `p[0] = x`, `p[1] = y`, `p[2] = z`, `p[3] = w`.
+    p: [4]f32,
+    u: f64,
+    v: f64,
+};
 
 /// The six frustum half-spaces in clip space (OpenGL convention, z in [-w, w]).
 /// A vertex is inside when every distance is >= 0.
 fn planeDistance(plane: usize, v: ClipVertex) f32 {
+    const p = v.p;
     return switch (plane) {
-        0 => v[3] + v[0], // left
-        1 => v[3] - v[0], // right
-        2 => v[3] + v[1], // bottom
-        3 => v[3] - v[1], // top
-        4 => v[3] + v[2], // near
-        5 => v[3] - v[2], // far
+        0 => p[3] + p[0], // left
+        1 => p[3] - p[0], // right
+        2 => p[3] + p[1], // bottom
+        3 => p[3] - p[1], // top
+        4 => p[3] + p[2], // near
+        5 => p[3] - p[2], // far
         else => unreachable,
     };
 }
 
 fn lerpClip(a: ClipVertex, b: ClipVertex, t: f32) ClipVertex {
     var out: ClipVertex = undefined;
-    for (&out, a, b) |*o, x, y| o.* = x + (y - x) * t;
+    const tf: f64 = t;
+    inline for (0..4) |i| {
+        out.p[i] = a.p[i] + (b.p[i] - a.p[i]) * t;
+    }
+    out.u = a.u + (b.u - a.u) * tf;
+    out.v = a.v + (b.v - a.v) * tf;
     return out;
 }
 
@@ -337,12 +511,14 @@ fn clipPlane(count: usize, src: []const ClipVertex, dst: []ClipVertex, plane: us
 }
 
 fn toScreen(v: ClipVertex, width: f32, height: f32) ?ScreenVertex {
-    const w = v[3];
+    const p = v.p;
+    const w = p[3];
     if (!(w > 1e-20) or !std.math.isFinite(w)) return null;
     const inv = 1.0 / w;
-    const nx = v[0] * inv;
-    const ny = v[1] * inv;
-    const nz = v[2] * inv;
+    const invd: f64 = @floatCast(inv);
+    const nx = p[0] * inv;
+    const ny = p[1] * inv;
+    const nz = p[2] * inv;
     if (!std.math.isFinite(nx) or !std.math.isFinite(ny) or !std.math.isFinite(nz)) return null;
     const sx = (nx * 0.5 + 0.5) * width;
     // Y flip: NDC is Y-up, the framebuffer is top-down.
@@ -357,6 +533,9 @@ fn toScreen(v: ClipVertex, width: f32, height: f32) ?ScreenVertex {
         .x = @intFromFloat(@round(fx)),
         .y = @intFromFloat(@round(fy)),
         .z = std.math.clamp(nz, -1.0, 1.0),
+        .uw = v.u * invd,
+        .vw = v.v * invd,
+        .w_inv = invd,
     };
 }
 
@@ -367,6 +546,7 @@ fn drawClipTriangle(
     rgba: [4]u8,
     options: Options,
     stats: *Stats,
+    texture: ?Texture,
 ) void {
     var buf_a: [12]ClipVertex = undefined;
     var buf_b: [12]ClipVertex = undefined;
@@ -399,7 +579,7 @@ fn drawClipTriangle(
     // The clipped polygon is convex, so a fan covers it exactly.
     var i: usize = 1;
     while (i + 1 < count) : (i += 1) {
-        if (rasterTriangle(target, screen[0], screen[i], screen[i + 1], rgba, options, &stats.pixels)) {
+        if (rasterTriangle(target, screen[0], screen[i], screen[i + 1], rgba, options, &stats.pixels, texture)) {
             stats.rasterized += 1;
         } else {
             stats.culled += 1;
@@ -407,16 +587,23 @@ fn drawClipTriangle(
     }
 }
 
-fn transformVertex(m: Mat4, p: [3]f32) ClipVertex {
+fn transformVertex(m: Mat4, p: [3]f32, uv: [2]f32) ClipVertex {
     var out: ClipVertex = undefined;
     inline for (0..4) |r| {
-        out[r] = m[0 * 4 + r] * p[0] + m[1 * 4 + r] * p[1] + m[2 * 4 + r] * p[2] + m[3 * 4 + r];
+        out.p[r] = m[0 * 4 + r] * p[0] + m[1 * 4 + r] * p[1] + m[2 * 4 + r] * p[2] + m[3 * 4 + r];
     }
+    out.u = uv[0];
+    out.v = uv[1];
     return out;
 }
 
-/// Rasterize one mesh with a flat RGBA color. `world` and `view_projection` are
+/// Rasterize one mesh with a flat RGBA color, or one multiplied by a
+/// perspective-correct sampled texture. `world` and `view_projection` are
 /// combined once, so the per-vertex cost is a single matrix-vector product.
+///
+/// A non-null `texture` requires `mesh.uvs` with one entry per position:
+/// `error.InvalidUv` is returned otherwise. Texture contents are validated
+/// before any draw (`error.InvalidTexture`).
 pub fn drawMesh(
     target: *Target,
     mesh: Mesh,
@@ -424,8 +611,14 @@ pub fn drawMesh(
     view_projection: Mat4,
     rgba: [4]u8,
     options: Options,
+    texture: ?Texture,
 ) Error!Stats {
     if (mesh.indices.len % 3 != 0) return error.InvalidIndex;
+    if (texture) |tex| {
+        try tex.validate();
+        const uvs = mesh.uvs orelse return error.InvalidUv;
+        if (uvs.len != mesh.positions.len) return error.InvalidUv;
+    }
     const mvp = transform.multiply(view_projection, world);
     var stats: Stats = .{};
     var i: usize = 0;
@@ -436,12 +629,15 @@ pub fn drawMesh(
         const idx2 = mesh.indices[i + 2];
         if (idx0 >= mesh.positions.len or idx1 >= mesh.positions.len or idx2 >= mesh.positions.len)
             return error.InvalidIndex;
+        const uv0: [2]f32 = if (mesh.uvs) |uvs| uvs[idx0] else .{ 0, 0 };
+        const uv1: [2]f32 = if (mesh.uvs) |uvs| uvs[idx1] else .{ 0, 0 };
+        const uv2: [2]f32 = if (mesh.uvs) |uvs| uvs[idx2] else .{ 0, 0 };
         const tri = [3]ClipVertex{
-            transformVertex(mvp, mesh.positions[idx0]),
-            transformVertex(mvp, mesh.positions[idx1]),
-            transformVertex(mvp, mesh.positions[idx2]),
+            transformVertex(mvp, mesh.positions[idx0], uv0),
+            transformVertex(mvp, mesh.positions[idx1], uv1),
+            transformVertex(mvp, mesh.positions[idx2], uv2),
         };
-        drawClipTriangle(target, tri, rgba, options, &stats);
+        drawClipTriangle(target, tri, rgba, options, &stats, texture);
     }
     return stats;
 }
@@ -453,9 +649,17 @@ pub fn drawMesh(
 ///
 /// - `fn mesh(self, handle: u32) ?Mesh`
 /// - `fn color(self, handle: u32) ?[4]f32` — linear RGBA in [0, 1]
+/// - `fn texture(self, handle: u32) ?Texture` — optional, detected at comptime
+///   via `@hasDecl`, which only sees `pub` decls; absent or returning null,
+///   the material shades flat
 ///
 /// A command whose mesh or material handle does not resolve is counted in
-/// `skipped_draws` and leaves the target untouched.
+/// `skipped_draws` and leaves the target untouched. A command whose material
+/// resolves a texture but whose mesh carries no (or a mismatched) `uvs` is
+/// likewise counted in `skipped_draws` and leaves the target untouched. A
+/// malformed texture is a hard `error.InvalidTexture`. Attributes are
+/// interpolated perspective-correctly; UV clipping is exact because UV
+/// attributes travel through Sutherland-Hodgman at the clip parameter.
 pub fn rasterize(
     target: *Target,
     commands: []const DrawCommand,
@@ -463,6 +667,7 @@ pub fn rasterize(
     resources: anytype,
     options: Options,
 ) Error!Stats {
+    const have_texture = comptime @hasDecl(@TypeOf(resources), "texture");
     var stats: Stats = .{};
     for (commands) |cmd| {
         const mesh = resources.mesh(cmd.mesh) orelse {
@@ -477,7 +682,19 @@ pub fn rasterize(
         for (&rgba, linear) |*out, component| {
             out.* = @intFromFloat(@round(std.math.clamp(component, 0.0, 1.0) * 255.0));
         }
-        stats.add(try drawMesh(target, mesh, cmd.world, view_projection, rgba, options));
+        var texture: ?Texture = null;
+        if (comptime have_texture) {
+            if (resources.texture(cmd.material)) |tex| {
+                try tex.validate();
+                const uv_ok = if (mesh.uvs) |uvs| uvs.len == mesh.positions.len else false;
+                if (!uv_ok) {
+                    stats.skipped_draws += 1;
+                    continue;
+                }
+                texture = tex;
+            }
+        }
+        stats.add(try drawMesh(target, mesh, cmd.world, view_projection, rgba, options, texture));
     }
     return stats;
 }
@@ -523,6 +740,7 @@ const TestSurface = struct {
 
 const red: [4]u8 = .{ 255, 0, 0, 255 };
 const green: [4]u8 = .{ 0, 255, 0, 255 };
+const white: [4]u8 = .{ 255, 255, 255, 255 };
 
 fn sv(x: i32, y: i32, z: f32) ScreenVertex {
     return .{ .x = x * subpixel_scale, .y = y * subpixel_scale, .z = z };
@@ -559,7 +777,7 @@ test "top-left fill rule matches a hand-computed coverage set" {
     // on it (x + y == 3) are excluded. That leaves the six pixels with x+y <= 2.
     var s = try TestSurface.init(4, 4);
     defer s.deinit();
-    const drew = rasterTriangle(&s.target, sv(0, 0, 0), sv(4, 0, 0), sv(0, 4, 0), red, .{ .cull = .none }, null);
+    const drew = rasterTriangle(&s.target, sv(0, 0, 0), sv(4, 0, 0), sv(0, 4, 0), red, .{ .cull = .none }, null, null);
     try testing.expect(drew);
     try testing.expectEqual(@as(usize, 6), s.covered());
     for (0..4) |y| {
@@ -578,8 +796,8 @@ test "shared edge is covered exactly once across a split quad" {
     defer a.deinit();
     var b = try TestSurface.init(4, 4);
     defer b.deinit();
-    _ = rasterTriangle(&a.target, sv(0, 0, 0), sv(4, 0, 0), sv(0, 4, 0), red, .{ .cull = .none }, null);
-    _ = rasterTriangle(&b.target, sv(4, 0, 0), sv(4, 4, 0), sv(0, 4, 0), green, .{ .cull = .none }, null);
+    _ = rasterTriangle(&a.target, sv(0, 0, 0), sv(4, 0, 0), sv(0, 4, 0), red, .{ .cull = .none }, null, null);
+    _ = rasterTriangle(&b.target, sv(4, 0, 0), sv(4, 4, 0), sv(0, 4, 0), green, .{ .cull = .none }, null, null);
     try testing.expectEqual(@as(usize, 6), a.covered());
     try testing.expectEqual(@as(usize, 10), b.covered());
     var union_count: usize = 0;
@@ -608,12 +826,12 @@ test "shared edge partition holds for many quad splits" {
         // Shared diagonal perturbed to a subpixel position on both triangles.
         const d0 = ScreenVertex{ .x = k, .y = k * 2, .z = 0 };
         const d1 = ScreenVertex{ .x = 8 * subpixel_scale - k, .y = 8 * subpixel_scale - k, .z = 0 };
-        _ = rasterTriangle(&a.target, p0, p1, d1, red, .{ .cull = .none }, null);
-        _ = rasterTriangle(&a.target, p0, d1, d0, red, .{ .cull = .none }, null);
-        _ = rasterTriangle(&a.target, p0, d0, p3, red, .{ .cull = .none }, null);
-        _ = rasterTriangle(&b.target, p1, p2, d1, green, .{ .cull = .none }, null);
-        _ = rasterTriangle(&b.target, d1, p2, p3, green, .{ .cull = .none }, null);
-        _ = rasterTriangle(&b.target, d1, p3, d0, green, .{ .cull = .none }, null);
+        _ = rasterTriangle(&a.target, p0, p1, d1, red, .{ .cull = .none }, null, null);
+        _ = rasterTriangle(&a.target, p0, d1, d0, red, .{ .cull = .none }, null, null);
+        _ = rasterTriangle(&a.target, p0, d0, p3, red, .{ .cull = .none }, null, null);
+        _ = rasterTriangle(&b.target, p1, p2, d1, green, .{ .cull = .none }, null, null);
+        _ = rasterTriangle(&b.target, d1, p2, p3, green, .{ .cull = .none }, null, null);
+        _ = rasterTriangle(&b.target, d1, p3, d0, green, .{ .cull = .none }, null, null);
         for (0..a.target.pixelCount()) |i| {
             const ca = a.target.color[i * 4 + 3] != 0;
             const cb = b.target.color[i * 4 + 3] != 0;
@@ -626,9 +844,9 @@ test "shared edge partition holds for many quad splits" {
 test "degenerate triangles are rejected" {
     var s = try TestSurface.init(4, 4);
     defer s.deinit();
-    try testing.expect(!rasterTriangle(&s.target, sv(0, 0, 0), sv(2, 0, 0), sv(4, 0, 0), red, .{ .cull = .none }, null));
-    try testing.expect(!rasterTriangle(&s.target, sv(1, 1, 0), sv(1, 1, 0), sv(1, 1, 0), red, .{ .cull = .none }, null));
-    try testing.expect(!rasterTriangle(&s.target, sv(0, 0, 0), sv(2, 2, 0), sv(4, 4, 0), red, .{ .cull = .none }, null));
+    try testing.expect(!rasterTriangle(&s.target, sv(0, 0, 0), sv(2, 0, 0), sv(4, 0, 0), red, .{ .cull = .none }, null, null));
+    try testing.expect(!rasterTriangle(&s.target, sv(1, 1, 0), sv(1, 1, 0), sv(1, 1, 0), red, .{ .cull = .none }, null, null));
+    try testing.expect(!rasterTriangle(&s.target, sv(0, 0, 0), sv(2, 2, 0), sv(4, 4, 0), red, .{ .cull = .none }, null, null));
     try testing.expectEqual(@as(usize, 0), s.covered());
 }
 
@@ -642,7 +860,7 @@ test "cull modes select one winding" {
             inline for (.{ CullMode.none, CullMode.back, CullMode.front }) |mode| {
                 var s = try TestSurface.init(4, 4);
                 defer s.deinit();
-                const drew = rasterTriangle(&s.target, tri[0], tri[1], tri[2], red, .{ .cull = mode, .front_face = ff }, null);
+                const drew = rasterTriangle(&s.target, tri[0], tri[1], tri[2], red, .{ .cull = mode, .front_face = ff }, null, null);
                 const want = switch (mode) {
                     .none => true,
                     .back => front,
@@ -663,8 +881,8 @@ test "coverage is identical for both windings when culling is off" {
     const v0 = ScreenVertex{ .x = 3, .y = 5, .z = 0 };
     const v1 = ScreenVertex{ .x = 100, .y = 17, .z = 0 };
     const v2 = ScreenVertex{ .x = 41, .y = 120, .z = 0 };
-    _ = rasterTriangle(&a.target, v0, v1, v2, red, .{ .cull = .none }, null);
-    _ = rasterTriangle(&b.target, v0, v2, v1, red, .{ .cull = .none }, null);
+    _ = rasterTriangle(&a.target, v0, v1, v2, red, .{ .cull = .none }, null, null);
+    _ = rasterTriangle(&b.target, v0, v2, v1, red, .{ .cull = .none }, null, null);
     try testing.expectEqualSlices(u8, a.color, b.color);
 }
 
@@ -685,6 +903,7 @@ test "depth test keeps the nearest fragment regardless of draw order" {
                 col,
                 .{ .cull = .none },
                 &pixels,
+                null,
             );
         }
         // Near first: the far pass then fails every test (6 writes). Far first:
@@ -703,9 +922,9 @@ test "depth test keeps the nearest fragment regardless of draw order" {
 test "equal depth does not overwrite" {
     var s = try TestSurface.init(4, 4);
     defer s.deinit();
-    _ = rasterTriangle(&s.target, sv(0, 0, 0.5), sv(4, 0, 0.5), sv(0, 4, 0.5), red, .{ .cull = .none }, null);
+    _ = rasterTriangle(&s.target, sv(0, 0, 0.5), sv(4, 0, 0.5), sv(0, 4, 0.5), red, .{ .cull = .none }, null, null);
     var pixels: usize = 0;
-    _ = rasterTriangle(&s.target, sv(0, 0, 0.5), sv(4, 0, 0.5), sv(0, 4, 0.5), green, .{ .cull = .none }, &pixels);
+    _ = rasterTriangle(&s.target, sv(0, 0, 0.5), sv(4, 0, 0.5), sv(0, 4, 0.5), green, .{ .cull = .none }, &pixels, null);
     try testing.expectEqual(@as(usize, 0), pixels);
     try testing.expectEqualSlices(u8, &red, &s.target.colorAt(0, 0));
 }
@@ -714,11 +933,11 @@ test "depth_write false leaves the depth buffer untouched" {
     var s = try TestSurface.init(4, 4);
     defer s.deinit();
     var pixels: usize = 0;
-    _ = rasterTriangle(&s.target, sv(0, 0, -0.5), sv(4, 0, -0.5), sv(0, 4, -0.5), red, .{ .cull = .none, .depth_write = false }, &pixels);
+    _ = rasterTriangle(&s.target, sv(0, 0, -0.5), sv(4, 0, -0.5), sv(0, 4, -0.5), red, .{ .cull = .none, .depth_write = false }, &pixels, null);
     try testing.expectEqual(@as(usize, 6), pixels);
     for (s.depth) |d| try testing.expectEqual(@as(f32, 1.0), d);
     // A later, farther triangle still passes because depth stayed at the clear.
-    _ = rasterTriangle(&s.target, sv(0, 0, 0.9), sv(4, 0, 0.9), sv(0, 4, 0.9), green, .{ .cull = .none }, &pixels);
+    _ = rasterTriangle(&s.target, sv(0, 0, 0.9), sv(4, 0, 0.9), sv(0, 4, 0.9), green, .{ .cull = .none }, &pixels, null);
     try testing.expectEqual(@as(usize, 12), pixels);
     try testing.expectEqualSlices(u8, &green, &s.target.colorAt(0, 0));
 }
@@ -726,8 +945,8 @@ test "depth_write false leaves the depth buffer untouched" {
 test "depth_test false paints in submission order" {
     var s = try TestSurface.init(4, 4);
     defer s.deinit();
-    _ = rasterTriangle(&s.target, sv(0, 0, -0.9), sv(4, 0, -0.9), sv(0, 4, -0.9), red, .{ .cull = .none, .depth_test = false }, null);
-    _ = rasterTriangle(&s.target, sv(0, 0, 0.9), sv(4, 0, 0.9), sv(0, 4, 0.9), green, .{ .cull = .none, .depth_test = false }, null);
+    _ = rasterTriangle(&s.target, sv(0, 0, -0.9), sv(4, 0, -0.9), sv(0, 4, -0.9), red, .{ .cull = .none, .depth_test = false }, null, null);
+    _ = rasterTriangle(&s.target, sv(0, 0, 0.9), sv(4, 0, 0.9), sv(0, 4, 0.9), green, .{ .cull = .none, .depth_test = false }, null, null);
     try testing.expectEqualSlices(u8, &green, &s.target.colorAt(0, 0));
 }
 
@@ -735,7 +954,7 @@ test "depth interpolates linearly across the triangle" {
     var s = try TestSurface.init(4, 4);
     defer s.deinit();
     // z = -1 at x=0, +1 at x=4: the value at a pixel center is x/2 - 0.75.
-    _ = rasterTriangle(&s.target, sv(0, 0, -1), sv(4, 0, 1), sv(0, 4, -1), red, .{ .cull = .none }, null);
+    _ = rasterTriangle(&s.target, sv(0, 0, -1), sv(4, 0, 1), sv(0, 4, -1), red, .{ .cull = .none }, null, null);
     for (0..4) |y| for (0..4) |x| {
         if (x + y <= 2) {
             const want = @as(f32, @floatFromInt(x)) * 0.5 - 0.75;
@@ -769,7 +988,7 @@ fn quadMesh() Mesh {
 test "drawMesh: a front-facing quad covers the whole viewport" {
     var s = try TestSurface.init(8, 8);
     defer s.deinit();
-    const stats = try drawMesh(&s.target, quadMesh(), transform.identity(), orthoSetup(), red, .{});
+    const stats = try drawMesh(&s.target, quadMesh(), transform.identity(), orthoSetup(), red, .{}, null);
     try testing.expectEqual(@as(usize, 2), stats.submitted);
     try testing.expectEqual(@as(usize, 2), stats.rasterized);
     try testing.expectEqual(@as(usize, 0), stats.culled);
@@ -782,7 +1001,7 @@ test "drawMesh: a front-facing quad covers the whole viewport" {
 test "drawMesh: the shared diagonal of a quad leaves no seam" {
     var s = try TestSurface.init(16, 16);
     defer s.deinit();
-    const stats = try drawMesh(&s.target, quadMesh(), transform.identity(), orthoSetup(), red, .{});
+    const stats = try drawMesh(&s.target, quadMesh(), transform.identity(), orthoSetup(), red, .{}, null);
     try testing.expectEqual(@as(usize, 256), stats.pixels);
     for (s.color[3..], 0..) |_, i| {
         if (i % 4 == 0) try testing.expectEqual(@as(u8, 255), s.color[i + 3]);
@@ -794,12 +1013,12 @@ test "drawMesh: a back-facing quad is culled, and cull none draws it" {
     const mesh = Mesh{ .positions = &quad_positions, .indices = &back_indices };
     var a = try TestSurface.init(8, 8);
     defer a.deinit();
-    const culled = try drawMesh(&a.target, mesh, transform.identity(), orthoSetup(), red, .{});
+    const culled = try drawMesh(&a.target, mesh, transform.identity(), orthoSetup(), red, .{}, null);
     try testing.expectEqual(@as(usize, 2), culled.culled);
     try testing.expectEqual(@as(usize, 0), culled.pixels);
     var b = try TestSurface.init(8, 8);
     defer b.deinit();
-    const drawn = try drawMesh(&b.target, mesh, transform.identity(), orthoSetup(), red, .{ .cull = .none });
+    const drawn = try drawMesh(&b.target, mesh, transform.identity(), orthoSetup(), red, .{ .cull = .none }, null);
     try testing.expectEqual(@as(usize, 2), drawn.rasterized);
     try testing.expectEqual(@as(usize, 64), drawn.pixels);
 }
@@ -811,7 +1030,7 @@ test "drawMesh: world transform is applied before the view-projection" {
     var world = transform.identity();
     world[0] = 0.5;
     world[5] = 0.5;
-    const stats = try drawMesh(&s.target, quadMesh(), world, orthoSetup(), red, .{});
+    const stats = try drawMesh(&s.target, quadMesh(), world, orthoSetup(), red, .{}, null);
     try testing.expectEqual(@as(usize, 16), stats.pixels);
     for (0..8) |y| for (0..8) |x| {
         const want = x >= 2 and x < 6 and y >= 2 and y < 6;
@@ -824,7 +1043,7 @@ test "drawMesh: geometry entirely behind the near plane is clipped" {
     defer s.deinit();
     const positions = [_][3]f32{ .{ -2, -2, 1 }, .{ 2, -2, 1 }, .{ 0, 2, 1 } };
     const indices = [_]u32{ 0, 1, 2 };
-    const stats = try drawMesh(&s.target, .{ .positions = &positions, .indices = &indices }, transform.identity(), orthoSetup(), red, .{});
+    const stats = try drawMesh(&s.target, .{ .positions = &positions, .indices = &indices }, transform.identity(), orthoSetup(), red, .{}, null);
     try testing.expectEqual(@as(usize, 1), stats.submitted);
     try testing.expectEqual(@as(usize, 1), stats.clipped);
     try testing.expectEqual(@as(usize, 0), stats.pixels);
@@ -836,7 +1055,7 @@ test "drawMesh: geometry beyond the far plane is clipped" {
     defer s.deinit();
     const positions = [_][3]f32{ .{ -2, -2, -9 }, .{ 2, -2, -9 }, .{ 0, 2, -9 } };
     const indices = [_]u32{ 0, 1, 2 };
-    const stats = try drawMesh(&s.target, .{ .positions = &positions, .indices = &indices }, transform.identity(), orthoSetup(), red, .{});
+    const stats = try drawMesh(&s.target, .{ .positions = &positions, .indices = &indices }, transform.identity(), orthoSetup(), red, .{}, null);
     try testing.expectEqual(@as(usize, 1), stats.clipped);
     try testing.expectEqual(@as(usize, 0), s.covered());
 }
@@ -850,7 +1069,7 @@ test "drawMesh: a triangle straddling the near plane is clipped, not projected" 
     // coordinate and the triangle smears across the whole target.
     const positions = [_][3]f32{ .{ -1, -1, 0 }, .{ 1, -1, 0 }, .{ 0, 1, 4.9 } };
     const indices = [_]u32{ 0, 1, 2 };
-    const stats = try drawMesh(&s.target, .{ .positions = &positions, .indices = &indices }, transform.identity(), cam.view_projection, red, .{});
+    const stats = try drawMesh(&s.target, .{ .positions = &positions, .indices = &indices }, transform.identity(), cam.view_projection, red, .{}, null);
     try testing.expectEqual(@as(usize, 1), stats.submitted);
     try testing.expectEqual(@as(usize, 0), stats.clipped);
     try testing.expect(stats.rasterized >= 1);
@@ -866,7 +1085,7 @@ test "drawMesh: a vertex exactly at the eye does not produce NaN" {
     const cam = camera.Camera.perspectiveLookAt(.{ 0, 0, 5 }, .{ 0, 0, 0 }, .{ 0, 1, 0 }, std.math.pi / 2.0, 1.0, 1, 100);
     const positions = [_][3]f32{ .{ -1, -1, 0 }, .{ 1, -1, 0 }, .{ 0, 0, 5 } };
     const indices = [_]u32{ 0, 1, 2 };
-    _ = try drawMesh(&s.target, .{ .positions = &positions, .indices = &indices }, transform.identity(), cam.view_projection, red, .{});
+    _ = try drawMesh(&s.target, .{ .positions = &positions, .indices = &indices }, transform.identity(), cam.view_projection, red, .{}, null);
     for (s.depth) |d| try testing.expect(std.math.isFinite(d));
 }
 
@@ -875,7 +1094,7 @@ test "drawMesh: a huge off-screen triangle is clipped to the viewport" {
     defer s.deinit();
     const positions = [_][3]f32{ .{ -1000, -1000, -2 }, .{ 1000, -1000, -2 }, .{ 0, 1000, -2 } };
     const indices = [_]u32{ 0, 1, 2 };
-    const stats = try drawMesh(&s.target, .{ .positions = &positions, .indices = &indices }, transform.identity(), orthoSetup(), red, .{});
+    const stats = try drawMesh(&s.target, .{ .positions = &positions, .indices = &indices }, transform.identity(), orthoSetup(), red, .{}, null);
     try testing.expectEqual(@as(usize, 64), stats.pixels);
     try testing.expectEqual(@as(usize, 64), s.covered());
 }
@@ -884,10 +1103,10 @@ test "drawMesh: rejects malformed index buffers" {
     var s = try TestSurface.init(4, 4);
     defer s.deinit();
     const short = [_]u32{ 0, 1 };
-    try testing.expectError(error.InvalidIndex, drawMesh(&s.target, .{ .positions = &quad_positions, .indices = &short }, transform.identity(), orthoSetup(), red, .{}));
+    try testing.expectError(error.InvalidIndex, drawMesh(&s.target, .{ .positions = &quad_positions, .indices = &short }, transform.identity(), orthoSetup(), red, .{}, null));
     const oob = [_]u32{ 0, 1, 99 };
-    try testing.expectError(error.InvalidIndex, drawMesh(&s.target, .{ .positions = &quad_positions, .indices = &oob }, transform.identity(), orthoSetup(), red, .{}));
-    const empty = try drawMesh(&s.target, .{ .positions = &quad_positions, .indices = &.{} }, transform.identity(), orthoSetup(), red, .{});
+    try testing.expectError(error.InvalidIndex, drawMesh(&s.target, .{ .positions = &quad_positions, .indices = &oob }, transform.identity(), orthoSetup(), red, .{}, null));
+    const empty = try drawMesh(&s.target, .{ .positions = &quad_positions, .indices = &.{} }, transform.identity(), orthoSetup(), red, .{}, null);
     try testing.expectEqual(@as(usize, 0), empty.submitted);
 }
 
@@ -898,12 +1117,12 @@ const SliceResources = struct {
     meshes: []const Mesh,
     colors: []const [4]f32,
 
-    fn mesh(self: SliceResources, handle: u32) ?Mesh {
+    pub fn mesh(self: SliceResources, handle: u32) ?Mesh {
         if (handle >= self.meshes.len) return null;
         return self.meshes[handle];
     }
 
-    fn color(self: SliceResources, handle: u32) ?[4]f32 {
+    pub fn color(self: SliceResources, handle: u32) ?[4]f32 {
         if (handle >= self.colors.len) return null;
         return self.colors[handle];
     }
@@ -988,11 +1207,11 @@ test "clipping a triangle against six planes stays within the fixed buffers" {
     // drives the growth path directly rather than trusting the bound.
     const cases = [_][3]ClipVertex{
         // Crosses all six: near+left+bottom at v0, right at v1, top+far at v2.
-        .{ .{ -100, -100, -2, 1 }, .{ 100, -100, 0.5, 1 }, .{ 0, 100, 3, 1 } },
+        .{ .{ .p = .{ -100, -100, -2, 1 }, .u = 0, .v = 0 }, .{ .p = .{ 100, -100, 0.5, 1 }, .u = 0, .v = 0 }, .{ .p = .{ 0, 100, 3, 1 }, .u = 0, .v = 0 } },
         // Crosses the four sides and the far plane.
-        .{ .{ -3, -3, -1, 2 }, .{ 3, -3, -1, 2 }, .{ 0, 3, 5, 2 } },
+        .{ .{ .p = .{ -3, -3, -1, 2 }, .u = 0, .v = 0 }, .{ .p = .{ 3, -3, -1, 2 }, .u = 0, .v = 0 }, .{ .p = .{ 0, 3, 5, 2 }, .u = 0, .v = 0 } },
         // Crosses only the four sides.
-        .{ .{ -50, 0, -1, 2 }, .{ 50, -50, -1, 2 }, .{ 0, 50, -1, 2 } },
+        .{ .{ .p = .{ -50, 0, -1, 2 }, .u = 0, .v = 0 }, .{ .p = .{ 50, -50, -1, 2 }, .u = 0, .v = 0 }, .{ .p = .{ 0, 50, -1, 2 }, .u = 0, .v = 0 } },
     };
     for (cases) |tri| {
         var buf_a: [12]ClipVertex = undefined;
@@ -1027,7 +1246,7 @@ test "drawMesh: a triangle crossing several planes still renders bounded output"
     const cam = camera.Camera.perspectiveLookAt(.{ 0, 0, 5 }, .{ 0, 0, 0 }, .{ 0, 1, 0 }, std.math.pi / 2.0, 1.0, 1, 100);
     const positions = [_][3]f32{ .{ -100, -100, 4.9 }, .{ 100, -100, -50 }, .{ 0, 100, -200 } };
     const indices = [_]u32{ 0, 1, 2 };
-    const stats = try drawMesh(&s.target, .{ .positions = &positions, .indices = &indices }, transform.identity(), cam.view_projection, red, .{});
+    const stats = try drawMesh(&s.target, .{ .positions = &positions, .indices = &indices }, transform.identity(), cam.view_projection, red, .{}, null);
     try testing.expectEqual(@as(usize, 1), stats.submitted);
     try testing.expect(stats.pixels <= 256);
     for (s.depth) |d| try testing.expect(std.math.isFinite(d) and d >= -1 and d <= 1);
@@ -1098,7 +1317,7 @@ test "rasterizer matches the independent reference bit for bit" {
             .{ .x = case.tri[2].x, .y = case.tri[2].y, .z = case.tri[2].z },
         };
         var pixels: usize = 0;
-        const drew = rasterTriangle(&s.target, tri[0], tri[1], tri[2], red, options, &pixels);
+        const drew = rasterTriangle(&s.target, tri[0], tri[1], tri[2], red, options, &pixels, null);
         std.testing.expectEqual(case.drew, drew) catch |err| {
             std.debug.print("case {s}: drew mismatch\n", .{case.name});
             return err;
@@ -1133,4 +1352,251 @@ test "rasterizer matches the independent reference bit for bit" {
     // Guard against the vector file silently becoming empty.
     try testing.expect(vectors.cases.len >= 70);
     try testing.expect(total_pixels >= 800);
+}
+
+const texture_vectors = @import("raster_texture_vectors.zig");
+
+test "textured rasterizer matches the independent reference bit for bit" {
+    var s = try TestSurface.init(texture_vectors.width, texture_vectors.height);
+    defer s.deinit();
+    const checker = Texture{
+        .width = 4,
+        .height = 4,
+        .pixels = &texture_vectors.texture,
+        .filter = .nearest, // overridden per case below
+    };
+    var total_pixels: usize = 0;
+    for (texture_vectors.cases) |case| {
+        s.target.clear(.{ 0, 0, 0, 0 }, 1.0);
+        const options = Options{
+            .cull = switch (case.cull) {
+                .none => .none,
+                .back => .back,
+                .front => .front,
+            },
+            .front_face = switch (case.front_face) {
+                .ccw => .counter_clockwise,
+                .cw => .clockwise,
+            },
+            .depth_test = case.depth_test,
+            .depth_write = case.depth_write,
+        };
+        const tex = Texture{
+            .width = checker.width,
+            .height = checker.height,
+            .pixels = checker.pixels,
+            .filter = switch (case.filter) {
+                .nearest => .nearest,
+                .bilinear => .bilinear,
+            },
+        };
+        const tri = [3]ScreenVertex{
+            .{ .x = case.tri[0].x, .y = case.tri[0].y, .z = case.tri[0].z, .uw = case.tri[0].uw, .vw = case.tri[0].vw, .w_inv = case.tri[0].w_inv },
+            .{ .x = case.tri[1].x, .y = case.tri[1].y, .z = case.tri[1].z, .uw = case.tri[1].uw, .vw = case.tri[1].vw, .w_inv = case.tri[1].w_inv },
+            .{ .x = case.tri[2].x, .y = case.tri[2].y, .z = case.tri[2].z, .uw = case.tri[2].uw, .vw = case.tri[2].vw, .w_inv = case.tri[2].w_inv },
+        };
+        var pixels: usize = 0;
+        const drew = rasterTriangle(&s.target, tri[0], tri[1], tri[2], case.tint, options, &pixels, tex);
+        std.testing.expectEqual(case.drew, drew) catch |err| {
+            std.debug.print("case {s}: drew mismatch\n", .{case.name});
+            return err;
+        };
+
+        // Coverage agrees bit for bit with the depth buffer (clear depth 1.0,
+        // every case writes depth), and the full RGBA frame matches exactly.
+        // The mask-via-depth shortcut is valid because every vector case keeps
+        // depth_test/depth_write enabled.
+        for (0..s.target.pixelCount()) |i| {
+            const want = (case.mask[i / 8] >> @as(u3, @intCast(i % 8))) & 1;
+            const got: u8 = if (s.depth[i] != 1.0) 1 else 0;
+            std.testing.expectEqual(want, got) catch |err| {
+                std.debug.print("case {s}: coverage mismatch at pixel {d} ({d},{d})\n", .{
+                    case.name, i, i % texture_vectors.width, i / texture_vectors.width,
+                });
+                return err;
+            };
+            for (0..4) |c| {
+                const want_byte = case.frame[i * 4 + c];
+                const got_byte = s.target.color[i * 4 + c];
+                std.testing.expectEqual(want_byte, got_byte) catch |err| {
+                    std.debug.print("case {s}: frame mismatch at pixel {d} ({d},{d}) channel {d}: want 0x{x:0>2} got 0x{x:0>2}\n", .{
+                        case.name, i, i % texture_vectors.width, i / texture_vectors.width, c, want_byte, got_byte,
+                    });
+                    return err;
+                };
+            }
+        }
+        total_pixels += pixels;
+    }
+    // Guard against the vector file silently becoming empty.
+    try testing.expect(texture_vectors.cases.len >= 40);
+    try testing.expect(total_pixels >= 500);
+}
+
+// --- texture-specific unit tests --------------------------------------------
+
+/// The 2x2 texture both unit tests and fixtures share. Texel order is
+/// row-major, top-down: (0,0) red, (1,0) green, (0,1) blue, (1,1) yellow.
+const texel_2x2 = [_]u8{
+    255, 0,   0,   255,
+    0,   255, 0,   255,
+    0,   0,   255, 255,
+    255, 255, 0,   255,
+};
+
+const four_positions = [_][3]f32{
+    .{ -2, -2, -2 }, .{ 2, -2, -2 }, .{ 2, 2, -2 }, .{ -2, 2, -2 },
+};
+const four_indices = [_]u32{ 0, 1, 2, 0, 2, 3 };
+const four_uvs = [_][2]f32{
+    .{ 0, 0 }, .{ 1, 0 }, .{ 1, 1 }, .{ 0, 1 },
+};
+
+fn quadMeshUv() Mesh {
+    return .{ .positions = &four_positions, .indices = &four_indices, .uvs = &four_uvs };
+}
+
+const SliceTexturedResources = struct {
+    meshes: []const Mesh,
+    colors: []const [4]f32,
+    textures: []const Texture,
+
+    pub fn mesh(self: SliceTexturedResources, handle: u32) ?Mesh {
+        if (handle >= self.meshes.len) return null;
+        return self.meshes[handle];
+    }
+
+    pub fn color(self: SliceTexturedResources, handle: u32) ?[4]f32 {
+        if (handle >= self.colors.len) return null;
+        return self.colors[handle];
+    }
+
+    pub fn texture(self: SliceTexturedResources, handle: u32) ?Texture {
+        if (handle >= self.textures.len) return null;
+        return self.textures[handle];
+    }
+};
+
+test "Texture.validate: rejects malformed textures, accepts a valid one" {
+    var short = Texture{ .width = 2, .height = 2, .pixels = texel_2x2[0..15], .filter = .nearest };
+    try testing.expectError(error.InvalidTexture, short.validate());
+    var zero = Texture{ .width = 0, .height = 2, .pixels = &texel_2x2, .filter = .nearest };
+    try testing.expectError(error.InvalidTexture, zero.validate());
+    var wide = Texture{ .width = max_dimension + 1, .height = 1, .pixels = texel_2x2[0..0], .filter = .nearest };
+    try testing.expectError(error.InvalidTexture, wide.validate());
+    var ok = Texture{ .width = 2, .height = 2, .pixels = &texel_2x2, .filter = .bilinear };
+    try ok.validate();
+}
+
+test "drawMesh: a texture without uvs is a hard error, target untouched" {
+    var s = try TestSurface.init(8, 8);
+    defer s.deinit();
+    const tex = Texture{ .width = 2, .height = 2, .pixels = &texel_2x2, .filter = .nearest };
+    try testing.expectError(error.InvalidUv, drawMesh(&s.target, quadMesh(), transform.identity(), orthoSetup(), red, .{}, tex));
+    try testing.expectEqual(@as(usize, 0), s.covered());
+    for (s.depth) |d| try testing.expectEqual(@as(f32, 1.0), d);
+}
+
+test "drawMesh: a uv buffer shorter than positions is a hard error" {
+    var s = try TestSurface.init(8, 8);
+    defer s.deinit();
+    const uvs = [_][2]f32{ .{ 0, 0 }, .{ 1, 0 } };
+    const mesh = Mesh{ .positions = &four_positions, .indices = &four_indices, .uvs = &uvs };
+    const tex = Texture{ .width = 2, .height = 2, .pixels = &texel_2x2, .filter = .nearest };
+    try testing.expectError(error.InvalidUv, drawMesh(&s.target, mesh, transform.identity(), orthoSetup(), red, .{}, tex));
+    try testing.expectEqual(@as(usize, 0), s.covered());
+}
+
+test "drawMesh: an all-red textured quad draws red, not the flat tint" {
+    var s = try TestSurface.init(8, 8);
+    defer s.deinit();
+    const all_red = [_]u8{ 255, 0, 0, 255 };
+    const tex = Texture{ .width = 1, .height = 1, .pixels = &all_red, .filter = .nearest };
+    const stats = try drawMesh(&s.target, quadMeshUv(), transform.identity(), orthoSetup(), white, .{}, tex);
+    try testing.expectEqual(@as(usize, 64), stats.pixels);
+    try testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, &s.target.colorAt(4, 4));
+}
+
+test "drawMesh: the material tint multiplies the sampled texel" {
+    var s = try TestSurface.init(8, 8);
+    defer s.deinit();
+    const all_red = [_]u8{ 255, 0, 0, 255 };
+    const tex = Texture{ .width = 1, .height = 1, .pixels = &all_red, .filter = .nearest };
+    const gray = [4]u8{ 128, 128, 128, 255 };
+    _ = try drawMesh(&s.target, quadMeshUv(), transform.identity(), orthoSetup(), gray, .{}, tex);
+    // floor(255 * 128 / 255 + 0.5) = 128, floor(0 * 128 / 255 + 0.5) = 0.
+    try testing.expectEqualSlices(u8, &.{ 128, 0, 0, 255 }, &s.target.colorAt(4, 4));
+    // A half-alpha tint leaves the alpha at floor(255 * 128 / 255 + 0.5) = 128.
+    s.target.clear(.{ 0, 0, 0, 0 }, 1.0);
+    const half = [4]u8{ 255, 255, 255, 128 };
+    _ = try drawMesh(&s.target, quadMeshUv(), transform.identity(), orthoSetup(), half, .{}, tex);
+    try testing.expectEqualSlices(u8, &.{ 255, 0, 0, 128 }, &s.target.colorAt(4, 4));
+}
+
+test "drawMesh: a degenerate w gradient falls back to uv (0,0)" {
+    var s = try TestSurface.init(8, 8);
+    defer s.deinit();
+    // Every vertex carries w_inv = 0, so den == 0 and the shader must clamp
+    // the sample to texel (0,0) instead of dividing by zero.
+    const tri = [3]ScreenVertex{
+        .{ .x = 0, .y = 0, .z = 0, .uw = 0, .vw = 0, .w_inv = 0 },
+        .{ .x = 8 * 16, .y = 0, .z = 0, .uw = 1, .vw = 0, .w_inv = 0 },
+        .{ .x = 0, .y = 8 * 16, .z = 0, .uw = 0, .vw = 1, .w_inv = 0 },
+    };
+    const tex = Texture{ .width = 2, .height = 2, .pixels = &texel_2x2, .filter = .nearest };
+    _ = rasterTriangle(&s.target, tri[0], tri[1], tri[2], red, .{ .cull = .none }, null, tex);
+    // texel (0,0) is pure red.
+    try testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, &s.target.colorAt(1, 1));
+}
+
+test "drawMesh: mesh uvs are ignored when the texture is null" {
+    var s = try TestSurface.init(8, 8);
+    defer s.deinit();
+    const stats = try drawMesh(&s.target, quadMeshUv(), transform.identity(), orthoSetup(), green, .{}, null);
+    try testing.expectEqual(@as(usize, 64), stats.pixels);
+    try testing.expectEqualSlices(u8, &.{ 0, 255, 0, 255 }, &s.target.colorAt(4, 4));
+}
+
+test "rasterize: material resolving a texture renders; uv-less mesh is skipped" {
+    var s = try TestSurface.init(4, 4);
+    defer s.deinit();
+    const tex = Texture{ .width = 1, .height = 1, .pixels = &[_]u8{ 255, 0, 0, 255 }, .filter = .nearest };
+    const flat_mesh = quadMeshUv();
+    const colors = [_][4]f32{.{ 1.0, 1.0, 1.0, 1.0 }};
+    // A mesh without uvs is skipped (non-fatal), the target stays untouched.
+    const plain = [_]Mesh{quadMesh()};
+    const res = SliceTexturedResources{ .meshes = &plain, .colors = &colors, .textures = &.{tex} };
+    const stats = try rasterize(&s.target, &.{command(0, 0)}, orthoSetup(), res, .{});
+    try testing.expectEqual(@as(usize, 1), stats.skipped_draws);
+    try testing.expectEqual(@as(usize, 0), stats.pixels);
+    try testing.expectEqual(@as(usize, 0), s.covered());
+    // Same material, uvs present: renders red.
+    const textured = [_]Mesh{flat_mesh};
+    const res2 = SliceTexturedResources{ .meshes = &textured, .colors = &colors, .textures = &.{tex} };
+    const stats2 = try rasterize(&s.target, &.{command(0, 0)}, orthoSetup(), res2, .{});
+    try testing.expectEqual(@as(usize, 0), stats2.skipped_draws);
+    try testing.expectEqual(@as(usize, 16), stats2.pixels);
+    try testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, &s.target.colorAt(2, 2));
+}
+
+test "rasterize: a malformed texture is a hard error, not a skip" {
+    var s = try TestSurface.init(4, 4);
+    defer s.deinit();
+    const bad = Texture{ .width = 2, .height = 2, .pixels = texel_2x2[0..3], .filter = .nearest };
+    const meshes = [_]Mesh{quadMeshUv()};
+    const colors = [_][4]f32{.{ 1.0, 1.0, 1.0, 1.0 }};
+    const res = SliceTexturedResources{ .meshes = &meshes, .colors = &colors, .textures = &.{bad} };
+    try testing.expectError(error.InvalidTexture, rasterize(&s.target, &.{command(0, 0)}, orthoSetup(), res, .{}));
+}
+
+test "rasterize: material without texture shades flat (backward compatibility)" {
+    var s = try TestSurface.init(4, 4);
+    defer s.deinit();
+    const meshes = [_]Mesh{quadMeshUv()};
+    const colors = [_][4]f32{.{ 0.0, 1.0, 0.0, 1.0 }};
+    // No texture entry for this handle: flat shading, uvs ignored.
+    const res = SliceTexturedResources{ .meshes = &meshes, .colors = &colors, .textures = &.{} };
+    const stats = try rasterize(&s.target, &.{command(0, 0)}, orthoSetup(), res, .{});
+    try testing.expectEqual(@as(usize, 16), stats.pixels);
+    try testing.expectEqualSlices(u8, &.{ 0, 255, 0, 255 }, &s.target.colorAt(2, 2));
 }
