@@ -26,7 +26,9 @@ Per triangle, in order:
 5. **Rasterize.** Integer edge functions with a top-left fill rule over a clamped
    bounding box, with a depth test. Per pixel the shaded result is either the flat
    material tint or a texture sample (nearest or bilinear, perspective-correct)
-   multiplied by that tint.
+   multiplied by that tint. When a light is configured, a per-channel Lambert
+   multiplier is applied to the albedo first (RGB only) — see
+   [Lighting](#lighting).
 
 A clipped triangle stays convex, so the resulting polygon (at most nine vertices)
 is covered exactly by a triangle fan. Both clip buffers are fixed 12-slot arrays
@@ -116,7 +118,9 @@ const stats = try R.rasterize(&target, frame.commands, cam.view_projection, reso
 pixel count. Errors are `InvalidTarget`, `InvalidDimension`, `InvalidIndex`
 (index past the position array, or an index count that is not a multiple of
 three), `InvalidUv` (a mesh whose `uvs` are missing or shorter than its
-`positions` when a texture is bound) and `InvalidTexture` (malformed texture).
+`positions` when a texture is bound), `InvalidTexture` (malformed texture) and
+`InvalidLight` (zero-length or non-finite light direction, or a negative/non-finite
+`color`/`ambient` channel — raised at the `drawMesh` entry, before any draw).
 
 `rasterTriangle` returns `false` **only** for a cull rejection or an exactly
 degenerate triangle. A triangle that survives but covers no pixel center returns
@@ -131,8 +135,9 @@ resolves them through a **duck-typed** `resources` value that must provide:
 
 ```zig
 pub fn mesh(self: @This(), handle: u32) ?RasterMesh
-pub fn color(self: @This(), handle: u32) ?[4]f32   // linear RGBA in [0, 1]
+pub fn color(self: @This(), handle: u32) ?[4]f32    // linear RGBA in [0, 1]
 pub fn texture(self: @This(), handle: u32) ?Texture // optional, see below
+pub fn directionalLight(self: @This()) ?Light       // optional, see below
 ```
 
 A command whose mesh or material does not resolve is counted in `skipped_draws`
@@ -184,6 +189,15 @@ for (0..view.vertex_count) |i| positions[i] = view.vertexAt(i).position;
 for (0..view.vertex_count) |i| uvs[i] = view.vertexAt(i).uv;
 for (0..view.index_count) |i| indices[i] = view.indexAt(i);
 ```
+
+The `directionalLight` method is **optional** in the same way: detected at comptime
+via `@hasDecl`, `pub` required. It returns one `Light` shaded for every draw command
+in the batch; an explicit `Options.light` on the call wins over it. A malformed
+light — provider or explicit — fails with `error.InvalidLight` at the `drawMesh`
+entry, before any draw. The light is **not** validated when resolved, only when it
+reaches `drawMesh`, so a provider may return it unconditionally without adding its
+own validation step. Omitting `directionalLight` (or returning null) keeps the
+unlit path and stays byte-identical to before lighting existed.
 
 Omitting `fn texture` from the provider (or returning null) keeps the flat path;
 the material tint is the shade color exactly as before.
@@ -359,7 +373,10 @@ target, x86-64:
 Small triangles are setup-bound; large ones approach the scalar fill limit. The
 per-pixel `f64` interpolation is deliberately kept rather than stepped
 incrementally in float, because incremental float accumulation would drift and
-break bit-exact reproducibility.
+break bit-exact reproducibility. When a light is configured, its multiplier is
+computed once per surviving triangle (one normalize + one dot); per pixel it
+adds only one `f64` multiply per RGB channel. The lit path has not been
+benchmarked separately — no fill-rate claim is made for it.
 
 ### Textured path
 
