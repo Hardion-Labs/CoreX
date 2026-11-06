@@ -178,9 +178,10 @@ with an `f32` depth buffer: clip-space frustum clipping, perspective divide,
 culling and flat or texture-mapped, optionally Lambert-lit, shading. Coverage
 is bit-exactly reproducible and shared edges are watertight. Geometry and
 materials arrive through a duck-typed provider, so `render` has no dependency
-on the asset layer, and the pixel path takes no allocator. It is a CPU
-reference path, **not** a renderer tier: antialiasing, mipmaps and the GPU
-backends remain planned. Texture-mapped shading: perspective-correct
+on the asset layer, and the pixel path takes no allocator (`antialias = .edge`
+is the sole exception and only through the caller's allocator). It is a CPU
+reference path, **not** a renderer tier: mipmaps and the GPU backends remain
+planned. Texture-mapped shading: perspective-correct
 UVs, repeat wrap, nearest/bilinear sampling of borrowed RGBA8 textures, tint
 multiply; `Mesh` carries optional `uvs` and the provider's optional `texture()`
 (a `pub` decl, detected at comptime) binds the material — absent, the path
@@ -194,7 +195,17 @@ source-over, premultiplied or additive (`.none` writes verbatim and is the
 default, byte-identical to the pre-blending path); alpha composites in every mode,
 depth is never blended, and the transparent modes pair with extraction's
 `back_to_front` sort. Blended frames are pinned against their own Python
-reference corpus. Cross-layer integration tests
+reference corpus. **Antialiasing** (`Options.antialias = .edge`) supersamples
+geometry edges with a 4x4 integer sub-sample grid that applies the same top-left
+rule to the sub-samples, so a shared edge is partitioned between its two triangles
+and coverage still sums to a full pixel; coverage is accumulated per draw command
+(never per fragment, which would seam) in caller-owned scratch sized from the
+mesh's screen reach, and resolved once through straight-alpha source-over with the
+coverage folded into the source alpha. Fully covered pixels take the
+un-antialiased path and stay byte-identical; partial pixels never write depth.
+Because it needs that scratch, antialiasing is only reachable through
+`rasterizeAlloc` / `drawMeshAlloc`; the allocator-free entry points force
+`antialias = .none`. Cross-layer integration tests
 (`src/render/raster_image_test.zig`) prove the whole chain — scene, world
 transforms, extraction, rasterizer — with a world-rotated face lit
 ambient-only and the explicit-options-over-provider priority intact.
