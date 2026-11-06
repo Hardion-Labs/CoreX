@@ -69,4 +69,5 @@ test {
     _ = @import("ecs/schedule_jobs_test.zig");
     _ = @import("ecs/frame_jobs_test.zig");
     _ = @import("assets/pipeline_jobs_test.zig");
+    _ = @import("render/raster_image_test.zig");
 }
