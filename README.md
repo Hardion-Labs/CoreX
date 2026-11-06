@@ -33,7 +33,8 @@ control, and maintainable code.
 > the job system, mark-and-sweep GC, change detection with incremental re-import),
 > the backend-independent render extraction
 > layer (camera math, frustum culling, sorted draw lists) with a CPU software
-> rasterizer (fixed-point watertight coverage, depth buffer, textured shading), and the
+> rasterizer (fixed-point watertight coverage, depth buffer, textured and
+> Lambert-lit shading), and the
 > device-independent audio runtime (mixer with voices, buses, pan, pitch,
 > linear/band-limited resampling, priority voice stealing and
 > biquad/compressor/delay/reverb/limiter/saturator insert chains, plus

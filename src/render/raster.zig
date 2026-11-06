@@ -54,6 +54,9 @@ pub const Error = error{
     /// A texture's dimensions are zero, exceed `max_dimension`, or its pixel
     /// slice does not hold exactly `width * height * 4` bytes.
     InvalidTexture,
+    /// A light is mis-shaped: direction is non-finite or zero-length, or a
+    /// color/ambient channel is negative or non-finite.
+    InvalidLight,
 };
 
 /// Largest framebuffer side. Bounds the fixed-point range and the pixel count.
@@ -71,11 +74,56 @@ pub const CullMode = enum { none, back, front };
 /// Texture magnification filter.
 pub const Filter = enum { nearest, bilinear };
 
+/// A single directional light for the Lambert shading path, set through
+/// `Options.light` (or supplied by the duck-typed `resources` via an optional
+/// `pub fn directionalLight(self) ?Light`, mirroring `texture()`).
+///
+/// `direction` points FROM the surface TOWARD the light, in world space; any
+/// nonzero length works — it is normalized internally per triangle with a
+/// pinned f64 operation order. `color` is the light's linear RGB radiance and
+/// `ambient` the constant linear RGB fill term; the pixel multiplier is
+/// `ambient + max(0, n · l) * color` per channel, unclamped (channels may
+/// exceed 1); clamping to [0, 1] happens exactly once, at the final multiply.
+/// Both `color` and `ambient` must be finite and non-negative. Light never
+/// touches the alpha channel.
+pub const Light = struct {
+    direction: [3]f32,
+    color: [3]f32 = .{ 1.0, 1.0, 1.0 },
+    ambient: [3]f32 = .{ 0.15, 0.15, 0.15 },
+
+    pub fn validate(self: Light) Error!void {
+        for (self.direction) |component| {
+            if (!std.math.isFinite(component)) return error.InvalidLight;
+        }
+        const len_sq = @as(f64, @floatCast(self.direction[0])) * @as(f64, @floatCast(self.direction[0])) +
+            @as(f64, @floatCast(self.direction[1])) * @as(f64, @floatCast(self.direction[1])) +
+            @as(f64, @floatCast(self.direction[2])) * @as(f64, @floatCast(self.direction[2]));
+        // Reject both zero-length and a length so tiny it underflows to zero.
+        if (!(len_sq > 0.0) or !std.math.isFinite(len_sq)) return error.InvalidLight;
+        for (self.color) |component| {
+            if (!std.math.isFinite(component) or component < 0.0) return error.InvalidLight;
+        }
+        for (self.ambient) |component| {
+            if (!std.math.isFinite(component) or component < 0.0) return error.InvalidLight;
+        }
+    }
+};
+
 pub const Options = struct {
     cull: CullMode = .back,
     front_face: FrontFace = .counter_clockwise,
     depth_test: bool = true,
     depth_write: bool = true,
+    /// Single directional Lambert light for this draw, or null for the flat
+    /// path. When set, the per-channel pixel multiplier is
+    /// `ambient + max(0, n · l) * color` (linear), applied to the albedo
+    /// (tint, or texel × tint) before quantization; alpha is never affected.
+    /// `n` is the triangle's world-space face normal — `rasterTriangle`
+    /// normalizes the caller-supplied raw normal itself — and `l` the light
+    /// direction, normalized per triangle with a pinned f64 evaluation. The
+    /// explicit `light` set here wins over any `directionalLight` the
+    /// `resources` provider may offer.
+    light: ?Light = null,
 };
 
 /// A triangle vertex in screen space: `x`/`y` are 28.4 fixed point pixels with
@@ -286,6 +334,47 @@ fn sampleTexture(tex: Texture, u: f64, v: f64) [4]u8 {
     };
 }
 
+/// Per-channel byte quantization with the pinned final round:
+/// `floor(min(max(s, 0), 255) + 0.5)`. Handles multipliers > 1 (HDR lights).
+fn clampByte(s: f64) u8 {
+    return @intFromFloat(@floor(@min(@max(s, 0.0), 255.0) + 0.5));
+}
+
+/// Normalize a world-space direction (from a `Light`) into f64. Direction
+/// validity is established by `Light.validate`; a zero or non-finite result
+/// can still only arise from degenerate data, so it maps to no light.
+fn normalizeDirection(d: [3]f32) [3]f64 {
+    const x = @as(f64, @floatCast(d[0]));
+    const y = @as(f64, @floatCast(d[1]));
+    const z = @as(f64, @floatCast(d[2]));
+    const len = std.math.sqrt((x * x + y * y) + z * z);
+    if (!(len > 0.0) or !std.math.isFinite(len)) return .{ 0.0, 0.0, 0.0 };
+    return .{ x / len, y / len, z / len };
+}
+
+/// Per-channel Lambert multiplier `ambient + max(0, n·l) * color` for one
+/// triangle. The raw world-space face normal arrives un-normalized (typically
+/// the cross product of two world-space edges); it is normalized here with a
+/// pinned f64 operation order. A zero or non-finite normal lights the
+/// triangle with `ambient` only. The result is unclamped — HDR multipliers
+/// are legal and will be clamped at the final quantization.
+fn lightMultiplier(light: Light, raw_normal: [3]f64) [3]f64 {
+    const l = normalizeDirection(light.direction);
+    const nrm = std.math.sqrt((raw_normal[0] * raw_normal[0] + raw_normal[1] * raw_normal[1]) + raw_normal[2] * raw_normal[2]);
+    var dot: f64 = 0.0;
+    if (nrm > 0.0 and std.math.isFinite(nrm)) {
+        const n0 = raw_normal[0] / nrm;
+        const n1 = raw_normal[1] / nrm;
+        const n2 = raw_normal[2] / nrm;
+        dot = @max(0.0, (n0 * l[0] + n1 * l[1]) + n2 * l[2]);
+    }
+    var lit: [3]f64 = undefined;
+    for (0..3) |c| {
+        lit[c] = @as(f64, @floatCast(light.ambient[c])) + dot * @as(f64, @floatCast(light.color[c]));
+    }
+    return lit;
+}
+
 /// Multiply the sampled texel by the material tint, one rounding per channel.
 fn tintMultiply(texel: [4]u8, tint: [4]u8) [4]u8 {
     var out: [4]u8 = undefined;
@@ -300,7 +389,9 @@ fn tintMultiply(texel: [4]u8, tint: [4]u8) [4]u8 {
 
 /// Shade one covered pixel: flat `rgba`, or `rgba` multiplied by the filtered
 /// texel with perspective-correct UVs (`w0`..`w2` are the already-biased
-/// coverage weights as f64, `inv_area` normalizes them).
+/// coverage weights as f64, `inv_area` normalizes them). `lit`, when set, is
+/// the per-channel Lambert multiplier from `lightMultiplier` (albedo lighting,
+/// alpha untouched).
 fn shadePixel(
     texture: ?Texture,
     v0: ScreenVertex,
@@ -311,8 +402,19 @@ fn shadePixel(
     w2: f64,
     inv_area: f64,
     rgba: [4]u8,
+    lit: ?[3]f64,
 ) [4]u8 {
-    const tex = texture orelse return rgba;
+    const tex = texture orelse {
+        if (lit) |lm| {
+            var out: [4]u8 = undefined;
+            for (0..3) |c| {
+                out[c] = clampByte(@as(f64, @floatFromInt(rgba[c])) * lm[c]);
+            }
+            out[3] = rgba[3];
+            return out;
+        }
+        return rgba;
+    };
     const den = ((w0 * v0.w_inv + w1 * v1.w_inv) + w2 * v2.w_inv) * inv_area;
     var u: f64 = 0.0;
     var v: f64 = 0.0;
@@ -323,7 +425,25 @@ fn shadePixel(
         u = (((w0 * v0.uw + w1 * v1.uw) + w2 * v2.uw) * inv_area) / den;
         v = (((w0 * v0.vw + w1 * v1.vw) + w2 * v2.vw) * inv_area) / den;
     }
-    return tintMultiply(sampleTexture(tex, u, v), rgba);
+    const sampled = sampleTexture(tex, u, v);
+    if (lit) |lm| {
+        var out: [4]u8 = undefined;
+        for (0..4) |c| {
+            if (c == 3) {
+                // Alpha is never lit: keep the exact unlit tint-multiply formula.
+                out[3] = @intFromFloat(@floor(
+                    @as(f64, @floatFromInt(sampled[3])) *
+                        @as(f64, @floatFromInt(rgba[3])) / 255.0 + 0.5,
+                ));
+                continue;
+            }
+            const s = ((@as(f64, @floatFromInt(sampled[c])) *
+                @as(f64, @floatFromInt(rgba[c]))) * lm[c]) / 255.0;
+            out[c] = clampByte(s);
+        }
+        return out;
+    }
+    return tintMultiply(sampled, rgba);
 }
 
 /// Rasterize one screen-space triangle. Returns false only when the triangle was
@@ -336,6 +456,14 @@ fn shadePixel(
 /// vertices' `uw`/`vw`/`w_inv` (bypassing them with the defaults yields a
 /// plain affine mapping), sampled with the texture's filter, and multiplied
 /// by the `rgba` tint. When it is null the triangle is shaded flat.
+///
+/// When `options.light` is set, the albedo is multiplied per channel by
+/// `ambient + max(0, n · l) * color`, where `n` is `world_normal` normalized
+/// here (the raw, typically cross-product, world-space face normal; a zero or
+/// non-finite normal lights with `ambient` only) and `l` the light's
+/// direction normalized with a pinned f64 evaluation. The alpha channel is
+/// never affected. `world_normal` must be the normal in the same space as the
+/// light direction (world space); it is ignored when `options.light` is null.
 pub fn rasterTriangle(
     target: *Target,
     a: ScreenVertex,
@@ -345,6 +473,7 @@ pub fn rasterTriangle(
     options: Options,
     pixels_written: ?*usize,
     texture: ?Texture,
+    world_normal: [3]f64,
 ) bool {
     const v0 = a;
     var v1 = b;
@@ -364,6 +493,11 @@ pub fn rasterTriangle(
         std.mem.swap(ScreenVertex, &v1, &v2);
         area = -area;
     }
+
+    // Lambert multiplier per channel, computed once per surviving triangle —
+    // the face normal is constant across it (clipping keeps sub-triangles
+    // coplanar), so the pixel loop pays three multiplies and no divides.
+    const lit: ?[3]f64 = if (options.light) |light| lightMultiplier(light, world_normal) else null;
 
     // Pixel centers sit at (x + 0.5, y + 0.5), i.e. half a pixel in fixed point.
     const bias0: i64 = if (isTopLeft(v1.x, v1.y, v2.x, v2.y)) 0 else 1;
@@ -417,7 +551,7 @@ pub fn rasterTriangle(
                 const wgt2 = @as(f64, @floatFromInt(w2 + bias2));
                 const depth: f32 = @floatCast(((wgt0 * z0 + wgt1 * z1) + wgt2 * z2) * inv_area);
                 if (!options.depth_test or depth < target.depth[index]) {
-                    const out_rgba = shadePixel(texture, v0, v1, v2, wgt0, wgt1, wgt2, inv_area, rgba);
+                    const out_rgba = shadePixel(texture, v0, v1, v2, wgt0, wgt1, wgt2, inv_area, rgba, lit);
                     const o = index * 4;
                     target.color[o + 0] = out_rgba[0];
                     target.color[o + 1] = out_rgba[1];
@@ -547,6 +681,7 @@ fn drawClipTriangle(
     options: Options,
     stats: *Stats,
     texture: ?Texture,
+    world_normal: [3]f64,
 ) void {
     var buf_a: [12]ClipVertex = undefined;
     var buf_b: [12]ClipVertex = undefined;
@@ -579,7 +714,7 @@ fn drawClipTriangle(
     // The clipped polygon is convex, so a fan covers it exactly.
     var i: usize = 1;
     while (i + 1 < count) : (i += 1) {
-        if (rasterTriangle(target, screen[0], screen[i], screen[i + 1], rgba, options, &stats.pixels, texture)) {
+        if (rasterTriangle(target, screen[0], screen[i], screen[i + 1], rgba, options, &stats.pixels, texture, world_normal)) {
             stats.rasterized += 1;
         } else {
             stats.culled += 1;
@@ -619,6 +754,7 @@ pub fn drawMesh(
         const uvs = mesh.uvs orelse return error.InvalidUv;
         if (uvs.len != mesh.positions.len) return error.InvalidUv;
     }
+    if (options.light) |light| try light.validate();
     const mvp = transform.multiply(view_projection, world);
     var stats: Stats = .{};
     var i: usize = 0;
@@ -632,14 +768,52 @@ pub fn drawMesh(
         const uv0: [2]f32 = if (mesh.uvs) |uvs| uvs[idx0] else .{ 0, 0 };
         const uv1: [2]f32 = if (mesh.uvs) |uvs| uvs[idx1] else .{ 0, 0 };
         const uv2: [2]f32 = if (mesh.uvs) |uvs| uvs[idx2] else .{ 0, 0 };
+        var world_normal: [3]f64 = .{ 0.0, 0.0, 0.0 };
+        if (options.light != null) {
+            world_normal = faceNormal(
+                worldPoint(world, mesh.positions[idx0]),
+                worldPoint(world, mesh.positions[idx1]),
+                worldPoint(world, mesh.positions[idx2]),
+            );
+        }
         const tri = [3]ClipVertex{
             transformVertex(mvp, mesh.positions[idx0], uv0),
             transformVertex(mvp, mesh.positions[idx1], uv1),
             transformVertex(mvp, mesh.positions[idx2], uv2),
         };
-        drawClipTriangle(target, tri, rgba, options, &stats, texture);
+        drawClipTriangle(target, tri, rgba, options, &stats, texture, world_normal);
     }
     return stats;
+}
+
+/// World-space position of `p` in f64, column-major mat4. Used for the face
+/// normal, which must live in the same (world) space as the light direction.
+/// The operation order is pinned so the reference vectors reproduce it.
+fn worldPoint(world: Mat4, p: [3]f32) [3]f64 {
+    const x = @as(f64, @floatCast(p[0]));
+    const y = @as(f64, @floatCast(p[1]));
+    const z = @as(f64, @floatCast(p[2]));
+    return .{
+        @as(f64, @floatCast(world[0])) * x + @as(f64, @floatCast(world[4])) * y + @as(f64, @floatCast(world[8])) * z + @as(f64, @floatCast(world[12])),
+        @as(f64, @floatCast(world[1])) * x + @as(f64, @floatCast(world[5])) * y + @as(f64, @floatCast(world[9])) * z + @as(f64, @floatCast(world[13])),
+        @as(f64, @floatCast(world[2])) * x + @as(f64, @floatCast(world[6])) * y + @as(f64, @floatCast(world[10])) * z + @as(f64, @floatCast(world[14])),
+    };
+}
+
+/// `cross(b - a, c - a)` for world-space points, deliberately not normalized —
+/// `lightMultiplier` normalizes with a pinned order.
+fn faceNormal(a: [3]f64, b: [3]f64, c: [3]f64) [3]f64 {
+    const e0 = b[0] - a[0];
+    const e1 = b[1] - a[1];
+    const e2 = b[2] - a[2];
+    const f0 = c[0] - a[0];
+    const f1 = c[1] - a[1];
+    const f2 = c[2] - a[2];
+    return .{
+        e1 * f2 - e2 * f1,
+        e2 * f0 - e0 * f2,
+        e0 * f1 - e1 * f0,
+    };
 }
 
 /// Rasterize an extracted draw list.
@@ -652,6 +826,9 @@ pub fn drawMesh(
 /// - `fn texture(self, handle: u32) ?Texture` — optional, detected at comptime
 ///   via `@hasDecl`, which only sees `pub` decls; absent or returning null,
 ///   the material shades flat
+/// - `fn directionalLight(self) ?Light` — optional, same comptime detection;
+///   supplies one world-space directional Lambert light for every command.
+///   An explicit `options.light` set by the caller wins over the provider's.
 ///
 /// A command whose mesh or material handle does not resolve is counted in
 /// `skipped_draws` and leaves the target untouched. A command whose material
@@ -668,6 +845,7 @@ pub fn rasterize(
     options: Options,
 ) Error!Stats {
     const have_texture = comptime @hasDecl(@TypeOf(resources), "texture");
+    const have_light = comptime @hasDecl(@TypeOf(resources), "directionalLight");
     var stats: Stats = .{};
     for (commands) |cmd| {
         const mesh = resources.mesh(cmd.mesh) orelse {
@@ -694,7 +872,14 @@ pub fn rasterize(
                 texture = tex;
             }
         }
-        stats.add(try drawMesh(target, mesh, cmd.world, view_projection, rgba, options, texture));
+        // An explicit Options.light wins over the provider's light.
+        var draw_options = options;
+        if (draw_options.light == null and comptime have_light) {
+            if (resources.directionalLight()) |light| {
+                draw_options.light = light;
+            }
+        }
+        stats.add(try drawMesh(target, mesh, cmd.world, view_projection, rgba, draw_options, texture));
     }
     return stats;
 }
@@ -777,7 +962,7 @@ test "top-left fill rule matches a hand-computed coverage set" {
     // on it (x + y == 3) are excluded. That leaves the six pixels with x+y <= 2.
     var s = try TestSurface.init(4, 4);
     defer s.deinit();
-    const drew = rasterTriangle(&s.target, sv(0, 0, 0), sv(4, 0, 0), sv(0, 4, 0), red, .{ .cull = .none }, null, null);
+    const drew = rasterTriangle(&s.target, sv(0, 0, 0), sv(4, 0, 0), sv(0, 4, 0), red, .{ .cull = .none }, null, null, .{ 0.0, 0.0, 0.0 });
     try testing.expect(drew);
     try testing.expectEqual(@as(usize, 6), s.covered());
     for (0..4) |y| {
@@ -796,8 +981,8 @@ test "shared edge is covered exactly once across a split quad" {
     defer a.deinit();
     var b = try TestSurface.init(4, 4);
     defer b.deinit();
-    _ = rasterTriangle(&a.target, sv(0, 0, 0), sv(4, 0, 0), sv(0, 4, 0), red, .{ .cull = .none }, null, null);
-    _ = rasterTriangle(&b.target, sv(4, 0, 0), sv(4, 4, 0), sv(0, 4, 0), green, .{ .cull = .none }, null, null);
+    _ = rasterTriangle(&a.target, sv(0, 0, 0), sv(4, 0, 0), sv(0, 4, 0), red, .{ .cull = .none }, null, null, .{ 0.0, 0.0, 0.0 });
+    _ = rasterTriangle(&b.target, sv(4, 0, 0), sv(4, 4, 0), sv(0, 4, 0), green, .{ .cull = .none }, null, null, .{ 0.0, 0.0, 0.0 });
     try testing.expectEqual(@as(usize, 6), a.covered());
     try testing.expectEqual(@as(usize, 10), b.covered());
     var union_count: usize = 0;
@@ -826,12 +1011,12 @@ test "shared edge partition holds for many quad splits" {
         // Shared diagonal perturbed to a subpixel position on both triangles.
         const d0 = ScreenVertex{ .x = k, .y = k * 2, .z = 0 };
         const d1 = ScreenVertex{ .x = 8 * subpixel_scale - k, .y = 8 * subpixel_scale - k, .z = 0 };
-        _ = rasterTriangle(&a.target, p0, p1, d1, red, .{ .cull = .none }, null, null);
-        _ = rasterTriangle(&a.target, p0, d1, d0, red, .{ .cull = .none }, null, null);
-        _ = rasterTriangle(&a.target, p0, d0, p3, red, .{ .cull = .none }, null, null);
-        _ = rasterTriangle(&b.target, p1, p2, d1, green, .{ .cull = .none }, null, null);
-        _ = rasterTriangle(&b.target, d1, p2, p3, green, .{ .cull = .none }, null, null);
-        _ = rasterTriangle(&b.target, d1, p3, d0, green, .{ .cull = .none }, null, null);
+        _ = rasterTriangle(&a.target, p0, p1, d1, red, .{ .cull = .none }, null, null, .{ 0.0, 0.0, 0.0 });
+        _ = rasterTriangle(&a.target, p0, d1, d0, red, .{ .cull = .none }, null, null, .{ 0.0, 0.0, 0.0 });
+        _ = rasterTriangle(&a.target, p0, d0, p3, red, .{ .cull = .none }, null, null, .{ 0.0, 0.0, 0.0 });
+        _ = rasterTriangle(&b.target, p1, p2, d1, green, .{ .cull = .none }, null, null, .{ 0.0, 0.0, 0.0 });
+        _ = rasterTriangle(&b.target, d1, p2, p3, green, .{ .cull = .none }, null, null, .{ 0.0, 0.0, 0.0 });
+        _ = rasterTriangle(&b.target, d1, p3, d0, green, .{ .cull = .none }, null, null, .{ 0.0, 0.0, 0.0 });
         for (0..a.target.pixelCount()) |i| {
             const ca = a.target.color[i * 4 + 3] != 0;
             const cb = b.target.color[i * 4 + 3] != 0;
@@ -844,9 +1029,9 @@ test "shared edge partition holds for many quad splits" {
 test "degenerate triangles are rejected" {
     var s = try TestSurface.init(4, 4);
     defer s.deinit();
-    try testing.expect(!rasterTriangle(&s.target, sv(0, 0, 0), sv(2, 0, 0), sv(4, 0, 0), red, .{ .cull = .none }, null, null));
-    try testing.expect(!rasterTriangle(&s.target, sv(1, 1, 0), sv(1, 1, 0), sv(1, 1, 0), red, .{ .cull = .none }, null, null));
-    try testing.expect(!rasterTriangle(&s.target, sv(0, 0, 0), sv(2, 2, 0), sv(4, 4, 0), red, .{ .cull = .none }, null, null));
+    try testing.expect(!rasterTriangle(&s.target, sv(0, 0, 0), sv(2, 0, 0), sv(4, 0, 0), red, .{ .cull = .none }, null, null, .{ 0.0, 0.0, 0.0 }));
+    try testing.expect(!rasterTriangle(&s.target, sv(1, 1, 0), sv(1, 1, 0), sv(1, 1, 0), red, .{ .cull = .none }, null, null, .{ 0.0, 0.0, 0.0 }));
+    try testing.expect(!rasterTriangle(&s.target, sv(0, 0, 0), sv(2, 2, 0), sv(4, 4, 0), red, .{ .cull = .none }, null, null, .{ 0.0, 0.0, 0.0 }));
     try testing.expectEqual(@as(usize, 0), s.covered());
 }
 
@@ -860,7 +1045,7 @@ test "cull modes select one winding" {
             inline for (.{ CullMode.none, CullMode.back, CullMode.front }) |mode| {
                 var s = try TestSurface.init(4, 4);
                 defer s.deinit();
-                const drew = rasterTriangle(&s.target, tri[0], tri[1], tri[2], red, .{ .cull = mode, .front_face = ff }, null, null);
+                const drew = rasterTriangle(&s.target, tri[0], tri[1], tri[2], red, .{ .cull = mode, .front_face = ff }, null, null, .{ 0.0, 0.0, 0.0 });
                 const want = switch (mode) {
                     .none => true,
                     .back => front,
@@ -881,8 +1066,8 @@ test "coverage is identical for both windings when culling is off" {
     const v0 = ScreenVertex{ .x = 3, .y = 5, .z = 0 };
     const v1 = ScreenVertex{ .x = 100, .y = 17, .z = 0 };
     const v2 = ScreenVertex{ .x = 41, .y = 120, .z = 0 };
-    _ = rasterTriangle(&a.target, v0, v1, v2, red, .{ .cull = .none }, null, null);
-    _ = rasterTriangle(&b.target, v0, v2, v1, red, .{ .cull = .none }, null, null);
+    _ = rasterTriangle(&a.target, v0, v1, v2, red, .{ .cull = .none }, null, null, .{ 0.0, 0.0, 0.0 });
+    _ = rasterTriangle(&b.target, v0, v2, v1, red, .{ .cull = .none }, null, null, .{ 0.0, 0.0, 0.0 });
     try testing.expectEqualSlices(u8, a.color, b.color);
 }
 
@@ -895,16 +1080,7 @@ test "depth test keeps the nearest fragment regardless of draw order" {
         const colors = [_][4]u8{ if (far_first) green else red, if (far_first) red else green };
         var pixels: usize = 0;
         for (order, colors) |z, col| {
-            _ = rasterTriangle(
-                &s.target,
-                .{ .x = tri[0].x, .y = tri[0].y, .z = z },
-                .{ .x = tri[1].x, .y = tri[1].y, .z = z },
-                .{ .x = tri[2].x, .y = tri[2].y, .z = z },
-                col,
-                .{ .cull = .none },
-                &pixels,
-                null,
-            );
+            _ = rasterTriangle(&s.target, .{ .x = tri[0].x, .y = tri[0].y, .z = z }, .{ .x = tri[1].x, .y = tri[1].y, .z = z }, .{ .x = tri[2].x, .y = tri[2].y, .z = z }, col, .{ .cull = .none }, &pixels, null, .{ 0.0, 0.0, 0.0 });
         }
         // Near first: the far pass then fails every test (6 writes). Far first:
         // it writes 6 and the near pass overwrites all 6 (12 writes). Either way
@@ -922,9 +1098,9 @@ test "depth test keeps the nearest fragment regardless of draw order" {
 test "equal depth does not overwrite" {
     var s = try TestSurface.init(4, 4);
     defer s.deinit();
-    _ = rasterTriangle(&s.target, sv(0, 0, 0.5), sv(4, 0, 0.5), sv(0, 4, 0.5), red, .{ .cull = .none }, null, null);
+    _ = rasterTriangle(&s.target, sv(0, 0, 0.5), sv(4, 0, 0.5), sv(0, 4, 0.5), red, .{ .cull = .none }, null, null, .{ 0.0, 0.0, 0.0 });
     var pixels: usize = 0;
-    _ = rasterTriangle(&s.target, sv(0, 0, 0.5), sv(4, 0, 0.5), sv(0, 4, 0.5), green, .{ .cull = .none }, &pixels, null);
+    _ = rasterTriangle(&s.target, sv(0, 0, 0.5), sv(4, 0, 0.5), sv(0, 4, 0.5), green, .{ .cull = .none }, &pixels, null, .{ 0.0, 0.0, 0.0 });
     try testing.expectEqual(@as(usize, 0), pixels);
     try testing.expectEqualSlices(u8, &red, &s.target.colorAt(0, 0));
 }
@@ -933,11 +1109,11 @@ test "depth_write false leaves the depth buffer untouched" {
     var s = try TestSurface.init(4, 4);
     defer s.deinit();
     var pixels: usize = 0;
-    _ = rasterTriangle(&s.target, sv(0, 0, -0.5), sv(4, 0, -0.5), sv(0, 4, -0.5), red, .{ .cull = .none, .depth_write = false }, &pixels, null);
+    _ = rasterTriangle(&s.target, sv(0, 0, -0.5), sv(4, 0, -0.5), sv(0, 4, -0.5), red, .{ .cull = .none, .depth_write = false }, &pixels, null, .{ 0.0, 0.0, 0.0 });
     try testing.expectEqual(@as(usize, 6), pixels);
     for (s.depth) |d| try testing.expectEqual(@as(f32, 1.0), d);
     // A later, farther triangle still passes because depth stayed at the clear.
-    _ = rasterTriangle(&s.target, sv(0, 0, 0.9), sv(4, 0, 0.9), sv(0, 4, 0.9), green, .{ .cull = .none }, &pixels, null);
+    _ = rasterTriangle(&s.target, sv(0, 0, 0.9), sv(4, 0, 0.9), sv(0, 4, 0.9), green, .{ .cull = .none }, &pixels, null, .{ 0.0, 0.0, 0.0 });
     try testing.expectEqual(@as(usize, 12), pixels);
     try testing.expectEqualSlices(u8, &green, &s.target.colorAt(0, 0));
 }
@@ -945,8 +1121,8 @@ test "depth_write false leaves the depth buffer untouched" {
 test "depth_test false paints in submission order" {
     var s = try TestSurface.init(4, 4);
     defer s.deinit();
-    _ = rasterTriangle(&s.target, sv(0, 0, -0.9), sv(4, 0, -0.9), sv(0, 4, -0.9), red, .{ .cull = .none, .depth_test = false }, null, null);
-    _ = rasterTriangle(&s.target, sv(0, 0, 0.9), sv(4, 0, 0.9), sv(0, 4, 0.9), green, .{ .cull = .none, .depth_test = false }, null, null);
+    _ = rasterTriangle(&s.target, sv(0, 0, -0.9), sv(4, 0, -0.9), sv(0, 4, -0.9), red, .{ .cull = .none, .depth_test = false }, null, null, .{ 0.0, 0.0, 0.0 });
+    _ = rasterTriangle(&s.target, sv(0, 0, 0.9), sv(4, 0, 0.9), sv(0, 4, 0.9), green, .{ .cull = .none, .depth_test = false }, null, null, .{ 0.0, 0.0, 0.0 });
     try testing.expectEqualSlices(u8, &green, &s.target.colorAt(0, 0));
 }
 
@@ -954,7 +1130,7 @@ test "depth interpolates linearly across the triangle" {
     var s = try TestSurface.init(4, 4);
     defer s.deinit();
     // z = -1 at x=0, +1 at x=4: the value at a pixel center is x/2 - 0.75.
-    _ = rasterTriangle(&s.target, sv(0, 0, -1), sv(4, 0, 1), sv(0, 4, -1), red, .{ .cull = .none }, null, null);
+    _ = rasterTriangle(&s.target, sv(0, 0, -1), sv(4, 0, 1), sv(0, 4, -1), red, .{ .cull = .none }, null, null, .{ 0.0, 0.0, 0.0 });
     for (0..4) |y| for (0..4) |x| {
         if (x + y <= 2) {
             const want = @as(f32, @floatFromInt(x)) * 0.5 - 0.75;
@@ -1317,7 +1493,7 @@ test "rasterizer matches the independent reference bit for bit" {
             .{ .x = case.tri[2].x, .y = case.tri[2].y, .z = case.tri[2].z },
         };
         var pixels: usize = 0;
-        const drew = rasterTriangle(&s.target, tri[0], tri[1], tri[2], red, options, &pixels, null);
+        const drew = rasterTriangle(&s.target, tri[0], tri[1], tri[2], red, options, &pixels, null, .{ 0.0, 0.0, 0.0 });
         std.testing.expectEqual(case.drew, drew) catch |err| {
             std.debug.print("case {s}: drew mismatch\n", .{case.name});
             return err;
@@ -1396,7 +1572,7 @@ test "textured rasterizer matches the independent reference bit for bit" {
             .{ .x = case.tri[2].x, .y = case.tri[2].y, .z = case.tri[2].z, .uw = case.tri[2].uw, .vw = case.tri[2].vw, .w_inv = case.tri[2].w_inv },
         };
         var pixels: usize = 0;
-        const drew = rasterTriangle(&s.target, tri[0], tri[1], tri[2], case.tint, options, &pixels, tex);
+        const drew = rasterTriangle(&s.target, tri[0], tri[1], tri[2], case.tint, options, &pixels, tex, .{ 0.0, 0.0, 0.0 });
         std.testing.expectEqual(case.drew, drew) catch |err| {
             std.debug.print("case {s}: drew mismatch\n", .{case.name});
             return err;
@@ -1544,7 +1720,7 @@ test "drawMesh: a degenerate w gradient falls back to uv (0,0)" {
         .{ .x = 0, .y = 8 * 16, .z = 0, .uw = 0, .vw = 1, .w_inv = 0 },
     };
     const tex = Texture{ .width = 2, .height = 2, .pixels = &texel_2x2, .filter = .nearest };
-    _ = rasterTriangle(&s.target, tri[0], tri[1], tri[2], red, .{ .cull = .none }, null, tex);
+    _ = rasterTriangle(&s.target, tri[0], tri[1], tri[2], red, .{ .cull = .none }, null, tex, .{ 0.0, 0.0, 0.0 });
     // texel (0,0) is pure red.
     try testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, &s.target.colorAt(1, 1));
 }
@@ -1599,4 +1775,250 @@ test "rasterize: material without texture shades flat (backward compatibility)" 
     const stats = try rasterize(&s.target, &.{command(0, 0)}, orthoSetup(), res, .{});
     try testing.expectEqual(@as(usize, 16), stats.pixels);
     try testing.expectEqualSlices(u8, &.{ 0, 255, 0, 255 }, &s.target.colorAt(2, 2));
+}
+
+const light_vectors = @import("raster_light_vectors.zig");
+
+test "lit rasterizer matches the independent reference bit for bit" {
+    var s = try TestSurface.init(light_vectors.width, light_vectors.height);
+    defer s.deinit();
+    const checker = Texture{
+        .width = 4,
+        .height = 4,
+        .pixels = &light_vectors.texture,
+        .filter = .nearest, // overridden per case below
+    };
+    var total_pixels: usize = 0;
+    for (light_vectors.cases) |case| {
+        s.target.clear(.{ 0, 0, 0, 0 }, 1.0);
+        const options = Options{
+            .cull = switch (case.cull) {
+                .none => .none,
+                .back => .back,
+                .front => .front,
+            },
+            .front_face = switch (case.front_face) {
+                .ccw => .counter_clockwise,
+                .cw => .clockwise,
+            },
+            .depth_test = case.depth_test,
+            .depth_write = case.depth_write,
+            .light = if (case.light) |l| .{ .direction = l.direction, .color = l.color, .ambient = l.ambient } else null,
+        };
+        var texture: ?Texture = null;
+        if (case.use_texture) {
+            texture = Texture{
+                .width = checker.width,
+                .height = checker.height,
+                .pixels = checker.pixels,
+                .filter = switch (case.filter) {
+                    .nearest => .nearest,
+                    .bilinear => .bilinear,
+                },
+            };
+        }
+        const tri = [3]ScreenVertex{
+            .{ .x = case.tri[0].x, .y = case.tri[0].y, .z = case.tri[0].z, .uw = case.tri[0].uw, .vw = case.tri[0].vw, .w_inv = case.tri[0].w_inv },
+            .{ .x = case.tri[1].x, .y = case.tri[1].y, .z = case.tri[1].z, .uw = case.tri[1].uw, .vw = case.tri[1].vw, .w_inv = case.tri[1].w_inv },
+            .{ .x = case.tri[2].x, .y = case.tri[2].y, .z = case.tri[2].z, .uw = case.tri[2].uw, .vw = case.tri[2].vw, .w_inv = case.tri[2].w_inv },
+        };
+        var pixels: usize = 0;
+        const drew = rasterTriangle(&s.target, tri[0], tri[1], tri[2], case.tint, options, &pixels, texture, case.world_normal);
+        std.testing.expectEqual(case.drew, drew) catch |err| {
+            std.debug.print("case {s}: drew mismatch\n", .{case.name});
+            return err;
+        };
+
+        // Coverage via depth (clear depth 1.0; every case keeps depth_write),
+        // then the full RGBA frame must match bit for bit.
+        for (0..s.target.pixelCount()) |i| {
+            const want = (case.mask[i / 8] >> @as(u3, @intCast(i % 8))) & 1;
+            const got: u8 = if (s.depth[i] != 1.0) 1 else 0;
+            std.testing.expectEqual(want, got) catch |err| {
+                std.debug.print("case {s}: coverage mismatch at pixel {d} ({d},{d})\n", .{
+                    case.name, i, i % light_vectors.width, i / light_vectors.width,
+                });
+                return err;
+            };
+            for (0..4) |c| {
+                const want_byte = case.frame[i * 4 + c];
+                const got_byte = s.target.color[i * 4 + c];
+                std.testing.expectEqual(want_byte, got_byte) catch |err| {
+                    std.debug.print("case {s}: frame mismatch at pixel {d} ({d},{d}) channel {d}: want 0x{x:0>2} got 0x{x:0>2}\n", .{
+                        case.name, i, i % light_vectors.width, i / light_vectors.width, c, want_byte, got_byte,
+                    });
+                    return err;
+                };
+            }
+        }
+        total_pixels += pixels;
+    }
+    // Guard against the vector file silently becoming empty.
+    try testing.expect(light_vectors.cases.len >= 35);
+    try testing.expect(total_pixels >= 600);
+}
+
+// --- lighting unit tests ------------------------------------------------------
+
+test "Light.validate: rejects malformed lights, accepts valid ones" {
+    var ok = Light{ .direction = .{ 0, 0, 1 } };
+    try ok.validate();
+    var zero = Light{ .direction = .{ 0, 0, 0 } };
+    try testing.expectError(error.InvalidLight, zero.validate());
+    var nan = Light{ .direction = .{ 0.0, std.math.nan(f32), 0 } };
+    try testing.expectError(error.InvalidLight, nan.validate());
+    var inf = Light{ .direction = .{ 0.0, std.math.inf(f32), 0 } };
+    try testing.expectError(error.InvalidLight, inf.validate());
+    var neg = Light{ .direction = .{ 0, 1, 0 }, .color = .{ 0.5, -0.1, 0.5 } };
+    try testing.expectError(error.InvalidLight, neg.validate());
+    var negamb = Light{ .direction = .{ 0, 1, 0 }, .ambient = .{ 0.1, 0.1, -0.2 } };
+    try testing.expectError(error.InvalidLight, negamb.validate());
+    var nanamb = Light{ .direction = .{ 0, 1, 0 }, .ambient = .{ std.math.nan(f32), 0.1, 0.1 } };
+    try testing.expectError(error.InvalidLight, nanamb.validate());
+    // HDR multipliers are legal; they clamp at quantization.
+    var hdr = Light{ .direction = .{ 0, 1, 0 }, .color = .{ 4.0, 4.0, 4.0 }, .ambient = .{ 2.0, 2.0, 2.0 } };
+    try hdr.validate();
+}
+
+test "drawMesh: an invalid light fails before any draw" {
+    var s = try TestSurface.init(8, 8);
+    defer s.deinit();
+    const lit = Light{ .direction = .{ 0, 0, 0 } };
+    try testing.expectError(error.InvalidLight, drawMesh(&s.target, quadMesh(), transform.identity(), orthoSetup(), red, .{ .light = lit }, null));
+    try testing.expectEqual(@as(usize, 0), s.covered());
+    for (s.depth) |d| try testing.expectEqual(@as(f32, 1.0), d);
+}
+
+test "drawMesh: a quad facing the light keeps the tint exactly" {
+    var s = try TestSurface.init(8, 8);
+    defer s.deinit();
+    // quad_positions wind to a +z face normal; light straight at it, dot = 1.
+    const lit = Light{ .direction = .{ 0, 0, 1 }, .color = .{ 1.0, 1.0, 1.0 }, .ambient = .{ 0.0, 0.0, 0.0 } };
+    _ = try drawMesh(&s.target, quadMesh(), transform.identity(), orthoSetup(), red, .{ .light = lit }, null);
+    try testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, &s.target.colorAt(4, 4));
+}
+
+test "drawMesh: a perpendicular light leaves only the ambient term" {
+    var s = try TestSurface.init(8, 8);
+    defer s.deinit();
+    // dot == 0 exactly: black with zero ambient.
+    const black = Light{ .direction = .{ 1, 0, 0 }, .color = .{ 1.0, 1.0, 1.0 }, .ambient = .{ 0.0, 0.0, 0.0 } };
+    _ = try drawMesh(&s.target, quadMesh(), transform.identity(), orthoSetup(), red, .{ .light = black }, null);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 255 }, &s.target.colorAt(4, 4));
+    // Non-trivial ambient: floor(255 * 0.25 + 0.5) = 64 on green, 255*.75=191+ rounds... just pin computed values.
+    s.target.clear(.{ 0, 0, 0, 0 }, 1.0);
+    const amb = Light{ .direction = .{ 1, 0, 0 }, .color = .{ 1.0, 1.0, 1.0 }, .ambient = .{ 0.25, 0.5, 0.75 } };
+    _ = try drawMesh(&s.target, quadMesh(), transform.identity(), orthoSetup(), red, .{ .light = amb }, null);
+    try testing.expectEqualSlices(u8, &.{ 64, 0, 0, 255 }, &s.target.colorAt(4, 4));
+}
+
+test "drawMesh: a face pointing away from the light is lit ambient-only" {
+    var s = try TestSurface.init(8, 8);
+    defer s.deinit();
+    // Reversed winding => the face normal points to -z (faceNormal cross).
+    const flipped_indices = [_]u32{ 0, 2, 1, 0, 3, 2 };
+    const flipped = Mesh{ .positions = &quad_positions, .indices = &flipped_indices };
+    const lit = Light{ .direction = .{ 0, 0, 1 }, .color = .{ 1.0, 1.0, 1.0 }, .ambient = .{ 0.0, 0.0, 0.0 } };
+    // Screen winding flips too, so opt out of culling; this pins the world-space
+    // normal chain (worldPoint -> faceNormal) rather than the cull stage.
+    _ = try drawMesh(&s.target, flipped, transform.identity(), orthoSetup(), red, .{ .light = lit, .cull = .none }, null);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 255 }, &s.target.colorAt(4, 4));
+}
+
+test "drawMesh: a translation does not bend the face normal" {
+    var s = try TestSurface.init(8, 8);
+    defer s.deinit();
+    // Translated quad, normal stays (0,0,1); perspective-free ortho path.
+    var world = transform.identity();
+    world[12] = 1.0;
+    world[13] = 1.0;
+    const lit = Light{ .direction = .{ 0, 0, 1 }, .color = .{ 1.0, 1.0, 1.0 }, .ambient = .{ 0.0, 0.0, 0.0 } };
+    _ = try drawMesh(&s.target, quadMesh(), world, orthoSetup(), red, .{ .light = lit }, null);
+    try testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, &s.target.colorAt(4, 4));
+}
+
+test "drawMesh: lit texture multiplies albedo through the multiplier" {
+    var s = try TestSurface.init(8, 8);
+    defer s.deinit();
+    const all_white = [_]u8{ 255, 255, 255, 255 };
+    const tex = Texture{ .width = 1, .height = 1, .pixels = &all_white, .filter = .nearest };
+    // Half-gray light straight at the face: red tint * white texel * 0.5.
+    const lit = Light{ .direction = .{ 0, 0, 1 }, .color = .{ 0.5, 0.5, 0.5 }, .ambient = .{ 0.0, 0.0, 0.0 } };
+    _ = try drawMesh(&s.target, quadMeshUv(), transform.identity(), orthoSetup(), red, .{ .light = lit }, tex);
+    try testing.expectEqualSlices(u8, &.{ 128, 0, 0, 255 }, &s.target.colorAt(4, 4));
+}
+
+const SliceLitResources = struct {
+    meshes: []const Mesh,
+    colors: []const [4]f32,
+    light: ?Light,
+
+    pub fn mesh(self: SliceLitResources, handle: u32) ?Mesh {
+        if (handle >= self.meshes.len) return null;
+        return self.meshes[handle];
+    }
+
+    pub fn color(self: SliceLitResources, handle: u32) ?[4]f32 {
+        if (handle >= self.colors.len) return null;
+        return self.colors[handle];
+    }
+
+    pub fn directionalLight(self: SliceLitResources) ?Light {
+        return self.light;
+    }
+};
+
+test "rasterize: the provider's directionalLight shades the draw" {
+    var s = try TestSurface.init(4, 4);
+    defer s.deinit();
+    const meshes = [_]Mesh{quadMesh()};
+    const colors = [_][4]f32{.{ 1.0, 1.0, 1.0, 1.0 }};
+    // Provider supplies a red half light with zero ambient: white tint * 0.5R.
+    const res = SliceLitResources{
+        .meshes = &meshes,
+        .colors = &colors,
+        .light = .{ .direction = .{ 0, 0, 1 }, .color = .{ 0.5, 0.0, 0.0 }, .ambient = .{ 0.0, 0.0, 0.0 } },
+    };
+    const stats = try rasterize(&s.target, &.{command(0, 0)}, orthoSetup(), res, .{});
+    try testing.expectEqual(@as(usize, 16), stats.pixels);
+    try testing.expectEqualSlices(u8, &.{ 128, 0, 0, 255 }, &s.target.colorAt(2, 2));
+}
+
+test "rasterize: an explicit options.light wins over the provider's" {
+    var s = try TestSurface.init(4, 4);
+    defer s.deinit();
+    const meshes = [_]Mesh{quadMesh()};
+    const colors = [_][4]f32{.{ 1.0, 1.0, 1.0, 1.0 }};
+    const res = SliceLitResources{
+        .meshes = &meshes,
+        .colors = &colors,
+        .light = .{ .direction = .{ 0, 0, 1 }, .color = .{ 0.5, 0.0, 0.0 }, .ambient = .{ 0.0, 0.0, 0.0 } },
+    };
+    // Explicit green-only light from the caller beats the provider's red one.
+    const explicit = Light{ .direction = .{ 0, 0, 1 }, .color = .{ 0.0, 0.5, 0.0 }, .ambient = .{ 0.0, 0.0, 0.0 } };
+    _ = try rasterize(&s.target, &.{command(0, 0)}, orthoSetup(), res, .{ .light = explicit });
+    try testing.expectEqualSlices(u8, &.{ 0, 128, 0, 255 }, &s.target.colorAt(2, 2));
+}
+
+test "rasterize: a provider with null light keeps the flat path" {
+    var s = try TestSurface.init(4, 4);
+    defer s.deinit();
+    const meshes = [_]Mesh{quadMesh()};
+    const colors = [_][4]f32{.{ 1.0, 1.0, 1.0, 1.0 }};
+    const res = SliceLitResources{ .meshes = &meshes, .colors = &colors, .light = null };
+    _ = try rasterize(&s.target, &.{command(0, 0)}, orthoSetup(), res, .{});
+    try testing.expectEqualSlices(u8, &.{ 255, 255, 255, 255 }, &s.target.colorAt(2, 2));
+}
+
+test "rasterize: a provider returning an invalid light is a hard error" {
+    var s = try TestSurface.init(4, 4);
+    defer s.deinit();
+    const meshes = [_]Mesh{quadMesh()};
+    const colors = [_][4]f32{.{ 1.0, 1.0, 1.0, 1.0 }};
+    const res = SliceLitResources{
+        .meshes = &meshes,
+        .colors = &colors,
+        .light = .{ .direction = .{ 0.0, 0.0, 0.0 } },
+    };
+    try testing.expectError(error.InvalidLight, rasterize(&s.target, &.{command(0, 0)}, orthoSetup(), res, .{}));
 }

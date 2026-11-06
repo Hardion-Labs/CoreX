@@ -74,6 +74,8 @@ pub const rasterTriangle = raster.rasterTriangle;
 pub const RasterTexture = raster.Texture;
 /// Texture minification filter (`nearest` or `bilinear`).
 pub const TextureFilter = raster.Filter;
+/// Single directional Lambert light for the rasterizer (`Options.light`).
+pub const RasterLight = raster.Light;
 
 test {
     std.testing.refAllDecls(@This());

@@ -175,15 +175,20 @@ A **CPU software rasterizer** (`src/render/raster.zig`,
 `docs/render-raster.md`) consumes that draw list and writes an RGBA8 framebuffer
 with an `f32` depth buffer: clip-space frustum clipping, perspective divide,
 28.4 fixed-point integer edge functions with a top-left fill rule, backface
-culling and flat or texture-mapped shading. Coverage is bit-exactly reproducible
-and shared edges are watertight. Geometry and materials arrive through a duck-typed
-provider, so `render` has no dependency on the asset layer, and the pixel path
-takes no allocator. It is a CPU reference path, **not** a renderer tier: lighting,
-blending and antialiasing are absent, and the GPU backends remain planned.
-Texture-mapped shading: perspective-correct UVs, repeat wrap, nearest/bilinear
-sampling of borrowed RGBA8 textures, tint multiply; `Mesh` carries optional `uvs`
-and the provider's optional `texture()` (a `pub` decl, detected at comptime)
-binds the material — absent, the path stays flat and byte-identical to before.
+culling and flat or texture-mapped, optionally Lambert-lit, shading. Coverage
+is bit-exactly reproducible and shared edges are watertight. Geometry and
+materials arrive through a duck-typed provider, so `render` has no dependency
+on the asset layer, and the pixel path takes no allocator. It is a CPU
+reference path, **not** a renderer tier: blending and antialiasing are absent,
+and the GPU backends remain planned. Texture-mapped shading: perspective-correct
+UVs, repeat wrap, nearest/bilinear sampling of borrowed RGBA8 textures, tint
+multiply; `Mesh` carries optional `uvs` and the provider's optional `texture()`
+(a `pub` decl, detected at comptime) binds the material — absent, the path
+stays flat and byte-identical to before. Directional Lambert lighting:
+per-face face-normal shading of the flat and textured paths (`Options.light`,
+or an optional `pub fn directionalLight()` on the provider — explicit options
+win), alpha never lit, bit-exact against Python reference vectors; callers
+without a light stay byte-identical to before.
 
 ### Audio runtime — mixing + spatialization implemented; device backends planned
 The device-independent playback layer is implemented (`src/audio/`, re-exported
