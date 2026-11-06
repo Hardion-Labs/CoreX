@@ -290,8 +290,32 @@ target, x86-64:
 Small triangles are setup-bound; large ones approach the scalar fill limit. The
 per-pixel `f64` interpolation is deliberately kept rather than stepped
 incrementally in float, because incremental float accumulation would drift and
-break bit-exact reproducibility. The textured path was not separately profiled;
-it adds one sample and one multiply per covered pixel on the flat path.
+break bit-exact reproducibility.
+
+### Textured path
+
+Measured with the committed harness (`zig build bench -Doptimize=ReleaseFast`,
+[`tools/bench_raster.zig`](../tools/bench_raster.zig); not run in CI) on an Intel
+Xeon @ 2.60GHz (2 vCPU), 1024 quads, 64×64 RGBA8 texture, repeat wrap, white
+tint, full coverage. The flat path re-measured on this machine is in the last
+column for a valid relative comparison; the absolute flat numbers are consistent
+with the table above within run-to-run variance.
+
+| Path | 256×256 | 512×512 | 1024×1024 | Relative cost @1024² |
+| --- | --- | --- | --- | --- |
+| Flat (re-measured) | 0.382 ms | 1.162 ms | 3.948 ms | 1× (265.6 Mpx/s) |
+| Nearest | 0.940 ms (69.7 Mpx/s) | 3.350 ms (78.2 Mpx/s) | 13.075 ms (80.2 Mpx/s) | ~3.3× |
+| Bilinear | 2.455 ms (26.7 Mpx/s) | 9.514 ms (27.6 Mpx/s) | 35.829 ms (29.3 Mpx/s) | ~9.1× |
+
+Bilinear is disproportionately expensive because of the per-pixel `f64`
+perspective correction: two divides by `Σλ·w_inv` per pixel. Replacing them with
+`x * (1/den)` would double-round and silently diverge from the pinned vectors,
+so it is deliberately not done — a reciprocal must be introduced in both
+references (or not at all). Nearest costs one texel fetch and a clamp; bilinear
+costs four fetches, four taps weighted in `f64` and two `f64` divides. Both
+numbers are honest scalar upper bounds of the current implementation, not
+aspirational targets: SIMD texel gathering, a reciprocal fast path guarded by
+exactness checks, and mipmaps all remain future work.
 
 The pixel path takes no allocator and uses only fixed stack scratch, so it cannot
 allocate, cannot fail with `OutOfMemory`, and is safe to call from a render thread.

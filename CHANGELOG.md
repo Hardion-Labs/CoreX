@@ -214,6 +214,11 @@ declared yet.
   `render` keeps no dependency on the asset layer. The pixel path takes no
   allocator and uses only fixed stack scratch. Not a renderer tier: no lighting,
   blending, antialiasing or GPU path.
+- Rasterizer benchmark harness (`tools/bench_raster.zig`, run with
+  `zig build bench -Doptimize=ReleaseFast`; not executed by CI or the default
+  build). The textured-shading path is now measured (nearest ~3.3x and bilinear
+  ~9.1x flat fill cost at 1024x1024 on a two-vCPU Xeon @ 2.60GHz) and documented
+  in `docs/render-raster.md`, which previously noted the path as unprofiled.
 - Texture-mapped shading in the CPU rasterizer (`Texture`, `Filter` in
   `src/render/raster.zig`): perspective-correct UV interpolation (`uw = u/w`,
   `vw = v/w`, `w_inv = 1/w` carried in clip space and through clipping, f64
