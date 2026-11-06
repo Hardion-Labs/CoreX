@@ -42,7 +42,7 @@ selection, and installation management belong to the CoreXHub (separate repo).
 The public surface is concentrated in `src/corex.zig`. Implemented modules live
 under `src/core/` (startup spine), `src/ecs/` (entity-component-system),
 `src/scene/` (scene documents), `src/assets/` (import pipeline + cache),
-`src/render/` (draw-list extraction) and `src/audio/` (playback mixing):
+`src/render/` (draw-list extraction + CPU rasterization) and `src/audio/` (playback mixing):
 
 ```text
 src/
@@ -88,11 +88,12 @@ src/
 │   ├── flac.zig          # FLAC decoder, same Audio/CXAW artifact      [implemented]
 │   ├── changes.zig       # Change detection + hot-reload baseline      [implemented]
 │   └── pipeline.zig      # Parallel import orchestration + report      [implemented]
-├── render.zig            # Render public module; backend-independent extraction
+├── render.zig            # Render public module; extraction + CPU rasterizer
 ├── render/
 │   ├── camera.zig        # View/projection math (right-handed)         [implemented]
 │   ├── culling.zig       # Frustum + AABB/sphere classification        [implemented]
-│   └── draw.zig          # Renderable + draw-list extraction + sorting [implemented]
+│   ├── draw.zig          # Renderable + draw-list extraction + sorting [implemented]
+│   └── raster.zig        # Software rasterizer: coverage + depth buffer  [implemented]
 ├── audio.zig             # Audio public module; device-independent mixing
 └── audio/
     ├── clip.zig          # Clip descriptor, channel maps, pan, PCM16   [implemented]
@@ -151,7 +152,7 @@ are planned on top of the GUI library.
 The engine's own GUI toolkit (widgets, layout, input, rendering integration) used
 by the editor and the graphical splash. No third-party GUI dependency is planned.
 
-### Renderer — extraction implemented; Low / Medium GPU backends planned
+### Renderer — extraction + CPU rasterization implemented; GPU backends planned
 Three quality tiers:
 - **Low:** minimal feature set, broad hardware reach.
 - **Medium:** default tier; modern features with wide compatibility.
@@ -168,8 +169,17 @@ draw-list extraction (`extractDrawList`) that reuses the scene's O(n) world
 transform snapshot, culls each `Renderable`'s world AABB, and emits a sorted
 `DrawCommand` list (`front_to_back` / `back_to_front` / `by_material`). It is pure
 CPU work with no GPU dependency, so it is fully tested headlessly and is the
-contract the Low/Medium/Advanced GPU backends will consume. The GPU backends
-themselves remain planned.
+contract the Low/Medium/Advanced GPU backends will consume.
+
+A **CPU software rasterizer** (`src/render/raster.zig`,
+`docs/render-raster.md`) consumes that draw list and writes an RGBA8 framebuffer
+with an `f32` depth buffer: clip-space frustum clipping, perspective divide,
+28.4 fixed-point integer edge functions with a top-left fill rule, backface
+culling and flat-color shading. Coverage is bit-exactly reproducible and shared
+edges are watertight. Geometry and materials arrive through a duck-typed provider,
+so `render` has no dependency on the asset layer, and the pixel path takes no
+allocator. It is a CPU reference path, **not** a renderer tier: textures, lighting,
+blending and antialiasing are absent, and the GPU backends remain planned.
 
 ### Audio runtime — mixing + spatialization implemented; device backends planned
 The device-independent playback layer is implemented (`src/audio/`, re-exported
@@ -396,7 +406,8 @@ importer, WAV and FLAC audio importers, atomic verified storage, parallel import
 over the job system,
 mark-and-sweep GC, change detection with incremental re-import), the
 backend-independent render extraction layer (camera,
-frustum culling, sorted draw lists) and the device-independent audio runtime
+frustum culling, sorted draw lists) with its CPU software rasterizer (watertight
+fixed-point coverage, depth buffer, flat color), and the device-independent audio runtime
 (mixer with voices/buses/pan/pitch, linear and band-limited resampling, priority
 voice stealing, biquad/compressor/delay/reverb/limiter/saturator insert chains,
 plus spatialization
