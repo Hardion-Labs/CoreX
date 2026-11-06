@@ -32,7 +32,8 @@ control, and maintainable code.
 > WAV and FLAC audio decoders, atomic verified storage, parallel import over
 > the job system, mark-and-sweep GC, change detection with incremental re-import),
 > the backend-independent render extraction
-> layer (camera math, frustum culling, sorted draw lists) and the
+> layer (camera math, frustum culling, sorted draw lists) with a CPU software
+> rasterizer (fixed-point watertight coverage, depth buffer, flat color), and the
 > device-independent audio runtime (mixer with voices, buses, pan, pitch,
 > linear/band-limited resampling, priority voice stealing and
 > biquad/compressor/delay/reverb/limiter/saturator insert chains, plus
@@ -352,8 +353,9 @@ hand-built frames that libFLAC itself decodes back before they are committed.
 The render subsystem (`corex.render`) currently provides the **backend-independent
 extraction layer** — the CPU foundation every GPU tier will consume. It builds
 camera view/projection matrices, frustum-culls renderables, and produces a sorted
-draw list from a scene. It has no GPU dependency, so it runs and is fully tested
-headlessly. The Low/Medium GPU backends are planned.
+draw list from a scene. A **CPU software rasterizer** then turns that list into an
+RGBA8 framebuffer with a depth buffer. Neither has a GPU dependency, so both run
+and are fully tested headlessly. The Low/Medium GPU backends are planned.
 
 ```zig
 const corex = @import("corex");
@@ -370,10 +372,22 @@ const cam = R.Camera.perspectiveLookAt(.{ 0, 0, 10 }, .{ 0, 0, 0 }, .{ 0, 1, 0 }
 var frame = try R.extractDrawList(&scene, cam, .front_to_back, allocator);
 defer frame.deinit();
 // frame.commands: culled + sorted DrawCommands; frame.culled: how many were rejected
+
+// Rasterize on the CPU. `resources` resolves the opaque mesh/material handles.
+var target = try R.Target.init(width, height, color_bytes, depth_values);
+target.clear(.{ 0, 0, 0, 255 }, 1.0);
+const stats = try R.rasterize(&target, frame.commands, cam.view_projection, resources, .{});
+// stats.pixels written; target.color is plain RGBA8 (feeds the QOI encoder as-is)
 ```
 
-The design, math conventions and guarantees are documented in
-[`docs/render-extraction.md`](docs/render-extraction.md).
+Coverage uses 28.4 fixed-point integer edge functions with a top-left fill rule,
+so it is bit-exactly reproducible and shared edges are watertight — no cracks and
+no double-drawn pixels. The pixel path takes no allocator. Shading is flat color:
+no textures, lighting, blending or antialiasing yet.
+
+The extraction design and math conventions are documented in
+[`docs/render-extraction.md`](docs/render-extraction.md); the rasterizer, its
+verification and its limits in [`docs/render-raster.md`](docs/render-raster.md).
 
 ## Audio
 
@@ -506,6 +520,7 @@ CoreX/
 │   ├── scene-transforms.md     # World-space transform propagation
 │   ├── scene-prefabs.md        # Reusable single-root prefabs (.prefab)
 │   ├── render-extraction.md    # Backend-independent render extraction
+│   ├── render-raster.md        # CPU software rasterizer (coverage + depth)
 │   ├── audio-mixer.md          # Device-independent audio mixer (voices/buses)
 │   ├── audio-effects.md        # Insert DSP: biquads, compressor, chains
 │   ├── audio-spatial.md        # Spatial audio + AudioSource/AudioSystem
@@ -526,7 +541,7 @@ CoreX/
 │   ├── assets.zig              # Asset public module (index + import + cache)
 │   ├── assets/                 # Import cache, importers, decoders, change detection, pipeline
 │   ├── render.zig              # Render public module (extraction layer)
-│   ├── render/                 # Camera, frustum culling, draw-list extraction
+│   ├── render/                 # Camera, culling, draw lists, software rasterizer
 │   ├── audio.zig               # Audio public module (mixing runtime)
 │   └── audio/                  # Clips, mixer, spatialization, bridge, resampler, DSP
 ├── tools/                      # Reproducible test-vector generators
@@ -572,7 +587,9 @@ Indicative; subject to change as technical decisions are validated.
 - [ ] Audio device backends (ALSA/WASAPI/CoreAudio), HRTF/occlusion, effects, streaming.
 - [ ] Hot-reload event watcher (inotify/FSEvents), dependency graph, startup/editor integration.
 - [x] Backend-independent render extraction (camera, frustum culling, sorted draw lists).
+- [x] CPU software rasterizer (fixed-point watertight coverage, depth buffer, flat color).
 - [ ] Renderer Low / Medium GPU backends; Advanced contract.
+- [ ] Rasterizer shading: textures, lighting, blending, antialiasing.
 - [ ] GUI library and graphical editor.
 - [ ] Lua VM and gameplay scripting.
 - [ ] Native Module API loader (C++).
