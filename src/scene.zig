@@ -25,6 +25,8 @@ pub const components = @import("scene/components.zig");
 pub const transform = @import("scene/transform.zig");
 /// Reusable single-root entity subtrees (`.prefab`) built on the scene format.
 pub const prefab = @import("scene/prefab.zig");
+/// Sector residency streaming (`.corexstream`) over a live scene.
+pub const stream = @import("scene/stream.zig");
 
 pub const Scene = scene.Scene;
 pub const Component = scene.Component;
@@ -47,9 +49,13 @@ pub const EngineScene = Scene(.{Component(Transform, "transform")});
 /// The engine's default prefab schema (matches `EngineScene`).
 pub const EnginePrefab = Prefab(.{Component(Transform, "transform")});
 
+/// The engine's default sector stream (matches `EngineScene`).
+pub const EngineStream = stream.Stream(.{Component(Transform, "transform")});
+
 test {
     std.testing.refAllDecls(@This());
     _ = scene;
     _ = components;
     _ = prefab;
+    _ = stream;
 }
