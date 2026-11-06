@@ -33,7 +33,8 @@ control, and maintainable code.
 > the job system, mark-and-sweep GC, change detection with incremental re-import),
 > the backend-independent render extraction
 > layer (camera math, frustum culling, sorted draw lists) with a CPU software
-> rasterizer (fixed-point watertight coverage, depth buffer, flat color), and the
+> rasterizer (fixed-point watertight coverage, depth buffer, textured and
+> Lambert-lit shading), and the
 > device-independent audio runtime (mixer with voices, buses, pan, pitch,
 > linear/band-limited resampling, priority voice stealing and
 > biquad/compressor/delay/reverb/limiter/saturator insert chains, plus
@@ -382,8 +383,10 @@ const stats = try R.rasterize(&target, frame.commands, cam.view_projection, reso
 
 Coverage uses 28.4 fixed-point integer edge functions with a top-left fill rule,
 so it is bit-exactly reproducible and shared edges are watertight — no cracks and
-no double-drawn pixels. The pixel path takes no allocator. Shading is flat color:
-no textures, lighting, blending or antialiasing yet.
+no double-drawn pixels. The pixel path takes no allocator. Materials shade flat or
+sample a borrowed RGBA8 texture with repeat wrap and nearest/bilinear magnification;
+UVs interpolate perspective-correctly and the texel multiplies the material tint.
+Lighting, blending and antialiasing are not implemented yet.
 
 The extraction design and math conventions are documented in
 [`docs/render-extraction.md`](docs/render-extraction.md); the rasterizer, its
@@ -587,9 +590,9 @@ Indicative; subject to change as technical decisions are validated.
 - [ ] Audio device backends (ALSA/WASAPI/CoreAudio), HRTF/occlusion, effects, streaming.
 - [ ] Hot-reload event watcher (inotify/FSEvents), dependency graph, startup/editor integration.
 - [x] Backend-independent render extraction (camera, frustum culling, sorted draw lists).
-- [x] CPU software rasterizer (fixed-point watertight coverage, depth buffer, flat color).
+- [x] CPU software rasterizer (fixed-point watertight coverage, depth buffer, textured shading).
 - [ ] Renderer Low / Medium GPU backends; Advanced contract.
-- [ ] Rasterizer shading: textures, lighting, blending, antialiasing.
+- [ ] Rasterizer shading: lighting, blending, antialiasing, mipmaps.
 - [ ] GUI library and graphical editor.
 - [ ] Lua VM and gameplay scripting.
 - [ ] Native Module API loader (C++).
