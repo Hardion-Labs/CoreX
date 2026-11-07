@@ -54,4 +54,19 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.step("bench-extract", "Run the extraction/occlusion benchmark (use -Doptimize=ReleaseFast)").dependOn(&b.addRunArtifact(bench_extract).step);
+
+    // GUI frame: renders one headless frame of real widgets and writes it as QOI.
+    // Used to inspect the GUI without a window, and by the smoke check.
+    const gui_frame = b.addExecutable(.{
+        .name = "gui-frame",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/gui_frame.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "corex", .module = corex_module }},
+        }),
+    });
+    const gui_frame_run = b.addRunArtifact(gui_frame);
+    gui_frame_run.addPassthruArgs();
+    b.step("gui-frame", "Render one headless GUI frame to a QOI file (zig build gui-frame -- out.qoi)").dependOn(&gui_frame_run.step);
 }

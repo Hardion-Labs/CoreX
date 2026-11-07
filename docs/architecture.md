@@ -102,18 +102,33 @@ src/
 │   ├── mipmap.zig        # Mip-chain construction (integer box filter)   [implemented]
 │   └── raster.zig        # Software rasterizer: coverage + depth buffer  [implemented]
 ├── audio.zig             # Audio public module; device-independent mixing
-└── audio/
-    ├── clip.zig          # Clip descriptor, channel maps, pan, PCM16   [implemented]
-    ├── mixer.zig         # Voice pool, buses, allocation-free render   [implemented]
-    ├── spatial.zig       # Listener, attenuation, pan, Doppler math    [implemented]
-    ├── system.zig        # AudioSource component + scene reconciler    [implemented]
-    ├── resample.zig      # Windowed-sinc prototype + polyphase bank    [implemented]
-    └── effects.zig       # Biquads, comp, delay, reverb, limiter, sat    [impl]
+├── audio/
+│   ├── clip.zig          # Clip descriptor, channel maps, pan, PCM16   [implemented]
+│   ├── mixer.zig         # Voice pool, buses, allocation-free render   [implemented]
+│   ├── spatial.zig       # Listener, attenuation, pan, Doppler math    [implemented]
+│   ├── system.zig        # AudioSource component + scene reconciler    [implemented]
+│   ├── resample.zig      # Windowed-sinc prototype + polyphase bank    [implemented]
+│   └── effects.zig       # Biquads, comp, delay, reverb, limiter, sat    [impl]
+├── gui.zig               # GUI public module; the engine's own widget layer
+└── gui/
+    ├── font.zig          # Built-in 8x8 bitmap font + measurement      [implemented]
+    ├── text.zig          # Text drawing on a canvas (clip, scale)      [implemented]
+    ├── canvas.zig        # RGBA8 canvas, Rect, clipped primitives      [implemented]
+    ├── layout.zig        # Size/Padding + stacking Layout cursor        [implemented]
+    ├── input.zig         # One frame of pointer/keyboard/text input    [implemented]
+    ├── theme.zig         # Widget colours + metrics (dark and light)   [implemented]
+    └── widgets.zig       # Immediate-mode Context: panel/button/...    [implemented]
 ```
 
-Planned subsystems will be added as sibling modules (e.g. `src/render/`,
-`src/gui/`, `src/editor/`, `src/script/`, `src/export/`) once an approved change
-gives them meaningful content. Empty placeholder modules are not created.
+Planned subsystems will be added as sibling modules (e.g. `src/editor/`,
+`src/script/`, `src/export/`) once an approved change gives them meaningful
+content. Empty placeholder modules are not created.
+
+The GUI layer ([gui-foundation.md](gui-foundation.md)) is dependency-free and
+headless: it paints into a caller-owned RGBA8 buffer in the same layout as
+`assets.image.Image.pixels` and `raster.Target.color`, so a GUI composites onto a
+rendered frame with no conversion. `zig build gui-frame -- out.qoi` renders one
+frame of real widgets without a window.
 
 ## The startup spine (implemented)
 

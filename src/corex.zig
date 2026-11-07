@@ -47,6 +47,9 @@ pub const render = @import("render.zig");
 /// platform layers land, the loop itself.
 pub const runtime = @import("runtime.zig");
 
+/// GUI subsystem: immediate-mode UI (built-in bitmap font, 2D canvas, layout).
+pub const gui = @import("gui.zig");
+
 /// Audio subsystem: device-independent mixing (voices, buses, gain/pan, pitch,
 /// resampling) — the CPU foundation the OS playback backends will consume.
 pub const audio = @import("audio.zig");
@@ -70,6 +73,7 @@ test {
     _ = assets;
     _ = runtime;
     _ = audio;
+    _ = gui;
     _ = @import("audio/cxaw_playback_test.zig");
     _ = @import("ecs/schedule_jobs_test.zig");
     _ = @import("ecs/frame_jobs_test.zig");
