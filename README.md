@@ -385,7 +385,7 @@ Coverage uses 28.4 fixed-point integer edge functions with a top-left fill rule,
 so it is bit-exactly reproducible and shared edges are watertight — no cracks and
 no double-drawn pixels. The pixel path takes no allocator (only `.edge`
 antialiasing allocates, through the caller's allocator). Materials shade flat or
-sample a borrowed RGBA8 texture with repeat wrap and nearest/bilinear magnification;
+sample a borrowed RGBA8 texture with repeat wrap and nearest/bilinear filtering;
 UVs interpolate perspective-correctly and the texel multiplies the material tint.
 A single directional Lambert light (`Options.light`) and framebuffer blending
 (`Options.blend`: `.none`, straight-alpha, premultiplied, additive) are
@@ -393,7 +393,11 @@ supported. `Options.antialias = .edge` supersamples geometry edges 4x4 (16 exact
 integer sub-samples per pixel sharing the same top-left rule, accumulated per draw
 command so shared edges stay seam-free and full-coverage pixels stay
 byte-identical); it needs an allocator for its per-draw scratch, so it goes
-through `rasterizeAlloc` / `drawMeshAlloc`. mipmaps are not implemented yet.
+through `rasterizeAlloc` / `drawMeshAlloc`. Minification is handled by a **mip
+chain** (`Texture.mips`, built by `corex.render.mipmap.Chain.generate` with an
+integer box filter) and per-pixel LOD selection from the exact screen-space UV
+gradient (`Options.mipmap = .trilinear`, the default; `.level0` keeps the crisp
+aliased path); a texture without `mips` samples level 0 exactly as before.
 
 The extraction design and math conventions are documented in
 [`docs/render-extraction.md`](docs/render-extraction.md); the rasterizer, its
@@ -602,7 +606,7 @@ Indicative; subject to change as technical decisions are validated.
 - [ ] Renderer Low / Medium GPU backends; Advanced contract.
 - [x] Rasterizer blending: `.none`, straight-alpha source-over, premultiplied, additive.
 - [x] Rasterizer antialiasing: 4x4 sub-sample coverage, per-draw accumulation, `Antialias.edge`.
-- [ ] Rasterizer shading: mipmaps / LOD selection.
+- [x] Rasterizer mipmaps: integer box-filter chain, per-pixel LOD, trilinear sampling.
 - [ ] GUI library and graphical editor.
 - [ ] Lua VM and gameplay scripting.
 - [ ] Native Module API loader (C++).
