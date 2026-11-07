@@ -123,7 +123,7 @@ src/
     ├── shell.zig         # Docks, hierarchy, viewport, inspector, status [implemented]
     ├── edit.zig          # Commands, undo/redo, dirty tracking, atomic save [implemented]
     ├── inspector.zig     # Editable numeric rows (fields, parsing, commit)  [implemented]
-    └── tree.zig          # Flat, bounded hierarchy rows + scrolling         [implemented]
+    └── tree.zig          # Flat hierarchy rows, folding and tree actions     [implemented]
 ```
 
 Planned subsystems will be added as sibling modules (e.g. `src/script/`,
@@ -195,8 +195,8 @@ borrowing the scene, renderer and surface instead of owning them. The *editing m
 atomic save, and the inspector edits the name, position and scale through it
 (`corex.editor.inspector` owns the numeric fields and their parsing). `zig build
 editor-frame` renders one real editor frame of a project headlessly. Still planned: a
-window and real input, rotation/camera fields, per-node collapse, asset browser, gizmos
-and the editor loop.
+window and real input, rotation/camera fields, drag-and-drop reparenting, asset browser,
+gizmos and the editor loop.
 
 ### First-party GUI library — implemented; text shaping planned
 The engine's own GUI toolkit (`corex.gui`, [gui-foundation.md](gui-foundation.md)):
