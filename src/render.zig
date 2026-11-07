@@ -82,6 +82,14 @@ pub const Blend = raster.Blend;
 /// Edge antialiasing mode (`Options.antialias`): `none` (one sample, default)
 /// or `edge` (16 sub-samples per pixel, translucent edge fragments).
 pub const Antialias = raster.Antialias;
+/// Mip level selection for textured draws (`Options.mipmap`): `level0`
+/// (always sample the full-size level) or `trilinear` (pick from the
+/// screen-space UV gradient and mix two levels; default).
+pub const Mipmap = raster.Mipmap;
+/// One mip level of a `RasterTexture` (`Texture.mips`, largest first).
+pub const MipLevel = raster.MipLevel;
+/// Builds the mip chain a `RasterTexture` samples when minifying.
+pub const mipmap = @import("render/mipmap.zig");
 /// Single directional Lambert light for the rasterizer (`Options.light`).
 pub const RasterLight = raster.Light;
 
