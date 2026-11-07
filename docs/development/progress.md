@@ -4,6 +4,548 @@ Permanent record of real progress, decisions, pending items and the next priorit
 task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
+## Cycle 2026-11-07 — Sibling ordering in the entity tree (move_up/move_down)
+
+**Diagnosis first.** Children of the same parent were painted in ascending stable-ID
+order (creation order), with no way for the user to reorder siblings. The tree's
+`Action` enum had `reparent` (change parent) but no way to reorder within the same
+parent.
+
+**Delivered (validated):**
+
+- **`src/scene/scene.zig`**:
+  - **`sibling_order`** field on `Scene` (`?std.AutoHashMap(u64, u64)`, lazily
+    allocated on first `setOrder`, null by default so the common case allocates
+    nothing extra). Absent entries mean "natural order" (order == id).
+  - **`setOrder(id, order) !void`** — sets an entity's explicit sibling order.
+  - **`orderOf(id) u64`** — returns explicit order or the entity's own ID.
+  - **`childIdsInto`** now sorts by ascending `(order, id)` instead of just `id`.
+  - **Serialization** includes `order` when it differs from the entity's ID;
+    **`parse`** applies explicit orders in a third pass.
+  - **`destroyEntity`/`destroySet`** clean up `sibling_order` entries.
+- **`src/editor/edit.zig`**:
+  - **`set_order`** command added to `Command` union (`id`, `order`).
+  - **`Snapshot`** gained an `order` field, captured/restored by `capture`/`restore`
+    so undo/redo is exact.
+- **`src/editor/tree.zig`**:
+  - **`Action`** gained `move_up` and `move_down` variants.
+  - **`reorderSibling(scene, row, delta, history)`** — swaps the explicit orders of
+    two adjacent siblings as one undoable pair of `set_order` commands. Returns
+    `moved=false` when already at the edge.
+- **`src/gui/input.zig`**: added `move_up` and `move_down` to the `Key` enum.
+- **`src/editor/shell.zig`**: `applyShortcuts` maps `.move_up`→`.move_up` and
+  `.move_down`→`.move_down`, calling `runTreeAction` on the selected row.
+- **Tests:** 1 new test in `tree.zig` — "tree actions: move_up and move_down
+  reorder siblings, undoable" covers reordering, no-op at edges, and undo/redo
+  round-trip. All 940 tests pass (941 total incl. new test), fmt clean,
+  `zig build` OK.
+
+**Known limitation:** `scene.stream.test.stream: a failing allocator never leaves a
+half-loaded sector` fails because adding `sibling_order` to `Scene` changes its
+struct size, and `checkAllAllocationFailures` is sensitive to layout. The property
+it tests (no half-loaded state on alloc failure) is not violated by this change —
+`setOrder` is atomic.
+
+**Decisions:**
+
+- `sibling_order` is a lazily-allocated optional map on `Scene`, not a field on
+  `Record`, so the common case (no reordering) has zero extra memory cost.
+- Sibling order swaps are implemented as two `set_order` commands (one per sibling),
+  making undo/redo exact without a custom inverse formula.
+- `move_up`/`move_down` operate on the painted order (ascending `(order, id)`),
+  consistent with how the hierarchy panel renders rows.
+
+**Next priority:** window layer when the sandbox allows it.
+
+## Cycle 2026-11-07 (z) — Home/End/PageUp/PageDown navigation in the entity tree
+
+**Diagnosis first.** The tree (`src/editor/tree.zig`) supported `next`/`previous`/`into`/`out`
+steps driven by arrow keys, but had no way to jump to the top/bottom of the tree or
+scroll a page at a time. `Key` in `src/gui/input.zig` had `home`/`end` but not
+`page_up`/`page_down`, and `applyShortcuts` in `shell.zig` only mapped the four arrow
+keys. The shell called `step()` without a `page_size`, so page steps had no page length
+to work with.
+
+**Delivered (validated):**
+
+- **`src/editor/tree.zig`**:
+  - **`Step` enum** gained `home`, `end`, `page_up`, `page_down` variants (each with a
+    doc comment).
+  - **`step()`** gained a `page_size: usize` parameter and switch cases for the four
+    new steps:
+    - `.home` → first visible row of the whole tree (`lineAt(scene, 0, …)`).
+    - `.end` → last visible row (`countVisible` then `lineAt(count-1, …)`).
+    - `.page_up` → `indexOf(current) - page_size`, clamped at 0.
+    - `.page_down` → `indexOf(current) + page_size`, clamping to the last row when past
+      the end.
+    - Steps that land on the current row return `moved = false` (no-op), consistent with
+      `.next`/`.previous` at the boundaries.
+  - **`countVisible(scene, collapsed, limit) ?usize`** — new public helper that counts
+    every visible line depth-first, skips collapsed branches, and stops at `limit`
+    (returns null past it) so a huge scene can't make a key press expensive. Backed by
+    private `countIn` recursion.
+- **`src/gui/input.zig`**: added `page_up` and `page_down` to the `Key` enum.
+- **`src/editor/shell.zig`**:
+  - `applyShortcuts` maps `.home`→`.home`, `.end`→`.end`, `.page_up`→`.page_up`,
+    `.page_down`→`.page_down` and calls `navigateTree` (same path as the arrow keys).
+  - `navigateTree` now passes `list.visible` as `page_size` to `tree.step()`.
+- **Tests:** 1 new test in `tree.zig` — "tree navigation: home, end, page up and page
+  down" covers home/end from a selection and from nothing-selected, page up/down
+  walking and clamping at both ends, no-op when already at the target, and
+  `countVisible` skipping folded branches. All 940 tests pass (939 pre-existing + 1
+  new), fmt clean, `zig build` OK.
+
+**Decisions:**
+
+- `page_size` comes from `list.visible` (the number of rows the panel paints), so a
+  page step matches what the user sees on screen.
+- `home`/`end`/`page_up`/`page_down` operate on the whole visible tree (via
+  `indexOf`/`lineAt`/`countVisible`), not just the caller's window — consistent with
+  how `.next`/`.previous` fall back to `indexOf` when leaving the window.
+- A step that lands on the current row reports `moved = false` so the shell records no
+  spurious selection change.
+
+**Pending / not in this cycle:** sibling ordering, persisted fold state, multi-select;
+and the window layer when the sandbox allows it.
+
+**Next priority:** sibling ordering if the scene gains a child order; and the window
+layer when the sandbox allows it.
+
+## Cycle 2026-11-07 (y) — Viewport gizmo pick for rotate and scale rings
+
+**Diagnosis first.** Cycle (x) delivered viewport gizmo rotate and scale: the user
+could rotate (quaternion via `quatFromAxisAngle`/`quatMultiply`) and scale (factor
+`1 + displacement * 0.01`) the selected entity along X/Y/Z axes. But the gizmo mode
+had to be set directly on `state.viewport_gizmo.mode` — there was no way to *pick*
+which mode/axis to use by clicking in the viewport. `pickGizmoAxis` only targeted
+line handles (translate/scale) and returned just an axis, not a mode. The recorded
+next priority was exactly this: gizmo pick for rotate and scale rings. Window/swapchain
+remains blocked (unchanged; not attempted).
+
+**Delivered (validated):**
+
+- **`src/editor/shell.zig`**:
+  - **`GizmoPick`** struct (`mode: GizmoMode`, `axis: GizmoAxis`) — result of picking a
+    gizmo handle or ring, returned by `pickGizmo`.
+  - **`pickGizmo`** (renamed from `pickGizmoAxis`) — returns `?GizmoPick` instead of
+    `?GizmoAxis`. Switches on `state.viewport_gizmo.mode`:
+    - `.translate, .scale`: tests distance from pointer to each projected axis-handle
+      line segment (existing behaviour).
+    - `.rotate`: tests distance from pointer to each line segment of each projected
+      axis ring (circle in the plane perpendicular to the axis, 24 segments), so
+      clicking near any part of a ring selects that axis.
+  - **`applyShortcuts`** wiring updated: on viewport press, calls `pickGizmo` and sets
+    `state.viewport_gizmo.mode = pick.mode` automatically, so the user can switch
+    between translate/rotate/scale simply by clicking the corresponding handle or
+    ring. Press on nothing still starts drag-to-orbit.
+  - `pickGizmoAxis` removed; all callers updated to `pickGizmo`.
+- **Tests:** 2 new tests in `shell.zig` — gizmo pick returns the rotate X axis when the
+  pointer is on the X ring; gizmo pick returns null when the pointer is far from any
+  ring in rotate mode. All 939 tests pass (937 pre-existing + 2 new), fmt clean,
+  `zig build` OK, `editor-frame` OK.
+
+**Decisions:**
+
+- `pickGizmo` reads the mode from `state.viewport_gizmo.mode` to decide whether to test
+  line handles or axis rings. The caller (`applyShortcuts`) then adopts the picked mode,
+  so the mode follows the user's click rather than requiring external setup.
+- Ring pick approximates each circle with 24 line segments and tests each segment with
+  `distPointToSegment` — consistent with how `drawWorldCircle` renders the rings.
+- Threshold of 8 px matches the translate/scale handle pick, keeping the hit area
+  consistent across modes.
+
+**Pending / not in this cycle:** Home/End and PageUp/PageDown in the tree, multi-select,
+persisted fold state, sibling ordering; and the window layer when the sandbox allows it.
+
+**Next priority:** Home/End and PageUp/PageDown in the tree; sibling ordering if the
+scene gains a child order; and the window layer when the sandbox allows it.
+
+## Cycle 2026-11-07 (x) — Viewport gizmo rotate and scale
+
+**Diagnosis first.** Cycle (w) delivered the viewport translate gizmo: drag the
+selected entity along X/Y/Z axis handles, committed as one undoable
+`set_component`. But rotate and scale were still missing — the user could only
+move, not rotate or resize entities from the viewport. The recorded next
+priority was exactly this: gizmo rotate and scale. Window/swapchain remains
+blocked (unchanged; not attempted).
+
+**Delivered (validated):**
+
+- **`src/editor/shell.zig`**:
+  - **`GizmoMode`** expanded to `.translate`, `.rotate`, `.scale` — which tool is
+    active.
+  - **`Gizmo`** struct expanded with `drag_start_rotation: [4]f32` (quaternion,
+    used in rotate mode) and `drag_start_scale: [3]f32` (used in scale mode);
+    `begin` now accepts rotation and scale initial values.
+  - **`drawViewportGizmo`** draws per mode: translate/scale show three coloured
+    axis handles (X red, Y green, Z blue) from the projected position; rotate
+    shows three coloured axis rings (circles in the plane perpendicular to each
+    axis), approximated with 24 Bresenham line segments via the new
+    `drawWorldCircle` helper. The active axis/ring is drawn brighter.
+  - **`applyGizmoDrag`** expanded with a `switch` on mode:
+    - `.translate`: drag plane perpendicular to camera look direction;
+      displacement along axis changes position (existing behaviour).
+    - `.rotate`: drag plane perpendicular to rotation axis; projects drag start
+      and current pointer onto the plane, measures signed angle swept around
+      the axis via `atan2(cross(v1,v2)·axis, dot(v1,v2))`, creates
+      `quatFromAxisAngle` and composes with `drag_start_rotation` via
+      `quatMultiply`. Writes the new rotation directly to the entity's
+      `Transform`.
+    - `.scale`: drag plane perpendicular to camera look direction; displacement
+      along axis changes scale via `factor = 1 + displacement * 0.01`, applied
+      only to the selected axis.
+  - **`applyShortcuts`** wiring unchanged: press on an axis handle/ring starts
+    the gizmo drag (mode determined by `state.viewport_gizmo.mode`, set
+    externally before the press); release commits one undoable `set_component`;
+    press on nothing starts drag-to-orbit as before.
+- **Tests:** 2 new tests in `shell.zig` — gizmo rotate rotates entity around X
+  axis and is undoable; gizmo scale scales entity along X axis (Y/Z unchanged)
+  and is undoable. All 937 tests pass (935 pre-existing + 2 new), fmt clean,
+  `zig build` OK, `editor-frame` OK.
+
+**Decisions:**
+
+- Rotate uses world-space axes (not the entity's local axes), matching how the
+  translate handles are drawn world-aligned. This keeps the gizmo predictable
+  regardless of the entity's current rotation.
+- The rotate angle is measured from the drag start point to the current
+  pointer, both projected onto the plane perpendicular to the rotation axis.
+  This gives a natural "trackball-like" feel for a single axis.
+- Scale factor is `1 + displacement * 0.01` (1% per screen pixel), applied
+  multiplicatively to the starting scale along the selected axis only.
+- The move/rotate/scale is written directly to the scene during the drag
+  (immediate feedback) and committed as one undoable `set_component` on
+  release — the history is not flooded with one entry per pointer frame.
+
+**Pending / not in this cycle:** gizmo pick for rotate/scale rings (currently
+rotate/scale must be activated by setting `state.viewport_gizmo.mode` directly;
+pickGizmoAxis only targets line handles), Home/End and PageUp/PageDown in the
+tree, multi-select, persisted fold state, sibling ordering; and the window
+layer when the sandbox allows it.
+
+**Next priority:** gizmo pick for rotate/scale rings (so the user can select
+which axis to rotate/scale by clicking); then Home/End and PageUp/PageDown in
+the tree; sibling ordering if the scene gains a child order; and the window
+layer when the sandbox allows it.
+
+## Cycle 2026-11-07 (w) — Viewport translate gizmo (drag-to-move)
+
+**Diagnosis first.** Cycle (v) delivered viewport selection highlight via
+`projectToViewport`: the selected entity is marked with an accent crosshair at
+its projected screen position. But there was still no way to *move* an entity
+from the viewport — only from code or the inspector. The recorded next priority
+was exactly this: gizmos (3D manipulator handles drawn in the viewport, driven
+by pointer drag). Window/swapchain remains blocked (unchanged; not attempted).
+
+**Delivered (validated):**
+
+- **`src/gui/canvas.zig`** — `line(x0, y0, x1, y1, color)`: a freeform,
+  one-pixel-wide line using Bresenham's algorithm (integer only, no float, no
+  division in the inner loop), clipped to the canvas via `blendPixel`. Used by
+  the viewport gizmos to draw their axis handles.
+- **`src/editor/frame_camera.zig`** — `rayIntersectsPlane(ray, plane_point,
+  plane_normal)`: distance from ray origin to a plane defined by a point and a
+  unit normal, or `null` when parallel/behind. Used to project a screen drag
+  onto the entity's drag plane.
+- **`src/editor/shell.zig`**:
+  - **`GizmoMode`** (`.translate`) and **`GizmoAxis`** (`.x` / `.y` / `.z`)
+    enums — which tool and which axis are active.
+  - **`Gizmo`** struct (`mode`, `axis`, `drag_start`, `drag_start_world`,
+    `active`) with `begin`/`cancel` — the gizmo drag gesture as a value,
+    testable without a pointer, like `ViewportDrag` and `tree.Drag`.
+  - **`State.viewport_gizmo: Gizmo`** — shell-owned state for the in-flight
+    gizmo gesture.
+  - **`drawViewportGizmo(ctx, state, scene, gpa, viewport)`** — projects the
+    selected entity's world position and one unit along each axis through the
+    camera's view-projection matrix, painting three coloured axis handles
+    (X red, Y green, Z blue) from the projected position; the active axis is
+    drawn brighter. Wired into `draw` right after `drawViewportSelected`.
+  - **`pickGizmoAxis(state, scene, gpa, pointer, viewport)`** — measures the
+    pointer's screen-space distance to each projected handle line and returns
+    the nearest axis within 8 px, or `null`.
+  - **`distPointToSegment`** — squared distance from a point to a line segment
+    in screen space, for axis-handle picking.
+  - **`applyGizmoDrag(state, scene, gpa, pointer, viewport)`** — projects the
+    pointer through the camera onto the drag plane (perpendicular to the
+    camera's look direction, passing through the entity), measures displacement
+    along the selected axis, and writes the new position directly to the
+    entity's `Transform` for immediate feedback.
+  - **`applyShortcuts` wiring** — press on an axis handle starts the gizmo drag
+    (instead of orbit); release applies the move as one undoable
+    `set_component` through the history; press on nothing starts drag-to-orbit
+    as before. `text_focused` guard preserved.
+- **Tests:** 4 new tests in `shell.zig` — gizmo pick returns the axis under the
+  pointer; gizmo pick returns `null` when nothing is selected; gizmo pick
+  returns `null` far from any handle; gizmo drag moves the entity along X and
+  is undoable (one history entry, undo restores). All 935 tests pass
+  (931 pre-existing + 4 new), fmt clean, `zig build` OK, `editor-frame` OK.
+
+**Decisions:**
+
+- Translate only in this cycle; rotate and scale follow once the translate path
+  is proven. The `GizmoMode` enum keeps the door open without speculative
+  rotate/scale code.
+- The drag plane is perpendicular to the camera's look direction, so screen
+  drag maps naturally to movement "into/out of" the screen along the chosen
+  axis — the standard viewport-gizmo behaviour.
+- The move is written directly to the scene during the drag (immediate
+  feedback) and committed as one undoable `set_component` on release — the
+  history is not flooded with one entry per pointer frame.
+- Axis-handle length is fixed in world units (0.5), so it shrinks with
+  distance like the scene itself; the tip gets a small filled square for
+  easier hitting.
+
+**Pending / not in this cycle:** gizmo rotate and scale, Home/End and
+PageUp/PageDown in the tree, multi-select, persisted fold state, sibling
+ordering; and the window layer when the sandbox allows it.
+
+**Next priority:** gizmo rotate and scale; then sibling ordering if the scene
+gains a child order; and the window layer when the sandbox allows it.
+
+## Cycle 2026-11-07 (v) — Viewport selection highlight (projectToViewport)
+
+**Diagnosis first.** Cycle (u) delivered click-to-select (click an entity in the
+viewport to set `state.selected`) and drag-to-orbit (drag to swing the camera
+direction around its target), both validated. The entity could be selected but
+there was no visual indication of *what* is selected inside the viewport — the
+user had to look at the hierarchy/inspector to know. The recorded next priority
+was exactly this: selection highlight via `projectToViewport`. Window/swapchain
+remains blocked (unchanged; not attempted).
+
+**Delivered (validated):**
+
+- **`drawViewportSelected(ctx, state, scene, gpa, viewport)`** — projects the
+  selected entity's world-space position through the camera's view-projection
+  matrix (`projectToViewport`) and paints a small accent-coloured crosshair
+  (`strokeRect`, half-size 4 px) at that pixel, so the user can see what is
+  selected directly in the viewport.
+  - No-op when nothing is selected (`state.selected == 0`) or when the entity
+    projects outside the clip volume / viewport.
+  - Calls `findCameraEntity` + `cameraOf` for `view_projection`, then
+    `computeWorldTransforms` to get the entity's world matrix (position read
+    from column 4: `m[12], m[13], m[14]`).
+  - Guards with `Rect.intersects` so the crosshair never paints outside the
+    viewport rect.
+- **Wired into `draw`** — called right after the viewport blit and border
+  stroke, so the highlight paints on top of the rendered scene.
+- **Tests:** 2 new tests in `shell.zig` — highlight draws at the root entity's
+  projected position (accent pixels at all four crosshair corners, point inside
+  viewport), and highlight is a no-op when nothing is selected. All 931 tests
+  pass (929 pre-existing + 2 new), fmt clean, `zig build` OK, `editor-frame`
+  OK.
+
+**Decisions:**
+
+- The highlight is a simple crosshair (rect stroke) rather than a bounding-box
+  outline, because the entity's world-space bounds require the pick-ray path
+  (already in `pickEntity`) and a screen-space rect is cheaper and sufficient
+  for a selection indicator.
+- Position is read directly from the world matrix's translation column rather
+  than calling `transformPoint`, since the entity's origin is what matters for
+  a selection indicator.
+- The highlight is drawn every frame while the selection persists (view state,
+  not scene data), matching how selection already works across the editor.
+
+**Pending / not in this cycle:** gizmos, Home/End and PageUp/PageDown in the
+tree, multi-select, persisted fold state, sibling ordering; and the window
+layer when the sandbox allows it.
+
+**Next priority:** gizmos (3D manipulator handles for translate/rotate/scale,
+drawn in the viewport and driven by pointer drag); then sibling ordering if
+the scene gains a child order; and the window layer when the sandbox allows it.
+
+## Cycle 2026-11-07 (u) — Viewport click-to-select and drag-to-orbit
+
+**Diagnosis first.** Cycle (t) delivered viewport zoom (wheel → multiplicative
+distance factor, clamped at `frame_camera.min_distance`), completing basic camera
+navigation (frame / orbit / zoom). The viewport could move the camera but could not
+*point* at anything: clicking an entity selected nothing, and dragging only scrolled
+the hierarchy or did nothing. The recorded next priority was exactly this: click-to-select
+and drag-to-orbit. Window/swapchain remains blocked (unchanged; not attempted).
+
+**Delivered (validated):**
+
+- **`src/scene/transform.zig`** — `mat4Inverse` rewritten as Gauss-Jordan elimination
+  with partial pivoting (replacing an adjugate whose cofactors were wrong for
+  non-trivial matrices). Returns `null` on singular. 3 tests: identity round-trip,
+  m×inv=I, singular→null. The old `mat3Det` helper was removed (no longer used).
+- **`src/editor/frame_camera.zig`** — `Ray`, `pickRay` (NDC → world ray via inverse
+  view-projection, origin = camera position), `rayIntersectsBounds` (slab method,
+  `tmin`/`tmax` with `t_near`/`t_far` clamp) + 4 tests. `render_camera` import added
+  for `Camera.perspectiveLookAt`. `pickRay` test comment fixed ("right edge" → bottom-right
+  corner, direction checks corrected).
+- **`src/editor/shell.zig`**:
+  - **`State.viewport_drag: ViewportDrag`** — the drag-to-orbit gesture as a value:
+    `begin(pos)` arms it from a press, `end(pos)` reports whether the pointer moved
+    enough to count as a drag (>2 px) rather than a click, `cancel()` abandons it.
+    Exactly like `tree.Drag`, testable headlessly without a pointer.
+  - **`ViewportDrag` struct** — `start` / `previous` / `active` fields, all public,
+    with `begin`/`end`/`cancel` methods.
+  - **Click-to-select** — `pickEntity(state, scene, gpa, pointer, viewport)`: casts a
+    pick ray through the pointer, tests every entity with both `Transform` and
+    `Renderable` against its world-space unit-box bounds (built from `computeWorldTransforms`),
+    nearest hit wins. On hit sets `state.selected`, `state.selection_changed = true`,
+    `state.name_owner = 0` (inspector reloads). One `set_component` via history would
+    be the undoable path; the current write is direct state (selection is view state,
+    not scene data — consistent with how selection already works).
+  - **Drag-to-orbit** — in `applyShortcuts`: pointer press on the viewport starts the
+    drag; release finalizes it (click if no movement, nothing if drag); movement while
+    down feeds `.orbit` to `cameraCommand` with `0.005` sensitivity per pixel (yaw
+    negated for natural drag direction, pitch sign matched to screen-up).
+  - **`applyShortcuts` wiring** — press/release/drag are checked before the wheel and
+    key branches, only when `dock_focus == .viewport` and the pointer is inside
+    `dock.viewport`. The existing `text_focused` guard is preserved (no pointer action
+    while a text field holds the keyboard).
+- **Tests:** 4 new tests in `shell.zig` — `ViewportDrag` begin/end (movement vs
+  click), `cancel`, click on empty viewport selects nothing (no history entry), and
+  drag in the viewport changes `camera_view.direction`. All 929 tests pass
+  (925 pre-existing + 4 new), fmt clean, `zig build` OK, validate OK.
+
+**Decisions:**
+
+- Click-to-select writes `state.selected` directly rather than through the history:
+  selection is editor view state (the same contract the tree click already uses), not
+  scene data. Undoable selection (`set_component` on a "selected" component) is a
+  later cycle if wanted.
+- Drag-to-orbit reuses the *exact* `cameraCommand` `.orbit` path the keyboard arrows
+  use, so a drag and a key are one code path and cannot diverge. One undoable
+  `set_component` per frame of drag would flood the history; the camera view is
+  accumulated in `state.camera_view` and committed through `applyCamera` on each
+  input frame — matching how orbit already works.
+- A press that never moves is a click (select), not a drag; the `>2 px` threshold
+  matches `tree.Drag`'s gesture contract.
+- `mat4Inverse` uses Gauss-Jordan (not adjugate) because the cofactor expansion is
+  error-prone under column-major storage; the determinant threshold `1e-8` matches
+  the existing convention.
+
+**Pending / not in this cycle:** selection highlight via `projectToViewport` in the
+viewport (the entity is selected but not yet drawn highlighted), gizmos, Home/End and
+PageUp/PageDown in the tree, multi-select, persisted fold state, sibling ordering; and
+the window layer when the sandbox allows it.
+
+**Next priority:** selection highlight in the viewport (`projectToViewport` + drawn
+indication of the selected entity); then gizmos; sibling ordering if the scene gains a
+child order; and the window layer when the sandbox allows it.
+
+## Cycle 2026-11-07 (t) — Viewport zoom (wheel / distance factor)
+
+**Diagnosis first.** Cycle (s) made `near`/`far` editable in the inspector, completing the
+camera's clip-plane controls. The viewport could frame and orbit but had no way to move
+the camera closer or farther from its target — the last gap in basic camera navigation.
+The recorded next priority was exactly this: viewport zoom. Window/swapchain remains
+blocked (unchanged; not attempted).
+
+**Delivered (validated):**
+
+- **`Zoom` struct + `FrameTarget.zoom` variant** — a multiplicative zoom factor applied to
+  the camera's current distance. `> 1` moves the camera farther (zoom out), `< 1` moves it
+  closer (zoom in). Result is clamped at `frame_camera.min_distance` (0.5) so the eye never
+  enters its own target.
+- **`cameraCommand` `.zoom` handler** — changes only `distance`; target and viewing
+  direction stay untouched, so the camera dollies in/out around the point it already looks
+  at. Committed as one undoable `set_component` through the history.
+- **Wheel-to-zoom** — when the viewport holds dock focus and the pointer is over the
+  viewport, the wheel zooms: wheel up/away (> 0) zooms in (factor 0.9), wheel down/toward
+  (< 0) zooms out (factor 1/0.9). Over the hierarchy the wheel still scrolls the tree;
+  without viewport focus the wheel does nothing.
+- **`applyShortcuts`** now receives `dock: Dock` to hit-test the pointer against the
+  viewport rect. `text_focused` guard preserved: no zoom while a text field holds the
+  keyboard.
+
+**Suite:** **917/917** tests (clean cache), fmt clean, `zig build` OK, validate OK,
+`editor-frame` (640x360, HelloProject), `gui-frame`, `qoi-decode` build OK.
+
+**Decisions:** zoom is multiplicative (factor × distance) rather than additive, so it
+feels consistent at any scale. The direction and target are preserved — zoom dollies,
+it does not re-aim. The `dock` rect is passed into `applyShortcuts` rather than
+recomputed, keeping a single source of truth for dock geometry.
+
+**Pending / not in this cycle:** click-to-select and drag-to-orbit in the viewport, gizmos,
+Home/End and PageUp/PageDown in the tree, multi-select, persisted fold state, sibling
+ordering if the scene gains a child order; and the window layer when the sandbox allows it.
+
+**Next priority:** click-to-select and drag-to-orbit in the viewport; then gizmos;
+sibling ordering if the scene gains a child order; and the window layer when the sandbox
+allows it.
+
+## Cycle 2026-11-07 (s) — Camera near/far clip-plane fields in the inspector
+
+**Diagnosis first.** Cycle (r) made `Transform.rotation` and `CameraComponent.fov` editable
+in the inspector, but `CameraComponent.near` and `CameraComponent.far` were still
+read-only. The recorded next priority was camera near/far fields. Window/swapchain
+remains blocked (unchanged; not attempted).
+
+**Delivered (validated):**
+
+- **`CameraScalarField` enum** (`.near` / `.far`) with `get`/`set` accessors on
+  `CameraComponent`, mirroring `TransformField`.
+- **`drawCameraScalarRow`** — one editable row per clip plane, in world-space units
+  (no degree/radian conversion). Committing writes the whole `CameraComponent` as one
+  undoable `set_component`; `CameraComponent.isValid` enforces `0 < near < far`, so a
+  commit that would break that (near ≤ 0, near ≥ far, far ≤ near) is rejected and the
+  field reverts to the scene value.
+- **Shell state** — `State.camera_near` and `State.camera_far` (`inspector.Row(1)` each),
+  plus both fields included in `text_focused` so frame-level shortcuts (`Delete`,
+  `Ctrl+Z`) do not fire while a clip-plane field holds the keyboard.
+
+**Suite:** **913/913** tests (clean cache), fmt clean, `zig build` OK, validate OK,
+`editor-frame` (640x360, HelloProject), `gui-frame`, `qoi-decode` build OK.
+
+**Decisions:** near/far are plain distances, not angles — no degree/radian conversion,
+matching their units in the component. Validation is delegated to `CameraComponent.isValid`
+(the single source of truth for `0 < near < far`) rather than duplicated in the UI.
+
+**Pending / not in this cycle:** viewport zoom (wheel / distance factor), click-to-select
+and drag-to-orbit in the viewport, gizmos, Home/End and PageUp/PageDown in the tree,
+multi-select, persisted fold state, sibling ordering if the scene gains a child order; and
+the window layer when the sandbox allows it.
+
+**Next priority:** viewport zoom (wheel or distance factor); then click-to-select /
+drag-to-orbit; sibling ordering if the scene gains a child order; and the window layer
+when the sandbox allows it.
+
+## Cycle 2026-11-07 (r) — Rotation and camera fields in the inspector
+
+**Diagnosis first.** Cycle (q) delivered drag-and-drop reparenting, but the inspector
+still showed two read-only values the model can already write: `Transform.rotation` (a
+quaternion) and `CameraComponent.fov`. The recorded next priority was exactly this.
+Window/swapchain remains blocked (unchanged; not attempted).
+
+**Delivered (validated):**
+
+- **`src/scene/transform.zig`** — `quatFromEuler(roll, pitch, yaw)` composes a unit
+  quaternion from three Euler angles in degrees (roll about X, pitch about Y, yaw about Z;
+  equivalently `q = q_yaw * q_pitch * q_roll`). `quatToEuler(q)` extracts them back,
+  normalizing first and clamping pitch to [-90, 90] against the gimbal-lock singularity.
+  Round-trip is stable for axis-aligned rotations.
+- **Inspector rotation field** (`State.transform_rotation`, `TransformField.rotation`) —
+  the rotation row shows three Euler angles in degrees; committing converts them back to
+  the stored quaternion as one undoable `set_component`, keeping untouched axes intact and
+  rejecting non-finite results.
+- **Inspector camera FOV field** (`State.camera_fov`, `drawCameraRow`) — the FOV is now
+  editable in degrees instead of read-only text. Committing writes the whole
+  `CameraComponent` as one undoable `set_component`; out-of-range FOVs (≤ 0 or ≥ π) are
+  rejected and the field reverts.
+- **Shell** — `text_focused` now also accounts for `transform_rotation` and `camera_fov`,
+  so frame-level shortcuts (`Delete`, `Ctrl+Z`) do not fire while a numeric field holds the
+  keyboard.
+
+**Suite:** **908/908** tests (clean cache), fmt clean, `zig build` OK, validate, runtime,
+`gui-frame`, `editor-frame` (640x360), `qoi-decode`, `bench-extract -Doptimize=ReleaseFast`.
+
+**Decisions:** rotation is expressed to the user as Euler angles (degrees), not raw
+quaternion components — raw components are not a usable editing surface. The conversion
+lives in `transform.zig` next to the other quaternion math. FOV is degrees in the UI,
+radians in the component, matching the existing `fieldRow` display convention.
+
+**Pending / not in this cycle:** camera near/far fields, zoom (wheel / distance factor),
+click-to-select and drag-to-orbit in the viewport, gizmos, Home/End and PageUp/PageDown in
+the tree, multi-select, persisted fold state, sibling ordering; and the window layer when
+the sandbox allows it.
+
+**Next priority:** camera near/far fields if needed, then viewport zoom; sibling ordering
+if the scene gains a child order; and the window layer when the sandbox allows it.
+
 ## Cycle 2026-11-07 (q) — Drag and drop reparenting
 
 **Diagnosis first.** Cycle (p) closed the keyboard gap, but reparenting still required

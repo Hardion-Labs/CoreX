@@ -289,6 +289,32 @@ pub const Canvas = struct {
         self.fillRect(.{ .x = x, .y = y0, .w = 1, .h = h }, color);
     }
 
+    /// A freeform line from `(x0, y0)` to `(x1, y1)`, one pixel wide, clipped to
+    /// the canvas. Bresenham's algorithm: integer only, no float, no division in
+    /// the inner loop. Used by the viewport gizmos to draw their axis handles.
+    pub fn line(self: Canvas, x0: i32, y0: i32, x1: i32, y1: i32, color: Color) void {
+        const dx = if (x1 > x0) x1 - x0 else x0 - x1;
+        const dy = if (y1 > y0) y1 - y0 else y0 - y1;
+        const sx = @as(i32, if (x0 < x1) 1 else -1);
+        const sy = @as(i32, if (y0 < y1) 1 else -1);
+        var err = dx - dy;
+        var cx = x0;
+        var cy = y0;
+        while (true) {
+            self.blendPixel(cx, cy, color);
+            if (cx == x1 and cy == y1) break;
+            const e2 = 2 * err;
+            if (e2 > -dy) {
+                err -= dy;
+                cx += sx;
+            }
+            if (e2 < dx) {
+                err += dx;
+                cy += sy;
+            }
+        }
+    }
+
     /// Blit an RGBA8 image scaled to fill `dst`, nearest-neighbour, clipped to both
     /// the destination and the canvas.
     ///
