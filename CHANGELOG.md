@@ -8,6 +8,22 @@ declared yet.
 
 ### Added
 
+- Per-frame allocator hand-off (`src/render/draw.zig`,
+  `corex.render.draw.extractIntoScratch`): the draw list keeps growing in the
+  caller's general-purpose allocator (it survives the frame), while every transient
+  allocation of a frame — the world-transform snapshot's matrix and entity arrays,
+  its two lookup maps and three work arrays — now comes from a **scratch arena** the
+  `RenderFrame` owns and resets once per `refill`. Pass the same allocator twice and
+  you get the previous `extractInto` exactly. `RenderFrame.allocated_last_frame`
+  reports whether a frame had to ask for memory at all, surfaced as
+  `EngineFrameReport.allocated`, so "this frame was free" is observable instead of
+  assumed. A counting-allocator test asserts **zero** calls and **zero** bytes on a
+  steady-state frame — after two warm-up frames, because `refill` extracts into the
+  spare buffer and a double-buffered frame reaches its steady size only once *both*
+  buffers have grown (paid twice per session, never per frame). The same test grows
+  the scene to 68 renderables and confirms the arena simply grows with it (708
+  total).
+
 - Scene renderer (`src/scene/render_scene.zig`, `corex.scene.render_scene`,
   `docs/scene-format.md`, `docs/render-extraction.md`): the layer that connects a
   project's scene file to the render pipeline, which was the missing half.
