@@ -263,7 +263,10 @@ Because it needs that scratch, antialiasing is only reachable through
 the level comes from the exact derivative of the perspective UV mapping, which is
 six constants per triangle, and the two neighbouring levels are mixed in `f64`
 with one final round (trilinear). A constant perspective denominator — any
-orthographic projection — hoists the level to once per triangle. Cross-layer
+orthographic projection — hoists the level to once per triangle, and with
+`raster.Mipmap.anisotropic` an elongated footprint is sampled with up to eight
+taps along its long axis at the level matching its short one (same fast path when
+the footprint is constant). Cross-layer
 integration tests
 (`src/render/raster_image_test.zig`) prove the whole chain — scene, world
 transforms, extraction, rasterizer — with a world-rotated face lit

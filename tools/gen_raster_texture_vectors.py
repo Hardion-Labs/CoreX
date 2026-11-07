@@ -182,6 +182,67 @@ def texel_gradient(p, q, den, dp, dq, dden, size):
     return du, dv
 
 
+MAX_ANISO_SAMPLES = 8
+MAX_ANISO_RATIO = 8.0
+
+
+def texel_derivatives(p, q, den, dp, dq, dden, size):
+    """Both screen-axis derivatives, per texel unit, mirrored from texelDerivatives."""
+    den_sq = den * den
+    if not (den_sq > 0.0):
+        return (0.0, 0.0), (0.0, 0.0)
+    inv_den_sq = 1.0 / den_sq
+    dudx = (dp[0] * den - p * dden[0]) * inv_den_sq
+    dvdx = (dq[0] * den - q * dden[0]) * inv_den_sq
+    dudy = (dp[1] * den - p * dden[1]) * inv_den_sq
+    dvdy = (dq[1] * den - q * dden[1]) * inv_den_sq
+    return (dudx * size[0], dudy * size[0]), (dvdx * size[1], dvdy * size[1])
+
+
+def aniso_footprint(du, dv, levels):
+    """Mirrored from anisoFootprint: (samples, axis, lod_major, lod_minor).
+
+    The two screen-axis columns of the Jacobian are the footprint; the longer one
+    is the long axis and its length is what the trilinear level follows."""
+    import math
+    len_x = math.sqrt(du[0] * du[0] + dv[0] * dv[0])
+    len_y = math.sqrt(du[1] * du[1] + dv[1] * dv[1])
+    major = max(len_x, len_y)
+    minor = min(len_x, len_y)
+    rho = major
+    lod_major = texture_lod(rho, 0.0, levels)
+    if not (major > minor) or not (minor > 0.0) or not math.isfinite(rho):
+        return 1, (0.0, 0.0), lod_major, lod_major
+    anisotropy = min(rho / minor, MAX_ANISO_RATIO)
+    lod_minor = max(lod_major - math.log2(anisotropy), 0.0)
+    wanted = math.ceil(min(anisotropy, float(MAX_ANISO_SAMPLES)))
+    samples = 1 if wanted < 1.0 else int(wanted)
+    if len_x >= len_y:
+        axis = (du[0] / major, dv[0] / major)
+    else:
+        axis = (du[1] / major, dv[1] / major)
+    return samples, axis, lod_major, lod_minor
+
+
+def sample_anisotropic(levels, u, v, footprint, size, filt):
+    """Mirrored from sampleAnisotropic: up to 8 taps along the long axis."""
+    import math
+    samples, axis, lod_major, lod_minor = footprint
+    if samples <= 1:
+        return sample_trilinear(levels, u, v, lod_major, filt)
+    n = float(samples)
+    step_u = axis[0] / (size[0] * n)
+    step_v = axis[1] / (size[1] * n)
+    acc = [0.0, 0.0, 0.0, 0.0]
+    for i in range(samples):
+        offset = float(i) - (n - 1.0) / 2.0
+        tap = sample_trilinear(levels, u + step_u * offset, v + step_v * offset, lod_minor, filt)
+        for c in range(4):
+            acc[c] += float(tap[c])
+    inv = 1.0 / n
+    return [int(math.floor(a * inv + 0.5)) for a in acc]
+
+
 def f64_bits(x):
     return struct.unpack("<Q", struct.pack("<d", x))[0]
 
@@ -248,7 +309,7 @@ def shade(vertex, w0, w1, w2, area_inv, tint, filt, levels=None, grad=None, mipm
     else:
         u = num_u / den
         v = num_v / den
-    use_mips = levels is not None and len(levels) > 1 and mipmap == "trilinear"
+    use_mips = levels is not None and len(levels) > 1 and mipmap in ("trilinear", "anisotropic")
     if not use_mips:
         if levels is not None:
             # `.level0` on a mipmapped texture samples the chain's own level 0.
@@ -258,7 +319,13 @@ def shade(vertex, w0, w1, w2, area_inv, tint, filt, levels=None, grad=None, mipm
         return tint_multiply(texel, tint)
     lw, lh = levels[0][0], levels[0][1]
     dp, dq, dden = grad
-    du, dv = texel_gradient(num_u, num_v, den, dp, dq, dden, (float(lw), float(lh)))
+    size = (float(lw), float(lh))
+    if mipmap == "anisotropic":
+        du, dv = texel_derivatives(num_u, num_v, den, dp, dq, dden, size)
+        footprint = aniso_footprint(du, dv, len(levels))
+        texel = sample_anisotropic(levels, u, v, footprint, size, filt)
+        return tint_multiply(texel, tint)
+    du, dv = texel_gradient(num_u, num_v, den, dp, dq, dden, size)
     lod = texture_lod(du, dv, len(levels))
     texel = sample_trilinear(levels, u, v, lod, filt)
     return tint_multiply(texel, tint)
@@ -295,7 +362,7 @@ def rasterize(vertex, tint, filt, cull="none", front_face="ccw",
     db = ((float(v[2][1] - v[0][1]) * SUBPIXEL_SCALE) * inv_area,
           (float(v[0][0] - v[2][0]) * SUBPIXEL_SCALE) * inv_area)
     grad = None
-    if levels is not None and len(levels) > 1 and mipmap == "trilinear":
+    if levels is not None and len(levels) > 1 and mipmap in ("trilinear", "anisotropic"):
         duv = (v[0][3] - v[2][3], v[0][4] - v[2][4], v[0][5] - v[2][5])
         duv1 = (v[1][3] - v[2][3], v[1][4] - v[2][4], v[1][5] - v[2][5])
         axis = lambda k, c: da[k] * duv[c] + db[k] * duv1[c]
@@ -471,6 +538,53 @@ def cases():
             mips="mip",
             mipmap=rng.choice(["trilinear", "trilinear", "level0"]))
 
+    # Anisotropic minification. A grazing footprint is built with a steep UV
+    # gradient along one axis and a shallow one along the other, which is exactly
+    # what a surface seen at a glancing angle produces.
+    # Trilinear over-blur reference: the same footprint, isotropic sampling.
+    grazing = [px(0, 0, 0, 0, 0), px(8, 0, 0, 4, 0), px(0, 8, 0, 0, 0.5)]
+    add("aniso_grazing_trilinear", grazing, filt="bilinear", mips="mip", mipmap="trilinear")
+    add("aniso_grazing", grazing, filt="bilinear", mips="mip", mipmap="anisotropic")
+    add("aniso_grazing_nearest", grazing, filt="nearest", mips="mip", mipmap="anisotropic")
+    # 8:1 is the clamp: the footprint cannot ask for more taps than the ceiling.
+    extreme = [px(0, 0, 0, 0, 0), px(8, 0, 0, 8, 0), px(0, 8, 0, 0, 0.125)]
+    add("aniso_extreme", extreme, filt="bilinear", mips="mip", mipmap="anisotropic")
+    # A symmetric footprint has nothing to correct: the anisotropic path must
+    # produce the trilinear frame bit for bit.
+    symmetric = [px(0, 0, 0, 0, 0), px(8, 0, 0, 3, 0), px(0, 8, 0, 0, 3)]
+    add("aniso_symmetric", symmetric, filt="bilinear", mips="mip", mipmap="anisotropic")
+    add("aniso_symmetric_trilinear", symmetric, filt="bilinear", mips="mip", mipmap="trilinear")
+    # Mild anisotropy (2:1) takes two taps and a half-level correction.
+    mild = [px(0, 0, 0, 0, 0), px(8, 0, 0, 3, 0), px(0, 8, 0, 0, 1.5)]
+    add("aniso_mild", mild, filt="bilinear", mips="mip", mipmap="anisotropic")
+    # Smaller level-0 texture, so the corrected level lands near the last one.
+    add("aniso_small_base", [px(0, 0, 0, 0, 0), px(8, 0, 0, 2, 0), px(0, 8, 0, 0, 0.25)],
+        filt="bilinear", mips="base", mipmap="anisotropic")
+    # Perspective grazing: the footprint changes per pixel, so the tap pattern
+    # does too. This is the path that must stay correct without the constant
+    # fast path.
+    add("aniso_perspective", [pxw(0, 0, 0, 0, 0, 1.0), pxw(8, 0, 0, 4, 0, 0.5),
+                              pxw(0, 8, 0, 0, 1.0, 2.0)],
+        filt="bilinear", mips="mip", mipmap="anisotropic")
+    # Deterministic random grazing cases: one axis deliberately much steeper.
+    for n in range(10):
+        tri = []
+        for k in range(3):
+            x = rng.randint(-2 * SUBPIXEL_SCALE, 10 * SUBPIXEL_SCALE)
+            y = rng.randint(-2 * SUBPIXEL_SCALE, 10 * SUBPIXEL_SCALE)
+            z = struct.unpack("<f", struct.pack("<f", rng.uniform(-1, 1)))[0]
+            u = rng.uniform(-1.0, 2.0) * rng.choice([1.0, 3.0])
+            v = rng.uniform(-1.0, 2.0) * rng.choice([0.25, 0.5, 1.0])
+            w = rng.uniform(0.6, 2.0)
+            tri.append((x, y, z, u / w, v / w, 1.0 / w))
+        add(f"aniso_random_{n:02d}", tri,
+            filt=rng.choice(["nearest", "bilinear"]),
+            tint=rng.choice([(255, 255, 255, 255), (200, 210, 230, 255)]),
+            cull=rng.choice(["none", "none", "back"]),
+            front_face=rng.choice(["ccw", "cw"]),
+            mips="mip",
+            mipmap="anisotropic")
+
     return out
 
 
@@ -515,7 +629,7 @@ def emit(all_cases):
     lines.append("    /// Mip levels below level 0, largest first; empty for a level-0-only")
     lines.append("    /// case (the whole pre-mipmap corpus).")
     lines.append("    levels: []const Level,")
-    lines.append("    mipmap: enum { level0, trilinear },")
+    lines.append("    mipmap: enum { level0, trilinear, anisotropic },")
     lines.append("    /// True when level 0 is `mip_texture` (16x16), false for `texture` (4x4).")
     lines.append("    big_base: bool,")
     lines.append("};")
@@ -572,7 +686,9 @@ def main():
     pixels = sum((b >> i) & 1 for c in all_cases for b in c["mask"] for i in range(8))
     print(f"wrote {out.relative_to(root)}")
     print(f"  cases: {len(all_cases)}  drew: {drew}  culled/degenerate: {len(all_cases) - drew}")
-    print(f"  covered pixels across all cases: {pixels}")
+    aniso = [c for c in all_cases if c["mipmap"] == "anisotropic"]
+    aniso_pixels = sum((b >> i) & 1 for c in aniso for b in c["mask"] for i in range(8))
+    print(f"  anisotropic cases: {len(aniso)}  covered pixels: {aniso_pixels}")
 
 
 if __name__ == "__main__":

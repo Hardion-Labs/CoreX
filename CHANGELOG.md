@@ -8,6 +8,30 @@ declared yet.
 
 ### Added
 
+- Anisotropic minification in the software rasterizer (`Mipmap.anisotropic`,
+  `src/render/raster.zig`): isotropic LOD takes the larger axis of the UV gradient,
+  which over-blurs any surface seen at a grazing angle — a limitation the previous
+  cycle documented rather than approximated. The new mode splits the footprint into
+  the two screen-axis columns of the Jacobian, and where they differ it takes up to
+  **eight taps** along the longer one at the level matching the shorter
+  (`lod_minor = lod_major - log2(aniso)`), averaging them with one final round.
+  Three properties are tested: a **round footprint is bit-identical to trilinear**
+  (one tap, no extra cost — measured at −1% to +3%), a **constant denominator still
+  hoists** the tap pattern to once per triangle (`GradSteps.constantAniso`), and the
+  ratio, tap count and correction all **clamp at 8:1**. Cost measured with the
+  committed harness: free when the footprint is round, ~4.9x at a full 8:1 grazing
+  footprint (36.96 ms → 180.49 ms at 1024x1024), which is why the mode is opt-in and
+  `.trilinear` remains the default. The Python reference
+  (`tools/gen_raster_texture_vectors.py`) reimplements the footprint, the tap
+  pattern and the averaging independently: **17 new anisotropic cases** (grazing,
+  the 8:1 clamp, a symmetric case that must equal the trilinear frame bit for bit,
+  mild, a smaller base, a perspective case and ten deterministic random grazing
+  ones) bring the corpus to 97 frames / 1390 covered pixels, all bit-exact.
+  `Tier::capabilities` gained `anisotropic` (Medium and Advanced; Low has no
+  textures at all) and `pipeline.resolve` coerces the mode to `.trilinear` on a tier
+  without it — a quality loss at grazing angles, not a wrong frame. A quality test
+  renders the same grazing quad both ways and asserts the anisotropic frame keeps
+  more than twice the detail. 7 new tests (741 total).
 - Asset upload and eviction (`src/scene/render_scene.zig`, `src/render/pipeline.zig`):
   the render table is now filled the way a renderer actually consumes it.
   - **Mip chains for uploaded textures.** `loadAssets` builds a chain below level 0 with

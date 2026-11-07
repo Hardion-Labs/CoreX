@@ -62,6 +62,11 @@ pub const Capabilities = struct {
     antialias: bool,
     /// `FrameOptions.mipmap == .trilinear` on a texture that carries mips.
     mipmaps: bool,
+    /// `FrameOptions.mipmap == .anisotropic` may be honoured: the same levels,
+    /// sampled with several taps along an elongated pixel footprint. Asked of a
+    /// tier with `mipmaps` but not this one, `pipeline.resolve` coerces it to
+    /// `.trilinear` — a quality loss at grazing angles, not a wrong frame.
+    anisotropic: bool,
     /// `FrameOptions.light` (or a provider light) may be set.
     lighting: bool,
     /// A textured draw may bind a texture at all.
@@ -81,6 +86,7 @@ pub fn capabilities(tier: Tier) Capabilities {
             .blending = false,
             .antialias = false,
             .mipmaps = false,
+            .anisotropic = false,
             .lighting = false,
             .textures = false,
             .depth = true,
@@ -89,6 +95,7 @@ pub fn capabilities(tier: Tier) Capabilities {
             .blending = true,
             .antialias = true,
             .mipmaps = true,
+            .anisotropic = true,
             .lighting = true,
             .textures = true,
             .depth = true,
@@ -97,6 +104,7 @@ pub fn capabilities(tier: Tier) Capabilities {
             .blending = true,
             .antialias = true,
             .mipmaps = true,
+            .anisotropic = true,
             .lighting = true,
             .textures = true,
             .depth = true,
@@ -377,6 +385,7 @@ pub fn unsupported(tier: Tier, options: FrameOptions) ?[]const u8 {
     // Level selection is only meaningful where textures exist at all; a tier
     // without them cannot sample any level, so the mode is not a request.
     if (caps.textures and !caps.mipmaps and options.mipmap != .level0) return "mipmap";
+
     if (!caps.lighting and options.light != null) return "light";
     return null;
 }

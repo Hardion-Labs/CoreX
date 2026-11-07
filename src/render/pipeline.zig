@@ -172,6 +172,10 @@ pub fn resolve(tier: backend.Tier, params: FrameParams, blend_hint: raster.Blend
     };
     if (!caps.antialias) options.antialias = .none;
     if (!caps.mipmaps) options.mipmap = .level0;
+    // Anisotropy refines the level choice, so a tier without it renders the same
+    // levels trilinearly: the image is still correct, just over-blurred at grazing
+    // angles, which is a quality loss rather than a wrong frame.
+    if (!caps.anisotropic and options.mipmap == .anisotropic) options.mipmap = .trilinear;
     if (!caps.lighting) options.light = null;
     if (!caps.blending) options.blend = .none;
     return options;
@@ -785,6 +789,23 @@ test "pipeline: a malformed surface is refused before any draw" {
     var good = Scratch{};
     try good.init();
     try testing.expectError(error.UnsupportedFeature, renderFrame(gpa, .advanced, good.surface, transform.identity(), &.{}, table.resources(false), .{}, .none));
+}
+
+test "pipeline: anisotropic is coerced to trilinear where the tier lacks it" {
+    // Quality refinement, not a capability gate: the frame still renders correctly,
+    // just without the grazing-angle correction. Medium declares it, so nothing is
+    // coerced there.
+    const medium = resolve(.medium, .{ .mipmap = .anisotropic }, .none);
+    try testing.expectEqual(raster.Mipmap.anisotropic, medium.mipmap);
+
+    const low = resolve(.low, .{ .mipmap = .anisotropic }, .none);
+    // Low has no textures at all, which is already the stronger coercion.
+    try testing.expectEqual(raster.Mipmap.level0, low.mipmap);
+
+    // The documented rule holds for every tier: asking for anything above
+    // `.level0` on a tier without mipmaps lands on `.level0`, never on a mode the
+    // tier cannot sample.
+    try testing.expectEqual(raster.Mipmap.level0, resolve(.low, .{ .mipmap = .trilinear }, .none).mipmap);
 }
 
 test "pipeline: handles carry a generation, so a stale handle does not alias" {
