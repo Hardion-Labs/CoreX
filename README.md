@@ -674,7 +674,7 @@ Indicative; subject to change as technical decisions are validated.
 - [x] GUI library foundation: built-in font, RGBA8 canvas, text, layout, immediate-mode widgets, headless frame renderer.
 - [x] Editor shell: docked hierarchy, scene viewport, inspector, status bar, headless frame renderer.
 - [x] Editor editing model: reversible commands, undo/redo, dirty tracking, atomic save.
-- [ ] Editor window and real input; transform fields, tree scrolling, gizmos, asset browser.
+- [ ] Editor window and real input; rotation/camera fields, tree scrolling, gizmos, asset browser.
 - [ ] Lua VM and gameplay scripting.
 - [ ] Native Module API loader (C++).
 - [ ] Runtime player and export system / Export Templates.
@@ -745,7 +745,8 @@ contracts and limitations are in [`docs/gui-foundation.md`](docs/gui-foundation.
 The graphical editor (`corex.editor`) is built on that GUI. Its shell paints one
 complete editor frame over a session the startup pipeline already prepared: a docked
 **hierarchy** (depth-first, clickable, stable entity IDs), a **scene viewport** showing
-the engine's own rendered surface, an **inspector** whose name field is editable, and a
+the engine's own rendered surface, an **inspector** whose name, position and scale are
+editable, and a
 **status bar** carrying the save marker, the undo depth and the renderer's real
 per-frame accounting.
 
@@ -799,12 +800,13 @@ try history.undo(scene); // exact inverse, allocates nothing
 try edit.saveScene(&history, scene, io, dir, "scenes/main.scene", gpa); // staged + renamed
 ```
 
-In the shell: `Ctrl+Z` undo, `Ctrl+Y` / `Ctrl+Shift+Z` redo, `Delete` delete the
-selection, `Escape` clear it, `Enter` in the name field commit a rename.
+In the shell: click the name, a position or a scale field, type, press `Enter` to commit
+one undoable step (`Escape` discards it); `Ctrl+Z` undo, `Ctrl+Y` / `Ctrl+Shift+Z` redo,
+`Delete` delete the selection, `Escape` clear it.
 
-Limits: no window or real input, only the name is editable (the model already carries
-`set_component`), the history is in-memory and not persisted, no tree scrolling, no
-gizmos or camera controls, fixed dock widths. See
+Limits: no window or real input, rotation and camera fields are read-only (the model
+already carries `set_component`), the history is in-memory and not persisted, no field
+scrubbing, no tree scrolling, no gizmos or camera controls, fixed dock widths. See
 [`docs/editor-shell.md`](docs/editor-shell.md).
 
 ## Development

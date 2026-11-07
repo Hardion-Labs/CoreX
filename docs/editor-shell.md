@@ -80,14 +80,28 @@ copied. Values are clipped to their own rect so a long name cannot run into the 
 column. With nothing selected the panel says so; an entity with no components still
 shows its name, ID and parent.
 
-The **name** is editable: clicking it focuses a text field, typing edits a buffer,
-**Enter** commits a `rename` command through the history and **Escape** discards the
-buffer. The buffer is what keeps a half-typed name out of the scene, and the history is
-what makes the commit undoable and marks the project dirty. The other rows stay
-read-only until the model grows a numeric field.
+The **name**, **position** and **scale** are editable; rotation, the renderable handles,
+the camera fov and the parent stay read-only.
 
-The field holds the keyboard while focused: a focused field must not also treat the
-frame's bytes as shortcuts (`Delete` is a text key there, not "destroy the entity").
+Every editable field follows the same rule: **typing edits a buffer, Enter commits
+through the history, Escape discards.** The buffer is what keeps a half-typed value out
+of the scene; the history is what makes the commit one undoable step and marks the
+project dirty.
+
+- The **name** commits a `rename` command.
+- **`pos`** and **`scale`** are rows of three numeric fields (`src/editor/inspector.zig`).
+  A commit builds the *whole* `Transform` — the edited row plus the untouched one — and
+  sends it as a **single** `set_component`, so `Ctrl+Z` steps back over the whole value
+  the user changed and an axis they did not touch is never rewritten.
+- A field that is not a number (`abc`, an empty box, `nan`, an overflow) commits
+  **nothing**: the row reverts to what the scene holds, so the panel never claims a value
+  the scene does not have. Leaving a field after editing it commits, the way a form does,
+  so a typed value is not silently lost.
+- The rows reload from the scene when the entity or the underlying values change (undo, a
+  command, a selection change) but **never while the user is typing**.
+
+Any focused inspector field holds the keyboard: the frame's shortcuts do not fire, so
+`Delete` is a text key there and never "destroy the entity".
 
 ## Status bar
 
@@ -181,8 +195,12 @@ behaviour, not a workaround.
 - **No window, no swapchain, no real input.** Blocked in this environment (no X11
   headers, no `DISPLAY`). The shell paints into a caller-owned buffer; wiring it to a
   window is `present()` of that same buffer.
-- **Only the name is editable.** Transform/camera fields need numeric input widgets;
-  the model already carries `set_component`, so that is a UI step, not a model one.
+- **Rotation and camera fields are read-only.** Rotation needs a field that can express a
+  normalized quaternion honestly (or an Euler editor with its own conversion rules), and
+  the camera fov is a single value with no angle widget yet. Neither is a model gap: the
+  history already carries `set_component` for any component.
+- **No scrub/drag on numeric fields.** Values are typed; a drag-to-scrub affordance needs
+  pointer-drag state the GUI can already report, but it is a separate interaction.
 - **The history is in-memory and per-session.** It is not persisted, and there is no
   "reopen and undo" — deliberate for now.
 - **No multi-select, no copy/paste, no grouping.**

@@ -33,6 +33,7 @@ const input_mod = @import("../gui/input.zig");
 const theme_mod = @import("../gui/theme.zig");
 const widgets = @import("../gui/widgets.zig");
 const edit = @import("edit.zig");
+const inspector = @import("inspector.zig");
 const scene_mod = @import("../scene/scene.zig");
 const render_scene = @import("../scene/render_scene.zig");
 
@@ -93,6 +94,16 @@ pub const State = struct {
     /// Entity the buffer currently mirrors, so a selection change reloads it. 0 means
     /// "resynchronize on the next frame".
     name_owner: u64 = 0,
+
+    /// Editable transform rows. They live beside the name buffer for the same reason:
+    /// they are what the user is typing, not what the scene holds.
+    transform_pos: inspector.Row(3) = .{},
+    transform_scale: inspector.Row(3) = .{},
+
+    /// True while any inspector field holds the keyboard. One flag, set once per frame by
+    /// the inspector, because the frame-level shortcuts must not fire for *any* focused
+    /// field — `Delete` in a text field is a text key, never "destroy the entity".
+    text_focused: bool = false,
 };
 
 /// The dock geometry of one frame, as rectangles. Exposed (rather than kept private)
@@ -172,7 +183,7 @@ pub fn draw(
     if (!dock.inspector.isEmpty()) drawInspector(ctx, state, scene, history, dock.inspector);
     if (!dock.status.isEmpty()) drawStatus(ctx, state, history, frame, dock.status, dock.viewport);
 
-    if (!state.name_focused) applyShortcuts(ctx, state, scene, history);
+    if (!state.text_focused) applyShortcuts(ctx, state, scene, history);
     return state.selection_changed;
 }
 
@@ -277,6 +288,7 @@ fn drawInspector(
     const line_h: i32 = @intCast(font.line_height);
     const theme = ctx.theme;
 
+    state.text_focused = false;
     const entity = if (state.selected != 0) scene.entityById(state.selected) else null;
     const ent = entity orelse {
         state.name_focused = false;
@@ -293,10 +305,16 @@ fn drawInspector(
     fieldRow(ctx, &stack, content, "id", id_line);
 
     if (scene.getComponent(render_scene.Transform, ent)) |t| {
-        const pos = std.fmt.bufPrint(&buf, "{d:.1} {d:.1} {d:.1}", .{ t.position[0], t.position[1], t.position[2] }) catch "?";
-        fieldRow(ctx, &stack, content, "pos", pos);
-        const scl = std.fmt.bufPrint(&buf, "{d:.1} {d:.1} {d:.1}", .{ t.scale[0], t.scale[1], t.scale[2] }) catch "?";
-        fieldRow(ctx, &stack, content, "scale", scl);
+        // Position and scale are editable; rotation stays read-only until there is a
+        // field that can express a normalized quaternion honestly.
+        const row_h = line_h + 2;
+        const pos_row = stack.measure(.{ .w = content.w, .h = row_h });
+        // A rejected value is already reverted inside `drawTransformRow`; the only
+        // error left is the history refusing the store (out of memory), and swallowing
+        // that would show the user a value the scene does not have.
+        drawTransformRow(ctx, state, scene, history, ent, &state.transform_pos, pos_row, .position, t, "pos") catch |err| reportEditFailure(err, "pos");
+        const scale_row = stack.measure(.{ .w = content.w, .h = row_h });
+        drawTransformRow(ctx, state, scene, history, ent, &state.transform_scale, scale_row, .scale, t, "scale") catch |err| reportEditFailure(err, "scale");
     }
     if (scene.getComponent(render_scene.Renderable, ent)) |r| {
         const mesh = std.fmt.bufPrint(&buf, "mesh {d} / mat {d}", .{ r.mesh, r.material }) catch "?";
@@ -317,7 +335,127 @@ fn drawInspector(
     const parent = scene.parent(ent);
     fieldRow(ctx, &stack, content, "parent", if (parent) |p| (scene.nameOf(p) orelse "?") else "root");
 
+    // Publish the keyboard claim for the shortcut pass, which runs after the panels.
+    state.text_focused = state.name_focused or
+        state.transform_pos.isFocused() or
+        state.transform_scale.isFocused();
+
     ctx.blockBelow(rect);
+}
+
+/// An edit that could not be stored. The editor keeps running (a frame must paint), but
+/// the failure is not silent: the field was reverted inside the row painter, and the
+/// reason goes to stderr where a headless session can see it.
+fn reportEditFailure(err: anyerror, row: []const u8) void {
+    std.debug.print("editor: could not store the {s} edit ({s}); the field was reverted\n", .{ row, @errorName(err) });
+}
+
+/// Which part of a `Transform` a row edits, and how to address it on commit.
+const TransformField = enum {
+    position,
+    scale,
+
+    fn get(self: TransformField, t: render_scene.Transform) [3]f32 {
+        return switch (self) {
+            .position => t.position,
+            .scale => t.scale,
+        };
+    }
+
+    fn set(self: TransformField, t: *render_scene.Transform, values: [3]f32) void {
+        switch (self) {
+            .position => t.position = values,
+            .scale => t.scale = values,
+        }
+    }
+};
+
+/// One editable transform row (`pos` or `scale`).
+///
+/// A commit builds the **whole** transform (the edited row plus the untouched one) and
+/// sends it as a single `set_component`, so one keystroke-and-Enter is one undo step, and
+/// a value the user did not touch is never rewritten.
+fn drawTransformRow(
+    ctx: *widgets.Context,
+    state: *State,
+    scene: anytype,
+    history: anytype,
+    entity: anytype,
+    row: anytype,
+    rect: Rect,
+    comptime field: TransformField,
+    transform: *const render_scene.Transform,
+    key: []const u8,
+) !void {
+    const values = field.get(transform.*);
+    // Load the buffers from the scene whenever the values changed underneath (a reload,
+    // an undo, another command). `signature` is a cheap hash of the three floats, so the
+    // comparison is not a second copy of the transform.
+    var sig = std.hash.Wyhash.init(0);
+    for (values) |v| sig.update(std.mem.asBytes(&v));
+    const signature = sig.final();
+    if (row.owner != state.selected or row.signature != signature) {
+        if (!row.isFocused()) {
+            row.load(values);
+            row.owner = state.selected;
+            row.signature = signature;
+        }
+    }
+    const seed = switch (field) {
+        .position => @as(u64, 0x706f_73),
+        .scale => @as(u64, 0x7363_616c),
+    };
+    const outcome = inspector.drawRow(ctx, 3, row, rect, .{
+        .entity_id = state.selected,
+        .signature = signature,
+        .key = key,
+    }, @intCast(font.line_height + 2), seed);
+
+    switch (outcome) {
+        .idle => return,
+        .escape => {
+            row.load(values);
+            row.owner = state.selected;
+            row.signature = signature;
+            return;
+        },
+        .commit => {},
+    }
+
+    const typed = row.values() orelse {
+        // A field that is not a number is not a value: revert rather than commit
+        // something the user did not type.
+        row.load(values);
+        row.owner = state.selected;
+        row.signature = signature;
+        return;
+    };
+
+    var next = transform.*;
+    field.set(&next, typed);
+    if (!next.isValid()) {
+        row.load(values);
+        row.owner = state.selected;
+        row.signature = signature;
+        return;
+    }
+    // Nothing changed (Enter on an untouched row) is not an edit.
+    if (std.mem.eql(u8, std.mem.asBytes(&typed), std.mem.asBytes(&values))) {
+        row.signature = signature;
+        return;
+    }
+
+    const id = scene.idOf(entity) orelse return;
+    try history.apply(scene, .{ .set_component = .{
+        .id = id,
+        .value = edit.valueFor(@TypeOf(scene.*), render_scene.Transform, next),
+    } });
+    row.owner = state.selected;
+    // After the commit the scene holds `next`; take its signature so the next frame does
+    // not think the buffers are stale and reload over the user's text.
+    var post = std.hash.Wyhash.init(0);
+    for (field.get(next)) |v| post.update(std.mem.asBytes(&v));
+    row.signature = post.final();
 }
 
 /// The `name:` row of the inspector: a real text field.
@@ -391,7 +529,7 @@ fn commitName(state: *State, history: anytype, scene: anytype, entity: anytype) 
     if (std.mem.eql(u8, typed, current)) return;
     const id = scene.idOf(entity) orelse return;
     const name: ?edit.Name = if (state.name_len == 0) null else edit.Name.init(typed) orelse return;
-    history.apply(scene, .{ .rename = .{ .id = id, .name = name } }) catch {};
+    history.apply(scene, .{ .rename = .{ .id = id, .name = name } }) catch |err| reportEditFailure(err, "name");
 }
 
 /// Point the field at the entity's current name, so the next keystroke starts from what
@@ -1017,4 +1155,117 @@ test "editor: an undo that removes the selected entity drops the selection" {
     try testing.expect(h.scene.entityById(new_id) == null);
     try testing.expectEqual(@as(u64, 0), h.state.selected);
     try testing.expectEqual(@as(u64, 0), h.state.name_owner);
+}
+
+/// Find a transform row's field on the last painted frame, so a test can click it.
+fn numFieldRect(h: *Harness, seed: u64, key: []const u8, index: usize) Rect {
+    const id = widgets.Id.from(seed + index, key);
+    var i: usize = 0;
+    while (i < h.ctx.entry_count) : (i += 1) {
+        if (h.ctx.entries[i].id.eql(id)) return h.ctx.entries[i].rect;
+    }
+    return Rect.none;
+}
+
+const seed_pos: u64 = 0x706f_73;
+const seed_scale: u64 = 0x7363_616c;
+
+fn focusNumField(h: *Harness, rect: Rect) void {
+    h.hover(rect.x + 2, rect.y + 2);
+    h.click(rect.x + 2, rect.y + 2);
+    h.release(rect.x + 2, rect.y + 2);
+}
+
+test "editor: typing a position and committing it is one undoable set_component" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.state.selected = h.root_id;
+    h.runFrames(2);
+
+    const field = numFieldRect(&h, seed_pos, "pos", 0);
+    try testing.expect(!field.isEmpty());
+    focusNumField(&h, field);
+    // The field starts from the scene's value, so the user sees what they are editing.
+    try testing.expect(h.state.transform_pos.isFocused());
+
+    // Select the whole buffer and type a new x, then commit.
+    h.frameInput(.{ .key = .home }, &h.state);
+    h.frameInput(.{ .key = .delete }, &h.state);
+    h.frameInput(.{ .text = "7.5" }, &h.state);
+    const before = h.history.undoDepth();
+    h.frameInput(.{ .key = .enter }, &h.state);
+
+    const root = h.scene.entityById(h.root_id).?;
+    const t = h.scene.getComponent(render_scene.Transform, root).?;
+    try testing.expectEqual(@as(f32, 7.5), t.position[0]);
+    // The axes the user did not touch are preserved exactly.
+    try testing.expectEqual(@as(f32, 2), t.position[1]);
+    try testing.expectEqual(@as(f32, 3), t.position[2]);
+    // One command, not three, so a single undo steps back over the whole value.
+    try testing.expectEqual(before + 1, h.history.undoDepth());
+
+    try testing.expect(undo(&h.history, &h.scene));
+    const back = h.scene.getComponent(render_scene.Transform, h.scene.entityById(h.root_id).?).?;
+    try testing.expectEqual(@as(f32, 1), back.position[0]);
+    try testing.expectEqual(@as(f32, 2), back.position[1]);
+}
+
+test "editor: an unparsable value is not committed and the field reverts" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.state.selected = h.root_id;
+    h.runFrames(2);
+
+    const field = numFieldRect(&h, seed_pos, "pos", 2);
+    focusNumField(&h, field);
+    h.frameInput(.{ .key = .home }, &h.state);
+    h.frameInput(.{ .key = .delete }, &h.state);
+    h.frameInput(.{ .text = "abc" }, &h.state);
+    const before = h.history.undoDepth();
+    h.frameInput(.{ .key = .enter }, &h.state);
+
+    const t = h.scene.getComponent(render_scene.Transform, h.scene.entityById(h.root_id).?).?;
+    try testing.expectEqual(@as(f32, 3), t.position[2]);
+    try testing.expectEqual(before, h.history.undoDepth());
+    // The buffer went back to what the scene holds, so the panel never claims a value
+    // the scene does not have.
+    try testing.expectEqualStrings("3", h.state.transform_pos.fields[2].text());
+}
+
+test "editor: Escape abandons a typed transform value" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.state.selected = h.root_id;
+    h.runFrames(2);
+
+    const field = numFieldRect(&h, seed_scale, "scale", 1);
+    focusNumField(&h, field);
+    h.frameInput(.{ .key = .home }, &h.state);
+    h.frameInput(.{ .key = .delete }, &h.state);
+    h.frameInput(.{ .text = "9" }, &h.state);
+    h.frameInput(.{ .key = .escape }, &h.state);
+
+    const t = h.scene.getComponent(render_scene.Transform, h.scene.entityById(h.root_id).?).?;
+    try testing.expectEqual(@as(f32, 1), t.scale[1]);
+    try testing.expectEqualStrings("1", h.state.transform_scale.fields[1].text());
+    try testing.expectEqual(@as(usize, 0), h.history.undoDepth());
+    try testing.expect(!h.history.dirty);
+}
+
+test "editor: the numeric fields follow the selection instead of the previous entity" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    // The child's transform is identity; the root sits at (1,2,3).
+    h.state.selected = h.root_id;
+    h.runFrames(2);
+    try testing.expectEqualStrings("1", h.state.transform_pos.fields[0].text());
+
+    h.state.selected = h.child_id;
+    h.runFrames(2);
+    try testing.expectEqualStrings("0", h.state.transform_pos.fields[0].text());
+    try testing.expectEqualStrings("1", h.state.transform_scale.fields[0].text());
 }

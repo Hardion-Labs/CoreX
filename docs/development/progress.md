@@ -4,6 +4,60 @@ Permanent record of real progress, decisions, pending items and the next priorit
 task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
+## Cycle 2026-11-07 (k) — Editable transform rows in the inspector
+
+**Diagnosis first.** Cycle (j) left the model complete but only the *name* editable; the
+recorded next priority was to bind the inspector's transform rows to `set_component`.
+Window/swapchain remains blocked (unchanged; not attempted), so this is again pure
+headless UI over a validated model.
+
+**Delivered (validated):**
+
+- **`editor/inspector.zig`** (new, `corex.editor.shell` re-exports nothing new — the
+  module is used by the shell) — the numeric row primitive: `Field` (24-byte inline
+  buffer, `set`, `text`, `parsed`), `Row(count)` (inline fields, focus index, owner +
+  value signature for reload), `drawRow` (widgets.TextField per axis, Enter commits,
+  Escape reverts, focus loss after a change commits) and `Outcome`.
+  - Parsing refuses empty, `abc`, `nan`, `inf` and overflow; a single bad axis makes the
+    row uncommittable rather than committing a partial value.
+- **`edit.componentIndexOf` / `edit.valueFor`** — a caller names a component by *type*
+  and the schema picks the union arm, at comptime. Adding a component before `transform`
+  cannot silently shift what the inspector edits.
+- **Shell** — `pos` and `scale` rows are editable, each commit is **one**
+  `set_component` of the whole `Transform` (one undo step, untouched axes preserved), and
+  `Escape` reverts. Rotation/render/camera/parent stay read-only.
+- **`State.text_focused`** — one flag set by the inspector each frame; the shortcut pass
+  keys off it, so no focused field can trigger `Delete`/`Escape`/`Ctrl+Z` behind the
+  user's back.
+- **No swallowed failures** — a store the history refuses is reported on stderr after the
+  field is reverted (`reportEditFailure`), instead of `catch {}`.
+
+**Bugs found and fixed while validating:**
+
+- `Field.text()`/`parsed()`/`Row.values()` took `self` **by value**: the returned slice
+  pointed at a temporary copy, so parsing read unrelated memory (observed as `parsed()`
+  returning `null` for `"1.5"`). Receivers are pointers now.
+- `Delete` while a numeric field had focus **destroyed the selected entity** — the
+  shortcut gate only knew about the name field. Caught by an integration test, not by
+  reading the code.
+- Two Zig 0.17 issues: a parameter shadowing a method name (`values`), and `@intCast`
+  needing an explicit result type inside `@divTrunc`.
+
+**Suite:** **851/851** tests (clean cache), fmt clean, `zig build` OK, `editor-frame`
+640x360 with 11 widgets (the four new numeric fields are hit-testable), preview refreshed.
+
+**Decisions:** the inspector's numeric rows live in their own module because parsing and
+commit rules are testable without a canvas and the shell must stay a composition layer; a
+commit is always one command for one user action; a non-numeric field reverts rather than
+being clamped; the "a field holds the keyboard" decision is one flag, not one per field.
+
+**Pending / not in this cycle:** rotation and camera fields (need a quaternion/Euler
+story), field scrubbing, multi-select, persisted history.
+
+**Next priority:** hierarchy interaction depth — create/rename/delete/reparent from the
+tree (the model already has every command) and tree scrolling, then the window/real-input
+layer when the sandbox allows it.
+
 ## Cycle 2026-11-07 (j) — Editing model: commands, undo/redo, dirty tracking, atomic save
 
 **Diagnosis first.** With the shell merged (#56) the editor could *show* a scene but not
