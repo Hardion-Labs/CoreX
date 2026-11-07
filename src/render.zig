@@ -60,6 +60,20 @@ pub const RenderFrame = draw.RenderFrame;
 pub const SortMode = draw.SortMode;
 pub const extractDrawList = draw.extractDrawList;
 
+/// Renderer tier contract shared by every backend (`low`/`medium`/`advanced`)
+/// and the CPU driver that implements it today; see `docs/render-backend.md`.
+pub const backend = @import("render/backend.zig");
+pub const Tier = backend.Tier;
+pub const Backend = backend.Backend;
+pub const BackendSurface = backend.Surface;
+pub const FrameOptions = backend.FrameOptions;
+pub const FrameStats = backend.FrameStats;
+pub const DrawStats = backend.DrawStats;
+pub const DrawResources = backend.DrawResources;
+pub const SoftwareBackend = backend.SoftwareBackend;
+pub const capabilities = backend.capabilities;
+pub const unsupported = backend.unsupported;
+
 pub const Target = raster.Target;
 pub const ScreenVertex = raster.ScreenVertex;
 pub const RasterMesh = raster.Mesh;
