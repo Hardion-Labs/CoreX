@@ -58,6 +58,10 @@ continuation. Newest cycle first.
   (`0.17.0` is yanked/missing its binary). CI still pins 0.17.0 and is green, so the
   engine does not depend on the patch version.
 
+**Merged:** PR **#43** → `main` `e90f1cb`, CI green (1 m 55 s). Post-merge on `main`
+in a clean worktree: **708/708**, `zig fmt --check` clean, `zig build` OK, smoke
+prints the frame line, `--mode validate` OK.
+
 **Next priority:** presentation — a window + event loop driving
 `EngineRenderer.render` with owned colour/depth and the now-implemented per-frame
 arena (then asset upload/eviction and CXTX mips).
