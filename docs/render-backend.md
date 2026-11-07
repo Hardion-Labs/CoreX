@@ -244,18 +244,19 @@ Presentation — a window, a swapchain, a frame loop — is still the next layer
 - **`FrameStats.culled` counts triangles**, because that is what the rasterizer
   reports per draw; a GPU backend may report draw-level culling instead, so the
   number is documented as backend-reported diagnostics, not a contract value.
-- **No presentation.** The engine binary renders one headless frame at startup and
-  prints its accounting, but no window, swapchain or frame loop exists: there is no
-  per-frame content on screen yet, and colour/depth are allocated per frame instead
-  of being owned by a loop.
+- **No window or swapchain.** A headless frame loop now exists
+  ([presentation.md](presentation.md)): it owns colour/depth for the whole run and
+  renders `--frames` frames (default 1), reusing the draw list and per-frame arenas,
+  so nothing is on screen and nothing allocates after the warm-up. A window,
+  swapchain, vsync and input still need a platform library.
 - **One frame in, one frame out.** No sub-frame pipelining and no per-pass API;
   `renderScene` extracts and draws in one call. A frame loop should drive
   `EngineRenderer.render` (reusable draw list + per-frame scratch arena, so a
   steady-state frame allocates nothing) rather than `renderScene`, which allocates
   its draw list per call.
 - **The surface is the caller's.** Colour and depth are owned by whoever renders;
-  the engine binary allocates them per headless frame because it has no loop to own
-  them. A window layer will keep one pair and clear once per frame.
+  `runtime.presentation.SurfaceTarget` owns one pair for a whole run and reallocates
+  only when the size changes.
 - **Resource table is manual.** Slots are bound by the caller; there is no
   automatic upload/eviction from the asset index, and no mip generation for `CXTX`
   textures (the artifact carries no levels yet).

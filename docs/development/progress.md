@@ -4,6 +4,77 @@ Permanent record of real progress, decisions, pending items and the next priorit
 task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
+## Cycle 2026-11-07 (b) — Presentation: owned frame surface + bounded frame loop
+
+**Delivered (validated):**
+
+- `src/runtime/` (new, `corex.runtime`, `docs/presentation.md`): the presentation layer,
+  which was the documented next priority.
+  - `presentation.SurfaceTarget` — RGBA8 colour + `f32` depth owned for a whole run.
+    `resize` returns whether it reallocated (a loop asking for the same size every frame
+    is a comparison, not an allocation) and allocates **both** buffers before replacing
+    either, so a failed or rejected resize leaves the previous frame intact and
+    renderable. Zero-sized and `> raster.max_dimension` requests are refused: a
+    zero-pixel surface is what a minimised window reports and rendering into it would
+    make every statistic meaninglessly zero. `clear` is explicit and once per frame.
+  - `presentation.FrameLoop` — owns the target, the `EngineRenderer` and one scratch
+    arena, and runs `--frames` frames. `RunReport{frames, empty_frames,
+    allocating_frames, last}`. A scene with no camera stops the loop instead of
+    repeating an answer that cannot change.
+  - Finding the camera calls `findCamera`, which resolves a world matrix and therefore
+    allocates a transform snapshot. Measured: that was **72 bytes per frame**. The loop
+    now owns `camera_scratch`, reset once per frame — the same hand-off `RenderFrame`
+    already does, applied one level up.
+- `--frames <n>` in the launch contract (`src/core/cli.zig`, `docs/launch-contract.md`):
+  bounded runs, default 1 (previous behaviour), `0` rejected as `error.InvalidFrames`
+  (exit 2). The binary now uses `FrameLoop` instead of the one-shot
+  `renderSceneFrame`, and prints
+  `Frames: N of N (N allocating) at WxH <tier> — last frame: …`.
+- Docs: new `docs/presentation.md`; `architecture.md` (module map + runtime section +
+  independent-runtime status), `render-backend.md` (limitations rewritten),
+  `launch-contract.md`, `README.md`, `CHANGELOG.md`.
+
+**Validation:**
+
+- `zig build test --summary all` → **718/718** (clean `.zig-cache`); also green with
+  `-Doptimize=ReleaseSafe` and `-Doptimize=ReleaseFast`.
+- `zig fmt --check src build.zig` clean; `zig build` OK.
+- Headless smoke on the example: `--frames 120` →
+  `Frames: 120 of 120 (2 allocating) at 1280x720 medium — last frame: 1 commands,
+  1 draws, 0 skipped, 43264 pixels, 0 culled`. `--mode runtime --frames 10` same;
+  `--mode validate --frames 5` still prepares no session; `--frames 0` exits 2 with a
+  usage message.
+
+**Errors found and fixed:**
+
+- `--frames` accepted a duplicate flag (the other options all reject one). Caught by the
+  new CLI test, fixed with an explicit `DuplicateArgument`.
+- First `FrameLoop` attempt allocated 72 bytes every frame: camera lookup built a world
+  transform snapshot per call. Fixed with the loop's own scratch arena, which is why the
+  steady-state test can assert 0 calls.
+- The failing-allocator test initially failed on `init` rather than on the resize,
+  because the allocator's failure index counted from construction. Restructured to fail
+  only the resize, in **both** orders (colour allocation fails, depth allocation fails)
+  so the rollback path is covered.
+- A duplicated block in `main.zig` was caught before it shipped: the binary now calls
+  `FrameLoop.run` and formats its report, instead of re-implementing the loop.
+
+**Decisions:**
+
+- No window/swapchain/vsync/input: they need a platform library and inventing the
+  abstraction beforehand would be speculative. The bounded `--frames` count is the honest
+  form of "run for a while" while nothing can terminate the loop.
+- Clearing stays the caller's call (once per frame) rather than moving into `render`,
+  which would add a full-surface pass on frames whose depth is already at the far plane.
+- `run` stops on a scene with no camera rather than looping to the count, and reports the
+  declined frames as `empty_frames` — it does not pretend to have rendered them.
+
+**Pending:** window/surface backend, swapchain and vsync (then `target_fps` can be
+honoured), input/event loop, frame timing statistics.
+
+**Next priority:** a window + swapchain backend that presents the surface the loop
+already owns, so the loop becomes visible and can be paced by the real present.
+
 ## Cycle 2026-11-07 (a) — Merge cleanup, stale-branch sweep, per-frame allocator hand-off
 
 **Delivered (validated):**

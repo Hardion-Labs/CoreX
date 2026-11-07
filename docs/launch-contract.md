@@ -27,6 +27,7 @@ corex-engine [options]
 | `--mode`, `-m` | `editor` \| `runtime` \| `validate` | Launch mode. Default: `editor`. |
 | `--scene` | path | Overrides the manifest's initial scene. Path relative to the project, without `..`. |
 | `--headless` | — | Forces execution without a graphical window (splash/editor in headless mode, log only). The graphical mode is planned; until the GUI library exists, execution is headless by default. |
+| `--frames` | integer > 0 | Frames to render before exiting. Default `1`. A headless run has no window to close, so the count bounds it; `validate` renders nothing regardless. |
 | `--jobs` | integer > 0 | Number of job-system workers. Default: logical cores minus one (minimum 1). |
 | `--log-level` | `error` \| `warn` \| `info` \| `debug` | Log level. Default: `info`. |
 | `--version`, `-v` | — | Prints the engine version and exits with code 0. |

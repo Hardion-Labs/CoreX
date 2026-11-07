@@ -43,6 +43,10 @@ pub const assets = @import("assets.zig");
 /// draw-list extraction (the CPU foundation the GPU tiers will consume).
 pub const render = @import("render.zig");
 
+/// Runtime subsystem: presentation (the frame-sized target a loop owns) and, as the
+/// platform layers land, the loop itself.
+pub const runtime = @import("runtime.zig");
+
 /// Audio subsystem: device-independent mixing (voices, buses, gain/pan, pitch,
 /// resampling) — the CPU foundation the OS playback backends will consume.
 pub const audio = @import("audio.zig");
@@ -64,6 +68,7 @@ test {
     _ = ecs;
     _ = scene;
     _ = assets;
+    _ = runtime;
     _ = audio;
     _ = @import("audio/cxaw_playback_test.zig");
     _ = @import("ecs/schedule_jobs_test.zig");
