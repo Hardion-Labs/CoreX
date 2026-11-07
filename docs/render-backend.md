@@ -41,6 +41,8 @@ so the tiers differ by documented, asserted feature sets instead of prose:
 | `blending` (`.alpha` / `.premultiplied` / `.additive`) | no | yes | yes |
 | `mipmaps` (`.trilinear` level selection) | no | yes | yes |
 | `antialias` (`.edge`) | no | yes | yes |
+| `anisotropic` (`Mipmap.anisotropic`) | no | yes | yes |
+| `sampling_controls` (`Sampling`: level bias, tap cap) | no | yes | yes |
 
 Low is the documented floor: opaque, untextured, unlit geometry with a depth
 buffer — "broad hardware reach, minimal feature set". Medium is everything the CPU
@@ -70,9 +72,9 @@ Two derived rules keep the gate honest:
 | --- | --- |
 | `Tier` | `low` / `medium` / `advanced`; `name()` for logs and diagnostics. |
 | `Capabilities` | One boolean per feature, returned by `capabilities(tier)`. |
-| `FrameOptions` | What the caller asks of a frame: `blend`, `antialias`, `mipmap`, `light`, `depth_test`, `depth_write`, `cull`, `front_face`. `rasterOptions()` converts to the rasterizer's `Options` so a field can never be forgotten on one side. |
+| `FrameOptions` | What the caller asks of a frame: `blend`, `antialias`, `mipmap`, `sampling`, `light`, `depth_test`, `depth_write`, `cull`, `front_face`. `rasterOptions()` converts to the rasterizer's `Options` so a field can never be forgotten on one side. |
 | `Surface` | The framebuffer: `width`, `height`, borrowed RGBA8 `color` (`w*h*4`), borrowed `f32` `depth` (`w*h`). `validate()`, `clear(rgba, depth)`, `pixelCount()`. `Surface.of(&target)` adapts the rasterizer's `Target` — a cast, not a copy. |
-| `DrawResources` | The asset resolver as a **runtime** value: a pointer plus `meshFn`/`colorFn` and optional `textureFn`/`lightFn`. `fromComptime(&provider)` adapts any provider the rasterizer already accepts — by pointer, so the borrow and its lifetime are explicit. |
+| `DrawResources` | The asset resolver as a **runtime** value: a pointer plus `meshFn`/`colorFn` and optional `textureFn`/`lightFn`/`samplingFn`. `fromComptime(&provider)` adapts any provider the rasterizer already accepts — by pointer, so the borrow and its lifetime are explicit. |
 | `DrawStats` | Per draw: `submitted`, `skipped`, `pixels`, `antialiased`, `culled`. |
 | `FrameStats` | Accumulated: `draws`, `submitted`, `skipped`, `pixels`, `antialiased_pixels`, `culled`; `add(DrawStats)` is the only way to fold one in. |
 | `Backend` | The vtable: `tier`, `beginFrame(surface, options)`, `draw(command, mvp, resources)`, `endFrame()`, `deinit(gpa)`. |
@@ -146,6 +148,12 @@ driver serves `.low` (through the capability gate) and `.medium`.
   in the test), and a partial-coverage frame reports `antialiased_pixels`.
 - **Lifecycle.** Every misuse path above is a test, including the malformed
   surface and the second frame.
+- **Sampling precedence.** `FrameOptions.sampling` is the frame default; a
+  provider's optional `sampling(handle)` overrides it **per material** on a tier
+  that declares `sampling_controls`, and is inert elsewhere (`pipeline.resolve`
+  zeroes the field, so the uncorrected level renders instead of a refusal). Absent
+  optional declarations are not defaulted: a provider without `sampling` yields a
+  null function pointer and the frame default stands.
 - **Light precedence.** Provider light → used; explicit `FrameOptions.light` →
   wins; tier without lighting → provider ignored (vertex colour survives).
 - **Adapter fidelity.** `fromComptime` yields null function pointers for absent
@@ -180,8 +188,8 @@ renderScene(gpa, tier, surface, scene, camera, sort_mode, resources, params)
   refuses it (`error.PreparationFailed`, exit code 6) instead of silently rendering
   a tier lower.
 - `resolve(tier, params, blend_hint)` turns a `FrameParams` into `FrameOptions`
-  the tier can actually honour: antialiasing, mip selection, lighting and blending
-  are switched off on a tier that lacks them. The pipeline never trips the gate it
+  the tier can actually honour: antialiasing, mip selection, sampling controls,
+  lighting and blending are switched off on a tier that lacks them. The pipeline never trips the gate it
   documents, and a caller still gets the whole feature set for free on Medium.
   The default blend comes from the extraction sort — `back_to_front` means
   transparency (`.alpha`), the other modes are opaque.
@@ -237,8 +245,10 @@ Presentation — a window, a swapchain, a frame loop — is still the next layer
 - **One surface format.** RGBA8 colour and `f32` depth only. HDR, MSAA targets and
   sRGB views are not modelled; a GPU backend would keep its own handles behind the
   vtable and use `Surface` only for readback.
-- **Per-frame options only.** No per-material or per-pass state, no render passes,
-  no compute, no command buffers: `draw` is immediate-mode.
+- **Almost per-frame options only.** `FrameOptions` is the frame default and
+  `sampling` is the single per-material override (resolved through the provider per
+  draw). There is no material object, no other per-material or per-pass state, no
+  render passes, no compute and no command buffers: `draw` is immediate-mode.
 - **No parallelism.** A backend draws on the calling thread; the frame loop,
   double buffering and presentation belong to the (planned) runtime/window layer.
 - **`FrameStats.culled` counts triangles**, because that is what the rasterizer

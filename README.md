@@ -436,7 +436,11 @@ aliased path); a texture without `mips` samples level 0 exactly as before.
 `Options.mipmap = .anisotropic` adds up to eight taps along an elongated pixel
 footprint, which stops the over-blur a grazing surface gets from a single level —
 free when the footprint is round, ~5x at a full 8:1 grazing footprint, so it is
-opt-in.
+opt-in. `corex.render.raster.Sampling` adds the two per-material controls a real
+renderer exposes — a LOD bias and an anisotropic tap cap — as plain data on
+`Options.sampling`, overridable per material by the resource provider's optional
+`sampling(handle)`; the default biases and caps nothing, so it changes no existing
+frame, and a tier without the capability renders with the uncorrected level.
 
 The extraction design and math conventions are documented in
 [`docs/render-extraction.md`](docs/render-extraction.md); the rasterizer, its
@@ -654,6 +658,7 @@ Indicative; subject to change as technical decisions are validated.
 - [x] Rasterizer antialiasing: 4x4 sub-sample coverage, per-draw accumulation, `Antialias.edge`.
 - [x] Rasterizer mipmaps: integer box-filter chain, per-pixel LOD, trilinear sampling.
 - [x] Rasterizer anisotropic filtering: up to 8 footprint-aligned taps, `Mipmap.anisotropic`.
+- [x] Per-material LOD bias and anisotropic tap cap (`Sampling`, frame default + per-material override).
 - [ ] GUI library and graphical editor.
 - [ ] Lua VM and gameplay scripting.
 - [ ] Native Module API loader (C++).

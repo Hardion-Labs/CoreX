@@ -130,6 +130,19 @@ const GrazingResources = struct {
 };
 
 fn runGrazing(gpa: std.mem.Allocator, size: u32, cmds: []const R.DrawCommand, mode: R.Mipmap) !Run {
+    return runGrazingSampling(gpa, size, cmds, mode, .{});
+}
+
+/// The same grazing draw with explicit sampling controls: the tap cap is the knob
+/// a material uses to trade the correction for time, so the harness measures what a
+/// cap actually buys instead of asserting it.
+fn runGrazingSampling(
+    gpa: std.mem.Allocator,
+    size: u32,
+    cmds: []const R.DrawCommand,
+    mode: R.Mipmap,
+    sampling: R.Sampling,
+) !Run {
     const n = @as(usize, size) * size;
     const color = try gpa.alloc(u8, n * 4);
     defer gpa.free(color);
@@ -139,7 +152,7 @@ fn runGrazing(gpa: std.mem.Allocator, size: u32, cmds: []const R.DrawCommand, mo
     var target = try R.Target.init(size, size, color, depth);
     target.clear(.{ 0, 0, 0, 255 }, 1.0);
     const t0 = monotonicNs();
-    const stats = try R.rasterize(&target, cmds, vp, GrazingResources{}, .{ .mipmap = mode });
+    const stats = try R.rasterize(&target, cmds, vp, GrazingResources{}, .{ .mipmap = mode, .sampling = sampling });
     const ns = monotonicNs() - t0;
     return .{ .ns = ns, .pixels = stats.pixels };
 }
@@ -308,15 +321,23 @@ pub fn main() !void {
         for (0..5) |_| best_graze_tri = @min(best_graze_tri, (try runGrazing(gpa, size, cmds, .trilinear)).ns);
         var best_graze_aniso: i128 = std.math.maxInt(i128);
         for (0..5) |_| best_graze_aniso = @min(best_graze_aniso, (try runGrazing(gpa, size, cmds, .anisotropic)).ns);
+        // The same 8:1 grazing footprint with the taps capped to four and to one:
+        // cap 1 is the trilinear image by construction, so the two numbers bracket
+        // what the correction costs and what a material can buy back.
+        var best_graze_cap4: i128 = std.math.maxInt(i128);
+        for (0..5) |_| best_graze_cap4 = @min(best_graze_cap4, (try runGrazingSampling(gpa, size, cmds, .anisotropic, .{ .max_samples = 4 })).ns);
+        var best_graze_cap1: i128 = std.math.maxInt(i128);
+        for (0..5) |_| best_graze_cap1 = @min(best_graze_cap1, (try runGrazingSampling(gpa, size, cmds, .anisotropic, .{ .max_samples = 1 })).ns);
         var best_aa: i128 = std.math.maxInt(i128);
         _ = try runAntialiased(gpa, size, cmds);
         for (0..5) |_| best_aa = @min(best_aa, (try runAntialiased(gpa, size, cmds)).ns);
-        std.debug.print("{d}x{d} covered={d} flat={d:.3}ms bilinear={d:.3}ms nearest={d:.3}ms alpha={d:.3}ms additive={d:.3}ms aa={d:.3}ms minify={d:.3}ms minify_mip={d:.3}ms minify_aniso={d:.3}ms graze_tri={d:.3}ms graze_aniso={d:.3}ms\n", .{
-            size,                                          size,                                            px,
-            @as(f64, @floatFromInt(best_flat)) / 1e6,      @as(f64, @floatFromInt(best_bi)) / 1e6,          @as(f64, @floatFromInt(best_near)) / 1e6,
-            @as(f64, @floatFromInt(best_alpha)) / 1e6,     @as(f64, @floatFromInt(best_add)) / 1e6,         @as(f64, @floatFromInt(best_aa)) / 1e6,
-            @as(f64, @floatFromInt(best_min_raw)) / 1e6,   @as(f64, @floatFromInt(best_min_mip)) / 1e6,     @as(f64, @floatFromInt(best_min_aniso)) / 1e6,
-            @as(f64, @floatFromInt(best_graze_tri)) / 1e6, @as(f64, @floatFromInt(best_graze_aniso)) / 1e6,
+        std.debug.print("{d}x{d} covered={d} flat={d:.3}ms bilinear={d:.3}ms nearest={d:.3}ms alpha={d:.3}ms additive={d:.3}ms aa={d:.3}ms minify={d:.3}ms minify_mip={d:.3}ms minify_aniso={d:.3}ms graze_tri={d:.3}ms graze_aniso={d:.3}ms graze_cap4={d:.3}ms graze_cap1={d:.3}ms\n", .{
+            size,                                           size,                                            px,
+            @as(f64, @floatFromInt(best_flat)) / 1e6,       @as(f64, @floatFromInt(best_bi)) / 1e6,          @as(f64, @floatFromInt(best_near)) / 1e6,
+            @as(f64, @floatFromInt(best_alpha)) / 1e6,      @as(f64, @floatFromInt(best_add)) / 1e6,         @as(f64, @floatFromInt(best_aa)) / 1e6,
+            @as(f64, @floatFromInt(best_min_raw)) / 1e6,    @as(f64, @floatFromInt(best_min_mip)) / 1e6,     @as(f64, @floatFromInt(best_min_aniso)) / 1e6,
+            @as(f64, @floatFromInt(best_graze_tri)) / 1e6,  @as(f64, @floatFromInt(best_graze_aniso)) / 1e6, @as(f64, @floatFromInt(best_graze_cap4)) / 1e6,
+            @as(f64, @floatFromInt(best_graze_cap1)) / 1e6,
         });
     }
 }

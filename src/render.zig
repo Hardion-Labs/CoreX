@@ -110,9 +110,15 @@ pub const Blend = raster.Blend;
 /// or `edge` (16 sub-samples per pixel, translucent edge fragments).
 pub const Antialias = raster.Antialias;
 /// Mip level selection for textured draws (`Options.mipmap`): `level0`
-/// (always sample the full-size level) or `trilinear` (pick from the
-/// screen-space UV gradient and mix two levels; default).
+/// (always sample the full-size level), `trilinear` (pick from the screen-space
+/// UV gradient and mix two levels; default) or `anisotropic` (up to eight taps
+/// along an elongated footprint).
 pub const Mipmap = raster.Mipmap;
+/// Per-draw refinement of that choice (`Options.sampling`): a LOD bias in levels
+/// and a cap on the anisotropic tap count. `Sampling{}` is the identity, so it
+/// changes no existing frame; a tier without `sampling_controls` renders with the
+/// uncorrected level instead of refusing.
+pub const Sampling = raster.Sampling;
 /// One mip level of a `RasterTexture` (`Texture.mips`, largest first).
 pub const MipLevel = raster.MipLevel;
 /// Builds the mip chain a `RasterTexture` samples when minifying.

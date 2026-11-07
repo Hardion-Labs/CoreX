@@ -107,6 +107,9 @@ pub const FrameParams = struct {
     /// `.level0`; `.level0` is never coerced the other way, so a caller can keep
     /// pixel art crisp on a tier that does have mips.
     mipmap: raster.Mipmap = .trilinear,
+    /// Frame-wide refinement of the mip choice. A material can override it through
+    /// the resource provider's `sampling()`; the default biases nothing.
+    sampling: raster.Sampling = .{},
     /// Edge antialiasing. Coerced to `.none` when the tier lacks it.
     antialias: raster.Antialias = .edge,
     /// Directional Lambert light, applied when the tier has lighting.
@@ -164,6 +167,7 @@ pub fn resolve(tier: backend.Tier, params: FrameParams, blend_hint: raster.Blend
         .blend = params.blend orelse blend_hint,
         .antialias = params.antialias,
         .mipmap = params.mipmap,
+        .sampling = params.sampling,
         .light = params.light,
         .depth_test = params.depth_test,
         .depth_write = params.depth_write,
@@ -176,6 +180,10 @@ pub fn resolve(tier: backend.Tier, params: FrameParams, blend_hint: raster.Blend
     // levels trilinearly: the image is still correct, just over-blurred at grazing
     // angles, which is a quality loss rather than a wrong frame.
     if (!caps.anisotropic and options.mipmap == .anisotropic) options.mipmap = .trilinear;
+    // Sampling controls refine the level; a tier without them renders the
+    // uncorrected level rather than refusing. `.{}` is the identity, so nothing
+    // changes where the controls are unsupported and nobody asked for them.
+    if (!caps.sampling_controls) options.sampling = .{};
     if (!caps.lighting) options.light = null;
     if (!caps.blending) options.blend = .none;
     return options;
@@ -806,6 +814,29 @@ test "pipeline: anisotropic is coerced to trilinear where the tier lacks it" {
     // `.level0` on a tier without mipmaps lands on `.level0`, never on a mode the
     // tier cannot sample.
     try testing.expectEqual(raster.Mipmap.level0, resolve(.low, .{ .mipmap = .trilinear }, .none).mipmap);
+}
+
+test "pipeline: sampling controls survive where the tier has them and are zeroed where not" {
+    const grazing = FrameParams{ .mipmap = .anisotropic, .sampling = .{ .lod_bias = 1.5, .max_samples = 4 } };
+
+    const medium = resolve(.medium, grazing, .none);
+    try testing.expectEqual(raster.Mipmap.anisotropic, medium.mipmap);
+    try testing.expectEqual(@as(f64, 1.5), medium.sampling.lod_bias);
+    try testing.expectEqual(@as(u8, 4), medium.sampling.tapCap());
+    try testing.expectEqual(@as(?[]const u8, null), backend.unsupported(.medium, medium));
+
+    // Low declares neither mipmaps nor sampling controls, so both are coerced: the
+    // frame renders with the identity sampling rather than being refused.
+    const low = resolve(.low, grazing, .none);
+    try testing.expectEqual(raster.Mipmap.level0, low.mipmap);
+    try testing.expect(low.sampling.isIdentity());
+    try testing.expectEqual(@as(?[]const u8, null), backend.unsupported(.low, low));
+
+    // The default requests nothing either, so the field is inert unless asked for.
+    try testing.expect(resolve(.medium, .{}, .none).sampling.isIdentity());
+    // A bias without a cap keeps the global tap count.
+    const bias_only = resolve(.medium, .{ .sampling = .{ .lod_bias = -0.5 } }, .none);
+    try testing.expectEqual(raster.max_aniso_samples, bias_only.sampling.tapCap());
 }
 
 test "pipeline: handles carry a generation, so a stale handle does not alias" {

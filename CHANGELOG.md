@@ -8,6 +8,42 @@ declared yet.
 
 ### Added
 
+- Per-material sampling controls in the software rasterizer (`raster.Sampling`,
+  `Options.sampling`, `src/render/raster.zig`): the footprint decides the level and
+  the default tap count, but two knobs belong to the material, not to the geometry.
+  - **`lod_bias: f64`** is added to the level *after* the selection rule and clamped
+    to the chain, so a positive value samples smaller levels (sharper, more aliasing)
+    and a negative one larger (blurrier). Trilinear uses it in
+    `textureLodBiased` (still hoisted per triangle on the constant-denominator fast
+    path); anisotropic shifts **both** `lod_major` and `lod_minor` in one place, so a
+    footprint can never be biased twice.
+  - **`max_samples: u8`** caps the anisotropic tap count through
+    `anisoFootprintCapped`, `0` meaning "the global 8" rather than "no taps", values
+    above 8 clamping to 8. `Sampling{ .max_samples = 1 }` reproduces
+    `Mipmap.trilinear` **byte for byte** — asserted, which is what makes the cap a
+    time/quality knob instead of a second filter. The cap never touches the level or
+    the axis.
+  - **`Sampling{}` is the identity**: every pre-existing image is reproduced byte for
+    byte, `isIdentity()` is an exact comparison so `0.0` takes the path that skips
+    the bias arithmetic entirely, and an untextured or `.level0` draw is unaffected.
+  - **Precedence:** `FrameParams.sampling`/`FrameOptions.sampling` is the frame
+    default; an optional `pub fn sampling(self, handle: u32) ?raster.Sampling` on the
+    resource provider overrides it **per material**, duck-typed like
+    `mesh`/`color`/`texture` and mirrored by `DrawResources.fromComptime` through
+    `@hasDecl` (a private decl stays invisible, a missing one yields null and no
+    invented default).
+  - **Tier policy:** `Capabilities.sampling_controls` is declared by Medium and
+    Advanced; `pipeline.resolve` zeroes `options.sampling` elsewhere, so the frame
+    renders with the uncorrected level rather than being refused.
+  - Verification: **18 new reference cases** — the identity (must equal the plain
+    frame), a bias in each direction on trilinear, anisotropic and a perspective
+    triangle, both clamps (far past the last level and below level 0), tap caps of
+    1/2/3/4 (cap 1 must equal the trilinear frame) and six random pairs — bring the
+    texture corpus to **116 frames / 1851 covered pixels**, all bit-exact against an
+    independent Python reference. 8 new tests (749 total), including the pixel-level
+    proof that the controls reach the frame and that the identity does not move it.
+    Found and fixed on the way: the generator's edge-function top-left tie-break
+    `bias` shadowed the new sampling parameter and silently overwrote it.
 - Anisotropic minification in the software rasterizer (`Mipmap.anisotropic`,
   `src/render/raster.zig`): isotropic LOD takes the larger axis of the UV gradient,
   which over-blurs any surface seen at a grazing angle — a limitation the previous

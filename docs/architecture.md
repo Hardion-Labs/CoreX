@@ -266,7 +266,11 @@ with one final round (trilinear). A constant perspective denominator — any
 orthographic projection — hoists the level to once per triangle, and with
 `raster.Mipmap.anisotropic` an elongated footprint is sampled with up to eight
 taps along its long axis at the level matching its short one (same fast path when
-the footprint is constant). Cross-layer
+the footprint is constant). `raster.Sampling` carries the two per-material knobs
+(level bias and tap cap) as plain data: the bias is added after the level rule and
+clamped to the chain, the cap only limits the tap count, `{}` reproduces every
+pre-existing frame byte for byte, and `pipeline.resolve` zeroes both on a tier that
+does not declare `sampling_controls` — quality loss, never a refused frame. Cross-layer
 integration tests
 (`src/render/raster_image_test.zig`) prove the whole chain — scene, world
 transforms, extraction, rasterizer — with a world-rotated face lit

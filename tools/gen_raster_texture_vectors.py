@@ -144,6 +144,28 @@ def sample_level(level, u, v, filt):
     return nearest_at(level, u, v) if filt == "nearest" else bilinear_at(level, u, v)
 
 
+def texture_lod_biased(du, dv, levels, bias):
+    """texture_lod plus a bias, clamped back into the chain (mirrors textureLodBiased)."""
+    import math
+    if bias == 0.0:
+        return texture_lod(du, dv, levels)
+    base = texture_lod(du, dv, levels)
+    biased = base + bias
+    if not (biased > 0.0):
+        return 0.0
+    return min(biased, float(levels - 1))
+
+
+def apply_bias(footprint, bias, levels):
+    """Mirror of GradSteps.aniso: bias both computed levels, re-clamp the chain."""
+    samples, axis, lod_major, lod_minor = footprint
+    if bias == 0.0:
+        return footprint
+    top = float(levels - 1)
+    return (samples, axis, max(min(lod_major + bias, top), 0.0),
+            max(min(lod_minor + bias, top), 0.0))
+
+
 def texture_lod(du, dv, levels):
     """log2 of the larger texel-space gradient, clamped to [0, levels - 1]."""
     import math
@@ -199,7 +221,10 @@ def texel_derivatives(p, q, den, dp, dq, dden, size):
     return (dudx * size[0], dudy * size[0]), (dvdx * size[1], dvdy * size[1])
 
 
-def aniso_footprint(du, dv, levels):
+MAX_ANISO_SAMPLES = 8
+
+
+def aniso_footprint(du, dv, levels, tap_cap=MAX_ANISO_SAMPLES):
     """Mirrored from anisoFootprint: (samples, axis, lod_major, lod_minor).
 
     The two screen-axis columns of the Jacobian are the footprint; the longer one
@@ -215,7 +240,8 @@ def aniso_footprint(du, dv, levels):
         return 1, (0.0, 0.0), lod_major, lod_major
     anisotropy = min(rho / minor, MAX_ANISO_RATIO)
     lod_minor = max(lod_major - math.log2(anisotropy), 0.0)
-    wanted = math.ceil(min(anisotropy, float(MAX_ANISO_SAMPLES)))
+    ceiling = float(min(tap_cap, MAX_ANISO_SAMPLES))
+    wanted = math.ceil(min(anisotropy, ceiling))
     samples = 1 if wanted < 1.0 else int(wanted)
     if len_x >= len_y:
         axis = (du[0] / major, dv[0] / major)
@@ -297,7 +323,8 @@ def math_floor(t):
     return math.floor(t)
 
 
-def shade(vertex, w0, w1, w2, area_inv, tint, filt, levels=None, grad=None, mipmap="trilinear"):
+def shade(vertex, w0, w1, w2, area_inv, tint, filt, levels=None, grad=None, mipmap="trilinear",
+          bias=0.0, tap_cap=MAX_ANISO_SAMPLES):
     """Shade one pixel. `levels` is the full chain (level 0 first) when the case
     is mipmapped; `grad` holds the per-pixel differences of the perspective
     numerator and denominator, as (dp, dq, dden)."""
@@ -322,17 +349,18 @@ def shade(vertex, w0, w1, w2, area_inv, tint, filt, levels=None, grad=None, mipm
     size = (float(lw), float(lh))
     if mipmap == "anisotropic":
         du, dv = texel_derivatives(num_u, num_v, den, dp, dq, dden, size)
-        footprint = aniso_footprint(du, dv, len(levels))
+        footprint = apply_bias(aniso_footprint(du, dv, len(levels), tap_cap), bias, len(levels))
         texel = sample_anisotropic(levels, u, v, footprint, size, filt)
         return tint_multiply(texel, tint)
     du, dv = texel_gradient(num_u, num_v, den, dp, dq, dden, size)
-    lod = texture_lod(du, dv, len(levels))
+    lod = texture_lod_biased(du, dv, len(levels), bias)
     texel = sample_trilinear(levels, u, v, lod, filt)
     return tint_multiply(texel, tint)
 
 
 def rasterize(vertex, tint, filt, cull="none", front_face="ccw",
-              depth_test=True, depth_write=True, levels=None, mipmap="trilinear"):
+              depth_test=True, depth_write=True, levels=None, mipmap="trilinear",
+              bias=0.0, tap_cap=MAX_ANISO_SAMPLES):
     """vertex: three (x, y, z, uw, vw, w_inv) tuples. Returns (drew, mask, frame).
 
     `levels` is the full mip chain (level 0 first) for a mipmapped case; the
@@ -384,8 +412,8 @@ def rasterize(vertex, tint, filt, cull="none", front_face="ccw",
                 a = v[(k + 1) % 3]
                 b = v[(k + 2) % 3]
                 e = edge(a[0], a[1], b[0], b[1], px, py)
-                bias = 0 if is_top_left(a[0], a[1], b[0], b[1]) else 1
-                if e - bias < 0:
+                edge_bias = 0 if is_top_left(a[0], a[1], b[0], b[1]) else 1
+                if e - edge_bias < 0:
                     inside = False
                     break
                 weights.append(float(e))
@@ -396,7 +424,8 @@ def rasterize(vertex, tint, filt, cull="none", front_face="ccw",
             if not depth_test or z < depth[i]:
                 mask[i] = 1
                 frame[i * 4: i * 4 + 4] = shade(v, weights[0], weights[1], weights[2], inv_area, tint, filt,
-                                                 levels=levels, grad=grad, mipmap=mipmap)
+                                                 levels=levels, grad=grad, mipmap=mipmap,
+                                                 bias=bias, tap_cap=tap_cap)
                 if depth_write:
                     depth[i] = z
     return True, mask, frame
@@ -437,14 +466,18 @@ def cases():
                 w, h = max(1, w // 2), max(1, h // 2)
                 assert (lw, lh) == (w, h), (name, lw, lh, w, h)
         mipmap = kw.pop("mipmap", "trilinear")
-        drew, mask, frame = rasterize(tri, tint, filt, levels=levels, mipmap=mipmap, **kw)
+        bias = kw.pop("bias", 0.0)
+        tap_cap = kw.pop("tap_cap", MAX_ANISO_SAMPLES)
+        drew, mask, frame = rasterize(tri, tint, filt, levels=levels, mipmap=mipmap,
+                                      bias=bias, tap_cap=tap_cap, **kw)
         entry = {"name": name, "tri": tri, "filt": filt, "tint": tint,
                  "cull": kw.get("cull", "none"),
                  "front_face": kw.get("front_face", "ccw"),
                  "depth_test": kw.get("depth_test", True),
                  "depth_write": kw.get("depth_write", True),
                  "drew": drew, "mask": mask_bytes(mask), "frame": frame,
-                 "mips": mips is not None, "mipmap": mipmap, "big_base": mips == "mip"}
+                 "mips": mips is not None, "mipmap": mipmap, "big_base": mips == "mip",
+                 "bias": bias, "tap_cap": tap_cap}
         if mips is not None:
             entry["levels"] = [(w, h, px) for (w, h, px) in chain_for(mips)[1:]]
         out.append(entry)
@@ -585,6 +618,48 @@ def cases():
             mips="mip",
             mipmap="anisotropic")
 
+    # LOD bias and tap cap. These are the per-material sampling controls, and the
+    # first case is the *identity*: bias 0.0 with the default cap must reproduce the
+    # plain trilinear frame bit for bit (the Zig side asserts exactly that).
+    add("bias_identity", grazing, filt="bilinear", mips="mip", mipmap="anisotropic")
+    add("bias_positive_sharpens", grazing, filt="bilinear", mips="mip", mipmap="trilinear", bias=1.0)
+    add("bias_negative_blurs", grazing, filt="bilinear", mips="mip", mipmap="trilinear", bias=-1.0)
+    add("bias_clamped_top", grazing, filt="bilinear", mips="mip", mipmap="trilinear", bias=64.0)
+    add("bias_clamped_bottom", grazing, filt="bilinear", mips="mip", mipmap="trilinear", bias=-64.0)
+    add("bias_aniso_positive", grazing, filt="bilinear", mips="mip", mipmap="anisotropic", bias=1.5)
+    add("bias_aniso_negative", grazing, filt="bilinear", mips="mip", mipmap="anisotropic", bias=-1.0)
+    # Tap caps: 1 collapses to the trilinear path, 2 and 4 limit the anisotropic
+    # one. The 8:1 footprint would ask for eight without a cap.
+    add("cap_one_is_trilinear", grazing, filt="bilinear", mips="mip", mipmap="anisotropic", tap_cap=1)
+    add("cap_two", grazing, filt="bilinear", mips="mip", mipmap="anisotropic", tap_cap=2)
+    add("cap_four", grazing, filt="bilinear", mips="mip", mipmap="anisotropic", tap_cap=4)
+    add("cap_four_nearest", grazing, filt="nearest", mips="mip", mipmap="anisotropic", tap_cap=4)
+    # Perspective with a bias: the per-pixel path must bias and clamp per pixel.
+    add("bias_perspective", [pxw(0, 0, 0, 0, 0, 1.0), pxw(8, 0, 0, 4, 0, 0.5),
+                             pxw(0, 8, 0, 0, 1.0, 2.0)],
+        filt="bilinear", mips="mip", mipmap="trilinear", bias=-0.75)
+    add("cap_perspective", [pxw(0, 0, 0, 0, 0, 1.0), pxw(8, 0, 0, 4, 0, 0.5),
+                            pxw(0, 8, 0, 0, 1.0, 2.0)],
+        filt="bilinear", mips="mip", mipmap="anisotropic", tap_cap=3)
+    # Random biased/capped cases over the same deterministic stream.
+    for n in range(6):
+        tri = []
+        for k in range(3):
+            x = rng.randint(-2 * SUBPIXEL_SCALE, 10 * SUBPIXEL_SCALE)
+            y = rng.randint(-2 * SUBPIXEL_SCALE, 10 * SUBPIXEL_SCALE)
+            z = struct.unpack("<f", struct.pack("<f", rng.uniform(-1, 1)))[0]
+            u = rng.uniform(-1.0, 2.0) * rng.choice([1.0, 3.0])
+            v = rng.uniform(-1.0, 2.0) * rng.choice([0.25, 0.5, 1.0])
+            w = rng.uniform(0.6, 2.0)
+            tri.append((x, y, z, u / w, v / w, 1.0 / w))
+        add(f"bias_random_{n:02d}", tri,
+            filt=rng.choice(["nearest", "bilinear"]),
+            tint=rng.choice([(255, 255, 255, 255), (200, 210, 230, 255)]),
+            mips="mip",
+            mipmap=rng.choice(["trilinear", "anisotropic"]),
+            bias=rng.choice([-2.0, -0.5, 0.5, 2.0]),
+            tap_cap=rng.choice([1, 2, 4, 8]))
+
     return out
 
 
@@ -632,6 +707,10 @@ def emit(all_cases):
     lines.append("    mipmap: enum { level0, trilinear, anisotropic },")
     lines.append("    /// True when level 0 is `mip_texture` (16x16), false for `texture` (4x4).")
     lines.append("    big_base: bool,")
+    lines.append("    /// LOD bias the case was rendered with (0.0 for every pre-existing case).")
+    lines.append("    lod_bias: f64,")
+    lines.append("    /// Anisotropic tap cap the case was rendered with (8 = the global maximum).")
+    lines.append("    tap_cap: u8,")
     lines.append("};")
     lines.append("")
     lines.append("pub const Level = struct { width: u32, height: u32, pixels: []const u8 };")
@@ -671,6 +750,8 @@ def emit(all_cases):
             lines.append("        .levels = &.{},")
             lines.append("        .mipmap = .trilinear,")
             lines.append("        .big_base = false,")
+        lines.append("        .lod_bias = {0!r},".format(float(c["bias"])))
+        lines.append("        .tap_cap = {0},".format(c["tap_cap"]))
         lines.append("    },")
     lines.append("};")
     lines.append("")
@@ -686,9 +767,12 @@ def main():
     pixels = sum((b >> i) & 1 for c in all_cases for b in c["mask"] for i in range(8))
     print(f"wrote {out.relative_to(root)}")
     print(f"  cases: {len(all_cases)}  drew: {drew}  culled/degenerate: {len(all_cases) - drew}")
+    controlled = [c for c in all_cases if c["bias"] != 0.0 or c["tap_cap"] != MAX_ANISO_SAMPLES]
     aniso = [c for c in all_cases if c["mipmap"] == "anisotropic"]
-    aniso_pixels = sum((b >> i) & 1 for c in aniso for b in c["mask"] for i in range(8))
-    print(f"  anisotropic cases: {len(aniso)}  covered pixels: {aniso_pixels}")
+    total_pixels = sum(sum(int(b).bit_count() for b in c["mask"]) for c in all_cases)
+    print(f"  sampling-control cases: {len(controlled)}")
+    print(f"  anisotropic cases: {len(aniso)}  mipmapped: "
+          f"{sum(1 for c in all_cases if c['mips'])}  covered pixels: {total_pixels}")
 
 
 if __name__ == "__main__":

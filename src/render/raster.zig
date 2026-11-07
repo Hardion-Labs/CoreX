@@ -209,6 +209,48 @@ pub const Options = struct {
     /// `Texture` that carries `mips`; without them every mode samples level 0,
     /// which is the pre-mipmap behaviour byte for byte.
     mipmap: Mipmap = .trilinear,
+    /// Per-draw refinement of that choice: level bias and a tap-count cap. The
+    /// default biases nothing and caps nothing, so every image produced before
+    /// this field existed is reproduced byte for byte.
+    sampling: Sampling = .{},
+};
+
+/// Refinement of the mip choice for one draw — the per-material controls a real
+/// renderer exposes, expressed as plain data so they can travel through the
+/// resource provider instead of through every command.
+///
+/// Both fields exist for the same reason: **the footprint is an estimate**. A LOD
+/// bias corrects for content or a projection the derivative does not know about
+/// (sharpen a signature, blur a distant sign), and a tap cap trades anisotropic
+/// quality for time on a material drawn many times.
+///
+/// Neither changes the level selection *rule*: the bias is added after the LOD is
+/// computed and the cap is applied to the tap count, so a `.level0` draw and an
+/// untextured draw are unaffected.
+pub const Sampling = struct {
+    /// Added to the computed level, in levels. Positive values sample **smaller**
+    /// levels (sharper, more aliasing), negative values sample larger ones
+    /// (blurrier). The result is clamped to the chain, so a large bias cannot read
+    /// past the last level.
+    lod_bias: f64 = 0.0,
+    /// Largest number of anisotropic taps this draw may take. `0` means "the
+    /// global default" (`max_aniso_samples`), not "none": a cap of zero taps would
+    /// mean no sampling at all, which is not a thing a caller can ask for.
+    /// Values above the global maximum are clamped to it.
+    max_samples: u8 = 0,
+
+    /// The cap actually in force, `1..max_aniso_samples`.
+    pub fn tapCap(self: Sampling) u8 {
+        if (self.max_samples == 0) return max_aniso_samples;
+        return @min(self.max_samples, max_aniso_samples);
+    }
+
+    /// Whether this is the do-nothing value, so the hot path can skip the bias
+    /// arithmetic entirely. Exact comparison: a caller who sets `0.0` gets the
+    /// pre-existing path, and any non-zero bias is honoured.
+    pub fn isIdentity(self: Sampling) bool {
+        return self.lod_bias == 0.0 and self.max_samples == 0;
+    }
 };
 
 /// Mip level selection for textured draws.
@@ -542,6 +584,24 @@ fn textureLod(du: f64, dv: f64, levels: u32) f64 {
     return @min(lod, max_level);
 }
 
+/// `textureLod` with a bias added and the result clamped back into the chain.
+///
+/// The clamp is the whole reason this is a separate function: `textureLod` clamps
+/// the *unbiased* value, so adding a bias afterwards could push a sample past the
+/// last level. Biasing before the clamp would change the unbiased result for a
+/// bias of zero on a magnification case (`rho <= 1` maps to 0 either way, so it
+/// would not, but the argument stops holding the moment the clamp moves) — this
+/// form keeps `bias == 0` bit-identical by construction and clamps once at the
+/// end.
+fn textureLodBiased(du: f64, dv: f64, levels: u32, bias: f64) f64 {
+    if (bias == 0.0) return textureLod(du, dv, levels);
+    const base = textureLod(du, dv, levels);
+    const max_level: f64 = @floatFromInt(levels - 1);
+    const biased = base + bias;
+    if (!(biased > 0.0)) return 0.0;
+    return @min(biased, max_level);
+}
+
 /// Trilinear sample: floor/ceil of `lod`, each level filtered with `filter`, then
 /// the two results mixed channel-wise in `f64` and rounded **once**. A `lod` on a
 /// level boundary does a single fetch, and level 0 with `lod == 0` reproduces the
@@ -652,6 +712,14 @@ pub const max_aniso_ratio: f64 = 8.0;
 /// A round footprint (`sigma >= rho`, which includes every degenerate or
 /// zero-gradient case) yields `samples = 1` and is sampled trilinearly.
 pub fn anisoFootprint(d: TexelDerivatives, levels: u32) AnisoFootprint {
+    return anisoFootprintCapped(d, levels, max_aniso_samples);
+}
+
+/// `anisoFootprint` with this draw's tap cap (`Sampling.tapCap`). The cap is
+/// applied after the ceiling, because a material that is drawn a thousand times
+/// is exactly the one that wants fewer taps, and because a cap can only ever
+/// lower the count.
+pub fn anisoFootprintCapped(d: TexelDerivatives, levels: u32, tap_cap: u8) AnisoFootprint {
     // The two screen-axis columns of the Jacobian. The longer one is the footprint's
     // long axis: its length is the extent of the footprint, and its direction is
     // the direction in UV space along which the texture compresses most — the axis
@@ -672,7 +740,8 @@ pub fn anisoFootprint(d: TexelDerivatives, levels: u32) AnisoFootprint {
     // Fractional taps interpolate linearly in quality, which is why the sample
     // count is rounded up from a continuous want. `@ceil` before `@intFromFloat`
     // keeps the mapping monotone and free of a floating-point cast trap.
-    const wanted = @ceil(@min(anisotropy, @as(f64, @floatFromInt(max_aniso_samples))));
+    const ceiling: f64 = @floatFromInt(@min(tap_cap, max_aniso_samples));
+    const wanted = @ceil(@min(anisotropy, ceiling));
     const samples: u8 = if (wanted < 1.0) 1 else @intFromFloat(wanted);
     // Unit direction of the longer column.
     const axis = if (len_x >= len_y)
@@ -1214,18 +1283,39 @@ const GradSteps = struct {
 
     /// The single level this triangle samples at, when `den` cannot vary. `size`
     /// is the level-0 extent in texels and `levels` the chain length.
-    fn constantLod(self: GradSteps, den: f64, size: [2]f64, levels: u32) ?f64 {
+    fn constantLod(self: GradSteps, den: f64, size: [2]f64, levels: u32, bias: f64) ?f64 {
         if (self.dden[0] != 0.0 or self.dden[1] != 0.0) return null;
         const grad_px = texelGradient(0.0, 0.0, den, self.dp, self.dq, self.dden, size);
-        return textureLod(grad_px.du, grad_px.dv, levels);
+        return textureLodBiased(grad_px.du, grad_px.dv, levels, bias);
     }
 
-    /// The single footprint every pixel of this triangle shares, when `den`
-    /// cannot vary. `p`/`q` only enter through the denominator, so evaluating the
-    /// derivatives at zero is exact rather than an approximation.
-    fn constantAniso(self: GradSteps, den: f64, size: [2]f64, levels: u32) ?AnisoFootprint {
+    /// The footprint this pixel samples, with this draw's `Sampling` applied: the
+    /// tap cap enters the count and the LOD bias is added to both computed levels
+    /// and re-clamped into the chain.
+    ///
+    /// `p`/`q` are the perspective numerators at this pixel. They only enter
+    /// through the denominator, which is why a constant denominator makes the whole
+    /// footprint constant and lets the caller cache it.
+    fn aniso(self: GradSteps, p: f64, q: f64, den: f64, size: [2]f64, levels: u32, sampling: Sampling) AnisoFootprint {
+        var footprint = anisoFootprintCapped(
+            texelDerivatives(p, q, den, self.dp, self.dq, self.dden, size),
+            levels,
+            sampling.tapCap(),
+        );
+        if (sampling.lod_bias != 0.0) {
+            const max_level: f64 = @floatFromInt(levels - 1);
+            footprint.lod_major = @max(@min(footprint.lod_major + sampling.lod_bias, max_level), 0.0);
+            footprint.lod_minor = @max(@min(footprint.lod_minor + sampling.lod_bias, max_level), 0.0);
+        }
+        return footprint;
+    }
+
+    /// The footprint every pixel of this triangle shares, when `den` cannot vary —
+    /// computed once at setup instead of per pixel. Returns null when the
+    /// denominator varies, so the caller falls back to `aniso`.
+    fn constantAniso(self: GradSteps, den: f64, size: [2]f64, levels: u32, sampling: Sampling) ?AnisoFootprint {
         if (self.dden[0] != 0.0 or self.dden[1] != 0.0) return null;
-        return anisoFootprint(texelDerivatives(0.0, 0.0, den, self.dp, self.dq, self.dden, size), levels);
+        return self.aniso(0.0, 0.0, den, size, levels, sampling);
     }
 };
 
@@ -1249,6 +1339,7 @@ fn shadePixel(
     lit: ?[3]f64,
     lod_mode: Mipmap,
     grad: ?GradSteps,
+    sampling: Sampling,
 ) [4]u8 {
     const tex = texture orelse {
         if (lit) |lm| {
@@ -1284,8 +1375,10 @@ fn shadePixel(
         // the trilinear path inside `anisoFootprint`, bit for bit.
         if (lod_mode == .anisotropic) {
             const size = [2]f64{ @floatFromInt(tex.width), @floatFromInt(tex.height) };
+            // The constant case was computed once per triangle at setup, bias
+            // included; otherwise the footprint is per pixel.
             const footprint = g.constant_aniso orelse
-                anisoFootprint(texelDerivatives(num_u, num_v, den, g.dp, g.dq, g.dden, size), tex.mipLevelCount());
+                g.aniso(num_u, num_v, den, size, tex.mipLevelCount(), sampling);
             break :blk sampleAnisotropic(tex, u, v, footprint, size);
         }
         break :blk sampleTrilinear(tex, u, v, g.constant_lod orelse level: {
@@ -1295,7 +1388,7 @@ fn shadePixel(
                 @floatFromInt(tex.width),
                 @floatFromInt(tex.height),
             });
-            break :level textureLod(grad_px.du, grad_px.dv, tex.mipLevelCount());
+            break :level textureLodBiased(grad_px.du, grad_px.dv, tex.mipLevelCount(), sampling.lod_bias);
         });
     };
     if (lit) |lm| {
@@ -1450,8 +1543,8 @@ fn rasterTriangleCore(
             @as(f64, @floatFromInt(step_y1)) * inv_area,
         });
         const size = [2]f64{ @floatFromInt(tex.width), @floatFromInt(tex.height) };
-        g.constant_lod = g.constantLod(v0.w_inv, size, tex.mipLevelCount());
-        if (options.mipmap == .anisotropic) g.constant_aniso = g.constantAniso(v0.w_inv, size, tex.mipLevelCount());
+        g.constant_lod = g.constantLod(v0.w_inv, size, tex.mipLevelCount(), options.sampling.lod_bias);
+        if (options.mipmap == .anisotropic) g.constant_aniso = g.constantAniso(v0.w_inv, size, tex.mipLevelCount(), options.sampling);
         break :blk g;
     } else null;
     const z0: f64 = v0.z;
@@ -1544,7 +1637,7 @@ fn rasterTriangleCore(
                 const wgt2 = @as(f64, @floatFromInt(weight2));
                 const depth: f32 = @floatCast(((wgt0 * z0 + wgt1 * z1) + wgt2 * z2) * inv_area);
                 if (!options.depth_test or depth < target.depth[index]) {
-                    const shaded = shadePixel(texture, v0, v1, v2, wgt0, wgt1, wgt2, inv_area, rgba, lit, options.mipmap, grad);
+                    const shaded = shadePixel(texture, v0, v1, v2, wgt0, wgt1, wgt2, inv_area, rgba, lit, options.mipmap, grad, options.sampling);
                     if (aa) {
                         // Accumulate; `resolveAccumulated` composites once the
                         // whole mesh has been submitted. The mapping is
@@ -2802,6 +2895,7 @@ test "textured rasterizer matches the independent reference bit for bit" {
                 .trilinear => .trilinear,
                 .anisotropic => .anisotropic,
             },
+            .sampling = .{ .lod_bias = case.lod_bias, .max_samples = case.tap_cap },
         };
         // Copy the case's levels into the sampler's own type (same layout).
         var mip_levels: [8]MipLevel = undefined;
@@ -2870,8 +2964,8 @@ test "textured rasterizer matches the independent reference bit for bit" {
     try testing.expect(texture_vectors.cases.len >= 70);
     try testing.expect(total_pixels >= 1000);
     try testing.expect(mip_pixels >= 500);
-    try testing.expect(texture_vectors.cases.len >= 95);
-    try testing.expect(aniso_pixels >= 250);
+    try testing.expect(texture_vectors.cases.len >= 116);
+    try testing.expect(aniso_pixels >= 500);
 }
 
 // --- texture-specific unit tests --------------------------------------------
@@ -3771,6 +3865,200 @@ test "antialias: single-triangle entry point ignores the mode" {
     // No accumulator is available, so the one-sample result is written: the
     // hypotenuse row keeps full coverage rather than a translucent edge.
     try testing.expectEqual(@as(usize, 6), pixels);
+}
+
+// --- per-draw sampling controls -------------------------------------------
+
+test "Sampling: the identity is tap 8 and no bias, and tests the fast path" {
+    const identity = Sampling{};
+    try testing.expect(identity.isIdentity());
+    try testing.expectEqual(max_aniso_samples, identity.tapCap());
+
+    // `max_samples == 0` means "the global default", not "no taps": a cap of
+    // zero would mean the draw samples nothing at all.
+    try testing.expectEqual(max_aniso_samples, (Sampling{ .max_samples = 0 }).tapCap());
+    try testing.expectEqual(@as(u8, 1), (Sampling{ .max_samples = 1 }).tapCap());
+    try testing.expectEqual(@as(u8, 4), (Sampling{ .max_samples = 4 }).tapCap());
+    // Above the global maximum the cap is clamped rather than honoured: the
+    // kernel has no more taps to give.
+    try testing.expectEqual(max_aniso_samples, (Sampling{ .max_samples = 9 }).tapCap());
+    try testing.expectEqual(max_aniso_samples, (Sampling{ .max_samples = 255 }).tapCap());
+
+    // Any deviation from the default is *not* the identity, including a bias that
+    // rounds to zero levels: exact comparison keeps the caller's intent.
+    try testing.expect(!(Sampling{ .lod_bias = 0.5 }).isIdentity());
+    try testing.expect(!(Sampling{ .lod_bias = -0.0 + 1e-18 }).isIdentity());
+    try testing.expect(!(Sampling{ .max_samples = 1 }).isIdentity());
+}
+
+test "textureLodBiased: the bias shifts the level and clamps to the chain" {
+    // 8 texels/pixel is level 3; a +1 bias must read one level *smaller* (sharper).
+    try testing.expectEqual(@as(f64, 3.0), textureLod(8.0, 8.0, 5));
+    try testing.expectEqual(@as(f64, 4.0), textureLodBiased(8.0, 8.0, 5, 1.0));
+    try testing.expectEqual(@as(f64, 2.0), textureLodBiased(8.0, 8.0, 5, -1.0));
+    try testing.expectEqual(@as(f64, 2.5), textureLodBiased(8.0, 8.0, 5, -0.5));
+
+    // Past the last level, and below level 0, the result stops at the chain ends.
+    try testing.expectEqual(@as(f64, 4.0), textureLodBiased(8.0, 8.0, 5, 64.0));
+    try testing.expectEqual(@as(f64, 0.0), textureLodBiased(8.0, 8.0, 5, -64.0));
+
+    // A bias of zero must be the pre-existing function bit for bit, and the two
+    // arguments are symmetric (the level follows the larger gradient).
+    const cases = [_][2]f64{ .{ 0.25, 1.0 }, .{ 3.0, 0.5 }, .{ 17.0, 2.0 } };
+    for (cases) |c| {
+        try testing.expectEqual(textureLod(c[0], c[1], 4), textureLodBiased(c[0], c[1], 4, 0.0));
+        try testing.expectEqual(textureLod(c[1], c[0], 4), textureLod(c[0], c[1], 4));
+    }
+}
+
+test "anisoFootprintCapped: the tap cap limits the count, never the level" {
+    // An 8:1 grazing footprint asks for eight taps by default.
+    const grazing = TexelDerivatives{ .du = .{ 8.0, 0.0 }, .dv = .{ 0.0, 1.0 } };
+    try testing.expectEqual(@as(u8, 8), anisoFootprintCapped(grazing, 5, max_aniso_samples).samples);
+
+    // Capping the taps must not change the levels: only the number of samples
+    // along the axis is a quality/time knob, the footprint itself is the same.
+    const full = anisoFootprintCapped(grazing, 5, max_aniso_samples);
+    for ([_]u8{ 1, 2, 4 }) |cap| {
+        const capped = anisoFootprintCapped(grazing, 5, cap);
+        try testing.expectEqual(cap, capped.samples);
+        try testing.expectEqual(full.lod_major, capped.lod_major);
+        try testing.expectEqual(full.lod_minor, capped.lod_minor);
+        try testing.expectEqual(full.axis, capped.axis);
+    }
+
+    // A cap wider than the kernel is the kernel's own maximum.
+    try testing.expectEqual(@as(u8, 8), anisoFootprintCapped(grazing, 5, 200).samples);
+    // And a round footprint stays at one tap whatever the cap says.
+    const round = TexelDerivatives{ .du = .{ 4.0, 0.0 }, .dv = .{ 0.0, 4.0 } };
+    try testing.expectEqual(@as(u8, 1), anisoFootprintCapped(round, 5, 4).samples);
+}
+
+test "GradSteps: sampling controls bias and cap without touching the rule" {
+    // A constant denominator (affine UVs) with a grazing footprint: 8 texels along
+    // x, 1 along y. `dp`/`dq` are the per-pixel derivatives of the numerators.
+    const size = [2]f64{ 16.0, 16.0 };
+    const grad = GradSteps{ .dp = .{ 8.0, 0.0 }, .dq = .{ 0.0, 1.0 }, .dden = .{ 0.0, 0.0 } };
+    const levels: u32 = 5;
+
+    // The identity reproduces the uncapped footprint and the plain level exactly.
+    const plain = grad.aniso(0.0, 0.0, 1.0, size, levels, .{});
+    const direct = anisoFootprintCapped(
+        texelDerivatives(0.0, 0.0, 1.0, grad.dp, grad.dq, grad.dden, size),
+        levels,
+        max_aniso_samples,
+    );
+    try testing.expectEqual(direct.samples, plain.samples);
+    try testing.expectEqual(direct.lod_major, plain.lod_major);
+    try testing.expectEqual(direct.lod_minor, plain.lod_minor);
+    // The cached path is the same footprint, because the denominator cannot vary.
+    const cached = grad.constantAniso(1.0, size, levels, .{}).?;
+    try testing.expectEqual(plain.samples, cached.samples);
+    try testing.expectEqual(plain.lod_major, cached.lod_major);
+    try testing.expectEqual(plain.lod_minor, cached.lod_minor);
+
+    // A tap cap removes taps but must leave both levels alone.
+    const capped = grad.aniso(0.0, 0.0, 1.0, size, levels, .{ .max_samples = 2 });
+    try testing.expectEqual(@as(u8, 2), capped.samples);
+    try testing.expectEqual(plain.lod_major, capped.lod_major);
+    try testing.expectEqual(plain.lod_minor, capped.lod_minor);
+    try testing.expectEqual(plain.axis, capped.axis);
+
+    // A positive bias sharpens (smaller level), negative blurs, and both clamp.
+    const sharper = grad.aniso(0.0, 0.0, 1.0, size, levels, .{ .lod_bias = 1.0 });
+    try testing.expectEqual(@min(plain.lod_major + 1.0, 4.0), sharper.lod_major);
+    try testing.expectEqual(@min(plain.lod_minor + 1.0, 4.0), sharper.lod_minor);
+    const blurrier = grad.aniso(0.0, 0.0, 1.0, size, levels, .{ .lod_bias = -1.0 });
+    try testing.expectEqual(@max(plain.lod_major - 1.0, 0.0), blurrier.lod_major);
+    try testing.expectEqual(@as(f64, 0.0), blurrier.lod_minor);
+    try testing.expectEqual(@as(f64, 4.0), grad.aniso(0.0, 0.0, 1.0, size, levels, .{ .lod_bias = 99.0 }).lod_major);
+
+    // The cached affine path biases exactly like the per-pixel one.
+    const cached_biased = grad.constantAniso(1.0, size, levels, .{ .lod_bias = 1.0 }).?;
+    try testing.expectEqual(sharper.lod_major, cached_biased.lod_major);
+    try testing.expectEqual(sharper.lod_minor, cached_biased.lod_minor);
+
+    // `constantLod` is the trilinear counterpart: same bias, same clamp, and it
+    // collapses the two axes with `max` exactly like `texelGradient`.
+    const g = texelGradient(0.0, 0.0, 1.0, grad.dp, grad.dq, grad.dden, size);
+    try testing.expectEqual(textureLod(g.du, g.dv, levels), grad.constantLod(1.0, size, levels, 0.0).?);
+    try testing.expectEqual(textureLodBiased(g.du, g.dv, levels, 1.0), grad.constantLod(1.0, size, levels, 1.0).?);
+    try testing.expectEqual(textureLodBiased(g.du, g.dv, levels, -1.0), grad.constantLod(1.0, size, levels, -1.0).?);
+    // The trilinear level follows the *long* axis (8 texels/pixel), the taps follow
+    // the short one: that difference is the whole point of the anisotropic mode.
+    try testing.expect(plain.lod_major > plain.lod_minor);
+    // A varying denominator has no cached value at all.
+    const varying = GradSteps{ .dp = .{ 8.0, 0.0 }, .dq = .{ 0.0, 1.0 }, .dden = .{ 0.25, 0.0 } };
+    try testing.expectEqual(@as(?f64, null), varying.constantLod(1.0, size, levels, 0.0));
+    try testing.expectEqual(@as(?AnisoFootprint, null), varying.constantAniso(1.0, size, levels, .{}));
+}
+
+test "rasterize: the sampling controls reach the pixels" {
+    // Stripes with an 8-texel period over a 32x32 chain: level 0 is crisp, level 4
+    // is already a flat average, so which level a draw samples is visible in the
+    // frame instead of only in the level arithmetic.
+    const AnisoResources = @import("raster_aniso_resources.zig").Provider;
+    const w = 32;
+    const h = 32;
+    var pixels: [w * h * 4]u8 = undefined;
+    for (0..h) |y| {
+        for (0..w) |x| {
+            const o = (y * w + x) * 4;
+            const on = (y % 8) < 4;
+            pixels[o + 0] = if (on) 240 else 16;
+            pixels[o + 1] = if (on) 240 else 16;
+            pixels[o + 2] = if (on) 240 else 16;
+            pixels[o + 3] = 255;
+        }
+    }
+    const alloc = testing.allocator;
+    var chain = try @import("mipmap.zig").Chain.generate(alloc, w, h, &pixels);
+    defer chain.deinit(alloc);
+
+    const size = 8;
+    const positions = [_][3]f32{ .{ -1, -1, 0 }, .{ 1, -1, 0 }, .{ 1, 1, 0 }, .{ -1, 1, 0 } };
+    const indices = [_]u32{ 0, 1, 2, 0, 2, 3 };
+    // 4 texels per pixel across x, 1 across y: LOD 2 for trilinear, a 4:1 footprint
+    // for anisotropic, so both the bias and the tap cap land on a different level.
+    const uvs = [_][2]f32{ .{ 0, 0 }, .{ 1, 0 }, .{ 1, 0.25 }, .{ 0, 0.25 } };
+    const mesh = Mesh{ .positions = &positions, .indices = &indices, .uvs = &uvs };
+    const vp = @import("camera.zig").orthographic(-1, 1, -1, 1, 0, 2);
+    const tex = Texture{ .width = w, .height = h, .pixels = &pixels, .mips = chain.levels(), .filter = .bilinear };
+    try tex.validate();
+
+    const settings = [_]Options{
+        .{ .cull = .none, .mipmap = .trilinear },
+        // +2 levels: past the last one, onto the flat level 4.
+        .{ .cull = .none, .mipmap = .trilinear, .sampling = .{ .lod_bias = 2.0 } },
+        .{ .cull = .none, .mipmap = .anisotropic },
+        // One tap: the documented collapse onto the trilinear level.
+        .{ .cull = .none, .mipmap = .anisotropic, .sampling = .{ .max_samples = 1 } },
+    };
+    var frames: [settings.len][size * size * 4]u8 = undefined;
+    var depth: [size * size]f32 = @splat(1.0);
+    for (settings, 0..) |options, i| {
+        @memset(&frames[i], 0);
+        @memset(&depth, 1.0);
+        // The target borrows the buffer itself, never a copy of it.
+        var target = try Target.init(size, size, &frames[i], &depth);
+        _ = try rasterize(&target, &.{.{
+            .entity = .{ .index = 1, .generation = 0 },
+            .mesh = 0,
+            .material = 0,
+            .world = @import("../scene/transform.zig").identity(),
+            .bounds = .{ .center = .{ 0, 0, 0 }, .extents = .{ 1, 1, 1 } },
+            .depth = 0,
+        }}, vp, AnisoResources{ .tex = tex, .quad = mesh }, options);
+    }
+
+    // The bias moves the frame, so it reaches the sampler and not just a struct field.
+    try testing.expect(!std.mem.eql(u8, &frames[0], &frames[1]));
+    // Capping the taps to the trilinear path changes the image: the correction was
+    // actually being spent.
+    try testing.expect(!std.mem.eql(u8, &frames[2], &frames[3]));
+    // And a cap of one *is* the trilinear path, byte for byte — the reason the cap
+    // can be described as a quality/time knob rather than as a second filter.
+    try testing.expectEqualSlices(u8, &frames[0], &frames[3]);
 }
 
 // --- anisotropic filtering ------------------------------------------------
