@@ -1009,12 +1009,13 @@ fn applyShortcuts(ctx: *widgets.Context, state: *State, scene: anytype, history:
         applyGizmoDrag(state, scene, gpa, ctx.input.pointer, dock.viewport);
         return;
     }
-    // Gizmo press: pick an axis handle under the pointer. If one is found, start the
-    // gizmo drag instead of the viewport drag-to-orbit. A press on nothing starts
-    // the orbit gesture as before.
+    // Gizmo press: pick an axis handle or ring under the pointer. If one is found,
+    // start the gizmo drag in the picked mode instead of the viewport drag-to-orbit.
+    // A press on nothing starts the orbit gesture as before.
     if (ctx.input.pointer_pressed and state.dock_focus == .viewport and dock.viewport.containsPoint(ctx.input.pointer)) {
-        const axis = pickGizmoAxis(state, scene, gpa, ctx.input.pointer, dock.viewport);
-        if (axis) |a| {
+        const pick = pickGizmo(state, scene, gpa, ctx.input.pointer, dock.viewport);
+        if (pick) |p| {
+            state.viewport_gizmo.mode = p.mode;
             var world = scene.computeWorldTransforms(gpa) catch return;
             const entity = scene.entityById(state.selected) orelse {
                 world.deinit();
@@ -1032,7 +1033,7 @@ fn applyShortcuts(ctx: *widgets.Context, state: *State, scene: anytype, history:
                 @sqrt(m[8] * m[8] + m[9] * m[9] + m[10] * m[10]),
             };
             world.deinit();
-            state.viewport_gizmo.begin(a, ctx.input.pointer, world_pos, rotation, scale);
+            state.viewport_gizmo.begin(p.axis, ctx.input.pointer, world_pos, rotation, scale);
             return;
         }
         state.viewport_drag.begin(ctx.input.pointer);
@@ -1261,6 +1262,13 @@ pub const GizmoMode = enum { translate, rotate, scale };
 
 /// Which axis of the gizmo is being dragged: X (red), Y (green), Z (blue).
 pub const GizmoAxis = enum { x, y, z };
+
+/// Result of picking a gizmo handle or ring: which mode and which axis the
+/// pointer is over. Returned by `pickGizmo`.
+pub const GizmoPick = struct {
+    mode: GizmoMode,
+    axis: GizmoAxis,
+};
 
 /// The viewport gizmo gesture: which mode and axis are being dragged, where the
 /// drag started, and the entity's world transform when the drag began. Kept as a
@@ -1679,13 +1687,13 @@ fn distPointToSegment(px: i32, py: i32, ax: i32, ay: i32, bx: i32, by: i32) f32 
 /// measures the pointer's distance to each projected handle line. Returns the
 /// nearest axis within `threshold` pixels, or `null` when the pointer is on no
 /// handle.
-fn pickGizmoAxis(
+fn pickGizmo(
     state: *State,
     scene: anytype,
     gpa: std.mem.Allocator,
     pointer: canvas.Point,
     viewport: Rect,
-) ?GizmoAxis {
+) ?GizmoPick {
     if (state.selected == 0) return null;
     const camera = findCameraEntity(scene) orelse return null;
     const cam = render_scene.EngineRenderer.cameraOf(scene, camera, gpa) catch return null orelse return null;
@@ -1700,34 +1708,85 @@ fn pickGizmoAxis(
     const cp = cam orelse return null;
     const origin = projectToViewport(cp.view_projection, world_pos, viewport) orelse return null;
 
-    const axes: [3]struct {
-        axis: GizmoAxis,
-        delta: [3]f32,
-    } = .{
-        .{ .axis = .x, .delta = .{ 0.5, 0, 0 } },
-        .{ .axis = .y, .delta = .{ 0, 0.5, 0 } },
-        .{ .axis = .z, .delta = .{ 0, 0, 0.5 } },
-    };
-
     const threshold: f32 = 8.0;
+    const ring_radius: f32 = 0.5;
     var best_axis: ?GizmoAxis = null;
     var best_dist: f32 = threshold;
-    var i: usize = 0;
-    while (i < 3) : (i += 1) {
-        const axis = axes[i];
-        const tip_world: [3]f32 = .{
-            world_pos[0] + axis.delta[0],
-            world_pos[1] + axis.delta[1],
-            world_pos[2] + axis.delta[2],
-        };
-        const tip = projectToViewport(cp.view_projection, tip_world, viewport) orelse continue;
-        const d = distPointToSegment(pointer.x, pointer.y, origin.x, origin.y, tip.x, tip.y);
-        if (d < best_dist) {
-            best_dist = d;
-            best_axis = axis.axis;
-        }
+
+    switch (state.viewport_gizmo.mode) {
+        .translate, .scale => {
+            const axes: [3]struct {
+                axis: GizmoAxis,
+                delta: [3]f32,
+            } = .{
+                .{ .axis = .x, .delta = .{ 0.5, 0, 0 } },
+                .{ .axis = .y, .delta = .{ 0, 0.5, 0 } },
+                .{ .axis = .z, .delta = .{ 0, 0, 0.5 } },
+            };
+
+            var i: usize = 0;
+            while (i < 3) : (i += 1) {
+                const axis = axes[i];
+                const tip_world: [3]f32 = .{
+                    world_pos[0] + axis.delta[0],
+                    world_pos[1] + axis.delta[1],
+                    world_pos[2] + axis.delta[2],
+                };
+                const tip = projectToViewport(cp.view_projection, tip_world, viewport) orelse continue;
+                const d = distPointToSegment(pointer.x, pointer.y, origin.x, origin.y, tip.x, tip.y);
+                if (d < best_dist) {
+                    best_dist = d;
+                    best_axis = axis.axis;
+                }
+            }
+        },
+        .rotate => {
+            // One ring per axis, lying in the plane perpendicular to that axis.
+            // Tests each line segment of the projected circle against the pointer,
+            // so clicking near any part of a ring selects that axis.
+            const rings: [3]struct {
+                axis: GizmoAxis,
+                u: [3]f32,
+                v: [3]f32,
+            } = .{
+                .{ .axis = .x, .u = .{ 0, 1, 0 }, .v = .{ 0, 0, 1 } },
+                .{ .axis = .y, .u = .{ 1, 0, 0 }, .v = .{ 0, 0, 1 } },
+                .{ .axis = .z, .u = .{ 1, 0, 0 }, .v = .{ 0, 1, 0 } },
+            };
+
+            const ring_segments: usize = 24;
+            var i: usize = 0;
+            while (i < 3) : (i += 1) {
+                const ring = rings[i];
+                var seg_j: usize = 0;
+                var prev_pt: ?canvas.Point = null;
+                while (seg_j <= ring_segments) : (seg_j += 1) {
+                    const angle = @as(f32, @floatFromInt(seg_j)) * 2.0 * std.math.pi / @as(f32, @floatFromInt(ring_segments));
+                    const c = std.math.cos(angle);
+                    const s = std.math.sin(angle);
+                    const p: [3]f32 = .{
+                        world_pos[0] + ring.u[0] * ring_radius * c + ring.v[0] * ring_radius * s,
+                        world_pos[1] + ring.u[1] * ring_radius * c + ring.v[1] * ring_radius * s,
+                        world_pos[2] + ring.u[2] * ring_radius * c + ring.v[2] * ring_radius * s,
+                    };
+                    const pt = projectToViewport(cp.view_projection, p, viewport) orelse {
+                        prev_pt = null;
+                        continue;
+                    };
+                    if (prev_pt) |p0| {
+                        const d = distPointToSegment(pointer.x, pointer.y, p0.x, p0.y, pt.x, pt.y);
+                        if (d < best_dist) {
+                            best_dist = d;
+                            best_axis = ring.axis;
+                        }
+                    }
+                    prev_pt = pt;
+                }
+            }
+        },
     }
-    return best_axis;
+    if (best_axis) |a| return .{ .mode = state.viewport_gizmo.mode, .axis = a };
+    return null;
 }
 
 /// Applies one frame of gizmo drag: projects the pointer through the camera onto the
@@ -3761,9 +3820,11 @@ test "editor: gizmo pick returns the axis under the pointer" {
     // The midpoint of the projected X handle is on the handle.
     const mid_x = @divTrunc(origin.x + tip.x, 2);
     const mid_y = @divTrunc(origin.y + tip.y, 2);
-    const axis = pickGizmoAxis(&h.state, &h.scene, testing.allocator, canvas.Point{ .x = mid_x, .y = mid_y }, dock.viewport);
-    try testing.expect(axis != null);
-    try testing.expectEqual(.x, axis.?);
+    const pick = pickGizmo(&h.state, &h.scene, testing.allocator, canvas.Point{ .x = mid_x, .y = mid_y }, dock.viewport);
+    try testing.expect(pick != null);
+    const p = pick.?;
+    try testing.expectEqual(.translate, p.mode);
+    try testing.expectEqual(.x, p.axis);
 }
 
 test "editor: gizmo pick returns null when nothing is selected" {
@@ -3774,8 +3835,8 @@ test "editor: gizmo pick returns null when nothing is selected" {
     h.state.selected = 0;
 
     const dock = Dock.compute(h.ctx.canvas.bounds());
-    const axis = pickGizmoAxis(&h.state, &h.scene, testing.allocator, canvas.Point{ .x = 100, .y = 100 }, dock.viewport);
-    try testing.expect(axis == null);
+    const pick = pickGizmo(&h.state, &h.scene, testing.allocator, canvas.Point{ .x = 100, .y = 100 }, dock.viewport);
+    try testing.expect(pick == null);
 }
 
 test "editor: gizmo pick returns null when pointer is far from any handle" {
@@ -3787,8 +3848,55 @@ test "editor: gizmo pick returns null when pointer is far from any handle" {
 
     const dock = Dock.compute(h.ctx.canvas.bounds());
     // A point far outside the viewport cannot be on any handle.
-    const axis = pickGizmoAxis(&h.state, &h.scene, testing.allocator, canvas.Point{ .x = -1000, .y = -1000 }, dock.viewport);
-    try testing.expect(axis == null);
+    const pick = pickGizmo(&h.state, &h.scene, testing.allocator, canvas.Point{ .x = -1000, .y = -1000 }, dock.viewport);
+    try testing.expect(pick == null);
+}
+
+test "editor: gizmo pick returns the rotate axis when pointer is on the X ring" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.runFrames(1);
+    h.state.selected = h.root_id;
+    h.state.dock_focus = .viewport;
+
+    // Rotate mode so pickGizmo tests the axis rings instead of the line handles.
+    h.state.viewport_gizmo.mode = .rotate;
+
+    const dock = Dock.compute(h.ctx.canvas.bounds());
+
+    // Project a point on the X ring (in the YZ plane) to get a screen point.
+    const camera = findCameraEntity(&h.scene) orelse return;
+    const cam = render_scene.EngineRenderer.cameraOf(&h.scene, camera, testing.allocator) catch return orelse return;
+    var world = h.scene.computeWorldTransforms(testing.allocator) catch return;
+    defer world.deinit();
+    const entity = h.scene.entityById(h.root_id) orelse return;
+    const m = world.get(entity) orelse return;
+    const world_pos: [3]f32 = .{ m[12], m[13], m[14] };
+    // X ring lies in the YZ plane: u={0,1,0}, v={0,0,1}. Point at angle 0 is (x, y+0.5, z).
+    const ring_pt: [3]f32 = .{ world_pos[0], world_pos[1] + 0.5, world_pos[2] };
+    const ring_screen = projectToViewport(cam.view_projection, ring_pt, dock.viewport) orelse return;
+
+    const pick = pickGizmo(&h.state, &h.scene, testing.allocator, ring_screen, dock.viewport);
+    try testing.expect(pick != null);
+    const p = pick.?;
+    try testing.expectEqual(.rotate, p.mode);
+    try testing.expectEqual(.x, p.axis);
+}
+
+test "editor: gizmo pick returns null when pointer is far from any ring in rotate mode" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.runFrames(1);
+    h.state.selected = h.root_id;
+    h.state.dock_focus = .viewport;
+
+    h.state.viewport_gizmo.mode = .rotate;
+
+    const dock = Dock.compute(h.ctx.canvas.bounds());
+    const pick = pickGizmo(&h.state, &h.scene, testing.allocator, canvas.Point{ .x = -1000, .y = -1000 }, dock.viewport);
+    try testing.expect(pick == null);
 }
 
 test "editor: gizmo drag moves entity along the selected axis" {
@@ -3879,7 +3987,7 @@ test "editor: gizmo rotate rotates entity around selected axis" {
     const origin = projectToViewport(cam.view_projection, world_pos, dock.viewport) orelse return;
     const start_rot: [4]f32 = .{ m[3], m[7], m[11], m[15] };
 
-    // Configure the gizmo for rotate around X, without going through pickGizmoAxis
+    // Configure the gizmo for rotate around X, without going through pickGizmo
     // (which targets line handles for translate/scale).
     h.state.viewport_gizmo.mode = .rotate;
     h.state.viewport_gizmo.axis = .x;

@@ -4,6 +4,55 @@ Permanent record of real progress, decisions, pending items and the next priorit
 task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
+## Cycle 2026-11-07 (y) — Viewport gizmo pick for rotate and scale rings
+
+**Diagnosis first.** Cycle (x) delivered viewport gizmo rotate and scale: the user
+could rotate (quaternion via `quatFromAxisAngle`/`quatMultiply`) and scale (factor
+`1 + displacement * 0.01`) the selected entity along X/Y/Z axes. But the gizmo mode
+had to be set directly on `state.viewport_gizmo.mode` — there was no way to *pick*
+which mode/axis to use by clicking in the viewport. `pickGizmoAxis` only targeted
+line handles (translate/scale) and returned just an axis, not a mode. The recorded
+next priority was exactly this: gizmo pick for rotate and scale rings. Window/swapchain
+remains blocked (unchanged; not attempted).
+
+**Delivered (validated):**
+
+- **`src/editor/shell.zig`**:
+  - **`GizmoPick`** struct (`mode: GizmoMode`, `axis: GizmoAxis`) — result of picking a
+    gizmo handle or ring, returned by `pickGizmo`.
+  - **`pickGizmo`** (renamed from `pickGizmoAxis`) — returns `?GizmoPick` instead of
+    `?GizmoAxis`. Switches on `state.viewport_gizmo.mode`:
+    - `.translate, .scale`: tests distance from pointer to each projected axis-handle
+      line segment (existing behaviour).
+    - `.rotate`: tests distance from pointer to each line segment of each projected
+      axis ring (circle in the plane perpendicular to the axis, 24 segments), so
+      clicking near any part of a ring selects that axis.
+  - **`applyShortcuts`** wiring updated: on viewport press, calls `pickGizmo` and sets
+    `state.viewport_gizmo.mode = pick.mode` automatically, so the user can switch
+    between translate/rotate/scale simply by clicking the corresponding handle or
+    ring. Press on nothing still starts drag-to-orbit.
+  - `pickGizmoAxis` removed; all callers updated to `pickGizmo`.
+- **Tests:** 2 new tests in `shell.zig` — gizmo pick returns the rotate X axis when the
+  pointer is on the X ring; gizmo pick returns null when the pointer is far from any
+  ring in rotate mode. All 939 tests pass (937 pre-existing + 2 new), fmt clean,
+  `zig build` OK, `editor-frame` OK.
+
+**Decisions:**
+
+- `pickGizmo` reads the mode from `state.viewport_gizmo.mode` to decide whether to test
+  line handles or axis rings. The caller (`applyShortcuts`) then adopts the picked mode,
+  so the mode follows the user's click rather than requiring external setup.
+- Ring pick approximates each circle with 24 line segments and tests each segment with
+  `distPointToSegment` — consistent with how `drawWorldCircle` renders the rings.
+- Threshold of 8 px matches the translate/scale handle pick, keeping the hit area
+  consistent across modes.
+
+**Pending / not in this cycle:** Home/End and PageUp/PageDown in the tree, multi-select,
+persisted fold state, sibling ordering; and the window layer when the sandbox allows it.
+
+**Next priority:** Home/End and PageUp/PageDown in the tree; sibling ordering if the
+scene gains a child order; and the window layer when the sandbox allows it.
+
 ## Cycle 2026-11-07 (x) — Viewport gizmo rotate and scale
 
 **Diagnosis first.** Cycle (w) delivered the viewport translate gizmo: drag the
