@@ -8,6 +8,32 @@ declared yet.
 
 ### Added
 
+- Editable **position and scale** in the inspector (`src/editor/inspector.zig`, exposed
+  through `corex.editor.shell`), over the editing model.
+  - Three numeric fields per row, with parsing that refuses what a scene cannot hold
+    (empty, `abc`, `nan`, overflow to infinity) instead of deferring the failure to
+    serialization.
+  - A commit builds the whole `Transform` (edited row + untouched row) and sends **one**
+    `set_component`, so one undo steps back over the whole value and untouched axes are
+    never rewritten. Leaving a field after an edit commits; `Escape` reverts the row.
+  - Rows reload from the scene when the entity or the values change (undo, another
+    command, a selection change) but never while the user is typing.
+- `edit.componentIndexOf` and `edit.valueFor` — the shell names a component by **type**
+  and the schema decides which union arm that is; a schema without the component is a
+  compile error, not a runtime no-op.
+- `State.text_focused` — one flag for "an inspector field holds the keyboard", so frame
+  shortcuts cannot fire for any focused field. Fixes `Delete` inside a numeric field
+  deleting the selected entity.
+- Edit failures are no longer swallowed: a store the history refuses is reported on
+  stderr after the field is reverted.
+
+### Fixed
+
+- `inspector.Field.text()`/`parsed()` and `Row.values()` took `self` **by value**, so the
+  returned slice pointed at a temporary copy. They take a pointer now; the by-value
+  version could hand back garbage or a dead slice.
+- `Delete` while a numeric field had focus destroyed the selected entity (the shortcut
+  gate only knew about the name field).
 - Editor **editing model** (`src/editor/edit.zig`, exposed as `corex.editor.edit`), the
   layer that turns the read-only inspector into an editor. Headless, renderer-free and
   fully tested.

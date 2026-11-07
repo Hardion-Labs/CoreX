@@ -406,6 +406,27 @@ pub fn History(comptime Scene: type) type {
     };
 }
 
+/// Position of component type `T` in a schema's declaration order.
+///
+/// A caller with a typed value (an inspector field writing a `Transform`) should not
+/// have to know that position: it is a schema implementation detail that would silently
+/// break when a component is added before it. Failing at **comptime** means a scene
+/// schema without the component is a compile error, not a runtime no-op.
+pub fn componentIndexOf(comptime types: anytype, comptime T: type) usize {
+    inline for (types, 0..) |C, i| {
+        if (C == T) return i;
+    }
+    @compileError("component " ++ @typeName(T) ++ " is not part of this scene schema");
+}
+
+/// Wrap a typed component value in the history's `ComponentValue` for `Scene`, choosing
+/// the union arm from the value's own type. This is what lets the shell commit a
+/// `Transform` without naming its schema index.
+pub fn valueFor(comptime Scene: type, comptime T: type, value: T) ValueUnion(Scene.component_types) {
+    const index = comptime componentIndexOf(Scene.component_types, T);
+    return @unionInit(ValueUnion(Scene.component_types), std.fmt.comptimePrint("{d}", .{index}), value);
+}
+
 /// Structural equality for one component value. Components are plain data by contract,
 /// so a field-by-field comparison is exact and needs no serialization round-trip.
 pub fn componentEql(comptime T: type, a: T, b: T) bool {
@@ -884,4 +905,30 @@ test "save: keeps the project dirty when the write fails" {
     // `../escape.corex` is refused by the path rules, so nothing is written.
     try testing.expectError(error.UnsafePath, saveScene(&history, &scene, io, tmp.dir, "../escape.corex", testing.allocator));
     try testing.expect(history.dirty);
+}
+
+test "edit: valueFor picks the union arm from the value's type, not from a caller-supplied index" {
+    var scene = try TestScene.init(testing.allocator, "level");
+    defer scene.deinit();
+    var history = TestHistory.init(testing.allocator);
+    defer history.deinit();
+    const entity = try scene.createEntity("box", null);
+    const id = scene.idOf(entity).?;
+    try scene.addComponent(entity, Extra{ .amount = 1 });
+
+    // The caller names the type; the schema decides which arm that is.
+    const value = valueFor(TestScene, Transform, Transform{ .position = .{ 0, 2, 0 } });
+    try testing.expectEqualStrings("0", @tagName(value));
+    try history.apply(&scene, .{ .set_component = .{ .id = id, .value = value } });
+    try testing.expectEqual(@as(f32, 2), scene.getComponent(Transform, entity).?.position[1]);
+    // The other component was untouched.
+    try testing.expectEqual(@as(i32, 1), scene.getComponent(Extra, entity).?.amount);
+
+    const other = valueFor(TestScene, Extra, Extra{ .amount = 9 });
+    try testing.expectEqualStrings("1", @tagName(other));
+    try history.apply(&scene, .{ .set_component = .{ .id = id, .value = other } });
+    try testing.expectEqual(@as(i32, 9), scene.getComponent(Extra, entity).?.amount);
+
+    try testing.expectEqual(@as(usize, 0), componentIndexOf(TestScene.component_types, Transform));
+    try testing.expectEqual(@as(usize, 1), componentIndexOf(TestScene.component_types, Extra));
 }
