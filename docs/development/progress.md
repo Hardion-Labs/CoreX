@@ -4,6 +4,54 @@ Permanent record of real progress, decisions, pending items and the next priorit
 task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
+## Cycle 2026-11-07 (q) — Drag and drop reparenting
+
+**Diagnosis first.** Cycle (p) closed the keyboard gap, but reparenting still required
+either `P` (to root) or a `tree.apply` call: there was no way to move an entity *under*
+another one with a gesture. The recorded next priority was exactly this. Window/swapchain
+remains blocked (unchanged; not attempted).
+
+**Delivered (validated):**
+
+- **`tree.Drag`** (`begin` / `end` / `cancel` / `active`) — the reparent gesture as a value,
+  with the rules in one place: a press on a row arms the drag; a release on another row
+  yields the `reparent` action, a release on the panel's blank area yields "to root", and a
+  useless drop yields `.none` without touching the history.
+- **`tree.isAncestor(scene, id, descendant)`** — the same bounded parent-chain walk the
+  scene uses to refuse a cycle, so a drop that cannot work is refused **before a command
+  exists**. `tree.apply` now reports `ParentCycle` for a direct call instead of silently
+  doing nothing.
+- **Shell** — `State.tree_drag`, a press on a row arms it, the release is resolved once for
+  the whole list against the rects the rows were actually painted at, and the result goes
+  through `runTreeAction`, so a drop is one undoable command like any other edit. A release
+  outside the panel abandons the gesture; `Escape` cancels it.
+- **Visible drag** — the dragged row's label is muted, the row under the pointer is
+  outlined, and a row the drop would refuse is not outlined.
+
+**Bugs found and fixed while validating:**
+
+- The first draft resolved the drop from a recomputed row index, which is a second,
+  drifting definition of where a row is; it now uses the layout the rows were painted with.
+- A release over the viewport was treated as "drop on nothing" → root, which would let a
+  gesture that left the panel restructure the scene. It now abandons the drag.
+- The disclosure arrow would have armed a drag on an 8 px target; it presses the row, so the
+  gesture resolves like any other press.
+
+**Suite:** **899/899** tests (clean cache), fmt clean, `zig build` OK, validate, runtime,
+`gui-frame`, `editor-frame` (640x360), `qoi-decode`, `bench-extract -Doptimize=ReleaseFast`.
+
+**Decisions:** the gesture is a value so it is testable headlessly; the drop target is what
+was painted; a refused drop records nothing; a press that never moves is still a click.
+
+**Pending / not in this cycle:** dropping *between* rows (sibling order needs an explicit
+child order in the scene), drag auto-scroll at the panel edge, Home/End and
+PageUp/PageDown in the tree, multi-select, rotation/camera fields, gizmos, persisted fold
+state.
+
+**Next priority:** rotation and camera fields in the inspector (the last read-only values
+the model can already write), then sibling ordering if the scene gains a child order; and
+the window layer when the sandbox allows it.
+
 ## Cycle 2026-11-07 (p) — Viewport keyboard framing and orbit
 
 **Diagnosis first.** Cycle (o) made the keyboard able to *reach* every dock, but the
@@ -68,9 +116,8 @@ the viewport is a Tab stop now that it answers keys.
 drag-to-orbit in the viewport, gizmos, Home/End and PageUp/PageDown in the tree,
 multi-select, drag-and-drop reparenting, rotation/camera fields, persisted fold state.
 
-**Next priority:** drag-and-drop reparenting in the hierarchy (a pointer gesture over rows,
-landing on the existing `tree.apply` `reparent` command), then rotation/camera fields; and
-the window layer when the sandbox allows it.
+**Next priority:** drag-and-drop reparenting in the hierarchy — delivered in cycle (q) — then
+rotation/camera fields; and the window layer when the sandbox allows it.
 
 ## Cycle 2026-11-07 (o) — Keyboard focus between docks
 

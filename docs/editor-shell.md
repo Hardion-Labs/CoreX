@@ -77,8 +77,32 @@ history command (one `Ctrl+Z` undoes exactly what one click did):
 | --- | --- | --- |
 | add a child (or a root) | the panel's `+` control, `N` | `create`, named `entity`, selected afterwards |
 | delete | `Delete` | `delete` |
+| reparent | drag a row onto another row (or onto the blank area, for a root) | `reparent` |
 | reparent to a root | `P` | `reparent` with a null parent |
 | fold / unfold | the disclosure, `Enter` on a row with children | none (view only) |
+
+### Drag and drop
+
+Reparenting is also a pointer gesture: press a row, drag it, release it on another row —
+or on the panel's blank area to make it a root.
+
+- The gesture is a **value**, `tree.Drag` (`begin` / `end` / `cancel`), not a flag buried in
+  a paint function, so "does this drop change anything?" is testable without a pointer —
+  exactly like `step` and `apply`.
+- A drop is resolved against the rects the rows were **actually painted at**, so the target
+  is always the row the user saw under the pointer.
+- A drop that cannot work records **no command**: releasing on the dragged row itself, on
+  its own subtree (`tree.isAncestor`, checked *before* a command exists, so the history never
+  holds an edit that would fail), on its current parent, or outside the panel at all (a
+  release over the viewport abandons the gesture — it does not mean "root"). A direct
+  `tree.apply(.{ .reparent = ... })` reports `ParentCycle` instead of silently doing nothing.
+- What it *does* work as is an ordinary edit: one `reparent` command, one undo step, the
+  dropped entity selected, and its new parent unfolded so the result is visible. A press
+  that never moves is still a click, so selecting and dragging are the same gesture.
+- The drag is visible: the dragged row's label is muted, the row under the pointer is
+  outlined, and a row the drop would refuse is not outlined. `Escape` abandons the gesture.
+- The disclosure arrow is **not** a drag handle: it is 8 px wide, and a drag from there would
+  be a drag nobody meant. Pressing it presses the row too, so the gesture resolves anyway.
 
 ### Keyboard navigation
 
@@ -340,12 +364,12 @@ behaviour, not a workaround.
 - **The history is in-memory and per-session.** It is not persisted, and there is no
   "reopen and undo" — deliberate for now.
 - **No multi-select, no copy/paste, no grouping.**
-- **No drag-and-drop reparenting.** Reparenting is `P` (to root) or a `tree.apply`
-  call; a pointer drag needs hover-target tracking across rows, which the GUI can already
-  report, but the interaction is a separate step.
+- **No drop *between* rows and no drop onto the panel title.** A drag reparents ("be a
+  child of this node") or roots ("be a root"); ordering siblings needs an explicit child
+  order in the scene, which the model does not have.
 - **The viewport has no pointer interaction.** Framing and orbit are keyboard-only: no
   click-to-select in the viewport, no drag to orbit, no zoom (the distance is set by `F`,
-  not by a wheel or a scale factor), and no gizmos.
+  not by a wheel or a scale factor), no gizmos, and no drag-across-the-edge auto-scroll.
 - **No focus ring on individual fields.** The outline marks the dock; the field inside it
   draws its own border when focused.
 - **No Home/End, PageUp/PageDown or multi-select in the tree.** One selected entity.

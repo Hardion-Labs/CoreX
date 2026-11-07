@@ -124,7 +124,7 @@ src/
     ├── edit.zig          # Commands, undo/redo, dirty tracking, atomic save [implemented]
     ├── inspector.zig     # Editable numeric rows (fields, parsing, commit)  [implemented]
     ├── frame_camera.zig  # Scene bounds, camera fit and orbit (no GUI)      [implemented]
-    └── tree.zig          # Flat rows, folding, tree actions, keyboard nav     [implemented]
+    └── tree.zig          # Flat rows, folding, actions, drag, keyboard nav    [implemented]
 ```
 
 Planned subsystems will be added as sibling modules (e.g. `src/script/`,

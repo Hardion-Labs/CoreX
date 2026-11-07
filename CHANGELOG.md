@@ -8,6 +8,19 @@ declared yet.
 
 ### Added
 
+- **Drag and drop reparenting** in the hierarchy (`tree.Drag`, `tree.isAncestor`).
+  - Press a row, drag it, release it on another row to make it that row's child; release on
+    the panel's blank area to make it a root. A drop is one `reparent` command, so it is one
+    undo step and marks the project dirty like any other edit.
+  - A drop that cannot work records nothing: on the dragged row itself, on its own subtree
+    (checked before a command exists, so the history never holds an edit that would fail),
+    on its current parent, or outside the panel (a release over the viewport abandons the
+    gesture rather than meaning "root"). `Escape` cancels a drag in flight.
+  - The drag is visible: the dragged row is muted and the row under the pointer is outlined,
+    except when the drop would be refused.
+  - `tree.apply(.{ .reparent = ... })` now reports `ParentCycle` for a direct call instead of
+    silently doing nothing.
+
 - **Viewport keyboard framing and orbit** (`editor.frame_camera`, `State.camera_view`).
   - `F` frames the whole scene, `Shift+F` frames the selection; the arrows orbit the view.
   - `bounds`/`boundsOf` frame the geometry the scene actually has (both a `Transform` and a

@@ -96,6 +96,10 @@ pub const State = struct {
     /// The camera view the editor last framed, kept so `orbit` turns from what is on screen
     /// rather than from the authored transform (which may be anywhere).
     camera_view: frame_camera.View = .{},
+    /// The reparent gesture in flight, if any: the row a press landed on, waiting for the
+    /// row it is released over. Only the row it started from is remembered, because a press
+    /// already resolved against the previous frame's widget table.
+    tree_drag: tree.Drag = .{},
     theme: Theme = .{},
     /// Set when the user clicked an entity this frame, so a caller can react
     /// (re-frame the camera, save the selection, ...) without diffing by hand.
@@ -298,11 +302,37 @@ fn drawHierarchy(ctx: *widgets.Context, state: *State, scene: anytype, history: 
     }
 
     var shown: usize = 0;
+    // The row the pointer is over, taken from the rect each row was actually painted at:
+    // resolving a drop from any other geometry would be a second, drifting definition of
+    // where a row is.
+    var under_pointer: ?u64 = null;
     for (list.rows[0..list.len]) |row| {
         const slot = stack.measure(.{ .w = content.w, .h = row_h });
         if (slot.isEmpty()) break;
+        if (ctx.input.pointer_in_window and slot.containsPoint(ctx.input.pointer)) under_pointer = row.id;
         if (drawTreeRow(ctx, state, scene, history, slot, row, row_h, content)) shown += 1;
     }
+
+    // The drop resolves against the rows painted above, so the whole gesture is decided by
+    // what the user could see: a release over a row reparents onto it, and a release in the
+    // panel's blank area makes the dragged entity a root.
+    //
+    // `ctx.input.pointer_released` is read here rather than from a row's `Response` because
+    // the release is one frame past the row widget it belongs to: the row the press landed
+    // on was resolved from the previous frame's table.
+    if (ctx.input.pointer_released and state.tree_drag.active()) {
+        // Past the panel is not a drop at all: the gesture is abandoned, not treated as
+        // "make it a root", so releasing over the viewport cannot restructure the scene.
+        if (ctx.input.pointer_in_window and rect.containsPoint(ctx.input.pointer)) {
+            const source = state.tree_drag.source;
+            const action = state.tree_drag.end(under_pointer, scene);
+            if (action != .none) runTreeAction(state, scene, history, action, source);
+        } else {
+            state.tree_drag.cancel();
+        }
+    }
+    // Escape abandons a drag in flight, like it abandons a half-typed value.
+    if (ctx.keyPressed(.escape)) state.tree_drag.cancel();
 
     if (shown == 0) {
         _ = widgets.label(ctx, stack.measure(.{ .w = content.w, .h = @intCast(font.line_height) }), "(empty scene)");
@@ -375,10 +405,12 @@ fn drawTreeRow(
     // The disclosure control is its own hit area *before* the row, so clicking it folds
     // the branch instead of selecting the entity. It is painted (and registered) first so
     // the row underneath still receives clicks everywhere else.
-    var disclosure_w: i32 = 0;
+    //
+    // It is deliberately *not* a drag handle: the rows are as tall as a line of text, and a
+    // drag that started on an 8 px arrow would be a drag the user did not mean. Pressing the
+    // arrow presses the row too, so a gesture from there resolves like any other.
     if (row.has_children) {
-        disclosure_w = 8;
-        const tri = Rect.init(row_rect.x + indent - 8, row_rect.y, disclosure_w, row_h);
+        const tri = Rect.init(row_rect.x + indent - 8, row_rect.y, 8, row_h);
         const dr = ctx.interact(Id.from(row.id, "tree.disclosure"), tri);
         const glyph: []const u8 = if (row.collapsed) ">" else "v";
         const ty = row_rect.y + @divTrunc(@max(row_h - @as(i32, @intCast(font.line_height)), 0), 2);
@@ -394,6 +426,9 @@ fn drawTreeRow(
 
     const id_hash = Id.from(row.id, "tree");
     const r = ctx.interact(id_hash, row_rect);
+    // A press arms the reparent gesture; the release is resolved once for the whole list,
+    // after every row is painted, because the target is whichever row it lands on.
+    if (r.owns_pointer and ctx.input.pointer_pressed) _ = state.tree_drag.begin(row.id);
     const selected = state.selected == row.id;
     if (selected) {
         ctx.canvas.fillRect(row_rect, theme.accent);
@@ -405,11 +440,22 @@ fn drawTreeRow(
         state.selection_changed = true;
     }
 
+    // A drag has to show where it came from and where it would land: the dragged row is
+    // muted and the row under the pointer is outlined, and a row the drop would refuse (the
+    // dragged row's own subtree) is not outlined at all.
+    var dragging_source = false;
+    if (state.tree_drag.active()) {
+        dragging_source = state.tree_drag.source == row.id;
+        if (!dragging_source and r.isHovered() and !tree.isAncestor(scene, state.tree_drag.source, row.id)) {
+            ctx.canvas.strokeRect(row_rect, theme.accent);
+        }
+    }
+
     const name = scene.nameOf(entity) orelse "(unnamed)";
     const label_rect = Rect.init(row_rect.x + indent, row_rect.y, @max(row_rect.w - indent, 0), row_h);
     const y = row_rect.y + @divTrunc(@max(row_h - @as(i32, @intCast(font.line_height)), 0), 2);
     _ = text.draw(ctx.canvas, label_rect.x, y, name, .{
-        .color = if (selected) theme.textOn(theme.accent) else theme.text,
+        .color = if (selected) theme.textOn(theme.accent) else if (dragging_source) theme.text_muted else theme.text,
         .clip = label_rect,
     });
     _ = content;
@@ -1202,6 +1248,17 @@ const Harness = struct {
         for (0..count) |_| self.frameInput(.{}, &self.state);
     }
 
+    /// The rect a widget was registered at in the last frame, or null when it was not
+    /// painted. Reused by the tests that need a row's real geometry.
+    fn widgetRect(self: *Harness, id: widgets.Id) ?Rect {
+        var found: ?Rect = null;
+        var i: usize = 0;
+        while (i < self.ctx.entry_count) : (i += 1) {
+            if (self.ctx.entries[i].id.eql(id)) found = self.ctx.entries[i].rect;
+        }
+        return found;
+    }
+
     fn hover(self: *Harness, x: i32, y: i32) void {
         self.frameInput(.{ .pointer = .{ .x = x, .y = y }, .pointer_in_window = true }, &self.state);
     }
@@ -1313,6 +1370,154 @@ test "editor: clicking a hierarchy row selects that entity, and only that one" {
         h.release(x, blank_y);
         try testing.expectEqual(h.child_id, h.state.selected);
     }
+}
+
+test "editor: dropping a row on another reparents it as one undoable edit" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.runFrames(2);
+
+    const dock = Dock.compute(h.ctx.canvas.bounds());
+    const theme = h.state.theme;
+    const title_h = @as(i32, @intCast(font.line_height)) + 2 * theme.panel_padding.top + 1;
+    const content_y = dock.hierarchy.y + title_h + theme.panel_padding.top;
+    // Rows, depth-first: root, child, loose, camera.
+    const row_y = struct {
+        fn at(base: i32, row_height: i32, n: i32) i32 {
+            return base + 1 + row_height * n;
+        }
+    }.at;
+    const x = dock.hierarchy.x + 20;
+
+    try testing.expectEqual(@as(?u64, null), h.scene.parentIdOf(h.loose_id));
+
+    // Press on the loose row and release on the root row: one reparent command.
+    h.hover(x, row_y(content_y, theme.row_height, 2));
+    h.click(x, row_y(content_y, theme.row_height, 2));
+    try testing.expectEqual(h.loose_id, h.state.tree_drag.source);
+    h.hover(x, row_y(content_y, theme.row_height, 0));
+    // The landing row is outlined while the drag is in flight, so the user can see where
+    // the drop will go. The row geometry comes from the widget table, the same source the
+    // drop itself is resolved from.
+    h.hover(x, row_y(content_y, theme.row_height, 0));
+    const landing = h.widgetRect(widgets.Id.from(h.root_id, "tree")).?;
+    try testing.expectEqual(theme.accent, h.pixel(landing.x, landing.y));
+
+    h.release(x, row_y(content_y, theme.row_height, 0));
+
+    try testing.expect(!h.state.tree_drag.active());
+    try testing.expectEqual(h.root_id, h.scene.parentIdOf(h.loose_id).?);
+    try testing.expectEqual(@as(usize, 1), h.history.undoDepth());
+    try testing.expect(h.history.dirty);
+
+    // Undo restores the tree exactly, and the selection follows the drop.
+    try h.history.undo(&h.scene);
+    try testing.expectEqual(@as(?u64, null), h.scene.parentIdOf(h.loose_id));
+}
+
+test "editor: a drop in the panel's blank area makes the row a root" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.runFrames(2);
+
+    const dock = Dock.compute(h.ctx.canvas.bounds());
+    const theme = h.state.theme;
+    const title_h = @as(i32, @intCast(font.line_height)) + 2 * theme.panel_padding.top + 1;
+    const content_y = dock.hierarchy.y + title_h + theme.panel_padding.top;
+    const row1_y = content_y + 1 + theme.row_height;
+    const x = dock.hierarchy.x + 20;
+    try testing.expectEqual(h.root_id, h.scene.parentIdOf(h.child_id).?);
+
+    h.hover(x, row1_y);
+    h.click(x, row1_y);
+    const blank_y = row1_y + theme.row_height * 5;
+    if (blank_y >= dock.hierarchy.bottom() - 2) return; // no blank area at this canvas size
+    h.hover(x, blank_y);
+    h.release(x, blank_y);
+
+    try testing.expectEqual(@as(?u64, null), h.scene.parentIdOf(h.child_id));
+    try testing.expectEqual(@as(usize, 1), h.history.undoDepth());
+}
+
+test "editor: a drag over its own subtree shows no landing, and never applies" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.runFrames(2);
+
+    const dock = Dock.compute(h.ctx.canvas.bounds());
+    const theme = h.state.theme;
+    const title_h = @as(i32, @intCast(font.line_height)) + 2 * theme.panel_padding.top + 1;
+    const content_y = dock.hierarchy.y + title_h + theme.panel_padding.top;
+    const row0_y = content_y + 1;
+    const row1_y = row0_y + theme.row_height;
+    const x = dock.hierarchy.x + 20;
+
+    // Pick the root up and drop it on its own child: a cycle, so nothing is recorded.
+    h.hover(x, row0_y);
+    h.click(x, row0_y);
+    try testing.expectEqual(h.root_id, h.state.tree_drag.source);
+    h.hover(x, row1_y);
+    h.release(x, row1_y);
+    try testing.expect(!h.state.tree_drag.active());
+    try testing.expectEqual(@as(usize, 0), h.history.undoDepth());
+    try testing.expectEqual(@as(?u64, null), h.scene.parentIdOf(h.root_id));
+    try testing.expect(h.state.edit_error == null);
+}
+
+test "editor: Escape abandons a drag in flight" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.runFrames(2);
+
+    const dock = Dock.compute(h.ctx.canvas.bounds());
+    const theme = h.state.theme;
+    const title_h = @as(i32, @intCast(font.line_height)) + 2 * theme.panel_padding.top + 1;
+    const content_y = dock.hierarchy.y + title_h + theme.panel_padding.top;
+    const row1_y = content_y + 1 + theme.row_height;
+    const x = dock.hierarchy.x + 20;
+
+    h.hover(x, row1_y);
+    h.click(x, row1_y);
+    try testing.expect(h.state.tree_drag.active());
+    h.frameInput(.{ .key = .escape }, &h.state);
+    try testing.expect(!h.state.tree_drag.active());
+
+    // The release after a cancelled drag is not a drop.
+    h.hover(x, content_y + 1);
+    h.release(x, content_y + 1);
+    try testing.expectEqual(@as(usize, 0), h.history.undoDepth());
+    try testing.expectEqual(h.root_id, h.scene.parentIdOf(h.child_id).?);
+}
+
+test "editor: releasing a drag outside the hierarchy abandons it instead of restructuring" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.runFrames(2);
+
+    const dock = Dock.compute(h.ctx.canvas.bounds());
+    const theme = h.state.theme;
+    const title_h = @as(i32, @intCast(font.line_height)) + 2 * theme.panel_padding.top + 1;
+    const content_y = dock.hierarchy.y + title_h + theme.panel_padding.top;
+    const row1_y = content_y + 1 + theme.row_height;
+    const x = dock.hierarchy.x + 20;
+
+    h.hover(x, row1_y);
+    h.click(x, row1_y);
+    try testing.expect(h.state.tree_drag.active());
+
+    // A release over the viewport is not a drop on "root": the gesture is dropped.
+    const vx = dock.viewport.x + 10;
+    const vy = dock.viewport.y + 10;
+    h.hover(vx, vy);
+    h.release(vx, vy);
+    try testing.expect(!h.state.tree_drag.active());
+    try testing.expectEqual(h.root_id, h.scene.parentIdOf(h.child_id).?);
+    try testing.expectEqual(@as(usize, 0), h.history.undoDepth());
 }
 
 test "editor: the inspector shows the selection and says so when there is none" {
