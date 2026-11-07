@@ -4,6 +4,87 @@ Permanent record of real progress, decisions, pending items and the next priorit
 task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
+## Cycle 2026-11-06 (d) — Renderer tier contract and CPU backend driver
+
+**Delivered (validated):**
+
+- `src/render/backend.zig` (new, `corex.render.backend`, re-exported on
+  `corex.render`): the contract every renderer tier implements, so a backend can
+  be added or swapped without touching the scene, extraction or caller.
+  - `Tier` (`low`/`medium`/`advanced`) with **one** `capabilities(tier)` table:
+    `depth`, `textures`, `lighting`, `blending`, `mipmaps`, `antialias`. Low is the
+    documented floor (opaque, untextured, unlit geometry with a depth buffer);
+    Medium is the full CPU feature set; Advanced declares the same set until a
+    backend exists and is deliberately not implied by Medium.
+  - `FrameOptions` (`blend`, `antialias`, `mipmap`, `light`, `depth_test`,
+    `depth_write`, `cull`, `front_face`) + `rasterOptions()` so a new field cannot
+    be forgotten on one side of the conversion.
+  - `Surface`: borrowed RGBA8 `color` + `f32` `depth`, `validate()`, `clear()`,
+    `pixelCount()`, and `Surface.of(&target)` adapting the rasterizer's `Target`
+    as a cast, not a copy.
+  - `DrawResources`: the duck-typed asset resolver as a **runtime** value (pointer
+    + `meshFn`/`colorFn` + optional `textureFn`/`lightFn`), with
+    `fromComptime(provider)` adapting any provider the rasterizer already accepts.
+    Absent optional declarations become null pointers and a **private** `texture`
+    decl stays invisible — the same rule `@hasDecl` applies.
+  - `Backend`: explicit vtable (`tier`, `beginFrame`, `draw`, `endFrame`,
+    `deinit`), the same shape as `core.splash.SplashScreen`, chosen because the
+    tier comes from `settings.json` at runtime. `draw` takes
+    `mvp = view_projection * world`, folded once by the caller.
+  - `Error` (`FrameNotBegun`, `FrameAlreadyBegun`, `InvalidSurface`,
+    `UnsupportedFeature`, `UnresolvedHandle`, `InvalidTexture`, `OutOfMemory`);
+    `DrawStats`/`FrameStats` with `FrameStats.add` as the only fold.
+- `unsupported(tier, options)`: pure capability gate. `beginFrame` **rejects**
+  (`error.UnsupportedFeature`) instead of degrading, and a rejected frame does not
+  start one. Two derived rules: `mipmap` is not a request on a tier without
+  textures, but a **material that binds a texture** on such a tier is rejected
+  (silent flat shading would hide the misconfiguration); a provider
+  `directionalLight` is ignored without `lighting`, while an explicit
+  `FrameOptions.light` is rejected.
+- `SoftwareBackend`: the CPU driver and **reference implementation** of the
+  contract, built on `raster.drawMeshAlloc` (passing the identity as the world
+  matrix so the pre-folded `mvp` is applied exactly once). It serves `.low`
+  through the gate as well as `.medium`.
+- `docs/render-backend.md` (new): tiers/capability table, the pieces, lifecycle,
+  ownership, the CPU driver, guarantees, limitations and next steps.
+- Docs updated: `docs/architecture.md` (module tree + tier section),
+  `README.md` (doc link, roadmap item now `[x]`), `CHANGELOG.md`.
+
+**Validation:** `zig build test` → **681/681** (9 new) in a cold cache; `zig fmt
+--check` clean; `zig build` and the headless smoke run OK. The key new test drives
+the same command through `SoftwareBackend` and through `raster.drawMeshAlloc`
+directly and asserts the colour **and** depth buffers are byte-identical — that is
+what makes the CPU path a valid oracle for a future GPU backend. Also covered:
+the capability table per tier, the gate (`UnsupportedFeature` for blend,
+antialias, explicit light, and a texture binding on Low; defaults and
+`mipmap = .level0` accepted; no frame left open after a rejection), stats
+accounting with a culled quad and an unresolved handle, frame lifecycle misuse,
+malformed surfaces, light precedence (provider / explicit / absent tier) and
+adapter fidelity.
+
+**Errors found and fixed in-cycle:** the first draft assumed `mvp` folded the
+world matrix inside the backend (the contract puts that on the caller) and two
+tests were wrong about the rasterizer's semantics — equal depth does not
+overwrite, and `culled` counts **triangles**, not draws. Also fixed a shadowed
+`command` identifier, type errors from an anonymous-struct provider at test scope
+(hoisted to file scope) and the `tier_supports(.feature)` enum-literal-as-string
+mistake (replaced by `caps()`).
+
+**Decisions:** the contract takes the tier as an argument rather than importing
+`core/config.zig` (non-trivial link from `render` to `core`, low coupling);
+runtime vtable rather than comptime generics (runtime tier selection; the
+rasterizer's comptime `resources` stays untouched behind the adapter); `Surface`
+carries borrowed plain buffers rather than a GPU handle (backends keep their own
+state behind the vtable; `Surface` serves readback and the reference path).
+
+**Pending:** GPU backend selection (Low/Medium) implementing this vtable — an
+API choice, to be documented before coding; wiring a backend into startup from
+`settings.json` together with the runtime/window layer; presentation and
+double buffering; per-material/per-pass state if a backend ever needs it.
+
+**Next priority:** the runtime/window layer that owns a swapchain and selects a
+backend by tier from `settings.json`, keeping the contract as the only seam.
+
 ## Cycle 2026-11-06 (c) — Mipmaps and LOD selection
 
 **Delivered (validated):**

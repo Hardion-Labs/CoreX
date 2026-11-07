@@ -93,6 +93,8 @@ src/
 │   ├── camera.zig        # View/projection math (right-handed)         [implemented]
 │   ├── culling.zig       # Frustum + AABB/sphere classification        [implemented]
 │   ├── draw.zig          # Renderable + draw-list extraction + sorting [implemented]
+│   ├── backend.zig       # Renderer tier contract + CPU backend driver   [implemented]
+│   ├── mipmap.zig        # Mip-chain construction (integer box filter)   [implemented]
 │   └── raster.zig        # Software rasterizer: coverage + depth buffer  [implemented]
 ├── audio.zig             # Audio public module; device-independent mixing
 └── audio/
@@ -152,14 +154,24 @@ are planned on top of the GUI library.
 The engine's own GUI toolkit (widgets, layout, input, rendering integration) used
 by the editor and the graphical splash. No third-party GUI dependency is planned.
 
-### Renderer — extraction + CPU rasterization implemented; GPU backends planned
+### Renderer — extraction, CPU rasterization and the tier contract implemented; GPU backends planned
 Three quality tiers:
 - **Low:** minimal feature set, broad hardware reach.
 - **Medium:** default tier; modern features with wide compatibility.
 - **Advanced:** high-end features; only the *contract* is defined for now.
 
-The project selects a tier via `settings.json` (`config.RendererTier`). No GPU
-backend is chosen yet.
+The project selects a tier via `settings.json` (`config.RendererTier`). **No GPU
+backend is chosen yet**, but the tier **contract** now exists
+(`src/render/backend.zig`, `docs/render-backend.md`): `Tier` (`low`/`medium`/
+`advanced`), a single `capabilities(tier)` table, `FrameOptions`, a borrowed
+`Surface` (RGBA8 + `f32` depth), a runtime `DrawResources` resolver adapted from
+the comptime provider, and a `Backend` vtable (`beginFrame` → N × `draw` →
+`endFrame`, plus `deinit`). `beginFrame` rejects any option a tier cannot honour
+with `UnsupportedFeature` instead of degrading silently, and a texture binding on
+a tier without textures is a rejected draw rather than a flat one. The CPU driver
+`SoftwareBackend` implements the contract on top of the rasterizer, and a test
+proves it is **byte-identical** to calling the rasterizer directly — so a GPU
+backend replacing that value must reproduce exactly that behaviour.
 
 The **backend-independent extraction layer** is implemented (`src/render/`,
 re-exported as `corex.render`, `docs/render-extraction.md`): right-handed camera
