@@ -433,6 +433,10 @@ chain** (`Texture.mips`, built by `corex.render.mipmap.Chain.generate` with an
 integer box filter) and per-pixel LOD selection from the exact screen-space UV
 gradient (`Options.mipmap = .trilinear`, the default; `.level0` keeps the crisp
 aliased path); a texture without `mips` samples level 0 exactly as before.
+`Options.mipmap = .anisotropic` adds up to eight taps along an elongated pixel
+footprint, which stops the over-blur a grazing surface gets from a single level —
+free when the footprint is round, ~5x at a full 8:1 grazing footprint, so it is
+opt-in.
 
 The extraction design and math conventions are documented in
 [`docs/render-extraction.md`](docs/render-extraction.md); the rasterizer, its
@@ -649,6 +653,7 @@ Indicative; subject to change as technical decisions are validated.
 - [x] Rasterizer blending: `.none`, straight-alpha source-over, premultiplied, additive.
 - [x] Rasterizer antialiasing: 4x4 sub-sample coverage, per-draw accumulation, `Antialias.edge`.
 - [x] Rasterizer mipmaps: integer box-filter chain, per-pixel LOD, trilinear sampling.
+- [x] Rasterizer anisotropic filtering: up to 8 footprint-aligned taps, `Mipmap.anisotropic`.
 - [ ] GUI library and graphical editor.
 - [ ] Lua VM and gameplay scripting.
 - [ ] Native Module API loader (C++).

@@ -58,6 +58,7 @@ const minified_mesh = R.RasterMesh{ .positions = &positions, .indices = &indices
 const MinifiedResources = struct {
     mipped: bool,
     filt: R.TextureFilter,
+    mode: R.Mipmap = .trilinear,
     pub fn mesh(self: MinifiedResources, handle: u32) ?R.RasterMesh {
         _ = self;
         _ = handle;
@@ -75,7 +76,14 @@ const MinifiedResources = struct {
     }
 };
 
-fn runMinified(gpa: std.mem.Allocator, size: u32, cmds: []const R.DrawCommand, mipped: bool, filt: R.TextureFilter) !Run {
+fn runMinifiedMode(
+    gpa: std.mem.Allocator,
+    size: u32,
+    cmds: []const R.DrawCommand,
+    mipped: bool,
+    filt: R.TextureFilter,
+    mode: R.Mipmap,
+) !Run {
     const n = @as(usize, size) * size;
     const color = try gpa.alloc(u8, n * 4);
     defer gpa.free(color);
@@ -84,9 +92,54 @@ fn runMinified(gpa: std.mem.Allocator, size: u32, cmds: []const R.DrawCommand, m
     const vp = corex.render.orthographic(-1, 1, -1, 1, 0, 2);
     var target = try R.Target.init(size, size, color, depth);
     target.clear(.{ 0, 0, 0, 255 }, 1.0);
-    const resources = MinifiedResources{ .mipped = mipped, .filt = filt };
+    const resources = MinifiedResources{ .mipped = mipped, .filt = filt, .mode = mode };
     const t0 = monotonicNs();
-    const stats = try R.rasterize(&target, cmds, vp, resources, .{});
+    const stats = try R.rasterize(&target, cmds, vp, resources, .{ .mipmap = mode });
+    const ns = monotonicNs() - t0;
+    return .{ .ns = ns, .pixels = stats.pixels };
+}
+
+fn runMinified(gpa: std.mem.Allocator, size: u32, cmds: []const R.DrawCommand, mipped: bool, filt: R.TextureFilter) !Run {
+    return runMinifiedMode(gpa, size, cmds, mipped, filt, .trilinear);
+}
+
+/// A grazing footprint: the tile maps 8 UV units across x but only 0.25 across y,
+/// so the pixel footprint is ~32:1 elongated. This is the case anisotropic
+/// filtering exists for, and the only one where the taps cost anything real.
+const grazing_uvs = [_][2]f32{
+    .{ 0, 0 }, .{ 8, 0 }, .{ 8, 0.25 }, .{ 0, 0.25 },
+};
+const grazing_mesh = R.RasterMesh{ .positions = &positions, .indices = &indices, .uvs = &grazing_uvs };
+
+const GrazingResources = struct {
+    pub fn mesh(self: GrazingResources, handle: u32) ?R.RasterMesh {
+        _ = self;
+        _ = handle;
+        return grazing_mesh;
+    }
+    pub fn color(self: GrazingResources, handle: u32) ?[4]f32 {
+        _ = self;
+        _ = handle;
+        return white;
+    }
+    pub fn texture(self: GrazingResources, handle: u32) ?R.RasterTexture {
+        _ = self;
+        _ = handle;
+        return tex_big_mipped;
+    }
+};
+
+fn runGrazing(gpa: std.mem.Allocator, size: u32, cmds: []const R.DrawCommand, mode: R.Mipmap) !Run {
+    const n = @as(usize, size) * size;
+    const color = try gpa.alloc(u8, n * 4);
+    defer gpa.free(color);
+    const depth = try gpa.alloc(f32, n);
+    defer gpa.free(depth);
+    const vp = corex.render.orthographic(-1, 1, -1, 1, 0, 2);
+    var target = try R.Target.init(size, size, color, depth);
+    target.clear(.{ 0, 0, 0, 255 }, 1.0);
+    const t0 = monotonicNs();
+    const stats = try R.rasterize(&target, cmds, vp, GrazingResources{}, .{ .mipmap = mode });
     const ns = monotonicNs() - t0;
     return .{ .ns = ns, .pixels = stats.pixels };
 }
@@ -247,14 +300,23 @@ pub fn main() !void {
         // The whole frame is timed: scratch sizing, the accumulated pass and the
         // resolve. One warm-up run first, so the scratch allocation does not
         // dominate the first sample.
+        // Anisotropic minification at the same 128 texels/pixel, and at the
+        // grazing footprint where the taps actually trigger.
+        var best_min_aniso: i128 = std.math.maxInt(i128);
+        for (0..5) |_| best_min_aniso = @min(best_min_aniso, (try runMinifiedMode(gpa, size, cmds, true, .bilinear, .anisotropic)).ns);
+        var best_graze_tri: i128 = std.math.maxInt(i128);
+        for (0..5) |_| best_graze_tri = @min(best_graze_tri, (try runGrazing(gpa, size, cmds, .trilinear)).ns);
+        var best_graze_aniso: i128 = std.math.maxInt(i128);
+        for (0..5) |_| best_graze_aniso = @min(best_graze_aniso, (try runGrazing(gpa, size, cmds, .anisotropic)).ns);
         var best_aa: i128 = std.math.maxInt(i128);
         _ = try runAntialiased(gpa, size, cmds);
         for (0..5) |_| best_aa = @min(best_aa, (try runAntialiased(gpa, size, cmds)).ns);
-        std.debug.print("{d}x{d} covered={d} flat={d:.3}ms bilinear={d:.3}ms nearest={d:.3}ms alpha={d:.3}ms additive={d:.3}ms aa={d:.3}ms minify={d:.3}ms minify_mip={d:.3}ms\n", .{
-            size,                                        size,                                        px,
-            @as(f64, @floatFromInt(best_flat)) / 1e6,    @as(f64, @floatFromInt(best_bi)) / 1e6,      @as(f64, @floatFromInt(best_near)) / 1e6,
-            @as(f64, @floatFromInt(best_alpha)) / 1e6,   @as(f64, @floatFromInt(best_add)) / 1e6,     @as(f64, @floatFromInt(best_aa)) / 1e6,
-            @as(f64, @floatFromInt(best_min_raw)) / 1e6, @as(f64, @floatFromInt(best_min_mip)) / 1e6,
+        std.debug.print("{d}x{d} covered={d} flat={d:.3}ms bilinear={d:.3}ms nearest={d:.3}ms alpha={d:.3}ms additive={d:.3}ms aa={d:.3}ms minify={d:.3}ms minify_mip={d:.3}ms minify_aniso={d:.3}ms graze_tri={d:.3}ms graze_aniso={d:.3}ms\n", .{
+            size,                                          size,                                            px,
+            @as(f64, @floatFromInt(best_flat)) / 1e6,      @as(f64, @floatFromInt(best_bi)) / 1e6,          @as(f64, @floatFromInt(best_near)) / 1e6,
+            @as(f64, @floatFromInt(best_alpha)) / 1e6,     @as(f64, @floatFromInt(best_add)) / 1e6,         @as(f64, @floatFromInt(best_aa)) / 1e6,
+            @as(f64, @floatFromInt(best_min_raw)) / 1e6,   @as(f64, @floatFromInt(best_min_mip)) / 1e6,     @as(f64, @floatFromInt(best_min_aniso)) / 1e6,
+            @as(f64, @floatFromInt(best_graze_tri)) / 1e6, @as(f64, @floatFromInt(best_graze_aniso)) / 1e6,
         });
     }
 }

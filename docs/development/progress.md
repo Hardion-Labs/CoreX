@@ -4,6 +4,106 @@ Permanent record of real progress, decisions, pending items and the next priorit
 task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
+## Cycle 2026-11-07 (e) — Anisotropic minification in the software rasterizer
+
+**Diagnosis first.** The window + swapchain backend was re-checked and is **still
+blocked** (no `/usr/include/X11`, no `libX11.so` dev symlink, no `pkg-config`, no
+`Xvfb`, `DISPLAY`/`WAYLAND_DISPLAY` empty), so it was not attempted. Of the two
+headless-verifiable candidates recorded last cycle (material batching in extraction,
+rasterizer filtering quality), the rasterizer was taken: extraction's `by_material`
+already sorts, so batching there would be a benchmark-driven change with no contract
+gain, while the filtering gap is a documented *quality* limitation with a **measured**
+claim to make.
+
+**The defect this closes.** `textureLod` takes `max` of the four gradient components,
+so the level follows the pixel footprint's **long** axis and over-blurs its short one.
+A floor receding to the horizon therefore loses detail it could still resolve, and the
+docs said so plainly ("no anisotropic filtering … over-blurs grazing angles"). This
+cycle makes that a mode instead of a limitation.
+
+**Delivered (validated):**
+
+- **`raster.Mipmap.anisotropic`** (+ helpers `AnisoFootprint`, `anisoFootprint`,
+  `sampleAnisotropic`, `texelDerivatives`, `max_aniso_samples = 8`,
+  `max_aniso_ratio = 8`):
+  - The footprint is the Jacobian's two screen-axis columns; the **longer** one is the
+    long axis (its length is the same quantity `textureLod` uses) and the ratio of the
+    lengths is the anisotropy.
+  - `samples = ceil(clamp(aniso, 1, 8))`, `lod_minor = max(lod_major - log2(aniso), 0)`.
+    Taps sit at `(i - (n-1)/2)/n` pixels along the unit long axis, each a trilinear
+    sample at `lod_minor`, averaged channel-wise in `f64` with **one final round**.
+  - **A round footprint is bit-identical to trilinear** (one tap); the constant
+    denominator case hoists the whole tap pattern to once per triangle
+    (`GradSteps.constantAniso`), so the orthographic/affine case pays nothing extra.
+- **Contract:** `Tier::capabilities.anisotropic` (Medium, Advanced; Low has no textures)
+  and `pipeline.resolve` coerces the mode to `.trilinear` where the tier lacks it — a
+  quality loss, not a wrong frame. `Mipmap.anisotropic` is the additive enum case;
+  `.trilinear` stays the default so nothing changes for existing callers.
+- **Reference vectors:** the Python generator reimplements the footprint, the tap
+  pattern and the averaging independently. **17 new cases** — grazing, the 8:1 clamp,
+  a symmetric one that must equal the trilinear frame, mild 2:1, a smaller base, a
+  perspective case, and ten deterministic random grazing triangles — take the texture
+  corpus from 78 to **97 frames / 1390 covered pixels**, all bit-exact.
+  `tools/gen_raster_texture_vectors.py` is reproducible.
+- **Unit tests:** the footprint's tap count / axis / levels (round, 2:1, the 8:1 clamp,
+  the axis flipping to y for a vertically elongated footprint, the level never going
+  below 0), `sampleAnisotropic` reducing to `sampleTrilinear` at one tap, the averaging
+  of taps, and — the claim itself, measured — a grazing quad rendered both ways where
+  the anisotropic frame keeps **more than twice** the neighbouring-pixel detail.
+- **Benchmark:** `tools/bench_raster.zig` gained `minify_aniso`, `graze_tri` and
+  `graze_aniso`.
+
+**Measured** (`ReleaseFast`, best of five, 1024 quads, x86-64):
+
+| Target | trilinear (round) | aniso (round) | trilinear (grazing) | aniso (grazing) |
+| --- | --- | --- | --- | --- |
+| 256² | 2.530 ms | 2.607 ms | 2.708 ms | 11.691 ms (~4.3×) |
+| 512² | 9.492 ms | 9.627 ms | 10.284 ms | 46.016 ms (~4.5×) |
+| 1024² | 36.752 ms | 36.427 ms | 36.961 ms | 180.490 ms (~4.9×) |
+
+Suite: **741/741** (was 734; 7 new), `zig fmt --check src tools build.zig` clean.
+
+**Two bugs found while validating, both in my own first attempt:**
+
+1. I first took the long axis from the *x* column unconditionally and the anisotropy
+   ratio from the difference of the two column lengths, so a vertically elongated
+   footprint reported **one** tap and a 4:1 horizontal error. The kernel is now
+   explicitly "the longer Jacobian column, by length, and the ratio of the two
+   lengths"; the unit test that caught it stayed.
+2. A first fixture for the one-tap test declared `1x2` below `2x2`, which
+   `Texture.validate` correctly rejected. The fixture was wrong, not the validator —
+   fixed the fixture.
+3. A stale `.zig-cache` binary made the suite look green at 734 while the real count
+   was 740. Cache was cleared and the counts in this log come from a clean build.
+
+**Decisions:**
+
+- **Opt-in enum case, not a default.** `Mipmap.trilinear` stays the default: the
+  grazing case costs ~5x, and silently making every textured draw pay it would be a
+  regression pretending to be a feature.
+- **Tap count from the ratio, not a fixed 8.** A round footprint must not spend eight
+  taps to reproduce the single-tap answer, which is why the round case measures as
+  free. The clamp at 8:1 caps the worst case.
+- **Explicitly `length`-based axis, not eigen-decomposition.** The exact minor axis
+  would need the full singular-value decomposition per pixel; the two-column
+  approximation is what the LOD already assumes, is cheap, and is exactly
+  reproducible by the reference generator — which is what makes bit-exactness
+  possible at all. Documented, with the sub-pixel edge overshoot and the uniform
+  tap weighting listed as limitations.
+- Coercion lives in `pipeline.resolve` (where every other "asked for X, got Y" rule
+  lives), not as a `beginFrame` rejection: a quality refinement must never turn a
+  frame into an error.
+
+**Pending:** window/swapchain/vsync (blocked here); `CXTX` levels at authoring time;
+per-material LOD bias and a per-material tap cap; sRGB transfer; GPU backend;
+input/event loop; GUI/editor.
+
+**Next priority:** the window + swapchain + vsync backend where a display and its dev
+headers exist. Still blocked here, so the next verifiable step is **per-material LOD
+bias and tap-count cap** (a `Renderable` material parameter threaded through extraction
+into `drawMeshAlloc`), or **occlusion culling / batching** in extraction — both
+headless and both continuations of work already in flight.
+
 ## Cycle 2026-11-07 (d) — Asset upload (mip chains) and eviction
 
 **Diagnosis first.** The logged next priority was the window + swapchain backend.

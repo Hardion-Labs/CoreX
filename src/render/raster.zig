@@ -221,6 +221,13 @@ pub const Mipmap = enum {
     /// instead of aliasing. Costs one extra filtered fetch when the level is
     /// fractional. This is the default and a no-op for a texture without `mips`.
     trilinear,
+    /// Trilinear, except when the pixel footprint is elongated (a surface seen at
+    /// a grazing angle): up to `max_aniso_samples` taps are taken along the
+    /// footprint's longer axis at a correspondingly sharper level, and their
+    /// results averaged. This is what stops the over-blur a single level causes
+    /// along the short axis. A round footprint takes exactly the trilinear path,
+    /// bit for bit. See "Anisotropic minification" in `docs/render-raster.md`.
+    anisotropic,
 };
 
 /// A triangle vertex in screen space: `x`/`y` are 28.4 fixed point pixels with
@@ -581,6 +588,128 @@ fn texelGradient(p: f64, q: f64, den: f64, dp: [2]f64, dq: [2]f64, dden: [2]f64,
         .du = @max(@abs(dudx), @abs(dudy)) * size[0],
         .dv = @max(@abs(dvdx), @abs(dvdy)) * size[1],
     };
+}
+
+/// Both screen-axis derivatives of the texel-space UV gradient, for
+/// anisotropic filtering. `texelGradient` collapses each axis with `max`; this
+/// keeps them apart so the footprint's elongation and orientation are known.
+/// Same pinned expressions, same single reciprocal.
+const TexelDerivatives = struct {
+    /// Per-axis derivatives, `[0]` across x and `[1]` across y, in texels.
+    du: [2]f64,
+    dv: [2]f64,
+};
+
+fn texelDerivatives(p: f64, q: f64, den: f64, dp: [2]f64, dq: [2]f64, dden: [2]f64, size: [2]f64) TexelDerivatives {
+    const den_sq = den * den;
+    if (!(den_sq > 0.0) or !std.math.isFinite(den_sq)) return .{ .du = .{ 0, 0 }, .dv = .{ 0, 0 } };
+    const inv_den_sq = 1.0 / den_sq;
+    const dudx = (dp[0] * den - p * dden[0]) * inv_den_sq;
+    const dvdx = (dq[0] * den - q * dden[0]) * inv_den_sq;
+    const dudy = (dp[1] * den - p * dden[1]) * inv_den_sq;
+    const dvdy = (dq[1] * den - q * dden[1]) * inv_den_sq;
+    return .{
+        .du = .{ dudx * size[0], dudy * size[0] },
+        .dv = .{ dvdx * size[1], dvdy * size[1] },
+    };
+}
+
+/// How one pixel's texel footprint is sampled anisotropically. Everything here
+/// is derived from the footprint alone, so it is reproducible by the reference
+/// generator and pinned bit for bit.
+pub const AnisoFootprint = struct {
+    /// Number of taps along the footprint's long axis, `1..max_aniso_samples`.
+    /// One means the footprint is round enough that the trilinear path is used.
+    samples: u8,
+    /// Long-axis direction of the footprint (unit length).
+    axis: [2]f64,
+    /// Level the trilinear path would choose — `log2` of the long axis.
+    lod_major: f64,
+    /// `lod_major - log2(anisotropy)`: the level that matches the *short* axis of
+    /// the footprint. Never below `lod_major`; sampled at by the taps.
+    lod_minor: f64,
+};
+
+/// Upper bound on taps per pixel for `Mipmap.anisotropic`. Eight is the value
+/// real hardware uses; the cost is linear in it and the quality gain above it is
+/// inaudible at the pixel level.
+pub const max_aniso_samples: u8 = 8;
+
+/// Largest anisotropy ratio the filter corrects for: a footprint more elongated
+/// than 8:1 is averaged as if it were 8:1 rather than spending taps a surface at
+/// that angle cannot support anyway.
+pub const max_aniso_ratio: f64 = 8.0;
+
+/// Decide how to sample a footprint from its per-axis texel derivatives.
+///
+/// The long axis is the footprint's longer direction (its length is `rho`, the
+/// same quantity `textureLod` takes the `log2` of); the short axis is the length
+/// of the other principal direction. `anisotropy = rho / sigma`, clamped to
+/// `[1, max_aniso_ratio]`, decides how many taps are worth taking, and the taps
+/// sample the level that matches `sigma` instead of `rho`, which is what removes
+/// the over-blur along the short axis.
+///
+/// A round footprint (`sigma >= rho`, which includes every degenerate or
+/// zero-gradient case) yields `samples = 1` and is sampled trilinearly.
+pub fn anisoFootprint(d: TexelDerivatives, levels: u32) AnisoFootprint {
+    // The two screen-axis columns of the Jacobian. The longer one is the footprint's
+    // long axis: its length is the extent of the footprint, and its direction is
+    // the direction in UV space along which the texture compresses most — the axis
+    // the taps must follow. The ratio of the two lengths is the anisotropy.
+    const len_x = @sqrt(d.du[0] * d.du[0] + d.dv[0] * d.dv[0]);
+    const len_y = @sqrt(d.du[1] * d.du[1] + d.dv[1] * d.dv[1]);
+    const major = @max(len_x, len_y);
+    const minor = @min(len_x, len_y);
+    const rho = major;
+    const lod_major = textureLod(rho, 0.0, levels);
+    // Round footprint, a degenerate derivative, or nothing to correct: the exact
+    // trilinear result. `!(...)` so a NaN takes this branch too.
+    if (!(major > minor) or !(minor > 0.0) or !std.math.isFinite(rho)) {
+        return .{ .samples = 1, .axis = .{ 0, 0 }, .lod_major = lod_major, .lod_minor = lod_major };
+    }
+    const anisotropy = @min(rho / minor, max_aniso_ratio);
+    const lod_minor = @max(lod_major - std.math.log2(anisotropy), 0.0);
+    // Fractional taps interpolate linearly in quality, which is why the sample
+    // count is rounded up from a continuous want. `@ceil` before `@intFromFloat`
+    // keeps the mapping monotone and free of a floating-point cast trap.
+    const wanted = @ceil(@min(anisotropy, @as(f64, @floatFromInt(max_aniso_samples))));
+    const samples: u8 = if (wanted < 1.0) 1 else @intFromFloat(wanted);
+    // Unit direction of the longer column.
+    const axis = if (len_x >= len_y)
+        [2]f64{ d.du[0] / major, d.dv[0] / major }
+    else
+        [2]f64{ d.du[1] / major, d.dv[1] / major };
+    return .{ .samples = samples, .axis = axis, .lod_major = lod_major, .lod_minor = lod_minor };
+}
+
+/// Sample an elongated footprint with `footprint.samples` taps spread along its
+/// long axis, in the pixel's own `(u, v)` space.
+///
+/// The tap spacing is chosen so the taps' centres span exactly one pixel:
+/// offset `i` is `(i + 0.5) / samples - 0.5` pixels along the axis, and the axis
+/// is expressed in texel units so the offset is divided by the level-0 extent.
+/// Each tap is a trilinear sample at `lod_minor`, and the results are averaged
+/// channel-wise in `f64` with **one** final round — the same one-round rule the
+/// trilinear mix follows, so a single tap reproduces `sampleTrilinear(lod_major)`
+/// only when the two levels coincide, which is the documented boundary.
+fn sampleAnisotropic(tex: Texture, u: f64, v: f64, footprint: AnisoFootprint, size: [2]f64) [4]u8 {
+    const n = footprint.samples;
+    if (n <= 1) return sampleTrilinear(tex, u, v, footprint.lod_major);
+    const step_u = footprint.axis[0] / (size[0] * @as(f64, @floatFromInt(n)));
+    const step_v = footprint.axis[1] / (size[1] * @as(f64, @floatFromInt(n)));
+    var acc: [4]f64 = .{ 0, 0, 0, 0 };
+    var i: u8 = 0;
+    while (i < n) : (i += 1) {
+        // Tap centres at -0.5 + (i + 0.5) / n pixels, so the outer taps sit half
+        // a tap inside the pixel footprint instead of on its edge.
+        const offset = @as(f64, @floatFromInt(i)) - (@as(f64, @floatFromInt(n)) - 1.0) / 2.0;
+        const tap = sampleTrilinear(tex, u + step_u * offset, v + step_v * offset, footprint.lod_minor);
+        for (0..4) |c| acc[c] += @as(f64, @floatFromInt(tap[c]));
+    }
+    var out: [4]u8 = undefined;
+    const inv = 1.0 / @as(f64, @floatFromInt(n));
+    for (0..4) |c| out[c] = @intFromFloat(@floor(acc[c] * inv + 0.5));
+    return out;
 }
 
 /// Per-channel byte quantization with the pinned final round:
@@ -1060,6 +1189,11 @@ const GradSteps = struct {
     /// per pixel. The value is bit-identical either way: the per-pixel derivative
     /// with `dden == 0` reduces to exactly this expression.
     constant_lod: ?f64 = null,
+    /// Set when the denominator is constant *and* the draw is anisotropic: the
+    /// footprint's tap count, axis and level are then the same for every pixel, so
+    /// only the tap *positions* vary. Computing them per pixel would repeat eight
+    /// square roots and two `log2`s for an answer that cannot change.
+    constant_aniso: ?AnisoFootprint = null,
 
     /// From the per-pixel barycentric steps (`da`, `db`) and the attribute
     /// differences to the reference vertex 2:
@@ -1084,6 +1218,14 @@ const GradSteps = struct {
         if (self.dden[0] != 0.0 or self.dden[1] != 0.0) return null;
         const grad_px = texelGradient(0.0, 0.0, den, self.dp, self.dq, self.dden, size);
         return textureLod(grad_px.du, grad_px.dv, levels);
+    }
+
+    /// The single footprint every pixel of this triangle shares, when `den`
+    /// cannot vary. `p`/`q` only enter through the denominator, so evaluating the
+    /// derivatives at zero is exact rather than an approximation.
+    fn constantAniso(self: GradSteps, den: f64, size: [2]f64, levels: u32) ?AnisoFootprint {
+        if (self.dden[0] != 0.0 or self.dden[1] != 0.0) return null;
+        return anisoFootprint(texelDerivatives(0.0, 0.0, den, self.dp, self.dq, self.dden, size), levels);
     }
 };
 
@@ -1137,6 +1279,15 @@ fn shadePixel(
     // no-mip path therefore stays the exact single-sample expression above.
     const sampled = if (tex.mips.len == 0 or lod_mode == .level0) sampleTexture(tex, u, v) else blk: {
         const g = grad.?;
+        // Anisotropic mode: the tap pattern depends on the per-pixel footprint, so
+        // it needs the two screen-axis derivatives. A round footprint collapses to
+        // the trilinear path inside `anisoFootprint`, bit for bit.
+        if (lod_mode == .anisotropic) {
+            const size = [2]f64{ @floatFromInt(tex.width), @floatFromInt(tex.height) };
+            const footprint = g.constant_aniso orelse
+                anisoFootprint(texelDerivatives(num_u, num_v, den, g.dp, g.dq, g.dden, size), tex.mipLevelCount());
+            break :blk sampleAnisotropic(tex, u, v, footprint, size);
+        }
         break :blk sampleTrilinear(tex, u, v, g.constant_lod orelse level: {
             // Perspective: the denominator varies per pixel, so the level does
             // too. One derivative and one log2 per pixel.
@@ -1298,10 +1449,9 @@ fn rasterTriangleCore(
             @as(f64, @floatFromInt(step_x1)) * inv_area,
             @as(f64, @floatFromInt(step_y1)) * inv_area,
         });
-        g.constant_lod = g.constantLod(v0.w_inv, .{
-            @floatFromInt(tex.width),
-            @floatFromInt(tex.height),
-        }, tex.mipLevelCount());
+        const size = [2]f64{ @floatFromInt(tex.width), @floatFromInt(tex.height) };
+        g.constant_lod = g.constantLod(v0.w_inv, size, tex.mipLevelCount());
+        if (options.mipmap == .anisotropic) g.constant_aniso = g.constantAniso(v0.w_inv, size, tex.mipLevelCount());
         break :blk g;
     } else null;
     const z0: f64 = v0.z;
@@ -2632,6 +2782,7 @@ test "textured rasterizer matches the independent reference bit for bit" {
     };
     var total_pixels: usize = 0;
     var mip_pixels: usize = 0;
+    var aniso_pixels: usize = 0;
     for (texture_vectors.cases) |case| {
         s.target.clear(.{ 0, 0, 0, 0 }, 1.0);
         const options = Options{
@@ -2649,6 +2800,7 @@ test "textured rasterizer matches the independent reference bit for bit" {
             .mipmap = switch (case.mipmap) {
                 .level0 => .level0,
                 .trilinear => .trilinear,
+                .anisotropic => .anisotropic,
             },
         };
         // Copy the case's levels into the sampler's own type (same layout).
@@ -2712,11 +2864,14 @@ test "textured rasterizer matches the independent reference bit for bit" {
         }
         total_pixels += pixels;
         if (case.levels.len > 0) mip_pixels += pixels;
+        if (case.mipmap == .anisotropic) aniso_pixels += pixels;
     }
     // Guard against the vector file silently becoming empty.
     try testing.expect(texture_vectors.cases.len >= 70);
     try testing.expect(total_pixels >= 1000);
     try testing.expect(mip_pixels >= 500);
+    try testing.expect(texture_vectors.cases.len >= 95);
+    try testing.expect(aniso_pixels >= 250);
 }
 
 // --- texture-specific unit tests --------------------------------------------
@@ -3616,4 +3771,216 @@ test "antialias: single-triangle entry point ignores the mode" {
     // No accumulator is available, so the one-sample result is written: the
     // hypotenuse row keeps full coverage rather than a translucent edge.
     try testing.expectEqual(@as(usize, 6), pixels);
+}
+
+// --- anisotropic filtering ------------------------------------------------
+
+test "anisoFootprint: a round footprint is one tap and the trilinear level" {
+    // Equal per-axis derivatives: nothing to correct, so the mode must not spend a
+    // second tap and the level is exactly what `textureLod` picks.
+    const round = TexelDerivatives{ .du = .{ 4.0, 0.0 }, .dv = .{ 0.0, 4.0 } };
+    const f = anisoFootprint(round, 5);
+    try testing.expectEqual(@as(u8, 1), f.samples);
+    try testing.expectEqual(textureLod(4.0, 4.0, 5), f.lod_major);
+    try testing.expectEqual(f.lod_major, f.lod_minor);
+    try testing.expectEqual([2]f64{ 0.0, 0.0 }, f.axis);
+
+    // A degenerate (zero) derivative cannot describe a footprint either.
+    const none = anisoFootprint(.{ .du = .{ 0, 0 }, .dv = .{ 0, 0 } }, 5);
+    try testing.expectEqual(@as(u8, 1), none.samples);
+    try testing.expectEqual(@as(f64, 0.0), none.lod_minor);
+}
+
+test "anisoFootprint: elongation sets the tap count and the minor level" {
+    // 8 texels across x, 1 across y: an 8:1 footprint, the clamp, so eight taps.
+    // The corrected level follows the *short* axis (1 texel/pixel -> level 0)
+    // while the trilinear level follows the long one (8 -> level 3).
+    const grazing = TexelDerivatives{ .du = .{ 8.0, 0.0 }, .dv = .{ 0.0, 1.0 } };
+    const f = anisoFootprint(grazing, 5);
+    try testing.expectEqual(@as(u8, 8), f.samples);
+    try testing.expectEqual(@as(f64, 3.0), f.lod_major);
+    try testing.expectEqual(@as(f64, 0.0), f.lod_minor);
+    // The axis runs along the long direction: +x here, normalised.
+    try testing.expectEqual([2]f64{ 1.0, 0.0 }, f.axis);
+
+    // 2:1 takes two taps and one level of correction.
+    const mild = TexelDerivatives{ .du = .{ 4.0, 0.0 }, .dv = .{ 0.0, 2.0 } };
+    const m = anisoFootprint(mild, 6);
+    try testing.expectEqual(@as(u8, 2), m.samples);
+    try testing.expectEqual(@as(f64, 2.0), m.lod_major);
+    try testing.expectEqual(@as(f64, 1.0), m.lod_minor);
+
+    // Beyond 8:1 the ratio clamps, so the tap count stops growing and the correction
+    // stops deepening: the extra taps would not buy anything a viewer can see.
+    const extreme = TexelDerivatives{ .du = .{ 64.0, 0.0 }, .dv = .{ 0.0, 1.0 } };
+    const e = anisoFootprint(extreme, 8);
+    try testing.expectEqual(@as(u8, max_aniso_samples), e.samples);
+    try testing.expectEqual(@as(f64, 6.0), e.lod_major);
+    try testing.expectEqual(@as(f64, 3.0), e.lod_minor);
+
+    // The minor level never goes below level 0, even where the arithmetic would.
+    const tiny = TexelDerivatives{ .du = .{ 0.5, 0.0 }, .dv = .{ 0.0, 0.0625 } };
+    const t = anisoFootprint(tiny, 4);
+    try testing.expectEqual(@as(f64, 0.0), t.lod_major);
+    try testing.expectEqual(@as(f64, 0.0), t.lod_minor);
+}
+
+test "anisoFootprint: the long axis is whichever direction is longer" {
+    // A vertically elongated footprint must put its taps along y, not x.
+    const vertical = TexelDerivatives{ .du = .{ 1.0, 0.0 }, .dv = .{ 0.0, 8.0 } };
+    const f = anisoFootprint(vertical, 5);
+    try testing.expectEqual(@as(u8, 8), f.samples);
+    try testing.expectEqual([2]f64{ 0.0, 1.0 }, f.axis);
+}
+
+test "sampleAnisotropic: one tap is exactly sampleTrilinear at the major level" {
+    const level0 = [_]u8{
+        255, 0, 0,   255, 0,   255, 0, 255,
+        0,   0, 255, 255, 255, 255, 0, 255,
+    };
+    // 2x2 -> 1x1 is the whole chain: the rasterizer rejects a level that does not
+    // halve the one above it, so the fixture must be a real chain.
+    const level1 = [_]u8{ 128, 128, 128, 255 };
+    const mips = [_]MipLevel{.{ .width = 1, .height = 1, .pixels = &level1 }};
+    const tex = Texture{ .width = 2, .height = 2, .pixels = &level0, .mips = &mips, .filter = .bilinear };
+    try tex.validate();
+
+    const round = anisoFootprint(.{ .du = .{ 3.0, 0.0 }, .dv = .{ 0.0, 3.0 } }, tex.mipLevelCount());
+    try testing.expectEqual(@as(u8, 1), round.samples);
+    const size = [2]f64{ 2, 2 };
+    const uv = [_][2]f64{ .{ 0.1, 0.1 }, .{ 0.7, 0.35 }, .{ 1.3, -0.2 } };
+    for (uv) |pair| {
+        try testing.expectEqualSlices(
+            u8,
+            &sampleTrilinear(tex, pair[0], pair[1], round.lod_major),
+            &sampleAnisotropic(tex, pair[0], pair[1], round, size),
+        );
+    }
+}
+
+test "sampleAnisotropic: taps average along the axis and stay inside one round" {
+    // A 4x1 texture of alternating black and white is the worst case for a single
+    // tap: the corrected footprint spans several texels, so averaging them must
+    // produce a value no tap alone could give, and every channel must stay exact.
+    const level0 = [_]u8{
+        0,   0,   0,   255,
+        255, 255, 255, 255,
+        0,   0,   0,   255,
+        255, 255, 255, 255,
+    };
+    const level1 = [_]u8{
+        128, 128, 128, 255,
+        128, 128, 128, 255,
+    };
+    const level2 = [_]u8{ 128, 128, 128, 255 };
+    const mips = [_]MipLevel{
+        .{ .width = 2, .height = 1, .pixels = &level1 },
+        .{ .width = 1, .height = 1, .pixels = &level2 },
+    };
+    const tex = Texture{ .width = 4, .height = 1, .pixels = &level0, .mips = &mips, .filter = .nearest };
+    try tex.validate();
+
+    const size = [2]f64{ @floatFromInt(tex.width), @floatFromInt(tex.height) };
+    const footprint = AnisoFootprint{ .samples = 4, .axis = .{ 1.0, 0.0 }, .lod_major = 2.0, .lod_minor = 0.0 };
+    const got = sampleAnisotropic(tex, 0.5, 0.25, footprint, size);
+    // Four taps spread over the middle of the strip hit both colours, so the
+    // average is a mid grey rather than black or white.
+    try testing.expect(got[0] > 60 and got[0] < 200);
+    try testing.expectEqual(@as(u8, 255), got[3]);
+
+    // Sampling the same footprint at the same place twice is deterministic.
+    try testing.expectEqualSlices(u8, &got, &sampleAnisotropic(tex, 0.5, 0.25, footprint, size));
+}
+
+test "anisotropic mode keeps detail that trilinear blurs away at grazing angles" {
+    // The claim the feature exists for, measured rather than asserted: on a
+    // high-frequency texture seen with a 4:1 footzprint, anisotropic sampling must
+    // preserve more contrast than isotropic sampling while still averaging (no
+    // aliasing). A pure level-0 sample is the aliasing baseline: it keeps contrast
+    // but by picking texels, not by averaging them.
+    const w = 64;
+    const h = 64;
+    var pixels: [w * h * 4]u8 = undefined;
+    for (0..h) |y| {
+        for (0..w) |x| {
+            const o = (y * w + x) * 4;
+            // Horizontal stripes with an 8-texel period: the variation runs along
+            // the footprint's *short* axis, which is exactly the detail anisotropic
+            // filtering is supposed to keep and an isotropic level blurs away.
+            const on = (y % 8) < 4;
+            pixels[o + 0] = if (on) 240 else 16;
+            pixels[o + 1] = if (on) 240 else 16;
+            pixels[o + 2] = if (on) 240 else 16;
+            pixels[o + 3] = 255;
+        }
+    }
+    const alloc = testing.allocator;
+    var chain = try @import("mipmap.zig").Chain.generate(alloc, w, h, &pixels);
+    defer chain.deinit(alloc);
+
+    // 8x8 target; UVs stretch 4 texels per pixel in x and 1 in y.
+    const size = 8;
+    var color: [size * size * 4]u8 = @splat(0);
+    var depth: [size * size]f32 = @splat(1.0);
+    var target = try Target.init(size, size, &color, &depth);
+    const vp = @import("camera.zig").orthographic(-1, 1, -1, 1, 0, 2);
+    // 16 texels per pixel across x, 2 across y: an 8:1 footprint (the clamp), so
+    // the trilinear level follows x (level 4) while the corrected level follows y
+    // (level 1).
+    const uvs = [_][2]f32{ .{ 0, 0 }, .{ 2, 0 }, .{ 2, 0.25 }, .{ 0, 0.25 } };
+    const positions = [_][3]f32{ .{ -1, -1, 0 }, .{ 1, -1, 0 }, .{ 1, 1, 0 }, .{ -1, 1, 0 } };
+    const indices = [_]u32{ 0, 1, 2, 0, 2, 3 };
+    const mesh = Mesh{ .positions = &positions, .indices = &indices, .uvs = &uvs };
+    // Provider methods named `mesh`/`color` cannot be declared inside a function
+    // body here (the enclosing test has locals by those names), so the provider
+    // lives at file scope with the quad passed in.
+    const AnisoResources = @import("raster_aniso_resources.zig").Provider;
+    // Mean absolute difference between neighbouring pixels: high means the image
+    // still carries detail, low means it was blurred to a flat field.
+    const Detail = struct {
+        fn measure(buf: []const u8, n: usize) f64 {
+            // Both axes, not just the horizontal one: the detail under test runs
+            // vertically, and a metric that only looked across would read zero for
+            // both modes and prove nothing.
+            var sum: f64 = 0;
+            var count: usize = 0;
+            for (0..n) |y| {
+                for (0..n) |x| {
+                    const here = @as(f64, @floatFromInt(buf[(y * n + x) * 4]));
+                    if (x + 1 < n) {
+                        const right = @as(f64, @floatFromInt(buf[(y * n + x + 1) * 4]));
+                        sum += @abs(here - right);
+                        count += 1;
+                    }
+                    if (y + 1 < n) {
+                        const down = @as(f64, @floatFromInt(buf[((y + 1) * n + x) * 4]));
+                        sum += @abs(here - down);
+                        count += 1;
+                    }
+                }
+            }
+            return sum / @as(f64, @floatFromInt(count));
+        }
+    };
+
+    var detail: [2]f64 = undefined;
+    for ([_]Mipmap{ .trilinear, .anisotropic }, 0..) |mode, i| {
+        @memset(&color, 0);
+        @memset(&depth, 1.0);
+        const tex = Texture{ .width = w, .height = h, .pixels = &pixels, .mips = chain.levels(), .filter = .bilinear };
+        try tex.validate();
+        _ = try rasterize(&target, &.{.{
+            .entity = .{ .index = 1, .generation = 0 },
+            .mesh = 0,
+            .material = 0,
+            .world = @import("../scene/transform.zig").identity(),
+            .bounds = .{ .center = .{ 0, 0, 0 }, .extents = .{ 1, 1, 1 } },
+            .depth = 0,
+        }}, vp, AnisoResources{ .tex = tex, .quad = mesh }, .{ .cull = .none, .mipmap = mode });
+        detail[i] = Detail.measure(&color, size);
+    }
+    // Anisotropic sampling follows the short axis (1 texel per pixel), so the
+    // checkerboard survives; trilinear follows the long one (4 texels per pixel)
+    // and averages it into a flat field.
+    try testing.expect(detail[1] > detail[0] * 2.0);
 }
