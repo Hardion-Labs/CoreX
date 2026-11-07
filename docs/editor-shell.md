@@ -105,6 +105,27 @@ Two details make it behave rather than nearly behave:
 - **Arrows in a text field are text keys.** The inspector holds the keyboard, so `Left` /
   `Right` move the caret and the tree selection does not move.
 
+### Focus
+
+`State.dock_focus` is which dock answers the keyboard; the focused dock is outlined in the
+accent colour, because focus that is invisible is focus the user cannot use.
+
+| Key | Effect |
+| --- | --- |
+| `Tab` | move focus to the other dock |
+| `Shift+Tab` | move it back |
+
+Only the hierarchy and the inspector are stops — they are the two docks with keyboard
+behaviour, and a stop that answers no key is a stop the user has to press `Tab` twice to
+get past. Clicking a field in the inspector moves the dock focus with it, so the outline,
+the Tab order and what actually receives keys never disagree.
+
+`Tab` is handled **before** the "a text field holds the keyboard" gate: otherwise a focused
+name field would be a place the user cannot leave. In the hierarchy, `N`/`P`/`Enter` and the
+arrows act; in the inspector they do not (they are text keys there). `Delete`, `Ctrl+Z` and
+`Ctrl+Y` are dock-independent: they act on the selection and the history, which are the
+tree's and the project's rather than a dock's.
+
 A refused action is never silent: `tree.apply` returns the failure, and the status bar
 shows it as `! ParentCycle` (or whichever error) for the frame instead of leaving the user
 with a click that appeared to do nothing. A new entity is selected immediately and the
@@ -275,9 +296,10 @@ behaviour, not a workaround.
 - **No drag-and-drop reparenting.** Reparenting is `P` (to root) or a `tree.apply`
   call; a pointer drag needs hover-target tracking across rows, which the GUI can already
   report, but the interaction is a separate step.
-- **No Tab focus traversal.** The tree answers arrow keys, but moving focus between the
-  hierarchy, the inspector and the viewport is not wired (the GUI reports Tab; nothing
-  consumes it). Arrows act on the tree whenever no text field holds the keyboard.
+- **The viewport is not a focus stop.** It has no keyboard behaviour yet (no camera keys,
+  no gizmos), so adding it now would be an empty stop.
+- **No focus ring on individual fields.** The outline marks the dock; the field inside it
+  draws its own border when focused.
 - **No Home/End, PageUp/PageDown or multi-select in the tree.** One selected entity.
 - **No inline rename in the tree.** Renaming goes through the inspector's name field.
 - **Fold state is not persisted.** It lives in `shell.State`, so reopening a project

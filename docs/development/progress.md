@@ -4,6 +4,55 @@ Permanent record of real progress, decisions, pending items and the next priorit
 task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
+## Cycle 2026-11-07 (o) — Keyboard focus between docks
+
+**Diagnosis first.** Cycle (n) made the tree navigable by keyboard, but the keyboard could
+never *leave* the tree: there was no Tab traversal (the GUI reports Tab; nothing consumed
+it), and the inspector could only be reached with a pointer. The recorded next priority was
+exactly this. Window/swapchain remains blocked (unchanged; not attempted).
+
+**Delivered (validated):**
+
+- **`shell.DockFocus`** (`.hierarchy` / `.inspector`) in `State.dock_focus`, with
+  `next()`/`previous()` written out separately so adding a third stop is a compile-time
+  reminder to give it a reverse.
+- **`focusStep`** — `Tab` / `Shift+Tab` handled **before** the `text_focused` gate (the only
+  shortcut that works from inside a text field), pushing the dock focus down to a widget id
+  via `focusDock` so the GUI's one-keyboard-owner rule agrees with it.
+- **Visible focus** — the focused dock is outlined in the accent colour; a click into an
+  inspector field moves `dock_focus` with it, so outline, Tab order and keys cannot
+  disagree.
+- **Dock-scoped keys** — `N`/`P`/`Enter`/arrows act only on the hierarchy; `Delete`,
+  `Ctrl+Z`/`Ctrl+Y` stay dock-independent (they act on the selection and the history).
+- **`nameFieldId`** — one constant for the inspector's name field, used by both the focus
+  pass and the field itself; the test helper stopped duplicating the hash and seed.
+
+**Bugs found and fixed while validating:**
+
+- A focused name field **trapped the keyboard**: Tab was inside the gate that a focused
+  field sets, so the field could never be left. Tab now runs first.
+- `state.name_focused`/`text_focused` stayed true for one frame after Tab, so the state
+  lied about who owned the keyboard; `focusStep` now clears them immediately.
+- Clicking a field left `dock_focus` pointing at the hierarchy while the field received
+  keys — the outline and the Tab order disagreed with reality. A click now sets the dock
+  focus.
+
+**Suite:** **879/879** tests (clean cache), fmt clean, `zig build` OK, validate, runtime,
+`gui-frame`, `editor-frame` (640x360, 13 widgets), `qoi-decode`, `bench-extract
+-Doptimize=ReleaseFast`; preview regenerated and inspected (accent outline on the hierarchy).
+
+**Decisions:** only docks with keyboard behaviour are Tab stops; focus is always visible;
+Tab is the one key that outranks a focused field, because otherwise the field is a modal
+trap; keys that act on the selection/history are not dock-scoped.
+
+**Pending / not in this cycle:** viewport as a focus stop (needs camera keys or gizmos
+first), Home/End and PageUp/PageDown in the tree, multi-select, drag-and-drop reparenting,
+rotation/camera fields, persisted fold state.
+
+**Next priority:** make the viewport useful without a pointer — keyboard camera framing
+(focus-all / focus-selection) — which also gives the viewport a reason to be a Tab stop,
+then drag-and-drop reparenting; and the window layer when the sandbox allows it.
+
 ## Cycle 2026-11-07 (n) — Keyboard navigation in the hierarchy
 
 **Diagnosis first.** Cycle (m) made the tree an editing surface, but every action needed a
