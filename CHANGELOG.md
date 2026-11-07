@@ -8,6 +8,38 @@ declared yet.
 
 ### Added
 
+- Renderer tier contract (`src/render/backend.zig`, `docs/render-backend.md`,
+  `corex.render.backend`): the boundary every renderer tier implements, so a
+  backend can be swapped without touching the scene or the extraction layer.
+  `Tier` = `low`/`medium`/`advanced` with **one** `capabilities(tier)` table (Low
+  is opaque, untextured, unlit geometry with a depth buffer; Medium is the full
+  CPU feature set: textures, Lambert lighting, blending, mip selection, edge
+  antialiasing; Advanced declares the same set until a backend exists).
+  `FrameOptions` (`blend`, `antialias`, `mipmap`, `light`, depth test/write,
+  `cull`, `front_face`) converts to the rasterizer's `Options` through
+  `rasterOptions()`. `Surface` is a borrowed RGBA8 colour + `f32` depth buffer
+  (`validate`/`clear`/`Surface.of(target)`). `DrawResources` is the asset resolver
+  as a *runtime* value — a pointer plus `meshFn`/`colorFn` and optional
+  `textureFn`/`lightFn` — adapted from any comptime provider by `fromComptime`,
+  with absent and private declarations staying invisible exactly as `@hasDecl`
+  makes them. `Backend` is an explicit vtable (`beginFrame` → N × `draw` →
+  `endFrame` → `deinit`) taking `mvp = view_projection * world`, folded once by
+  the caller. `beginFrame` validates the surface and **rejects** any option the
+  tier cannot honour (`error.UnsupportedFeature`) instead of degrading silently;
+  `unsupported(tier, options)` reports which one. Lifecycle misuse is an error
+  (`FrameNotBegun`/`FrameAlreadyBegun`), never undefined behaviour. `SoftwareBackend`
+  implements the contract on the existing rasterizer as the reference driver, and
+  the tests prove it is **byte-identical** (colour *and* depth) to calling
+  `raster.drawMeshAlloc` directly, plus stats accounting, culling, skipped
+  handles, light precedence (provider vs explicit vs absent) and the whole
+  capability gate — 9 new tests (681 total).
+
+### Changed
+
+- `Texture` in the render contract is validated before shading
+  (`error.InvalidTexture`), and a texture binding on a tier without textures is a
+  rejected draw rather than a silently flat one.
+
 - Mipmaps and LOD selection in the software rasterizer (`Texture.mips`,
   `corex.render.MipLevel`, `Options.mipmap` = `trilinear`/`level0`,
   `corex.render.mipmap.Chain`, `docs/render-raster.md`): a texture may now carry
