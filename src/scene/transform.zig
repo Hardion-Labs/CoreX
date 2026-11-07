@@ -203,6 +203,57 @@ pub fn cross(a: Vec3, b: Vec3) Vec3 {
     };
 }
 
+// --- Euler angles ----------------------------------------------------------
+
+/// Degrees to radians and back.
+const deg_to_rad: f32 = std.math.pi / 180.0;
+const rad_to_deg: f32 = 180.0 / std.math.pi;
+
+/// Compose a unit quaternion from Euler angles in degrees:
+/// roll about X, then pitch about Y, then yaw about Z (intrinsic; equivalently
+/// `q = q_yaw * q_pitch * q_roll`). All angles are in degrees.
+pub fn quatFromEuler(roll: f32, pitch: f32, yaw: f32) Quat {
+    const cr = std.math.cos(roll * deg_to_rad * 0.5);
+    const sr = std.math.sin(roll * deg_to_rad * 0.5);
+    const cp = std.math.cos(pitch * deg_to_rad * 0.5);
+    const sp = std.math.sin(pitch * deg_to_rad * 0.5);
+    const cy = std.math.cos(yaw * deg_to_rad * 0.5);
+    const sy = std.math.sin(yaw * deg_to_rad * 0.5);
+    return .{
+        sr * cp * cy - cr * sp * sy,
+        cr * sp * cy + sr * cp * sy,
+        cr * cp * sy - sr * sp * cy,
+        cr * cp * cy + sr * sp * sy,
+    };
+}
+
+/// Extract Euler angles in degrees from a quaternion (the inverse of
+/// `quatFromEuler`, normalized first). Returns roll (about X), pitch (about Y),
+/// yaw (about Z), all in degrees. Pitch is clamped to [-90, 90] to avoid the
+/// gimbal-lock singularity.
+pub fn quatToEuler(q: Quat) [3]f32 {
+    const n = quatNormalize(q);
+    const x = n[0];
+    const y = n[1];
+    const z = n[2];
+    const w = n[3];
+
+    const roll_rad = std.math.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y));
+
+    const sinp = 2 * (w * y - z * x);
+    const half_pi = std.math.pi / 2.0;
+    const sign: f32 = if (sinp >= 0) 1.0 else -1.0;
+    const pitch_rad = if (@abs(sinp) >= 1) sign * half_pi else std.math.asin(sinp);
+
+    const yaw_rad = std.math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z));
+
+    return .{
+        roll_rad * rad_to_deg,
+        pitch_rad * rad_to_deg,
+        yaw_rad * rad_to_deg,
+    };
+}
+
 // --- tests -----------------------------------------------------------------
 
 const testing = std.testing;
@@ -345,4 +396,48 @@ test "vec3: cross is right-handed and orthogonal" {
     const c = cross(a, b);
     try testing.expectApproxEqAbs(@as(f32, 0), dot(a, c), eps);
     try testing.expectApproxEqAbs(@as(f32, 0), dot(b, c), eps);
+}
+
+test "euler: quatFromEuler and quatToEuler round-trip identity" {
+    const q = quatFromEuler(0, 0, 0);
+    try testing.expectEqualSlices(f32, &identity_quat, &q);
+}
+
+test "euler: quatFromEuler 90deg yaw about Z maps X to Y" {
+    const q = quatFromEuler(0, 0, 90);
+    const m = fromTransform(.{ .rotation = q });
+    try expectVec3(.{ 0, 1, 0 }, transformPoint(m, .{ 1, 0, 0 }));
+    try expectVec3(.{ -1, 0, 0 }, transformPoint(m, .{ 0, 1, 0 }));
+}
+
+test "euler: quatToEuler extracts yaw from a pure-z rotation" {
+    const q = quatFromAxisAngle(.{ 0, 0, 1 }, std.math.pi / 4.0);
+    const e = quatToEuler(q);
+    try testing.expectApproxEqAbs(@as(f32, 45), e[2], eps); // yaw
+    try testing.expectApproxEqAbs(@as(f32, 0), e[0], eps); // roll
+    try testing.expectApproxEqAbs(@as(f32, 0), e[1], eps); // pitch
+}
+
+test "euler: quatToEuler extracts pitch from a pure-y rotation" {
+    const q = quatFromAxisAngle(.{ 0, 1, 0 }, std.math.pi / 3.0);
+    const e = quatToEuler(q);
+    try testing.expectApproxEqAbs(@as(f32, 60), e[1], eps); // pitch
+    try testing.expectApproxEqAbs(@as(f32, 0), e[0], eps); // roll
+    try testing.expectApproxEqAbs(@as(f32, 0), e[2], eps); // yaw
+}
+
+test "euler: quatToEuler extracts roll from a pure-x rotation" {
+    const q = quatFromAxisAngle(.{ 1, 0, 0 }, -std.math.pi / 6.0);
+    const e = quatToEuler(q);
+    try testing.expectApproxEqAbs(@as(f32, -30), e[0], eps); // roll
+    try testing.expectApproxEqAbs(@as(f32, 0), e[1], eps); // pitch
+    try testing.expectApproxEqAbs(@as(f32, 0), e[2], eps); // yaw
+}
+
+test "euler: quatFromEuler with zero axis-like angles yields identity-like quaternion" {
+    const q = quatFromEuler(0, 0, 0);
+    try testing.expectApproxEqAbs(@as(f32, 0), q[0], eps);
+    try testing.expectApproxEqAbs(@as(f32, 0), q[1], eps);
+    try testing.expectApproxEqAbs(@as(f32, 0), q[2], eps);
+    try testing.expectApproxEqAbs(@as(f32, 1), q[3], eps);
 }

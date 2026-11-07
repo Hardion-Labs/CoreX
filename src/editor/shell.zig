@@ -121,6 +121,10 @@ pub const State = struct {
     /// they are what the user is typing, not what the scene holds.
     transform_pos: inspector.Row(3) = .{},
     transform_scale: inspector.Row(3) = .{},
+    transform_rotation: inspector.Row(3) = .{},
+
+    /// Editable camera field (`fov` in degrees). Same rationale as the transform rows.
+    camera_fov: inspector.Row(1) = .{},
 
     /// True while any inspector field holds the keyboard. One flag, set once per frame by
     /// the inspector, because the frame-level shortcuts must not fire for *any* focused
@@ -527,24 +531,25 @@ fn drawInspector(
     fieldRow(ctx, &stack, content, "id", id_line);
 
     if (scene.getComponent(render_scene.Transform, ent)) |t| {
-        // Position and scale are editable; rotation stays read-only until there is a
-        // field that can express a normalized quaternion honestly.
+        // Position, scale and rotation are editable. Rotation is shown as three
+        // Euler angles (roll/pitch/yaw in degrees) and converted to/from the stored
+        // quaternion on load and commit.
         const row_h = line_h + 2;
         const pos_row = stack.measure(.{ .w = content.w, .h = row_h });
-        // A rejected value is already reverted inside `drawTransformRow`; the only
-        // error left is the history refusing the store (out of memory), and swallowing
-        // that would show the user a value the scene does not have.
         drawTransformRow(ctx, state, scene, history, ent, &state.transform_pos, pos_row, .position, t, "pos") catch |err| reportEditFailure(err, "pos");
         const scale_row = stack.measure(.{ .w = content.w, .h = row_h });
         drawTransformRow(ctx, state, scene, history, ent, &state.transform_scale, scale_row, .scale, t, "scale") catch |err| reportEditFailure(err, "scale");
+        const rotation_row = stack.measure(.{ .w = content.w, .h = row_h });
+        drawTransformRow(ctx, state, scene, history, ent, &state.transform_rotation, rotation_row, .rotation, t, "rot") catch |err| reportEditFailure(err, "rot");
     }
     if (scene.getComponent(render_scene.Renderable, ent)) |r| {
         const mesh = std.fmt.bufPrint(&buf, "mesh {d} / mat {d}", .{ r.mesh, r.material }) catch "?";
         fieldRow(ctx, &stack, content, "render", mesh);
     }
     if (scene.getComponent(render_scene.CameraComponent, ent)) |c| {
-        const fov = std.fmt.bufPrint(&buf, "{d:.1} deg", .{c.fov * 180.0 / std.math.pi}) catch "?";
-        fieldRow(ctx, &stack, content, "fov", fov);
+        const row_h = line_h + 2;
+        const fov_row = stack.measure(.{ .w = content.w, .h = row_h });
+        drawCameraRow(ctx, state, scene, history, ent, &state.camera_fov, fov_row, c, "fov") catch |err| reportEditFailure(err, "fov");
     }
     if (scene.getComponent(render_scene.Transform, ent) == null and
         scene.getComponent(render_scene.Renderable, ent) == null and
@@ -560,7 +565,9 @@ fn drawInspector(
     // Publish the keyboard claim for the shortcut pass, which runs after the panels.
     state.text_focused = state.name_focused or
         state.transform_pos.isFocused() or
-        state.transform_scale.isFocused();
+        state.transform_scale.isFocused() or
+        state.transform_rotation.isFocused() or
+        state.camera_fov.isFocused();
 
     ctx.blockBelow(rect);
 }
@@ -576,11 +583,13 @@ fn reportEditFailure(err: anyerror, row: []const u8) void {
 const TransformField = enum {
     position,
     scale,
+    rotation,
 
     fn get(self: TransformField, t: render_scene.Transform) [3]f32 {
         return switch (self) {
             .position => t.position,
             .scale => t.scale,
+            .rotation => transform_mod.quatToEuler(t.rotation),
         };
     }
 
@@ -588,11 +597,12 @@ const TransformField = enum {
         switch (self) {
             .position => t.position = values,
             .scale => t.scale = values,
+            .rotation => t.rotation = transform_mod.quatFromEuler(values[0], values[1], values[2]),
         }
     }
 };
 
-/// One editable transform row (`pos` or `scale`).
+/// One editable transform row (`pos`, `scale` or `rot`).
 ///
 /// A commit builds the **whole** transform (the edited row plus the untouched one) and
 /// sends it as a single `set_component`, so one keystroke-and-Enter is one undo step, and
@@ -626,6 +636,7 @@ fn drawTransformRow(
     const seed = switch (field) {
         .position => @as(u64, 0x706f_73),
         .scale => @as(u64, 0x7363_616c),
+        .rotation => @as(u64, 0x726f_74),
     };
     const outcome = inspector.drawRow(ctx, 3, row, rect, .{
         .entity_id = state.selected,
@@ -677,6 +688,82 @@ fn drawTransformRow(
     // not think the buffers are stale and reload over the user's text.
     var post = std.hash.Wyhash.init(0);
     for (field.get(next)) |v| post.update(std.mem.asBytes(&v));
+    row.signature = post.final();
+}
+
+/// One editable camera field (`fov` in degrees).
+///
+/// A commit writes the whole `CameraComponent` back as one `set_component`, so a
+/// changed FOV is one undo step, and an out-of-range FOV is rejected without
+/// touching the scene.
+fn drawCameraRow(
+    ctx: *widgets.Context,
+    state: *State,
+    scene: anytype,
+    history: anytype,
+    entity: anytype,
+    row: anytype,
+    rect: Rect,
+    camera: *const render_scene.CameraComponent,
+    key: []const u8,
+) !void {
+    const values = .{camera.fov * 180.0 / std.math.pi};
+    var sig = std.hash.Wyhash.init(0);
+    sig.update(std.mem.asBytes(&values[0]));
+    const signature = sig.final();
+    if (row.owner != state.selected or row.signature != signature) {
+        if (!row.isFocused()) {
+            row.load(values);
+            row.owner = state.selected;
+            row.signature = signature;
+        }
+    }
+    const seed = @as(u64, 0x66_6f_76);
+    const outcome = inspector.drawRow(ctx, 1, row, rect, .{
+        .entity_id = state.selected,
+        .signature = signature,
+        .key = key,
+    }, @intCast(font.line_height + 2), seed);
+
+    switch (outcome) {
+        .idle => return,
+        .escape => {
+            row.load(values);
+            row.owner = state.selected;
+            row.signature = signature;
+            return;
+        },
+        .commit => {},
+    }
+
+    const typed = row.values() orelse {
+        row.load(values);
+        row.owner = state.selected;
+        row.signature = signature;
+        return;
+    };
+
+    var next = camera.*;
+    next.fov = typed[0] * std.math.pi / 180.0;
+    if (!next.isValid()) {
+        row.load(values);
+        row.owner = state.selected;
+        row.signature = signature;
+        return;
+    }
+    if (std.mem.eql(u8, std.mem.asBytes(&typed), std.mem.asBytes(&values))) {
+        row.signature = signature;
+        return;
+    }
+
+    const id = scene.idOf(entity) orelse return;
+    try history.apply(scene, .{ .set_component = .{
+        .id = id,
+        .value = edit.valueFor(@TypeOf(scene.*), render_scene.CameraComponent, next),
+    } });
+    row.owner = state.selected;
+    var post = std.hash.Wyhash.init(0);
+    post.update(std.mem.asBytes(&next.fov));
     row.signature = post.final();
 }
 
@@ -1823,6 +1910,7 @@ fn numFieldRect(h: *Harness, seed: u64, key: []const u8, index: usize) Rect {
 
 const seed_pos: u64 = 0x706f_73;
 const seed_scale: u64 = 0x7363_616c;
+const seed_rot: u64 = 0x726f_74;
 
 fn focusNumField(h: *Harness, rect: Rect) void {
     h.hover(rect.x + 2, rect.y + 2);
@@ -1907,6 +1995,96 @@ test "editor: Escape abandons a typed transform value" {
     try testing.expectEqualStrings("1", h.state.transform_scale.fields[1].text());
     try testing.expectEqual(@as(usize, 0), h.history.undoDepth());
     try testing.expect(!h.history.dirty);
+}
+
+test "editor: typing rotation angles commits one undoable set_component" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.state.selected = h.root_id;
+    h.runFrames(2);
+
+    // Identity quaternion shows as zero degrees on all three axes.
+    try testing.expectEqualStrings("0", h.state.transform_rotation.fields[2].text());
+
+    const field = numFieldRect(&h, seed_rot, "rot", 2);
+    focusNumField(&h, field);
+    try testing.expect(h.state.transform_rotation.isFocused());
+
+    h.frameInput(.{ .key = .home }, &h.state);
+    h.frameInput(.{ .key = .delete }, &h.state);
+    h.frameInput(.{ .text = "45" }, &h.state);
+    const before = h.history.undoDepth();
+    h.frameInput(.{ .key = .enter }, &h.state);
+
+    const root = h.scene.entityById(h.root_id).?;
+    const t = h.scene.getComponent(render_scene.Transform, root).?;
+    // 45deg yaw about Z maps local X toward +Y.
+    try testing.expectApproxEqAbs(@as(f32, 0), t.rotation[0], 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 0), t.rotation[1], 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 0.382683), t.rotation[2], 1e-3); // sin(22.5deg)
+    try testing.expectApproxEqAbs(@as(f32, 0.923880), t.rotation[3], 1e-3); // cos(22.5deg)
+    // One command for the whole row.
+    try testing.expectEqual(before + 1, h.history.undoDepth());
+
+    try testing.expect(undo(&h.history, &h.scene));
+    const back = h.scene.getComponent(render_scene.Transform, h.scene.entityById(h.root_id).?).?;
+    try testing.expectEqualSlices(f32, &[4]f32{ 0, 0, 0, 1 }, &back.rotation);
+}
+
+test "editor: camera fov is editable and commits one undoable set_component" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.state.selected = h.camera_id;
+    h.runFrames(2);
+
+    // Default fov is pi/3 = 60 degrees.
+    try testing.expectEqualStrings("60", h.state.camera_fov.fields[0].text());
+
+    const field = numFieldRect(&h, 0x66_6f_76, "fov", 0);
+    focusNumField(&h, field);
+    try testing.expect(h.state.camera_fov.isFocused());
+
+    h.frameInput(.{ .key = .home }, &h.state);
+    h.frameInput(.{ .key = .delete }, &h.state);
+    h.frameInput(.{ .key = .delete }, &h.state);
+    h.frameInput(.{ .text = "90" }, &h.state);
+    const before = h.history.undoDepth();
+    h.frameInput(.{ .key = .enter }, &h.state);
+
+    const camera = h.scene.entityById(h.camera_id).?;
+    const c = h.scene.getComponent(render_scene.CameraComponent, camera).?;
+    try testing.expectApproxEqAbs(@as(f32, std.math.pi / 2.0), c.fov, 1e-4);
+    try testing.expectEqual(before + 1, h.history.undoDepth());
+
+    try testing.expect(undo(&h.history, &h.scene));
+    const back = h.scene.getComponent(render_scene.CameraComponent, h.scene.entityById(h.camera_id).?).?;
+    try testing.expectApproxEqAbs(@as(f32, std.math.pi / 3.0), back.fov, 1e-4);
+}
+
+test "editor: an out-of-range camera fov is rejected" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.state.selected = h.camera_id;
+    h.runFrames(2);
+
+    const field = numFieldRect(&h, 0x66_6f_76, "fov", 0);
+    focusNumField(&h, field);
+    h.frameInput(.{ .key = .home }, &h.state);
+    h.frameInput(.{ .key = .delete }, &h.state);
+    h.frameInput(.{ .key = .delete }, &h.state);
+    // 180deg is not a valid fov (must be strictly below pi).
+    h.frameInput(.{ .text = "180" }, &h.state);
+    const before = h.history.undoDepth();
+    h.frameInput(.{ .key = .enter }, &h.state);
+
+    const c = h.scene.getComponent(render_scene.CameraComponent, h.scene.entityById(h.camera_id).?).?;
+    try testing.expectApproxEqAbs(@as(f32, std.math.pi / 3.0), c.fov, 1e-4);
+    try testing.expectEqual(before, h.history.undoDepth());
+    // The buffer reverts to what the scene holds.
+    try testing.expectEqualStrings("60", h.state.camera_fov.fields[0].text());
 }
 
 test "editor: the numeric fields follow the selection instead of the previous entity" {

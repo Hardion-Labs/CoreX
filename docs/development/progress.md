@@ -4,6 +4,48 @@ Permanent record of real progress, decisions, pending items and the next priorit
 task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
+## Cycle 2026-11-07 (r) — Rotation and camera fields in the inspector
+
+**Diagnosis first.** Cycle (q) delivered drag-and-drop reparenting, but the inspector
+still showed two read-only values the model can already write: `Transform.rotation` (a
+quaternion) and `CameraComponent.fov`. The recorded next priority was exactly this.
+Window/swapchain remains blocked (unchanged; not attempted).
+
+**Delivered (validated):**
+
+- **`src/scene/transform.zig`** — `quatFromEuler(roll, pitch, yaw)` composes a unit
+  quaternion from three Euler angles in degrees (roll about X, pitch about Y, yaw about Z;
+  equivalently `q = q_yaw * q_pitch * q_roll`). `quatToEuler(q)` extracts them back,
+  normalizing first and clamping pitch to [-90, 90] against the gimbal-lock singularity.
+  Round-trip is stable for axis-aligned rotations.
+- **Inspector rotation field** (`State.transform_rotation`, `TransformField.rotation`) —
+  the rotation row shows three Euler angles in degrees; committing converts them back to
+  the stored quaternion as one undoable `set_component`, keeping untouched axes intact and
+  rejecting non-finite results.
+- **Inspector camera FOV field** (`State.camera_fov`, `drawCameraRow`) — the FOV is now
+  editable in degrees instead of read-only text. Committing writes the whole
+  `CameraComponent` as one undoable `set_component`; out-of-range FOVs (≤ 0 or ≥ π) are
+  rejected and the field reverts.
+- **Shell** — `text_focused` now also accounts for `transform_rotation` and `camera_fov`,
+  so frame-level shortcuts (`Delete`, `Ctrl+Z`) do not fire while a numeric field holds the
+  keyboard.
+
+**Suite:** **908/908** tests (clean cache), fmt clean, `zig build` OK, validate, runtime,
+`gui-frame`, `editor-frame` (640x360), `qoi-decode`, `bench-extract -Doptimize=ReleaseFast`.
+
+**Decisions:** rotation is expressed to the user as Euler angles (degrees), not raw
+quaternion components — raw components are not a usable editing surface. The conversion
+lives in `transform.zig` next to the other quaternion math. FOV is degrees in the UI,
+radians in the component, matching the existing `fieldRow` display convention.
+
+**Pending / not in this cycle:** camera near/far fields, zoom (wheel / distance factor),
+click-to-select and drag-to-orbit in the viewport, gizmos, Home/End and PageUp/PageDown in
+the tree, multi-select, persisted fold state, sibling ordering; and the window layer when
+the sandbox allows it.
+
+**Next priority:** camera near/far fields if needed, then viewport zoom; sibling ordering
+if the scene gains a child order; and the window layer when the sandbox allows it.
+
 ## Cycle 2026-11-07 (q) — Drag and drop reparenting
 
 **Diagnosis first.** Cycle (p) closed the keyboard gap, but reparenting still required
