@@ -84,8 +84,16 @@ pub const EngineRenderPrefab = @import("prefab.zig").Prefab(.{
 pub const LoadedAssets = struct {
     gpa: Allocator,
     table: pipeline.AssetTable,
-    /// File bytes, one allocation each, owned here.
-    blobs: std.ArrayList([]u8) = .empty,
+    /// Per-texture pixel ownership. An entry is the level-0 copy the table borrows;
+    /// `null` once that texture was evicted (the block was freed and the table no
+    /// longer holds a slice into it).
+    pixel_blocks: std.ArrayList(?[]u8) = .empty,
+    /// Generated mip chains, one optional entry per chain-carrying texture. Level 0
+    /// is *not* in the chain: `mipmap.Chain` holds the levels below it.
+    mip_chains: std.ArrayList(?r.mipmap.Chain) = .empty,
+    /// What was uploaded from each path, so an eviction knows exactly which blocks to
+    /// free instead of guessing from the slot.
+    uploads: std.ArrayList(Uploaded) = .empty,
     /// What the loader used and skipped.
     report: AssetReport = .{},
     /// Path -> table slot for every renderable asset the plan placed (a path whose
@@ -93,9 +101,21 @@ pub const LoadedAssets = struct {
     /// keys are borrowed from the startup asset index, which outlives this struct.
     slots: std.StringHashMap(usize),
 
+    /// One uploaded asset: which slot it fills and which owned blocks back it.
+    const Uploaded = struct {
+        slot: usize,
+        /// Index into `pixel_blocks`, for a texture.
+        pixel: ?usize = null,
+        /// Index into `mip_chains`, for a texture with levels below 0.
+        chain: ?usize = null,
+    };
+
     pub fn deinit(self: *LoadedAssets) void {
-        for (self.blobs.items) |blob| self.gpa.free(blob);
-        self.blobs.deinit(self.gpa);
+        for (self.pixel_blocks.items) |block| if (block) |bytes| self.gpa.free(bytes);
+        for (self.mip_chains.items) |*chain| if (chain.*) |*c| c.deinit(self.gpa);
+        self.pixel_blocks.deinit(self.gpa);
+        self.mip_chains.deinit(self.gpa);
+        self.uploads.deinit(self.gpa);
         self.slots.deinit();
         self.table.deinit();
         self.* = undefined;
@@ -105,18 +125,75 @@ pub const LoadedAssets = struct {
     /// renderable at all. A caller that writes a scene, or one that resolves a
     /// scene's handles, uses this instead of recomputing the table layout.
     ///
-    /// A loaded slot always carries generation 1 in a fresh table, which is what the
-    /// handle encodes; a later `release`/`set*` on that slot changes the generation
-    /// and the stored handle stops resolving, as the generation exists to guarantee.
+    /// While an asset is live this returns the table's own handle, so it is correct
+    /// even if the generation moved. A path that was planned but holds nothing —
+    /// because its bytes failed to decode, or because it was evicted — gets the
+    /// stable load-time name (generation 1), which resolves to nothing: that is the
+    /// contract a stored `.scene` depends on, since it cannot be rewritten when one
+    /// file in the project is broken. An unplanned path has no handle at all.
     pub fn handleOf(self: *const LoadedAssets, path: []const u8) ?u32 {
         const slot = self.slots.get(path) orelse return null;
-        const handle = pipeline.Handle{ .index = @intCast(slot), .generation = 1 };
-        return handle.toBits();
+        if (self.table.handleOf(slot, .mesh)) |handle| return handle.toBits();
+        if (self.table.handleOf(slot, .texture)) |handle| return handle.toBits();
+        const planned = pipeline.Handle{ .index = @intCast(slot), .generation = 1 };
+        return planned.toBits();
+    }
+
+    /// Evict one asset: release its slot and free the pixel blocks behind it. Returns
+    /// whether the path held a live asset.
+    ///
+    /// This is what makes the table's capacity and its memory reusable within a run.
+    /// The slot keeps its place in the path map — the layout is a property of the
+    /// project, and a reload must land in the same slot for stored scene handles to
+    /// keep meaning the same thing — but it no longer resolves: `handleOf` returns
+    /// null and every handle into it stops working, because `release` bumps the
+    /// generations. A mesh's copy lives in the table's own scratch, which is reused by
+    /// the next upload, so releasing the slot releases it.
+    pub fn evict(self: *LoadedAssets, path: []const u8) bool {
+        const slot = self.slots.get(path) orelse return false;
+        if (!self.table.isLive(slot, .mesh) and !self.table.isLive(slot, .texture)) return false;
+        self.table.release(slot);
+        if (self.findUpload(slot)) |index| {
+            const upload = &self.uploads.items[index];
+            if (upload.pixel) |p| {
+                if (self.pixel_blocks.items[p]) |bytes| self.gpa.free(bytes);
+                self.pixel_blocks.items[p] = null;
+            }
+            if (upload.chain) |c| {
+                if (self.mip_chains.items[c]) |*chain| chain.deinit(self.gpa);
+                self.mip_chains.items[c] = null;
+            }
+        }
+        self.report.evicted += 1;
+        return true;
+    }
+
+    /// Bytes the table currently holds for assets: the mesh scratch it copied plus
+    /// every level of the textures it borrows. This is what the renderer owns, and it
+    /// is not the size of the source files; after `evict` the freed blocks are gone
+    /// from it, so the number is a measurement and not an estimate.
+    pub fn uploadedBytes(self: *const LoadedAssets) usize {
+        return self.table.uploadedBytes();
     }
 
     /// The number of assets the table can still hold (slots free in either kind).
     pub fn freeSlots(self: *const LoadedAssets) usize {
         return self.table.table.capacity() - self.slots.count();
+    }
+
+    fn findUpload(self: *const LoadedAssets, slot: usize) ?usize {
+        for (self.uploads.items, 0..) |upload, i| {
+            if (upload.slot == slot) return i;
+        }
+        return null;
+    }
+
+    /// A one-level owned "chain" for a texture's level-0 copy is not representable in
+    /// `mipmap.Chain` (which holds the levels *below* 0), so level 0 lives in
+    /// `pixel_blocks` and only generated levels live in `mip_chains`.
+    fn appendPixelBlock(self: *LoadedAssets, bytes: []u8) error{OutOfMemory}!usize {
+        self.pixel_blocks.append(self.gpa, bytes) catch return error.OutOfMemory;
+        return self.pixel_blocks.items.len - 1;
     }
 };
 
@@ -131,6 +208,11 @@ pub const AssetReport = struct {
     /// Files that were found but not loadable (decoder error, oversized mesh,
     /// table full). Counted, not fatal: a scene still renders the rest.
     skipped: usize = 0,
+    /// Assets evicted after load. Counted so a report can distinguish "never
+    /// uploaded" from "uploaded and released".
+    evicted: usize = 0,
+    /// Textures that received a generated mip chain below level 0.
+    mipmapped: usize = 0,
 };
 
 /// First candidate slot for a project-relative asset path: a hash folded into the
@@ -449,16 +531,19 @@ pub fn loadAssets(
     loaded.slots = try plan.slots.clone();
 
     // Read and store each planned asset.
+    //
+    // The file bytes are **released as soon as the slot is filled**: a mesh is copied
+    // into the table's own scratch and a texture keeps its pixels through a separate
+    // allocation that survives the file, so holding the source bytes for the life of
+    // the session would double every mesh's footprint for no reader. What outlives the
+    // read is exactly what the rasterizer samples.
     for (plan.entries) |item| {
         const bytes = dir.readFileAlloc(io, item.path, gpa, .limited(max_asset_bytes)) catch {
             log.warn("unreadable asset \"{s}\"", .{item.path});
             loaded.report.skipped += 1;
             continue;
         };
-        loaded.blobs.append(gpa, bytes) catch {
-            gpa.free(bytes);
-            return error.OutOfMemory;
-        };
+        defer gpa.free(bytes);
 
         switch (item.kind) {
             .mesh => {
@@ -481,6 +566,7 @@ pub fn loadAssets(
                     error.OutOfMemory => return error.OutOfMemory,
                 };
                 _ = loaded.table.setColor(item.slot, .{ 1, 1, 1, 1 });
+                loaded.uploads.append(gpa, .{ .slot = item.slot }) catch return error.OutOfMemory;
                 loaded.report.meshes += 1;
             },
             .texture => {
@@ -500,22 +586,34 @@ pub fn loadAssets(
                     loaded.report.skipped += 1;
                     continue;
                 };
-                // The rasterizer samples the pixels directly; the artifact
-                // round-trip above is what validates the CXTX layout, and the pixels
-                // are owned by `image`, which ends here — so store a copy the table
-                // can borrow.
-                const copy = gpa.dupe(u8, parsed.pixels) catch return error.OutOfMemory;
-                loaded.blobs.append(gpa, copy) catch {
-                    gpa.free(copy);
+                // The artifact round-trip above is what validates the CXTX layout, but
+                // `artifact` dies with this iteration. Copy the level-0 pixels once,
+                // owned by the mip storage list, and build the chain below them in the
+                // same list so a texture costs one allocation per level block and the
+                // table can keep borrowing plain slices.
+                const level0 = gpa.dupe(u8, parsed.pixels) catch return error.OutOfMemory;
+                const pixel_index = loaded.appendPixelBlock(level0) catch {
+                    gpa.free(level0);
                     return error.OutOfMemory;
                 };
+                const mips = generateMips(gpa, &loaded.mip_chains, parsed.width, parsed.height, level0) catch |err| {
+                    _ = loaded.evict(item.path);
+                    return err;
+                };
+                if (mips.len > 0) loaded.report.mipmapped += 1;
+                // A generated chain is the last entry of `mip_chains` at this point;
+                // `generateMips` appends exactly one when it appends any.
+                const chain_index: ?usize = if (mips.len > 0) loaded.mip_chains.items.len - 1 else null;
                 _ = loaded.table.setColor(item.slot, .{ 1, 1, 1, 1 });
                 _ = loaded.table.setTexture(item.slot, .{
                     .width = parsed.width,
                     .height = parsed.height,
-                    .pixels = copy,
+                    .pixels = level0,
                     .filter = .bilinear,
+                    .mips = mips,
                 });
+                loaded.uploads.append(gpa, .{ .slot = item.slot, .pixel = pixel_index, .chain = chain_index }) catch
+                    return error.OutOfMemory;
                 loaded.report.textures += 1;
             },
         }
@@ -554,6 +652,37 @@ const Planned = struct {
     slot: usize,
     kind: AssetKind,
 };
+
+/// Generate the mip levels of a texture and keep the chain alive in `chains`.
+///
+/// `render.mipmap` builds a chain with integer box filtering (deterministic across
+/// platforms) and owns the level block; the chain is stored whole in the caller's
+/// list, so its lifetime is exactly the loader's and `deinit` frees it. The returned
+/// slice borrows into the chain — the shape `raster.Texture.mips` expects, with no
+/// per-level allocation and nothing for the caller to free separately.
+///
+/// A 1x1 texture has no levels below it, so nothing is appended and the returned
+/// slice is empty: level 0 only is the honest answer for an image that cannot be
+/// minified. A `level0`-only request therefore costs no allocation here.
+fn generateMips(
+    gpa: Allocator,
+    chains: *std.ArrayList(?r.mipmap.Chain),
+    width: u32,
+    height: u32,
+    pixels: []const u8,
+) error{OutOfMemory}![]const r.MipLevel {
+    if (r.mipmap.levelCount(width, height) < 2) return &.{};
+    const chain = r.mipmap.Chain.generate(gpa, width, height, pixels) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    chains.append(gpa, chain) catch {
+        var undo = chain;
+        undo.deinit(gpa);
+        return error.OutOfMemory;
+    };
+    // `items.len` moved, so address the stored element: `append` may have reallocated.
+    return chains.items[chains.items.len - 1].?.levels();
+}
 
 /// Store one mesh artifact in `slot`. A `CXMH` artifact is parsed zero-copy, so the
 /// table borrows the file bytes the caller holds.
@@ -721,6 +850,156 @@ test "render_scene: loadAssets decodes a project's mesh and texture" {
     try testing.expect(mesh_bits != tex_handle or (mesh_bits & 0xffff) != (tex_handle & 0xffff));
     try testing.expectEqual(@as(usize, 2), loaded.slots.count());
     try testing.expectEqual(@as(usize, options.capacity - 2), loaded.freeSlots());
+}
+
+test "render_scene: an uploaded texture carries a real mip chain" {
+    // The gap this closes: `FrameParams.mipmap` defaults to `.trilinear` and Medium
+    // declares mipmaps, but a texture uploaded without levels could only ever sample
+    // level 0 — minification aliased and the tier's capability was decorative.
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "assets");
+
+    // A 4x4 image with four distinct quadrants, so every generated level has a
+    // predictable value rather than one averaged into a uniform grey.
+    var texels: [4 * 4 * 4]u8 = undefined;
+    for (0..4) |y| {
+        for (0..4) |x| {
+            const i = (y * 4 + x) * 4;
+            const top = y < 2;
+            const left = x < 2;
+            texels[i + 0] = if (left) 255 else 0;
+            texels[i + 1] = if (top) 255 else 0;
+            texels[i + 2] = 0;
+            texels[i + 3] = 255;
+        }
+    }
+    const qoi = try assets.image.encodeQoi(gpa, .{ .width = 4, .height = 4, .pixels = &texels });
+    defer gpa.free(qoi);
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/grid.qoi", .data = qoi });
+
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buf);
+    const root = buf[0..n];
+
+    var index = try @import("../core/assets.zig").indexDirectories(gpa, io, root, &.{"assets"});
+    defer index.deinit();
+
+    const options = pipeline.AssetTable.Options{ .capacity = 4, .vertices_per_slot = 8, .indices_per_slot = 12 };
+    var loaded = try loadAssets(gpa, io, root, index, options);
+    defer loaded.deinit();
+    try testing.expectEqual(@as(usize, 1), loaded.report.mipmapped);
+
+    const texture = loaded.table.resources(true).texture(loaded.handleOf("assets/grid.qoi").?).?;
+    // 4x4 -> 2x2 -> 1x1: level 0 plus two generated levels.
+    try testing.expectEqual(@as(u32, 3), texture.mipLevelCount());
+    try testing.expectEqual(@as(u32, 2), texture.mipLevel(1).width);
+    try testing.expectEqual(@as(u32, 1), texture.mipLevel(2).width);
+    // `validate` is the contract the backend trusts: every level halved, every level
+    // complete. A chain that failed either would be rejected at draw time.
+    try texture.validate();
+
+    // The 2x2 level is the box average of each quadrant, so the top-left texel keeps
+    // its yellow-red corner and the 1x1 level averages the four quadrants.
+    const level1 = texture.mipLevel(1);
+    try testing.expectEqualSlices(u8, &.{ 255, 255, 0, 255 }, level1.pixels[0..4]);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 255 }, level1.pixels[12..16]);
+    const level2 = texture.mipLevel(2);
+    try testing.expectEqualSlices(u8, &.{ 128, 128, 0, 255 }, level2.pixels[0..4]);
+
+    // The chain is counted in the table's footprint, and it is not the file size.
+    const uploaded = loaded.uploadedBytes();
+    try testing.expect(uploaded >= 4 * 4 * 4 + 2 * 2 * 4 + 4);
+    try testing.expect(uploaded < qoi.len + 4 * 4 * 4 + 2 * 2 * 4 + 4 + 64);
+}
+
+test "render_scene: a 1x1 texture generates no levels and says so" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "assets");
+    const texels = [_]u8{ 9, 8, 7, 255 };
+    const qoi = try assets.image.encodeQoi(gpa, .{ .width = 1, .height = 1, .pixels = @constCast(&texels) });
+    defer gpa.free(qoi);
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/dot.qoi", .data = qoi });
+
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buf);
+    const root = buf[0..n];
+    var index = try @import("../core/assets.zig").indexDirectories(gpa, io, root, &.{"assets"});
+    defer index.deinit();
+
+    const options = pipeline.AssetTable.Options{ .capacity = 2, .vertices_per_slot = 8, .indices_per_slot = 12 };
+    var loaded = try loadAssets(gpa, io, root, index, options);
+    defer loaded.deinit();
+    try testing.expectEqual(@as(usize, 0), loaded.report.mipmapped);
+    try testing.expectEqual(@as(usize, 0), loaded.mip_chains.items.len);
+
+    const texture = loaded.table.resources(true).texture(loaded.handleOf("assets/dot.qoi").?).?;
+    try testing.expectEqual(@as(u32, 1), texture.mipLevelCount());
+    try testing.expectEqualSlices(u8, &texels, texture.pixels);
+}
+
+test "render_scene: eviction frees the pixels and kills the handles into the slot" {
+    // The eviction contract: the slot stops resolving, the memory is actually
+    // returned (not just hidden behind a liveness flag), the layout never shifts, and
+    // a reload of the same path cannot resurrect the old handles unless it really is
+    // the same generation.
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "assets");
+
+    const texels = [_]u8{ 255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255 };
+    const qoi = try assets.image.encodeQoi(gpa, .{ .width = 2, .height = 2, .pixels = @constCast(&texels) });
+    defer gpa.free(qoi);
+    try tmp.dir.writeFile(io, .{ .sub_path = "assets/checker.qoi", .data = qoi });
+
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buf);
+    const root = buf[0..n];
+    var index = try @import("../core/assets.zig").indexDirectories(gpa, io, root, &.{"assets"});
+    defer index.deinit();
+
+    const options = pipeline.AssetTable.Options{ .capacity = 4, .vertices_per_slot = 8, .indices_per_slot = 12 };
+    var loaded = try loadAssets(gpa, io, root, index, options);
+    defer loaded.deinit();
+
+    const path = "assets/checker.qoi";
+    const bits = loaded.handleOf(path).?;
+    const slot = loaded.slots.get(path).?;
+    const before = loaded.uploadedBytes();
+    try testing.expect(before >= 16);
+    try testing.expect(loaded.table.resources(true).texture(bits) != null);
+
+    // Evicting is idempotent: the second call reports "nothing was live".
+    try testing.expect(loaded.evict(path));
+    try testing.expect(!loaded.evict(path));
+    try testing.expectEqual(@as(usize, 1), loaded.report.evicted);
+
+    // The handle a scene stored does not resolve, and the table holds no bytes for it.
+    try testing.expect(loaded.table.resources(true).texture(bits) == null);
+    try testing.expectEqual(@as(usize, 0), loaded.uploadedBytes());
+    try testing.expect(!loaded.table.isLive(slot, .texture));
+    // The path still owns its slot: the layout is a property of the project, so the
+    // handle bits a stored scene carries stay addressable even when empty.
+    try testing.expect(loaded.handleOf(path) != null);
+    try testing.expectEqual(@as(usize, options.capacity - 1), loaded.freeSlots());
+
+    // The generation moved, so a handle rebuilt with the old generation cannot alias
+    // a future upload in that slot.
+    const table_handle = loaded.table.handleOf(slot, .texture);
+    try testing.expect(table_handle == null);
+
+    // Reload path: a fresh table filled the same way gives generation 1 again, which
+    // is why a stored handle is stable across runs but not across an eviction.
+    var reloaded = try loadAssets(gpa, io, root, index, options);
+    defer reloaded.deinit();
+    try testing.expectEqual(bits, reloaded.handleOf(path).?);
 }
 
 test "render_scene: loadAssets decodes an OBJ source, no artifact needed" {

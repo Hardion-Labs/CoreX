@@ -192,6 +192,14 @@ counts frames it cannot keep up with instead of sleeping past them; a paced run 
 is no present to synchronise with yet. A window, swapchain, vsync and input remain the
 next platform step.
 
+Asset **upload** runs through the same scene renderer: each texture gets a mip chain
+built with `render.mipmap` at upload time, the source bytes are released as soon as the
+slot is filled, and `uploadedBytes()` reports the footprint the renderer holds. Eviction
+(`LoadedAssets.evict`) releases a slot and its pixel blocks and bumps the slot's
+generations, so a stored handle stops resolving instead of aliasing the next upload; it
+is an explicit call, not a budget or an LRU. There is no GPU yet, so "upload" is a copy
+into CPU scratch.
+
 The **scene renderer** (`src/scene/render_scene.zig`) connects a project to that
 pipeline, which was the missing half: the engine's own scene schema
 (`EngineScene`) carried only `transform`, so a `.scene` file could not reference a

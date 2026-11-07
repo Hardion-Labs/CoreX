@@ -4,6 +4,94 @@ Permanent record of real progress, decisions, pending items and the next priorit
 task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
+## Cycle 2026-11-07 (d) — Asset upload (mip chains) and eviction
+
+**Diagnosis first.** The logged next priority was the window + swapchain backend.
+Re-checked this cycle and **still blocked**: no `/usr/include/X11`, no `libX11.so`
+dev symlink, no `pkg-config`, no `Xvfb`, `DISPLAY`/`WAYLAND_DISPLAY` empty. Writing a
+window backend here would be unvalidated speculative code, so it was not attempted and
+the block is reported again. The next verifiable item on the roadmap was taken instead:
+the pending "asset upload/eviction and CXTX mips" entry.
+
+**What the code actually showed (three real defects, not a wish list):**
+
+1. `loadAssets` kept **every source file's bytes alive for the whole session** in
+   `blobs`, even though a mesh is copied into the table's own scratch and a texture's
+   pixels are read through a separate allocation. The bytes had no reader after upload.
+2. Textures were uploaded with **no mip chain**, while `FrameParams.mipmap` defaults to
+   `.trilinear` and Medium declares `mipmaps` — so minification aliased and the tier
+   capability was decorative. `render.mipmap` already existed and was unused by the
+   loader.
+3. **Eviction did not exist.** `ResourceTable.release` existed but nothing in the asset
+   path called it, `LoadedAssets.handleOf` hard-coded `generation = 1`, and `release`
+   did not bump generations itself — so a slot released and refilled could resurrect old
+   handles, and a handle rebuilt from a slot index was wrong by construction.
+
+**Delivered (validated):**
+
+- **Mip chains at upload** (`render_scene.loadAssets` + `generateMips`): each texture
+  gets a chain built by `render.mipmap.Chain.generate` (integer box filter,
+  deterministic), owned as a whole `Chain` in `LoadedAssets.mip_chains`, borrowed by the
+  table as `raster.MipLevel`s. A 1x1 texture generates nothing (`mipmapped` stays 0 and
+  no allocation happens). Tests pin the **values** of the 4x4 → 2x2 → 1x1 levels and run
+  `Texture.validate()` on the result, so a chain that does not halve correctly fails.
+- **Source bytes released at upload**: `defer gpa.free(bytes)` per file; the table owns
+  a level-0 copy plus its chain. Measured on a test project with an 8x8 PNG:
+  `Assets uploaded: 1 meshes, 1 textures (1 mipmapped), 0 skipped, 484 bytes`
+  (144 mesh + 256 + 64 + 16 + 4), not the file sizes.
+- **`AssetTable.uploadedBytes()`**: the footprint the renderer holds — the scratch
+  copied for meshes plus every texture level it borrows — computed from liveness, so it
+  drops to 0 for an evicted slot instead of being an estimate. Printed by the binary
+  next to the skip count.
+- **`LoadedAssets.evict(path)`**: releases the slot and `gpa.free`s the pixel block and
+  the chain. The path keeps its slot (the layout is a property of the project), but the
+  slot stops resolving. Idempotent: a second call returns false and does not count.
+  `AssetReport` gained `evicted` and `mipmapped`.
+- **`ResourceTable.release` bumps every kind's generation itself** (and is a no-op on an
+  already-free slot), plus `ResourceTable.handleOf(slot, kind)` / `isLive` and
+  `AssetTable.handleOf`/`isLive`/`release`. `LoadedAssets.handleOf` now reads the
+  table's handle and only falls back to the load-time generation 1 for a
+  planned-but-empty slot — the case a `.scene` depends on, since a broken or evicted
+  file must not invalidate the handles of its neighbours.
+- 6 new tests (734 total): mip chain values + `validate`, the 1x1 case, eviction
+  (memory freed, handles dead, idempotent, layout stable, reload gives the same bits),
+  `release` generation invariants (including that two releases do not churn them), and
+  `uploadedBytes` arithmetic before/after eviction.
+
+**Decisions:**
+
+- **Eviction is explicit, not automatic.** There is no budget, no LRU and no residency
+  policy, because there is no GPU: "upload" is a copy into CPU scratch, and an
+  automatic policy over CPU memory would evict assets the frame is about to draw. The
+  honest shape is a call the caller owns; a budget becomes meaningful when a swapchain
+  and a GPU backend exist.
+- **`release` bumps the generation, not the next `set*` alone.** Two independent
+  bumpers would make generations depend on the order of operations; one owner (the
+  release) plus the existing store bump is what the handle contract needs.
+- **Mips are generated at upload, not stored in `CXTX`.** The artifact format is a
+  documented contract and bumping it would invalidate every cached artifact for a chain
+  that the deterministic integer filter reproduces exactly. `docs/render-backend.md`
+  says so explicitly.
+- `LoadedAssets.handleOf` keeps returning a resolvable-looking bits value for a planned
+  but empty slot rather than null, because a stored `.scene` cannot be rewritten when
+  one asset in the project fails; the handle simply resolves to nothing. The existing
+  test for that behaviour caught my first attempt to return null.
+
+**Measured:** `ReleaseFast`, `--frames 20 --fps 60` on the texture project: 0 late,
+16.574 ms/frame, `Assets uploaded: … 484 bytes`; Debug suite **734/734**; `zig build`
+OK; `zig fmt --check` clean.
+
+**Pending:** window/surface backend, swapchain, vsync (still blocked here); a texture
+budget / automatic residency policy once a GPU backend exists; `CXTX` levels if
+authoring-time mips ever beat the deterministic filter; input/event loop; GUI/editor.
+
+**Next priority:** the window + swapchain + vsync backend, in an environment with a
+display and its dev headers. Still blocked here, so the next verifiable step is the one
+behind it: **scaling/presentation of the finished surface** (nearest/bilinear upscale
+from the render size to the window size) is window-dependent too, so the verifiable
+candidate is instead **draw-list batching by material** in extraction, or **texture
+filtering quality work** in the rasterizer (both testable headless).
+
 ## Cycle 2026-11-07 (c) — Frame pacing (`target_fps`) and frame timing statistics
 
 **Diagnosis first (the logged next priority was not implementable here).** Cycle (b)

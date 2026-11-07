@@ -8,6 +8,28 @@ declared yet.
 
 ### Added
 
+- Asset upload and eviction (`src/scene/render_scene.zig`, `src/render/pipeline.zig`):
+  the render table is now filled the way a renderer actually consumes it.
+  - **Mip chains for uploaded textures.** `loadAssets` builds a chain below level 0 with
+    `render.mipmap` (integer box filter, deterministic) and hands it to the texture's
+    `mips`. `FrameParams.mipmap` defaulted to `.trilinear` and Medium declares mipmaps,
+    but a texture uploaded without levels could only ever sample level 0 — minification
+    aliased and the tier capability was decorative. A 1x1 texture generates nothing and
+    says so (`report.mipmapped`); a test pins the 4x4 → 2x2 → 1x1 values, not just the
+    level count.
+  - **Source bytes are released at upload.** A mesh is copied into the table's scratch
+    and a texture keeps only level 0 plus its chain, so the file bytes a session decoded
+    no longer stay alive for the whole run. `AssetTable.uploadedBytes` reports the
+    footprint the renderer actually holds (scratch + every level), and the binary prints
+    `Assets uploaded: N meshes, M textures (K mipmapped), S skipped, B bytes`.
+  - **Real eviction.** `LoadedAssets.evict(path)` releases the slot and frees the pixel
+    blocks; `ResourceTable.release` now bumps every kind's generation itself, so stored
+    handles stop resolving immediately instead of waiting for the next `set*`, and
+    releasing an already-free slot is a no-op. `ResourceTable.handleOf(slot, kind)` and
+    `isLive` expose the authoritative handles, and `LoadedAssets.handleOf` reads them
+    instead of rebuilding generation 1 — which is still returned for a planned-but-empty
+    slot, because a stored `.scene` cannot be rewritten when one file is broken.
+    `AssetReport` gained `evicted` and `mipmapped`. 6 new tests (734 total).
 - Frame pacing (`src/runtime/pacing.zig`, `corex.runtime.pacing`,
   `docs/presentation.md`): a `Pacer` that holds a frame loop to a target rate, and the
   frame timing statistics the loop was missing. `FramePacing` reports each frame's
