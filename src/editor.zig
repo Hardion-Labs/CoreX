@@ -10,6 +10,7 @@ pub const shell = @import("editor/shell.zig");
 pub const edit = @import("editor/edit.zig");
 pub const tree = @import("editor/tree.zig");
 pub const inspector = @import("editor/inspector.zig");
+pub const frame_camera = @import("editor/frame_camera.zig");
 
 test {
     std.testing.refAllDecls(@This());

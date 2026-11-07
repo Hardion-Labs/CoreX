@@ -18,7 +18,7 @@ rendered surface (RGBA8, the renderer's own) ─┤─► editor.shell.draw ─�
 input frame + editor state                   ─┘
 ```
 
-`editor.shell.draw(ctx, state, history, scene, frame) -> bool` paints a complete editor frame
+`editor.shell.draw(ctx, state, scene, history, frame, gpa) -> bool` paints a complete editor frame
 into the GUI context's canvas and returns whether the selection changed. It owns no
 scene, no renderer and no surface: everything is borrowed for the duration of the
 frame. That is what lets the same call serve a headless tool (`zig build
@@ -112,19 +112,23 @@ accent colour, because focus that is invisible is focus the user cannot use.
 
 | Key | Effect |
 | --- | --- |
-| `Tab` | move focus to the other dock |
-| `Shift+Tab` | move it back |
+| `Tab` | move focus to the next dock: hierarchy → viewport → inspector → hierarchy |
+| `Shift+Tab` | the same order backwards |
 
-Only the hierarchy and the inspector are stops — they are the two docks with keyboard
-behaviour, and a stop that answers no key is a stop the user has to press `Tab` twice to
-get past. Clicking a field in the inspector moves the dock focus with it, so the outline,
-the Tab order and what actually receives keys never disagree.
+All three docks are stops, because all three now answer keys: the hierarchy navigates and
+edits, the viewport frames and orbits the camera, and the inspector's fields take text. A
+dock that answered nothing would be a stop the user has to press `Tab` twice to get past,
+which is why the viewport only became one once it had its own vocabulary. Clicking a field
+in the inspector moves the dock focus with it, so the outline, the Tab order and what
+actually receives keys never disagree.
 
 `Tab` is handled **before** the "a text field holds the keyboard" gate: otherwise a focused
 name field would be a place the user cannot leave. In the hierarchy, `N`/`P`/`Enter` and the
-arrows act; in the inspector they do not (they are text keys there). `Delete`, `Ctrl+Z` and
-`Ctrl+Y` are dock-independent: they act on the selection and the history, which are the
-tree's and the project's rather than a dock's.
+arrows act; in the viewport the arrows orbit and `F` frames; in the inspector they do not
+(they are text keys there). The same key therefore means different things per dock — and
+that is the point of having a dock focus at all. `Delete`, `Ctrl+Z` and `Ctrl+Y` are
+dock-independent: they act on the selection and the history, which are the tree's and the
+project's rather than a dock's.
 
 A refused action is never silent: `tree.apply` returns the failure, and the status bar
 shows it as `! ParentCycle` (or whichever error) for the frame instead of leaving the user
@@ -154,6 +158,45 @@ buffer `raster.Target.color` and `backend.Surface.color` describe — and the sh
 samples it into the viewport rect with `Canvas.blitScaled`: nearest-neighbour, clipped
 to the destination *and* the canvas, so a viewport smaller than the render is a
 downsample of the whole frame rather than a crop, and nothing spills over the panels.
+
+### Keyboard framing and orbit
+
+The viewport answers the keyboard, so the editor is usable without a pointer at all
+(`src/editor/frame_camera.zig`, `corex.editor.frame_camera`):
+
+| Key (viewport focused) | Effect |
+| --- | --- |
+| `F` | frame the whole scene |
+| `Shift+F` | frame the selection |
+| `Left` / `Right` | orbit left / right (yaw about world +Y) |
+| `Up` / `Down` | orbit up / down (pitch about the camera's right axis) |
+
+- **What gets framed.** `frame_camera.bounds` walks the scene's world transforms and
+  returns the box containing every entity that has **both** a `Transform` and a
+  `Renderable`, using the eight corners of the local unit box so a scaled mesh is framed by
+  its real extent. Cameras and empties do not contribute: focusing the view frames what can
+  be *seen*. `boundsOf(scene, id)` is the same for one entity, and an entity with no
+  geometry still frames — as the point it occupies — because a user who selects a group and
+  presses `Shift+F` wants to look at the group, not at nothing.
+- **Where the camera goes.** `fit` keeps the authored **direction** and only moves the
+  target to the box centre and the eye to `radius / sin(fov/2) * 1.15`, floored at
+  `min_distance`. Keeping the direction is what makes repeated `F` presses stable instead of
+  drifting; the margin keeps geometry off the frame edges.
+- **Orbit** turns the view direction about the target: pitch about the camera's right axis
+  first, then yaw about world +Y. Elevation is clamped to `±(π/2 − 0.02)` by clamping the
+  **sine** and rescaling the horizontal part — a rotation-based clamp only approximates the
+  limit and overshoots when pitch is applied in steps, which is exactly what key repeat does.
+- **It is an ordinary edit.** The resulting transform goes onto the scene's first usable
+  camera entity as **one** `set_component` through the history, so `Ctrl+Z` restores the
+  camera the user had and the project is marked dirty like any other change. Nothing is
+  stored outside the scene: reopening a project shows the camera it authored.
+- **Honest failures.** A scene with no camera reports `NoCamera`; a scene with nothing to
+  frame reports `NothingToFrame`; both appear in the status bar for the frame rather than
+  moving the camera somewhere arbitrary. An invalid transform is refused before it reaches
+  the history.
+- **It starts from the screen, not from a default.** Each command re-reads the camera's
+  placement from the scene (`viewOf`) and keeps the distance the editor last worked with,
+  so an orbit after an inspector edit or an undo turns from what is actually on screen.
 
 `editor.shell.projectToViewport(view_projection, world, rect)` maps a world position to
 a viewport pixel using the **same** matrix the renderer used, so a marker lands on the
@@ -258,6 +301,10 @@ holds focus:
 | `Delete` | delete the selected entity (undoable) |
 | `Escape` | clear the selection |
 
+`Delete` and `Escape` act on the **selection**, so they are not scoped to a dock: they work
+from any dock that is not a text field (where `Delete` is a text key and `Escape` reverts
+the field).
+
 They are a convenience over `shell.undo`/`redo`/`deleteSelected`, which are the same
 functions a menu or a test calls — the shortcuts add no behaviour of their own. A
 selection whose entity no longer resolves (undoing a create, redoing a delete) is
@@ -296,17 +343,16 @@ behaviour, not a workaround.
 - **No drag-and-drop reparenting.** Reparenting is `P` (to root) or a `tree.apply`
   call; a pointer drag needs hover-target tracking across rows, which the GUI can already
   report, but the interaction is a separate step.
-- **The viewport is not a focus stop.** It has no keyboard behaviour yet (no camera keys,
-  no gizmos), so adding it now would be an empty stop.
+- **The viewport has no pointer interaction.** Framing and orbit are keyboard-only: no
+  click-to-select in the viewport, no drag to orbit, no zoom (the distance is set by `F`,
+  not by a wheel or a scale factor), and no gizmos.
 - **No focus ring on individual fields.** The outline marks the dock; the field inside it
   draws its own border when focused.
 - **No Home/End, PageUp/PageDown or multi-select in the tree.** One selected entity.
 - **No inline rename in the tree.** Renaming goes through the inspector's name field.
 - **Fold state is not persisted.** It lives in `shell.State`, so reopening a project
   starts unfolded.
-- **No drag/drop, no viewport camera controls, no gizmos.** The camera is whatever the
-  scene authors.
-- **No keyboard focus traversal.** Clicking a row selects; Tab order is not
-  implemented (the GUI layer reports Tab, nothing consumes it yet).
+- **One camera.** Framing moves the scene's first usable camera (the one the renderer
+  would use). Multi-camera switching is out of scope for now.
 - **Fixed dock widths, no resizable splitters, no docking/re-docking.**
 - **One viewport, one scene.** Multi-scene editing and tabs are out of scope for now.
