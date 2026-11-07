@@ -4,6 +4,61 @@ Permanent record of real progress, decisions, pending items and the next priorit
 task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
+## Cycle 2026-11-07 (l) — Hierarchy row model: scrolling and scroll-to-selection
+
+**Diagnosis first.** Cycle (k) left the tree exactly as cycle (i) wrote it: a recursion
+that re-derived depth at every level with a 64-entry buffer per node, a row budget that
+silently cut the tree off, and a "more..." hint that could lie. The recorded next
+priority was hierarchy depth (create/rename/delete/reparent from the tree) **with tree
+scrolling**; the row model is the prerequisite for both, so it came first.
+Window/swapchain remains blocked (unchanged; not attempted).
+
+**Delivered (validated):**
+
+- **`editor/tree.zig`** (new, `corex.editor.tree`) — the hierarchy's row model.
+  - `Row{id, depth}` and `List{rows, len, offset, visible, more}`; `tree.build(scene,
+    list)` walks depth-first into a **caller-owned flat array**, stops when the window is
+    full (plus one row, to know whether a "more..." hint is honest), skips rows above the
+    scroll offset and **never allocates**.
+  - `max_depth = 32` bounds the recursion, so a corrupt parent chain cannot overflow the
+    stack; `max_rows = 512` bounds the row table.
+  - `tree.indexOf(scene, id, limit)` — a bounded search for a row's line in the whole
+    tree, used to bring a far-away selection into view.
+- **`Scene.parentIdOf(id)`** — a row's parent ID without resolving the parent entity, so
+  the walk costs one lookup per row instead of two. The only scene-level addition; no
+  existing contract changed.
+- **Shell** — the tree paints one flat loop over the row list (`drawTreeRow`) instead of
+  a per-level recursion; `State.tree_offset` scrolls by wheel (three rows), clamped at
+  both ends and pulled back when the offset would show blank rows;
+  `revealSelection` centres the window on a selection it does not contain.
+- **`corex.editor`** now exports `tree` and `inspector` alongside `shell` and `edit`.
+
+**Bugs found and fixed while validating:**
+
+- The "more..." hint appeared whenever the window was full, even with nothing after it;
+  the walk now records `List.more` from what it actually saw.
+- Scrolling past the end left the panel painting blank rows; the offset is reset to the
+  last full window when the walk returns nothing.
+- Two Zig 0.17 issues: a generic `Walk(Scene)` had to be a function returning a type
+  (a struct cannot declare an `anytype` field), and its methods needed `@This()`.
+
+**Suite:** **859/859** tests (clean cache), fmt clean (`tree.zig` had to be formatted),
+`zig build` OK, validate, runtime, `gui-frame`, `editor-frame` (640x360, 11 widgets),
+`qoi-decode`, `bench-extract -Doptimize=ReleaseFast`; preview refreshed and inspected.
+
+**Decisions:** the row list is a caller-owned array, not a heap structure — the panel is
+a fixed height and a tree view must never allocate per frame; the walk stops early rather
+than enumerating and slicing; depth and cycle protection live in the model, not in the
+painter; a selection must always be visible, so scrolling and selection are one concern.
+
+**Pending / not in this cycle:** per-node collapse, keyboard tree navigation,
+create/rename/delete/reparent from the tree (the commands exist in `edit`), rotation and
+camera fields, persisted history.
+
+**Next priority:** hierarchy actions — a context row/toolbar for create, delete (already
+a shortcut) and reparent through the same history commands, plus per-node collapse, so the
+tree becomes an editing surface rather than a selector.
+
 ## Cycle 2026-11-07 (k) — Editable transform rows in the inspector
 
 **Diagnosis first.** Cycle (j) left the model complete but only the *name* editable; the

@@ -465,6 +465,16 @@ pub fn Scene(comptime schemas: anytype) type {
             return written;
         }
 
+        /// The stable ID of an entity's parent, without resolving the parent entity.
+        ///
+        /// A tree view walks thousands of rows a frame and only needs the IDs, so asking
+        /// for the entity and then its ID back would be two hash lookups per row for no
+        /// information. Returns `null` for a root or an unknown ID.
+        pub fn parentIdOf(self: *const Self, id: u64) ?u64 {
+            const record = self.records.get(id) orelse return null;
+            return record.parent;
+        }
+
         /// Sorted stable IDs of all root entities (entities without a parent).
         /// Caller owns the returned slice and frees it with `gpa`.
         pub fn rootIds(self: *const Self, gpa: Allocator) Error![]u64 {
@@ -1508,4 +1518,18 @@ test "scene: destroySet performs no allocation at all" {
     try std.testing.expectEqual(@as(usize, 2000), s.destroySet(ids));
     try std.testing.expectEqual(before, failing.alloc_index);
     try std.testing.expect(s.world.alive(survivor));
+}
+
+test "scene: parentIdOf answers without resolving the parent entity" {
+    var s = try TestScene.init(std.testing.allocator, "main");
+    defer s.deinit();
+    const root = try s.createEntity("Root", null);
+    const child = try s.createEntity("Child", s.idOf(root));
+    const root_id = s.idOf(root).?;
+    const child_id = s.idOf(child).?;
+
+    try std.testing.expect(s.parentIdOf(root_id) == null);
+    try std.testing.expectEqual(root_id, s.parentIdOf(child_id).?);
+    // An unknown ID is not an error: the caller is a per-frame scan, not a query.
+    try std.testing.expect(s.parentIdOf(999) == null);
 }

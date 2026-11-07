@@ -8,6 +8,8 @@
 const std = @import("std");
 pub const shell = @import("editor/shell.zig");
 pub const edit = @import("editor/edit.zig");
+pub const tree = @import("editor/tree.zig");
+pub const inspector = @import("editor/inspector.zig");
 
 test {
     std.testing.refAllDecls(@This());
