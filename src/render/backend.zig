@@ -73,6 +73,9 @@ pub const Capabilities = struct {
     textures: bool,
     /// Depth-stencil target (`Surface.depth`) is written and tested.
     depth: bool,
+    /// `FrameOptions.sampling` may deviate from the default: a LOD bias or a
+    /// reduced tap cap. Only meaningful where mip levels are sampled at all.
+    sampling_controls: bool,
 };
 
 /// The documented capability of each tier. Low is the floor ("broad hardware
@@ -90,6 +93,7 @@ pub fn capabilities(tier: Tier) Capabilities {
             .lighting = false,
             .textures = false,
             .depth = true,
+            .sampling_controls = false,
         },
         .medium => .{
             .blending = true,
@@ -99,6 +103,7 @@ pub fn capabilities(tier: Tier) Capabilities {
             .lighting = true,
             .textures = true,
             .depth = true,
+            .sampling_controls = true,
         },
         .advanced => .{
             .blending = true,
@@ -108,6 +113,7 @@ pub fn capabilities(tier: Tier) Capabilities {
             .lighting = true,
             .textures = true,
             .depth = true,
+            .sampling_controls = true,
         },
     };
 }
@@ -118,6 +124,9 @@ pub const FrameOptions = struct {
     blend: raster.Blend = .none,
     antialias: raster.Antialias = .none,
     mipmap: raster.Mipmap = .trilinear,
+    /// Per-draw refinement of the mip choice (level bias, anisotropic tap cap).
+    /// Resolved by `pipeline.resolve` against the tier.
+    sampling: raster.Sampling = .{},
     light: ?raster.Light = null,
     depth_test: bool = true,
     depth_write: bool = true,
@@ -137,6 +146,7 @@ pub const FrameOptions = struct {
             .blend = self.blend,
             .antialias = self.antialias,
             .mipmap = self.mipmap,
+            .sampling = self.sampling,
         };
     }
 };
@@ -264,6 +274,8 @@ pub const DrawResources = struct {
     colorFn: *const fn (ptr: *anyopaque, handle: u32) ?[4]f32,
     textureFn: ?*const fn (ptr: *anyopaque, handle: u32) ?raster.Texture = null,
     lightFn: ?*const fn (ptr: *anyopaque) ?raster.Light = null,
+    /// Per-material sampling controls, if the provider offers them.
+    samplingFn: ?*const fn (ptr: *anyopaque, handle: u32) ?raster.Sampling = null,
 
     pub fn mesh(self: DrawResources, handle: u32) ?raster.Mesh {
         return self.meshFn(self.ptr, handle);
@@ -275,6 +287,15 @@ pub const DrawResources = struct {
 
     pub fn texture(self: DrawResources, handle: u32) ?raster.Texture {
         const f = self.textureFn orelse return null;
+        return f(self.ptr, handle);
+    }
+
+    /// The sampling controls of the material `handle`, or null when the material
+    /// asks for the frame's own values. Resolved per draw: two meshes sharing a
+    /// frame can want different sharpness, which is the entire reason this is a
+    /// material property rather than a frame parameter.
+    pub fn sampling(self: DrawResources, handle: u32) ?raster.Sampling {
+        const f = self.samplingFn orelse return null;
         return f(self.ptr, handle);
     }
 
@@ -317,15 +338,21 @@ pub const DrawResources = struct {
                 const self: *const P = @ptrCast(@alignCast(ptr));
                 return self.directionalLight();
             }
+            fn sampling(ptr: *anyopaque, handle: u32) ?raster.Sampling {
+                const self: *const P = @ptrCast(@alignCast(ptr));
+                return self.sampling(handle);
+            }
         };
         const has_texture = comptime @hasDecl(P, "texture");
         const has_light = comptime @hasDecl(P, "directionalLight");
+        const has_sampling = comptime @hasDecl(P, "sampling");
         return .{
             .ptr = @ptrCast(@constCast(provider)),
             .meshFn = Adapter.mesh,
             .colorFn = Adapter.color,
             .textureFn = if (has_texture) Adapter.texture else null,
             .lightFn = if (has_light) Adapter.light else null,
+            .samplingFn = if (has_sampling) Adapter.sampling else null,
         };
     }
 };
@@ -543,6 +570,11 @@ pub const SoftwareBackend = struct {
             return error.UnsupportedFeature;
         }
         var options = self.frame_options;
+        // A material's own sampling controls win when the tier has them: the frame
+        // values are the default a material overrides, not a cap it must live under.
+        if (self.caps().sampling_controls) {
+            if (resources.sampling(cmd.material)) |material_sampling| options.sampling = material_sampling;
+        }
         // Same precedence as the rasterizer: explicit options beat the provider.
         if (options.light == null and self.caps().lighting) {
             if (resources.directionalLight()) |light| options.light = light;
@@ -653,6 +685,75 @@ const Provider = struct {
         _ = handle;
         if (!self.texture_handle) return null;
         return .{ .width = 1, .height = 1, .pixels = &all_red, .filter = .nearest };
+    }
+};
+
+/// A provider that exposes per-material sampling controls.
+const SamplingProvider = struct {
+    pub fn mesh(_: SamplingProvider, _: u32) ?raster.Mesh {
+        return quad_mesh;
+    }
+    pub fn color(_: SamplingProvider, _: u32) ?[4]f32 {
+        return .{ 1, 1, 1, 1 };
+    }
+    pub fn sampling(_: SamplingProvider, handle: u32) ?raster.Sampling {
+        if (handle != 7) return null;
+        return .{ .lod_bias = 1.5, .max_samples = 4 };
+    }
+};
+
+/// A 8x8 texture whose chain ends in a flat white 1x1 level, drawn minified so the
+/// chosen level is visible; `bias` comes from the per-material sampling controls.
+const MippedProvider = struct {
+    bias: f64,
+
+    const level0 = [_]u8{
+        255, 0,   0, 255, 0,   255, 0, 255, 255, 0,   0, 255, 0,   255, 0, 255, 255, 0,   0, 255, 0,   255, 0, 255, 255, 0,   0, 255, 0,   255, 0, 255,
+        0,   255, 0, 255, 255, 0,   0, 255, 0,   255, 0, 255, 255, 0,   0, 255, 0,   255, 0, 255, 255, 0,   0, 255, 0,   255, 0, 255, 255, 0,   0, 255,
+        255, 0,   0, 255, 0,   255, 0, 255, 255, 0,   0, 255, 0,   255, 0, 255, 255, 0,   0, 255, 0,   255, 0, 255, 255, 0,   0, 255, 0,   255, 0, 255,
+        0,   255, 0, 255, 255, 0,   0, 255, 0,   255, 0, 255, 255, 0,   0, 255, 0,   255, 0, 255, 255, 0,   0, 255, 0,   255, 0, 255, 255, 0,   0, 255,
+        255, 0,   0, 255, 0,   255, 0, 255, 255, 0,   0, 255, 0,   255, 0, 255, 255, 0,   0, 255, 0,   255, 0, 255, 255, 0,   0, 255, 0,   255, 0, 255,
+        0,   255, 0, 255, 255, 0,   0, 255, 0,   255, 0, 255, 255, 0,   0, 255, 0,   255, 0, 255, 255, 0,   0, 255, 0,   255, 0, 255, 255, 0,   0, 255,
+        255, 0,   0, 255, 0,   255, 0, 255, 255, 0,   0, 255, 0,   255, 0, 255, 255, 0,   0, 255, 0,   255, 0, 255, 255, 0,   0, 255, 0,   255, 0, 255,
+        0,   255, 0, 255, 255, 0,   0, 255, 0,   255, 0, 255, 255, 0,   0, 255, 0,   255, 0, 255, 255, 0,   0, 255, 0,   255, 0, 255, 255, 0,   0, 255,
+    };
+    const level1 = [_]u8{
+        128, 128, 0, 255, 128, 128, 0, 255, 128, 128, 0, 255, 128, 128, 0, 255,
+        128, 128, 0, 255, 128, 128, 0, 255, 128, 128, 0, 255, 128, 128, 0, 255,
+        128, 128, 0, 255, 128, 128, 0, 255, 128, 128, 0, 255, 128, 128, 0, 255,
+        128, 128, 0, 255, 128, 128, 0, 255, 128, 128, 0, 255, 128, 128, 0, 255,
+    };
+    const level2 = [_]u8{
+        128, 128, 0, 255, 128, 128, 0, 255,
+        128, 128, 0, 255, 128, 128, 0, 255,
+    };
+    const level3 = [_]u8{
+        255, 255, 255, 255,
+    };
+    const mips = [_]raster.MipLevel{
+        .{ .width = 4, .height = 4, .pixels = &level1 },
+        .{ .width = 2, .height = 2, .pixels = &level2 },
+        .{ .width = 1, .height = 1, .pixels = &level3 },
+    };
+    // 2 texels per pixel over the 8 px quad: the unbiased level is 1 (the flat
+    // olive 4x4 level), so a +3 bias saturates on the white 1x1 one.
+    const uvs = [_][2]f32{ .{ 0, 0 }, .{ 2, 0 }, .{ 2, 2 }, .{ 0, 2 } };
+    const mipped_mesh = raster.Mesh{ .positions = &quad_positions, .indices = &quad_indices, .uvs = &uvs };
+
+    pub fn mesh(_: MippedProvider, _: u32) ?raster.Mesh {
+        return mipped_mesh;
+    }
+
+    pub fn color(_: MippedProvider, _: u32) ?[4]f32 {
+        return .{ 1, 1, 1, 1 };
+    }
+
+    pub fn texture(_: MippedProvider, _: u32) ?raster.Texture {
+        return .{ .width = 8, .height = 8, .pixels = &level0, .mips = &mips, .filter = .bilinear };
+    }
+
+    pub fn sampling(self: MippedProvider, _: u32) ?raster.Sampling {
+        return .{ .lod_bias = self.bias };
     }
 };
 
@@ -904,6 +1005,64 @@ test "backend: DrawResources.fromComptime mirrors the optional declarations" {
     var priv_provider = PrivateExtras{};
     const priv = DrawResources.fromComptime(&priv_provider);
     try testing.expect(priv.textureFn == null);
+}
+
+test "backend: fromComptime picks up an optional sampling() and ignores its absence" {
+    var with = SamplingProvider{};
+    const has = DrawResources.fromComptime(&with);
+    try testing.expect(has.samplingFn != null);
+    const s = has.sampling(7).?;
+    try testing.expectEqual(@as(f64, 1.5), s.lod_bias);
+    try testing.expectEqual(@as(u8, 4), s.max_samples);
+    try testing.expectEqual(@as(?raster.Sampling, null), has.sampling(999));
+
+    // A provider without the declaration yields a null pointer and a null answer,
+    // exactly like `@hasDecl` missing in the comptime path: no default is invented.
+    var without = NoExtras{};
+    const none = DrawResources.fromComptime(&without);
+    try testing.expect(none.samplingFn == null);
+    try testing.expectEqual(@as(?raster.Sampling, null), none.sampling(0));
+    // Same rule for a private decl.
+    var priv = PrivateExtras{};
+    const hidden = DrawResources.fromComptime(&priv);
+    try testing.expect(hidden.samplingFn == null);
+}
+
+test "backend: a material's sampling controls apply on a tier that has them only" {
+    // A chain whose last level is a flat colour: biasing down to it turns the quad
+    // flat, so the bias is visible as a colour change and not just as a number.
+    var flat_provider = MippedProvider{ .bias = 0.0 };
+    var biased_provider = MippedProvider{ .bias = 3.0 };
+
+    var plain_surface = TestSurface{};
+    var plain = try plain_surface.init();
+    plain.clear(.{ 0, 0, 0, 255 }, 1.0);
+    var medium = SoftwareBackend.init(testing.allocator, .medium);
+    const medium_iface = medium.interface();
+    defer medium_iface.deinit(testing.allocator);
+    try medium_iface.beginFrame(Surface.of(&plain), .{ .mipmap = .trilinear });
+    _ = try medium_iface.draw(testCommand(), ortho(), DrawResources.fromComptime(&flat_provider));
+    _ = try medium_iface.endFrame();
+    const unbiased = plain.colorAt(4, 4);
+
+    var biased_surface = TestSurface{};
+    var biased = try biased_surface.init();
+    biased.clear(.{ 0, 0, 0, 255 }, 1.0);
+    try medium_iface.beginFrame(Surface.of(&biased), .{ .mipmap = .trilinear });
+    _ = try medium_iface.draw(testCommand(), ortho(), DrawResources.fromComptime(&biased_provider));
+    _ = try medium_iface.endFrame();
+    const with_bias = biased.colorAt(4, 4);
+
+    // The bias lands on the last (1x1, white) level, so the pixel is white; without
+    // it the level is fractional and the pattern still shows through.
+    try testing.expectEqual([4]u8{ 255, 255, 255, 255 }, with_bias);
+    try testing.expect(!std.mem.eql(u8, &with_bias, &unbiased));
+
+    // The low tier has no textures at all, so the controls cannot be observed
+    // there; `pipeline.resolve` is what zeroes them, and its test pins that.
+    try testing.expect(!capabilities(.low).sampling_controls);
+    try testing.expect(capabilities(.medium).sampling_controls);
+    try testing.expect(capabilities(.advanced).sampling_controls);
 }
 
 test "backend: a provider whose fields matter survives the frame, not just a call" {

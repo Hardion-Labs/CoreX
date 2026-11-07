@@ -115,12 +115,13 @@ const stats = try R.rasterize(&target, frame.commands, cam.view_projection, reso
 | `Texture` | `width`/`height`, borrowed `pixels` RGBA8 (row-major, top-down), `filter`, and optional `mips` (`[]const MipLevel`, largest first; empty by default). `validate()` rejects zero/oversized dims, length mismatches and a chain that is not repeated halving — all with `InvalidTexture`. |
 | `MipLevel` | `{ width, height, pixels }` for one reduced level, same layout as `Texture.pixels`. |
 | `mipmap.Chain` | `generate(gpa, width, height, pixels)` builds the levels below level 0 (integer box filter) and owns them; `levels()` feeds `Texture.mips`, `deinit(gpa)` frees. `levelCount`/`levelDims` are the pure helpers. |
-| `Mipmap` | `.trilinear` (default, pick and mix levels) or `.level0` (always full size). |
+| `Mipmap` | `.trilinear` (default, pick and mix levels), `.level0` (always full size) or `.anisotropic` (up to 8 taps along a grazing footprint). |
+| `Sampling` | Per-draw refinement of the level choice: `lod_bias` (levels, added after selection and clamped) and `max_samples` (`0` = the global 8, higher values clamp to it). `tapCap()` and `isIdentity()` are the two helpers `{}` relies on. |
 | `Filter` | `nearest` or `bilinear`. |
 | `Light` | Directional light for the Lambert path: `direction` (toward the light, world space, normalized internally), `color`, `ambient`. `validate()` rejects malformed lights with `InvalidLight`. |
 | `Blend` | `.none` (default, verbatim write), `.alpha` (straight-alpha source-over), `.premultiplied`, `.additive`. |
 | `Antialias` | `.none` (default, one sample per pixel) or `.edge` (4x4 sub-samples, see [Antialiasing](#antialiasing)). |
-| `Options` | `cull` (`.none`/`.back`/`.front`), `front_face`, `depth_test`, `depth_write`, `light` (optional directional Lambert light; beats a `resources.directionalLight()` provider), `blend`, `antialias`, `mipmap`. |
+| `Options` | `cull` (`.none`/`.back`/`.front`), `front_face`, `depth_test`, `depth_write`, `light` (optional directional Lambert light; beats a `resources.directionalLight()` provider), `blend`, `antialias`, `mipmap`, `sampling`. |
 | `Stats` | `skipped_draws`, `submitted`, `clipped`, `culled`, `rasterized`, `pixels`, `antialiased_pixels`. |
 | `rasterize` / `rasterizeAlloc` | Whole draw list, resolving handles through `resources`. `rasterize` takes no allocator and therefore forces `antialias = .none`; `rasterizeAlloc` is the entry point that can antialias. |
 | `drawMesh` / `drawMeshAlloc` | One mesh, one world matrix, one flat RGBA8 tint, optional texture and light. Same split: only the `Alloc` variant antialiases. |
@@ -569,14 +570,65 @@ quality setting, and a frame that cannot afford it asks for `.trilinear` and get
 the previous image, not a broken one.
 
 Not implemented: sRGB transfer, or wrap modes other than repeat. Taps are
-uniformly spaced with equal weight (not Gaussian), there is no per-material level
-bias or sample-count cap, and the sub-pixel offset near a triangle edge can tap
-past the footprint by half a pixel. Without a mip chain a minified texture still aliases — build one with
-`mipmap.Chain.generate`. The sampling math (filters, LOD and the trilinear mix) is
+uniformly spaced with equal weight (not Gaussian), and the sub-pixel offset near a
+triangle edge can tap past the footprint by half a pixel. Without a mip chain a
+minified texture still aliases — build one with `mipmap.Chain.generate`. The sampling math (filters, LOD and the trilinear mix) is
 pinned to the reference in `tools/gen_raster_texture_vectors.py`; changing any
 expression there requires regenerating
 [`src/render/raster_texture_vectors.zig`](../src/render/raster_texture_vectors.zig)
 and the tests will fail loudly until both sides agree bit for bit.
+
+## Per-material sampling controls (`Sampling`)
+
+The anisotropic mode above picks the level and the tap count from the footprint
+alone. Two knobs belong to the **material**, not to the footprint, and
+`Options.sampling` carries them as plain data:
+
+| Field | Meaning |
+| --- | --- |
+| `lod_bias: f64 = 0.0` | Added to the computed level, in levels, **after** the selection rule and clamped to `[0, levels-1]`. Positive samples smaller levels (sharper, more aliasing), negative larger ones (blurrier). |
+| `max_samples: u8 = 0` | Largest number of anisotropic taps this draw may take. `0` means "the global default" (`max_aniso_samples`, 8), **not** "no taps"; values above 8 clamp to 8. |
+
+`Sampling{}` is the identity: every image produced before the field existed is
+reproduced byte for byte, and the hot path skips the bias arithmetic
+(`isIdentity()` is an exact comparison, so a caller who writes `0.0` gets that
+path and any non-zero bias is honoured).
+
+**Where the bias lands.** Both modes bias the *result* of their own level rule:
+
+- trilinear: `lod = textureLodBiased(rho, levels, bias)` — `textureLod` plus the
+  bias, clamped back into the chain, computed once per triangle on the
+  constant-denominator fast path;
+- anisotropic: both `lod_major` **and** `lod_minor` are shifted and re-clamped, so
+  the corrected level keeps its relationship to the taps. The bias is applied in
+  exactly one place, so a footprint can never be biased twice.
+
+**Where the cap lands.** `tapCap()` feeds `anisoFootprintCapped`, so it changes
+the tap *count* only: `lod_major`, `lod_minor` and the axis are untouched. A cap
+of `1` therefore reproduces `Mipmap.trilinear` byte for byte with the same
+footprint — that is asserted, not approximated. The cap is a time/quality knob: a
+grazing draw that cannot afford eight taps asks for four and gets eight fewer
+taps' worth of work at the same level.
+
+**Precedence.** The caller's runtime `FrameOptions.sampling` is the frame default;
+a provider's optional
+
+```zig
+pub fn sampling(self: Provider, handle: u32) ?raster.Sampling
+```
+
+overrides it **per material** (resolved once per draw, before any pixel). The
+provider name is duck-typed exactly like `mesh`/`color`/`texture` and is optional:
+a provider without the declaration yields a null answer and the frame default
+stands, with no made-up default invented in between. `DrawResources.fromComptime`
+mirrors that with `@hasDecl`, so a private `sampling` decl stays invisible.
+
+**Tier policy.** Only `medium` and `advanced` declare
+`Capabilities.sampling_controls`. `pipeline.resolve` zeroes
+`options.sampling` on any other tier: the frame renders with the identity
+sampling — the uncorrected level — instead of being refused. That is a quality
+loss, exactly like the anisotropic → trilinear coercion, and it is the reason the
+controls can be exposed through `FrameParams` without a new failure mode.
 
 ## Lighting
 
@@ -634,21 +686,25 @@ and the tests will fail loudly until both sides agree bit for bit.
   Agreement therefore validates the stepping, the bbox clamp and the fill-rule
   bias independently. Coverage masks and `f32` depth **bit patterns** must match
   exactly — 866 covered pixels across the corpus. CI never runs the generator.
-- **97 texture reference frames** in `src/render/raster_texture_vectors.zig`,
+- **116 texture reference frames** in `src/render/raster_texture_vectors.zig`,
   generated by [`tools/gen_raster_texture_vectors.py`](../tools/gen_raster_texture_vectors.py)
   (same brute-force coverage). UVs are carried as pre-divided `uw`/`vw`/`w_inv`
   tuples, and the Python reference recomputes the perspective-correct
   interpolation, both filters, repeat wrap (including negative UVs), tint
   multiply and rounding from scratch; the tests compare the **full RGBA8 frame**
-  plus coverage, so alpha writes and tint rounding are pinned as well. 43 of the
+  plus coverage, so alpha writes and tint rounding are pinned as well. 72 of the
   cases are mipmapped (a 16x16 level 0 with 8 levels below it, and a 4x4 level 0
   with 2; the generator rebuilds both chains with the same integer box filter and
-  recomputes the per-pixel LOD derivative and the trilinear mix). 17 of those are
+  recomputes the per-pixel LOD derivative and the trilinear mix). 28 of those are
   **anisotropic** — grazing, extreme (8:1 clamp), symmetric (which must equal the
-  trilinear frame), mild, a smaller base and a perspective case plus ten
+  trilinear frame), mild, a smaller base and a perspective case plus sixteen
   deterministic random ones — and the Python reference reimplements the
-  footprint, the tap pattern and the averaging independently, 296 of the corpus's
-  pixels. In total 1390 covered pixels, all bit-exact.
+  footprint, the tap pattern and the averaging independently, 550 of the corpus's
+  pixels. 18 cases carry a **sampling control**: the identity (which must equal
+  the plain frame), a bias in each direction on both modes and on a perspective
+  triangle, both clamps (far past the last level and below level 0), tap caps of
+  1/2/3/4 (cap 1 must equal the trilinear frame) and six random pairs. In total
+  1,851 covered pixels, all bit-exact.
 - **40 lit reference frames** in `src/render/raster_light_vectors.zig`,
   generated by [`tools/gen_raster_light_vectors.py`](../tools/gen_raster_light_vectors.py)
   (same brute-force coverage). The raw world-space face normal is an input per
@@ -801,6 +857,23 @@ The round case being *free* (the −1% is run-to-run variance) is the point of t
 design: a scene that asks for anisotropic filtering pays nothing until a footprint
 is actually elongated, and then pays in proportion to `samples`.
 
+`Sampling.max_samples` is what that proportionality buys a material. Same grazing
+draw, same machine, one more column pair in the harness (`graze_cap4`,
+`graze_cap1`):
+
+| Target | `cap = 8` (default) | `cap = 4` | `cap = 1` (trilinear image) |
+| --- | --- | --- | --- |
+| 256×256 | 13.365 ms | 9.088 ms (−32%) | 3.656 ms |
+| 512×512 | 52.618 ms | 34.586 ms (−34%) | 13.125 ms |
+| 1024×1024 | 216.246 ms | 131.681 ms (−39%) | 42.799 ms |
+
+The saving tracks the tap count because the taps are the cost. A cap of one is the
+trilinear frame bit for bit (asserted in the test suite and reproduced as a
+reference vector), so a material that caps is choosing a documented image, not an
+approximation of one. The `cap = 8` column is higher than the cycle-(e) table above
+because this harness variant times a different draw count; the ratios inside a row
+are the comparable numbers.
+
 Bilinear is disproportionately expensive because of the per-pixel `f64`
 perspective correction: two divides by `Σλ·w_inv` per pixel. Replacing them with
 `x * (1/den)` would double-round and silently diverge from the pinned vectors,
@@ -849,9 +922,11 @@ See [asset-decoders.md](asset-decoders.md) for the codec.
 - **Mip selection is isotropic by default.** `Mipmap.trilinear` takes the larger
   axis of the UV gradient, so a grazing surface over-blurs; `Mipmap.anisotropic`
   corrects that at up to ~5x the shading cost (see above), and remains opt-in.
-  There is no LOD bias, no per-material level clamp, no per-material sample cap
-  and no `textureQueryLod`; a texture without `mips` still minifies by point
-  sampling level 0 and aliases.
+  `Sampling` adds the per-material level bias and sample cap; there is no
+  per-material level *clamp* (the chain ends are the clamp), no `textureQueryLod`
+  and no Gaussian/weighted tap kernel. A texture without `mips` still minifies
+  by point sampling level 0 and aliases, and the controls do nothing there: with
+  a single level the bias is clamped away and the taps stay at one.
 - **No GPU backend.** This is a CPU reference path, not a Renderer Low tier.
 - **Single-threaded.** No tile parallelism or binning; a frame is rasterized in
   submission order on the calling thread.

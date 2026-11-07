@@ -4,6 +4,104 @@ Permanent record of real progress, decisions, pending items and the next priorit
 task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
+## Cycle 2026-11-07 (f) — Per-material LOD bias and anisotropic tap cap
+
+**Diagnosis first.** Window/swapchain was re-checked and is **still blocked** (no
+`/usr/include/X11`, no `pkg-config`, no `Xvfb`, `DISPLAY` empty), so it was not
+attempted. The previous cycle left two named follow-ups; the filtering one was taken
+because the anisotropic mode shipped with a documented gap — *the footprint decides
+the level, but a material knows better* — and because the whole path is headless and
+bit-exactly verifiable. Occlusion culling in extraction stays queued.
+
+**The defect this closes.** After cycle (e) the rasterizer could correct a grazing
+footprint, but a **material** had no way to say "sample one level sharper" (a
+normal-mapped surface, a UI element that must stay crisp) or "cap the taps for this
+draw" (the same scene, a cheaper tier of quality). Both are the two knobs a real
+renderer exposes, and both are absent from the docs' limitation list before now.
+
+**Delivered (validated):**
+
+- **`raster.Sampling`** (`src/render/raster.zig`), plain data, `Options.sampling`:
+  - `lod_bias: f64 = 0.0` — added to the level **after** the selection rule, clamped
+    to `[0, levels-1]`. Trilinear goes through the new `textureLodBiased` (still
+    hoisted per triangle via `GradSteps.constantLod(..., bias)`); anisotropic shifts
+    both `lod_major` and `lod_minor` inside **one** function (`GradSteps.aniso`), so a
+    footprint cannot be biased twice and `constantAniso` stays bit-identical to the
+    per-pixel path.
+  - `max_samples: u8 = 0` — `0` means "the global default" (8), values above 8 clamp
+    to 8 (`tapCap()`). It feeds `anisoFootprintCapped`, so it changes **only** the tap
+    count: level and axis are untouched. `max_samples = 1` is therefore exactly
+    `Mipmap.trilinear` — asserted byte for byte on a real frame, which is what makes
+    the cap a time/quality knob rather than a second filter.
+  - `Sampling{}` is the identity, `isIdentity()` is an exact comparison, and an
+    untextured or `.level0` draw is unaffected: every pre-existing frame is
+    reproduced byte for byte (the 97 pre-existing reference frames were re-generated
+    and compared, unchanged).
+- **Contract layer:** `Capabilities.sampling_controls` (medium/advanced; Low has no
+  textures at all), `FrameOptions.sampling`, `DrawResources.samplingFn` +
+  `sampling(handle)`, the `fromComptime` adapter behind `@hasDecl` (a private decl
+  stays invisible; absent means null, no invented default) and per-material
+  resolution in `drawFn` before any pixel. `pipeline.FrameParams.sampling` forwards
+  into the options; `resolve` zeroes it when the tier lacks the capability.
+- **Verification:** the generator gained `texture_lod_biased`, `apply_bias`, a
+  `tap_cap` on `aniso_footprint` and `bias`/`tap_cap` on `shade`/`rasterize`;
+  **18 new cases** (identity, ±bias on trilinear/anisotropic/perspective, both
+  clamps, caps 1/2/3/4, six random pairs) bring the corpus to **116 frames /
+  1,851 covered pixels**, all bit-exact. 8 new Zig tests (**749/749**) cover
+  `tapCap`/`isIdentity`, the bias direction and clamps, the cap's
+  level-invariance, both `GradSteps` paths, the pixel-level proof that a bias and a
+  cap reach the frame (and that cap 1 equals trilinear), the provider adapter and
+  the tier coercion.
+
+**One real bug found while validating, in my own first attempt:** the generator's
+per-pixel top-left tie-break was a local named `bias`, which shadowed and then
+overwrote the new sampling `bias` parameter inside `rasterize`. Nine pre-existing
+reference frames silently changed. Caught by regenerating with the old generator and
+diffing byte for byte (all 97 must be unchanged); fixed by renaming the local to
+`edge_bias` with a comment, and the "identity reproduces the old frames" property is
+now pinned by a dedicated vector case as well as by the diff.
+
+**Decisions:**
+
+- **Two scalar fields on a `Sampling` struct, not a per-`Renderable` field.** The
+  previous cycle's plan mentioned threading it through extraction; that would have
+  put a renderer knob on the scene contract and forced every command to carry it.
+  A frame default plus a per-material provider hook matches how the other optional
+  per-material properties (`texture`, `color`) already work, and leaves extraction
+  untouched.
+- **Bias after the rule, in one place.** Applying it inside `anisoFootprint` *and*
+  the caller (or to `lod_major` before deriving `lod_minor`) double-counts. Both
+  modes bias exactly once, and the tests compare against `textureLodBiased` and the
+  uncapped footprint rather than against themselves.
+- **Quality loss, never a refusal.** A tier without `sampling_controls` renders the
+  uncorrected level (same rule as anisotropic → trilinear). A cap is a cost knob and
+  a bias is a look knob; neither is a capability a frame can be missing.
+- **`max_samples = 0` means default, not zero.** A cap of zero taps would mean "do
+  not sample", which is not a thing a draw may ask for. Documented on the field.
+- Counts in this entry come from a **cleared cache** (`.zig-cache` removed), after the
+  stale-binary trap of cycle (e).
+
+**Measured cost of the cap** (`zig build bench -Doptimize=ReleaseFast`, same grazing
+draw, best of five): 1024² `graze_aniso` 216.2 ms at the default 8 taps →
+**131.7 ms at cap 4 (−39%)** → 42.8 ms at cap 1, which is the trilinear image bit
+for bit. 512²: 52.6 → 34.6 (−34%). The saving tracks the tap count, which is what
+makes the cap a real knob rather than a flag. `tools/bench_raster.zig` now prints
+`graze_cap4`/`graze_cap1` so the claim stays measured, not asserted.
+
+**Suite:** **749/749** (`zig build test --summary all`, clean cache), `zig fmt
+--check src build.zig tools` clean, `zig build` OK, headless smoke
+(`--headless --frames 2`: 1 draw, 43,264 pixels) and `--mode validate` OK.
+
+**Pending:** window/swapchain/vsync (blocked here); `CXTX` mip levels authored at
+build time; sRGB transfer; a weighted (non-uniform) tap kernel; per-material level
+*clamp* (both ends); extraction-side occlusion culling / batching; GPU backend;
+input/event loop; GUI/editor.
+
+**Next priority:** extraction-level **occlusion culling / batching** (`render/culling.zig`
+already has `Frustum`, `classifyAabb`, `classifySphere`, `transformAabb` as the
+read-only groundwork) — headless, benchmarkable, and the last renderer item before
+the GUI/editor work.
+
 ## Cycle 2026-11-07 (e) — Anisotropic minification in the software rasterizer
 
 **Diagnosis first.** The window + swapchain backend was re-checked and is **still
