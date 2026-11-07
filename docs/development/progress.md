@@ -4,6 +4,104 @@ Permanent record of real progress, decisions, pending items and the next priorit
 task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
+## Cycle 2026-11-06 (e) — Frame pipeline over the contract + rasterizer overflow fix
+
+**Delivered (validated):**
+
+- `src/render/pipeline.zig` (new, `corex.render.pipeline`, re-exported on
+  `corex.render`): the layer that **uses** the tier contract, so a scene becomes a
+  frame in one call.
+  - `renderScene(gpa, tier, surface, scene, cam, sort_mode, resources, params)`
+    = `extractDrawList` → `renderFrame`; `renderFrame` is the same path for an
+    already extracted list (`beginFrame` → N × `draw` → `endFrame`).
+  - `mvp = view_projection * world` folded once per draw here, per the contract.
+  - `tierFromConfig(config.RendererTier)` maps the project setting onto `Tier`
+    **without** `render` importing `core/config.zig` (duck-typed on the tag name,
+    `std.meta.stringToEnum`) and with a **comptime** check that no config tier
+    lacks a render tier. `backendFor(tier, gpa)` is the single registration point;
+    `advanced` has no backend.
+  - `resolve(tier, params, blend_hint)` → `FrameOptions` the tier can honour
+    (antialias/mipmap/light/blend coerced off), so the pipeline never trips its own
+    gate; the default blend follows the sort mode (`back_to_front` → `.alpha`).
+  - `FrameReport`: tier, commands, extraction culling, backend `FrameStats` and the
+    **accepted** options.
+  - `ResourceTable`: fixed-capacity, no allocation after `init`, slots for
+    meshes/colours/textures with **per-kind generations** (a released or reused
+    slot cannot be aliased by a stale handle; setting a material does not
+    invalidate the slot's mesh). `liveCount()` counts mesh+colour pairs.
+  - `AssetTable` + `textureFromAsset`: render real project assets — a zero-copy
+    `CXMH` view (`assets.mesh`) is copied into tightly-packed scratch, a decoded
+    `CXTX` texture is adapted with no copy; oversized meshes are
+    `error.MeshTooLarge`, never truncated. `render` keeps no asset-layer
+    dependency beyond these two adapters (only `raster.Mesh`/`Texture` are stored).
+- Startup step 7 now selects the renderer tier from `settings.json`, logs it
+  (`renderer tier: <name>`), and fails the session with `error.PreparationFailed`
+  (exit code 6) when the tier has no backend — Advanced is refused, never silently
+  rendered at Medium. `StartupResult.renderTier` carries it; the launch summary
+  prints the selected tier (`validate` prepares no session and reports the config).
+- **Bug fixed in the rasterizer** (pre-existing, found by a pipeline test): a
+  triangle whose vertices project outside the target could panic with an integer
+  overflow in the pixel-box math. The box was clamped *before* the fixed-point→pixel
+  shift (which floors, so it can be negative); the antialiasing halo then widened
+  it to -2 and `clip_min - min` overflowed `i32`. Both paths now clamp to the
+  target after the shift and share the same four clamps.
+- Docs: `docs/render-backend.md` gains the pipeline and asset-handle sections plus
+  updated limitations; `docs/render-raster.md` documents the box clamp;
+  `architecture.md`, `README.md`, `CHANGELOG.md` updated.
+
+- **Second bug fixed (lifetime, found by running the suite in every optimize
+  mode):** `DrawResources.fromComptime` (previous cycle) took the provider by
+  value and stored the address of its own parameter — a dangling pointer that read
+  correctly at `-O Debug` and, at `-O ReleaseSafe`, made the software backend
+  render a different colour from the rasterizer it must match. It now takes
+  `&provider`, checked at comptime with an explicit message, so the borrow and its
+  lifetime are the caller's. Regression test drives a provider whose handles and
+  tint are read through the adapter and asserts the pixel channel by channel.
+
+**Validation:** `zig build test` → **696/696** (15 new) on a cold cache in
+**Debug, ReleaseSafe and ReleaseFast**; `zig fmt --check` clean; `zig build` OK;
+headless smoke on `examples/hello-project` OK with `[90%] selecting renderer` and
+`renderer tier: medium`. (Running only Debug is what hid the lifetime bug — every
+optimize mode is now part of the check.) New tests: config↔render
+tier bijection, `resolve` per tier (including that the resolved options pass
+`unsupported`), backend selection (Advanced refused), a scene rendered on Low and
+Medium through the pipeline, **pipeline output byte-identical** to driving the
+backend by hand, malformed surface and missing backend refused, handle generations
+(stale handle dead, per-kind independence, null for unused kinds, live-pair count),
+`AssetTable` faithfulness and `MeshTooLarge`, `CXTX` adapter (no copy, validated),
+a real `CXMH` + `CXTX` textured frame end to end (textured vs flat differ), startup
+tier selection, Advanced-at-startup failure, and `validate` selecting no tier. The
+rasterizer regression test was checked to **fail without the fix**.
+
+**Errors found and fixed in-cycle:** the per-slot generation design invalidated a
+slot's mesh handle as soon as its material was set (now per kind); `@typeInfo`
+enum iteration needed `field_names` + `inline for`; `@field(Enum, name)` is
+compile-time only, so the mapping goes through `stringToEnum`; `std.meta.fields`
+is deprecated/allocation-backed here; error-set and zig-shadowing fixes. Test
+assumptions corrected against real behaviour: the importer dedupes only identical
+`v/vt` pairs (6 vertices, not 4), a 2x2 texture is 16 bytes, `liveCount` counts
+pairs, and a filtered checker produces few distinct luminances — so the asset test
+now compares textured against flat output instead.
+
+**Decisions:** pipeline lives in `render` (not `core/startup`) so it stays a
+pure, testable layer and `startup` only *selects*; tier mapping is comptime-checked
+so a tier cannot exist on one side only; `resolve` coerces instead of rejecting so
+callers need no per-tier branching; per-kind generations beat a single slot
+generation because a draw's mesh and material normally share a slot; asset handles
+are plain `u32` (as `DrawCommand` already defines them) rather than a new
+generic-handle type.
+
+**Pending:** presentation layer (window + swapchain + frame loop) so the engine
+actually renders per frame; per-frame allocator hand-off for the draw list;
+automatic asset upload/eviction from the asset index; mip generation for `CXTX`
+(the artifact has no levels yet); GUI library and graphical editor; Lua VM;
+export templates; native module API; audio device backends.
+
+**Next priority:** the runtime/window presentation layer — own a swapchain and a
+frame loop, select the backend with the now-wired tier, and call `renderScene` per
+frame. It must stay behind the existing `Backend` vtable and the pipeline, and the
+GPU API choice (Vulkan/Metal/D3D12) must be documented before coding.
+
 ## Cycle 2026-11-06 (d) — Renderer tier contract and CPU backend driver
 
 **Delivered (validated):**

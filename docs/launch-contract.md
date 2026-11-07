@@ -88,8 +88,13 @@ On receiving a project, the engine runs, in this order:
    scene (manifest or `--scene`) into the ECS; with no scene specified, prepares
    an empty scene. Does not apply to `validate` mode. Format:
    [scene-format.md](scene-format.md).
-7. **Open the graphical editor** — opens the editor session (or prepares the
-   runtime in `runtime` mode). Does not apply to `validate` mode.
+7. **Select the renderer and open the graphical editor** — maps the configured
+   renderer tier (`settings.json` → `renderer`) onto the render contract and
+   verifies a backend exists for it; a tier with no backend (`advanced` in this
+   build) fails the session and exits with code 6 instead of silently rendering at
+   a lower tier. Then opens the editor session (or prepares the runtime in
+   `runtime` mode). Does not apply to `validate` mode, which validates the project
+   without preparing a session.
 
 A failure at any stage aborts the sequence and produces the corresponding exit
 code. The splash screen is closed on every exit path.
@@ -104,7 +109,7 @@ code. The splash screen is closed on every exit path.
 | 3 | Invalid project manifest (malformed JSON, missing required field, unsupported `format_version`, unsafe path). |
 | 4 | Project version incompatible with the engine. |
 | 5 | Project not found or an I/O error while reading it. |
-| 6 | Failure preparing configuration, assets or the initial scene. |
+| 6 | Failure preparing configuration, assets, the initial scene or the renderer tier (configured tier has no backend). |
 
 Exit codes are part of the stable contract and must not be reordered or reused
 with a different meaning.

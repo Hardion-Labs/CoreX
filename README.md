@@ -404,7 +404,9 @@ The extraction design and math conventions are documented in
 verification and its limits in [`docs/render-raster.md`](docs/render-raster.md);
 the renderer **tier contract** (Low/Medium/Advanced capabilities, the backend
 vtable, the frame lifecycle and the CPU driver that implements Medium today) in
-[`docs/render-backend.md`](docs/render-backend.md).
+[`docs/render-backend.md`](docs/render-backend.md) — including the frame pipeline
+that renders a scene through the contract (`renderScene`) and the handle tables
+that adapt real `CXMH`/`CXTX` assets to it.
 
 ## Audio
 
@@ -607,6 +609,7 @@ Indicative; subject to change as technical decisions are validated.
 - [x] CPU software rasterizer (fixed-point watertight coverage, depth buffer, textured shading).
 - [x] Rasterizer lighting: single directional Lambert (face normals, CPU reference path).
 - [x] Renderer tier contract (Low/Medium/Advanced capabilities + backend vtable, CPU driver).
+- [x] Frame pipeline over the contract (`renderScene`, tier selection from `settings.json`, asset handle tables).
 - [ ] Renderer Low / Medium GPU backends implementing that contract.
 - [x] Rasterizer blending: `.none`, straight-alpha source-over, premultiplied, additive.
 - [x] Rasterizer antialiasing: 4x4 sub-sample coverage, per-draw accumulation, `Antialias.edge`.

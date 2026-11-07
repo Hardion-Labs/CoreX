@@ -1250,10 +1250,16 @@ fn rasterTriangleCore(
     const bias2: i64 = if (isTopLeft(v0.x, v0.y, v1.x, v1.y)) 0 else 1;
 
     const half: i32 = subpixel_scale / 2;
+    // Clamped *after* the shift, not before: `floorDiv` takes the floor of the
+    // pixel index (`v >> 4`), so a vertex far to the left of the target yields a
+    // large negative index. Clamping the fixed-point coordinate to 0 first left
+    // a small negative `min_x` that the antialiasing halo below then widened by
+    // one more, i.e. -2, and `clip_min_y - min_y` overflowed the i32 subtraction
+    // that computes the box shift. Both paths pay the same four clamps.
     const min_x = @max(0, floorDiv(@min(v0.x, @min(v1.x, v2.x)) - half));
     const min_y = @max(0, floorDiv(@min(v0.y, @min(v1.y, v2.y)) - half));
-    const max_x = @min(@as(i32, @intCast(target.width)) - 1, floorDiv(@max(v0.x, @max(v1.x, v2.x)) - half));
-    const max_y = @min(@as(i32, @intCast(target.height)) - 1, floorDiv(@max(v0.y, @max(v1.y, v2.y)) - half));
+    const max_x = @max(0, @min(@as(i32, @intCast(target.width)) - 1, floorDiv(@max(v0.x, @max(v1.x, v2.x)) - half)));
+    const max_y = @max(0, @min(@as(i32, @intCast(target.height)) - 1, floorDiv(@max(v0.y, @max(v1.y, v2.y)) - half)));
     // An empty box means no pixel center can be inside. That is not culling:
     // the triangle was still accepted, it simply covers nothing here.
     if (min_x > max_x or min_y > max_y) return true;
@@ -1312,17 +1318,17 @@ fn rasterTriangleCore(
     const aa = options.antialias == .edge and accum != null;
     const clip_min_x = if (aa) @max(0, @as(i32, @intCast(@as(u32, @intCast(@max(min_x, 0))) -| 1))) else min_x;
     const clip_min_y = if (aa) @max(0, @as(i32, @intCast(@as(u32, @intCast(@max(min_y, 0))) -| 1))) else min_y;
-    // `min_x`/`max_x` are already clamped to the target, so the halo is clamped
-    // from the inside instead of adding one to a possible overflow.
-    const clip_max_x = if (aa) max_x + @as(i32, @intFromBool(max_x < @as(i32, @intCast(target.width)) - 1)) else max_x;
-    const clip_max_y = if (aa) max_y + @as(i32, @intFromBool(max_y < @as(i32, @intCast(target.height)) - 1)) else max_y;
+    // The halo can reach one pixel to the right/bottom, never past the target:
+    // the extra pixel is only added when one exists.
+    const clip_max_x = if (aa) @min(@as(i32, @intCast(target.width)) - 1, max_x + 1) else max_x;
+    const clip_max_y = if (aa) @min(@as(i32, @intCast(target.height)) - 1, max_y + 1) else max_y;
     if (clip_min_x > clip_max_x or clip_min_y > clip_max_y) return true;
 
     // Offsets of the (possibly widened) box origin from the pixel-center origin the
     // rows were seeded at, in whole pixels — `step_x*`/`step_y*` are already
     // per-pixel deltas. Zero on the one-sample path.
-    const shift_y: i64 = @intCast(clip_min_y - min_y);
-    const shift_x: i64 = @intCast(clip_min_x - min_x);
+    const shift_y: i64 = @as(i64, clip_min_y) - @as(i64, min_y);
+    const shift_x: i64 = @as(i64, clip_min_x) - @as(i64, min_x);
     var row0c = if (aa) row0 + step_y0 * shift_y + step_x0 * shift_x else row0 - bias0;
     var row1c = if (aa) row1 + step_y1 * shift_y + step_x1 * shift_x else row1 - bias1;
     var row2c = if (aa) row2 + step_y2 * shift_y + step_x2 * shift_x else row2 - bias2;
@@ -3423,6 +3429,43 @@ test "antialias: a grid-aligned quad is unchanged and writes depth" {
     for (plain.target.depth, smooth.target.depth) |x, y| try testing.expectEqual(x, y);
     try testing.expectEqual(plain_stats.pixels, smooth_stats.pixels);
     try testing.expectEqual(@as(usize, 0), smooth_stats.antialiased_pixels);
+}
+
+/// A triangle that covers the whole viewport and beyond: its vertices project far
+/// outside the target, so the pixel box is clamped on all four sides.
+const oversize_positions = [_][3]f32{
+    .{ -40, -40, -2 }, .{ 40, -40, -2 }, .{ 0, 40, -2 },
+};
+
+test "antialias: a triangle far larger than the target rasterizes without overflow" {
+    // Regression: the pixel box was clamped *before* the fixed-point to pixel
+    // shift, which can produce a negative index; the antialiasing halo then
+    // widened it by one more and the i32 subtraction that computes the box shift
+    // (`clip_min - min`) overflowed — a panic in Debug/ReleaseSafe on any
+    // oversized triangle with `antialias = .edge`. Both paths now clamp to the
+    // target after the shift and share the same four clamps.
+    var plain = try TestSurface.init(8, 8);
+    defer plain.deinit();
+    var smooth = try TestSurface.init(8, 8);
+    defer smooth.deinit();
+    const tri_indices = [_]u32{ 0, 1, 2 };
+    const mesh = Mesh{ .positions = &oversize_positions, .indices = &tri_indices };
+    const plain_stats = try drawMesh(&plain.target, mesh, transform.identity(), orthoSetup(), red, .{}, null);
+    const smooth_stats = try drawMeshAlloc(testing.allocator, &smooth.target, mesh, transform.identity(), orthoSetup(), red, .{ .antialias = .edge }, null);
+    // The triangle covers every pixel, so both paths agree exactly.
+    try testing.expectEqual(@as(usize, 64), plain_stats.pixels);
+    try testing.expectEqualSlices(u8, plain.target.color, smooth.target.color);
+    try testing.expectEqual(plain_stats.pixels, smooth_stats.pixels);
+
+    // The same triangle shifted so that one vertex lands left of and above the
+    // target: `min` clamps to 0 while the triangle's own extent stays negative.
+    const shifted = [_][3]f32{
+        .{ -40, 40, -2 }, .{ 1.2, 1.2, -2 }, .{ 1.4, 1.9, -2 },
+    };
+    const mesh2 = Mesh{ .positions = &shifted, .indices = &tri_indices };
+    var out = try TestSurface.init(8, 8);
+    defer out.deinit();
+    _ = try drawMeshAlloc(testing.allocator, &out.target, mesh2, transform.identity(), orthoSetup(), red, .{ .antialias = .edge }, null);
 }
 
 /// A quad with no axis-aligned edge in screen space: every edge cuts pixels at a

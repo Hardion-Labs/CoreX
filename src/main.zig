@@ -101,7 +101,9 @@ fn printSummary(io: Io, result: *const startup.StartupResult) void {
         result.manifest.name,
         result.mode.name(),
         result.asset_index.count(),
-        @tagName(result.config.renderer),
+        // The tier the render contract actually selected, not just the config
+        // value: `validate` mode prepares no session and reports the config.
+        if (result.render_tier) |tier| tier.name() else @tagName(result.config.renderer),
         scene,
     }) catch return;
     writeOut(io, line);
