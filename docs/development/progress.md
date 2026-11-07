@@ -67,6 +67,11 @@ continuation. Newest cycle first.
   `--mode runtime --headless` (all exit 0).
 - Benchmark @1024²: level 0 68.62 ms, trilinear 79.84 ms (128 texels/pixel);
   @512²: 17.76 → 20.69 ms; @256²: 4.96 → 5.92 ms.
+- Generator reproducible: two consecutive runs produce the same vector file
+  (md5 `7d50729f…`).
+- Merged as PR #35 (merge commit `b5ea278`); `main` re-tested afterwards:
+  672/672, `zig fmt`, `zig build` and the launch-contract smoke all green, and the
+  merge tree is identical to the branch tree.
 
 **Pending / next priority:**
 
