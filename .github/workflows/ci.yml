@@ -18,7 +18,7 @@ jobs:
           version: 0.17.0
 
       - name: Check formatting
-        run: zig fmt --check src/ build.zig
+        run: zig fmt --check src/ build.zig tools/
 
       - name: Build
         run: zig build
@@ -32,3 +32,5 @@ jobs:
           ./zig-out/bin/corex-engine --project examples/hello-project/HelloProject.corex --mode validate
           ./zig-out/bin/corex-engine --project examples/hello-project/HelloProject.corex --headless
           ./zig-out/bin/corex-engine --project examples/hello-project/HelloProject.corex --mode runtime --headless
+          # The editor shell renders a real frame of the example project headlessly.
+          zig build editor-frame -- examples/hello-project/HelloProject.corex "$RUNNER_TEMP/editor.qoi"

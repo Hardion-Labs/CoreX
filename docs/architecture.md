@@ -110,25 +110,34 @@ src/
 │   ├── resample.zig      # Windowed-sinc prototype + polyphase bank    [implemented]
 │   └── effects.zig       # Biquads, comp, delay, reverb, limiter, sat    [impl]
 ├── gui.zig               # GUI public module; the engine's own widget layer
-└── gui/
-    ├── font.zig          # Built-in 8x8 bitmap font + measurement      [implemented]
-    ├── text.zig          # Text drawing on a canvas (clip, scale)      [implemented]
-    ├── canvas.zig        # RGBA8 canvas, Rect, clipped primitives      [implemented]
-    ├── layout.zig        # Size/Padding + stacking Layout cursor        [implemented]
-    ├── input.zig         # One frame of pointer/keyboard/text input    [implemented]
-    ├── theme.zig         # Widget colours + metrics (dark and light)   [implemented]
-    └── widgets.zig       # Immediate-mode Context: panel/button/...    [implemented]
+├── gui/
+│   ├── font.zig          # Built-in 8x8 bitmap font + measurement      [implemented]
+│   ├── text.zig          # Text drawing on a canvas (clip, scale)      [implemented]
+│   ├── canvas.zig        # RGBA8 canvas, Rect, clipped primitives      [implemented]
+│   ├── layout.zig        # Size/Padding + stacking Layout cursor        [implemented]
+│   ├── input.zig         # One frame of pointer/keyboard/text input    [implemented]
+│   ├── theme.zig         # Widget colours + metrics (dark and light)   [implemented]
+│   └── widgets.zig       # Immediate-mode Context: panel/button/...    [implemented]
+├── editor.zig            # Editor public module; the graphical editor shell
+└── editor/
+    └── shell.zig         # Docks, hierarchy, viewport, inspector, status [implemented]
 ```
 
-Planned subsystems will be added as sibling modules (e.g. `src/editor/`,
-`src/script/`, `src/export/`) once an approved change gives them meaningful
-content. Empty placeholder modules are not created.
+Planned subsystems will be added as sibling modules (e.g. `src/script/`,
+`src/export/`) once an approved change gives them meaningful content. Empty
+placeholder modules are not created.
 
 The GUI layer ([gui-foundation.md](gui-foundation.md)) is dependency-free and
 headless: it paints into a caller-owned RGBA8 buffer in the same layout as
 `assets.image.Image.pixels` and `raster.Target.color`, so a GUI composites onto a
 rendered frame with no conversion. `zig build gui-frame -- out.qoi` renders one
 frame of real widgets without a window.
+
+The editor shell ([editor-shell.md](editor-shell.md)) composes one editor frame on top
+of that GUI — docked hierarchy/viewport/inspector plus a status bar — over a session the
+startup pipeline prepared, borrowing the scene, renderer and surface rather than owning
+them. `zig build editor-frame -- <project> out.qoi` renders one real editor frame of a
+project headlessly. Editing (undo, dirty tracking, save) and a window are still planned.
 
 ## The startup spine (implemented)
 
@@ -147,8 +156,9 @@ The engine opens a project through a fixed sequence (see
 6. **Initial scene** — resolve the scene path (manifest or `--scene`), validate
    and load the versioned scene document into the ECS. When no scene is
    requested, an empty scene is prepared. Skipped in `validate` mode.
-7. **Editor / runtime** — open the session. Headless until the GUI/editor exist.
-   Skipped in `validate` mode.
+7. **Editor / runtime** — open the session. Headless: the editor shell renders
+   frames into an owned surface, and nothing presents them yet. Skipped in
+   `validate` mode.
 
 Configuration and asset indexing run concurrently as jobs; both are awaited
 before the pipeline proceeds. Errors map to stable exit codes.
@@ -166,14 +176,20 @@ editor. The `runtime` launch mode prepares the session headless and now drives a
 real bounded frame loop (`corex.runtime.presentation`, `--frames`); the window,
 swapchain and player are planned.
 
-### First-party graphical editor — planned
-The graphical editor. The startup pipeline already opens an editor *session*
-(headless). Panels, inspectors, scene view, asset browser and the editor loop
-are planned on top of the GUI library.
+### First-party graphical editor — shell implemented; editing and window planned
+The editor *shell* is implemented (`corex.editor.shell`,
+[editor-shell.md](editor-shell.md)): docked hierarchy, scene viewport, inspector and
+status bar painted over a prepared session, borrowing the scene, renderer and surface
+instead of owning them. `zig build editor-frame` renders one real editor frame of a
+project headlessly. Still planned: editing (undo/redo, dirty tracking, save), a window
+and real input, tree scrolling, asset browser, gizmos and the editor loop.
 
-### First-party GUI library — planned
-The engine's own GUI toolkit (widgets, layout, input, rendering integration) used
-by the editor and the graphical splash. No third-party GUI dependency is planned.
+### First-party GUI library — implemented; text shaping planned
+The engine's own GUI toolkit (`corex.gui`, [gui-foundation.md](gui-foundation.md)):
+built-in 8x8 bitmap font, RGBA8 canvas, text drawing, stacking layout and immediate-mode
+widgets with a theme, painted into any caller-owned buffer in the engine's own pixel
+layout. No third-party GUI dependency. Still planned: text shaping beyond ASCII, line
+wrapping and automatic focus traversal.
 
 ### Renderer — extraction, CPU rasterization and the tier contract implemented; GPU backends planned
 Three quality tiers:

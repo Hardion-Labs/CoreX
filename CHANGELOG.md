@@ -8,6 +8,39 @@ declared yet.
 
 ### Added
 
+- Graphical editor *shell* (`src/editor/`, exposed as `corex.editor`) — one complete
+  editor frame painted with the engine's own GUI, over a session the startup pipeline
+  already prepared. It owns no scene, renderer or surface (all borrowed for the frame),
+  so the same call serves a headless tool, a test and a future windowed editor.
+  - **Docks** (`shell.Dock.compute`): hierarchy (left), scene viewport (centre),
+    inspector (right) and status bar (bottom), tiling the canvas with no gap or
+    overlap. Side panels are fixed width; a panel is admitted only if a viewport of at
+    least 60 px still fits — both, then the hierarchy alone, then neither, because an
+    editor without a viewport is not an editor.
+  - **Hierarchy**: depth-first rows, indented, clickable, keyed by stable entity ID
+    (survives handle recycling). Rows come from the new `Scene.childIdsInto`, an
+    allocation-free scan that writes **ascending** IDs, never overflows the caller's
+    buffer and keeps the smallest IDs when a node has more children than fit — so the
+    visible prefix does not depend on hash-map visit order. `Scene.rootIds` is now
+    defined in terms of it. A per-frame row budget bounds large scenes.
+  - **Viewport**: the scene is rendered by the engine's own renderer into its RGBA8
+    surface and sampled into the viewport with the new `Canvas.blitScaled` —
+    nearest-neighbour, clipped to both the destination and the canvas, so a viewport
+    smaller than the render is a downsample of the whole frame rather than a crop.
+    `shell.projectToViewport` maps a world point through the renderer's own
+    `view_projection`; a point at or behind the eye (`w <= 0`) or outside the clip
+    volume returns null instead of landing on the wrong side of the screen.
+  - **Inspector**: name, stable ID, transform, renderable handles, camera fov and
+    parent, read from the scene and clipped per column. Read-only by design: editing
+    needs undo/redo, dirty tracking and write-back, which is its own step.
+  - **Status bar**: project, scene, command/draw counts, pixels and viewport size, all
+    taken from the renderer's own report. ASCII only — the built-in font draws anything
+    else as `?`, which the first render of this bar made obvious.
+  - **`tools/editor_frame.zig`** + `zig build editor-frame -- <project> out.qoi`: runs
+    the documented startup pipeline, renders one frame of the project through
+    `EngineRenderer`, paints the editor around it and writes it as QOI (preview in the
+    README).
+
 - Built-in GUI foundation (`src/gui/`, exposed as `corex.gui`) — the layer the
   graphical editor will sit on. No window, no system font, no external toolkit:
   everything paints into a caller-owned RGBA8 buffer in the same layout as
