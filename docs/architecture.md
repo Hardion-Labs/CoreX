@@ -123,7 +123,7 @@ src/
     ├── shell.zig         # Docks, hierarchy, viewport, inspector, status [implemented]
     ├── edit.zig          # Commands, undo/redo, dirty tracking, atomic save [implemented]
     ├── inspector.zig     # Editable numeric rows (fields, parsing, commit)  [implemented]
-    └── tree.zig          # Flat hierarchy rows, folding and tree actions     [implemented]
+    └── tree.zig          # Flat rows, folding, tree actions, keyboard nav     [implemented]
 ```
 
 Planned subsystems will be added as sibling modules (e.g. `src/script/`,

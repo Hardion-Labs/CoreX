@@ -607,3 +607,311 @@ test "tree collapse: toggle is a set, and a full set refuses instead of evicting
     set.expand(1);
     try testing.expect(!set.contains(1));
 }
+
+// --- keyboard navigation -----------------------------------------------------
+
+/// A navigation step over the visible tree.
+///
+/// The tree is navigated by *visible line*, not by entity: Down must move to the row the
+/// user sees under the current one, which — with folders — is not "the next entity in the
+/// scene". So the step is expressed over the flat row list `build` already produces.
+pub const Step = enum {
+    /// The next visible row (a child of a folded row is not visible, so Down skips it).
+    next,
+    /// The previous visible row.
+    previous,
+    /// One level down: the first child, if the row is unfolded and has one.
+    into,
+    /// One level up: the parent row.
+    out,
+};
+
+/// Where a step lands.
+pub const Move = struct {
+    /// The row to select, or 0 when the step has nowhere to go.
+    id: u64 = 0,
+    /// A fold was performed by `into`/`out` (Left/Right on a branch), which is a view
+    /// change the caller must not treat as a scene edit.
+    folded: bool = false,
+    /// The step had an effect on the tree (fold or selection) rather than doing nothing.
+    moved: bool = false,
+};
+
+/// Resolve `step` from `current` against the visible tree.
+///
+/// `rows` is a caller-built window (with its offset), so navigation is bounded by the same
+/// walk the panel paints and never allocates. Moving *out* of the window is handled by
+/// falling back to `indexOf`, which is why `limit` exists: a selection far above the
+/// window still has a parent, and Up must find it.
+///
+/// Fold semantics follow every file tree the user has ever met: Right on a folded branch
+/// unfolds it, Right on an unfolded branch steps into it; Left on an unfolded branch folds
+/// it, Left on a folded (or leaf) row steps out to its parent.
+pub fn step(
+    scene: anytype,
+    rows: []const Row,
+    current: u64,
+    what: Step,
+    collapsed: *Collapsed,
+    limit: usize,
+) Move {
+    if (current == 0) {
+        // Nothing selected: any step that has a destination starts at the first visible
+        // row, whether or not the caller passed a window (`into` has nowhere to go: there
+        // is no branch to enter).
+        if (what == .into) return .{};
+        if (rows.len > 0) return .{ .id = rows[0].id, .moved = true };
+        const first = firstVisible(scene, collapsed, limit) orelse return .{};
+        return .{ .id = first, .moved = true };
+    }
+
+    const index = indexIn(rows, current);
+    switch (what) {
+        .next => {
+            if (index) |i| {
+                if (i + 1 < rows.len) return .{ .id = rows[i + 1].id, .moved = true };
+                // The end of the window: the next row may exist past it.
+                return nextAfter(scene, rows, current, collapsed, limit);
+            }
+            return nextAfter(scene, rows, current, collapsed, limit);
+        },
+        .previous => {
+            if (index) |i| {
+                if (i > 0) return .{ .id = rows[i - 1].id, .moved = true };
+            }
+            // Above the window: ask the whole tree for the previous line.
+            const line = indexOf(scene, current, limit) orelse return .{};
+            if (line == 0) return .{};
+            const prev = lineAt(scene, line - 1, collapsed, limit) orelse return .{};
+            return .{ .id = prev, .moved = true };
+        },
+        .into => {
+            // The fold state comes from the *set*, not from the row: a caller may pass a
+            // window that does not contain the current row (it is scrolled away), and the
+            // step must still behave the same.
+            if (!hasChildren(scene, current)) return .{};
+            if (collapsed.contains(current)) {
+                collapsed.expand(current);
+                return .{ .folded = true, .moved = true };
+            }
+            var kids: [1]u64 = @splat(0);
+            if (scene.childIdsInto(current, &kids) == 0) return .{};
+            // The child may sit under another fold; the caller reveals the selection,
+            // which unfolds the chain above it.
+            return .{ .id = kids[0], .moved = true };
+        },
+        .out => {
+            // Collapse the current branch first if it is open, then leave it.
+            if (hasChildren(scene, current) and !collapsed.contains(current)) {
+                _ = collapsed.toggle(current);
+                return .{ .folded = true, .moved = true };
+            }
+            if (scene.parentIdOf(current)) |parent| return .{ .id = parent, .moved = true };
+            return .{};
+        },
+    }
+}
+
+fn indexIn(rows: []const Row, id: u64) ?usize {
+    for (rows, 0..) |row, i| {
+        if (row.id == id) return i;
+    }
+    return null;
+}
+
+fn hasChildren(scene: anytype, id: u64) bool {
+    var kids: [1]u64 = @splat(0);
+    return scene.childIdsInto(id, &kids) > 0;
+}
+
+/// The first row of the whole tree (the first root, or 0 if the scene is empty).
+fn firstVisible(scene: anytype, collapsed: *Collapsed, limit: usize) ?u64 {
+    _ = collapsed;
+    _ = limit;
+    var ids: [1]u64 = @splat(0);
+    if (scene.childIdsInto(null, &ids) == 0) return null;
+    return ids[0];
+}
+
+/// The next visible row after `current`, for a row at the end of the caller's window.
+fn nextAfter(scene: anytype, rows: []const Row, current: u64, collapsed: *Collapsed, limit: usize) Move {
+    const line = indexOf(scene, current, limit) orelse return .{};
+    const next = lineAt(scene, line + 1, collapsed, limit) orelse return .{};
+    _ = rows;
+    return .{ .id = next, .moved = true };
+}
+
+/// The visible row at `want`, counting only rows a folded tree actually shows.
+///
+/// This is the bounded counterpart of `indexOf`: it walks depth-first, skips collapsed
+/// branches and stops at the wanted line. `limit` bounds the walk so a huge scene cannot
+/// make a key press expensive.
+fn lineAt(scene: anytype, want: usize, collapsed: *Collapsed, limit: usize) ?u64 {
+    if (limit == 0) return null;
+    var state = LineWalk(@TypeOf(scene.*)){
+        .scene = scene,
+        .want = want,
+        .collapsed = collapsed,
+        .limit = limit,
+    };
+    var ids: [64]u64 = @splat(0);
+    const roots = scene.childIdsInto(null, &ids);
+    var i: usize = 0;
+    while (i < roots) : (i += 1) {
+        if (state.visit(ids[i], 0)) |found| return found;
+        if (state.seen > state.limit) return null;
+    }
+    return null;
+}
+
+fn LineWalk(comptime Scene: type) type {
+    return struct {
+        scene: *const Scene,
+        want: usize,
+        seen: usize = 0,
+        collapsed: *const Collapsed,
+        limit: usize,
+
+        fn visit(self: *@This(), id: u64, depth: u8) ?u64 {
+            if (self.seen == self.want) {
+                self.seen += 1;
+                return id;
+            }
+            self.seen += 1;
+            if (self.seen > self.limit) return null;
+            if (self.collapsed.contains(id)) return null;
+            if (depth + 1 > max_depth) return null;
+            var kids: [64]u64 = @splat(0);
+            const n = self.scene.childIdsInto(id, &kids);
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                if (self.visit(kids[i], depth + 1)) |found| return found;
+                if (self.seen > self.limit) return null;
+            }
+            return null;
+        }
+    };
+}
+
+test "tree navigation: down and up walk the visible lines, skipping folded children" {
+    const testing = std.testing;
+    const scene_mod = @import("../scene/scene.zig");
+    const components = @import("../scene/components.zig");
+    const Scene = scene_mod.Scene(.{scene_mod.Component(components.Transform, "transform")});
+
+    var scene = try Scene.init(testing.allocator, "level");
+    defer scene.deinit();
+    var collapsed = Collapsed{};
+    const root = try scene.createEntity("root", null);
+    const root_id = scene.idOf(root).?;
+    const kid = try scene.createEntity("kid", root_id);
+    const kid_id = scene.idOf(kid).?;
+    const other = try scene.createEntity("other", null);
+    const other_id = scene.idOf(other).?;
+
+    var rows: [16]Row = undefined;
+    var list = List{ .rows = &rows, .visible = 16, .collapsed = &collapsed };
+    build(&scene, &list);
+    try testing.expectEqual(@as(usize, 3), list.len);
+
+    // root -> kid -> other, and back.
+    try testing.expectEqual(kid_id, step(&scene, list.rows[0..list.len], root_id, .next, &collapsed, 100).id);
+    try testing.expectEqual(other_id, step(&scene, list.rows[0..list.len], kid_id, .next, &collapsed, 100).id);
+    try testing.expectEqual(kid_id, step(&scene, list.rows[0..list.len], other_id, .previous, &collapsed, 100).id);
+    try testing.expectEqual(root_id, step(&scene, list.rows[0..list.len], kid_id, .previous, &collapsed, 100).id);
+    // The last row has nowhere to go.
+    try testing.expectEqual(@as(u64, 0), step(&scene, list.rows[0..list.len], other_id, .next, &collapsed, 100).id);
+
+    // Folding root hides kid: down from root goes straight to other.
+    _ = collapsed.toggle(root_id);
+    var folded_rows: [16]Row = undefined;
+    var folded = List{ .rows = &folded_rows, .visible = 16, .collapsed = &collapsed };
+    build(&scene, &folded);
+    try testing.expectEqual(@as(usize, 2), folded.len);
+    try testing.expectEqual(other_id, step(&scene, folded.rows[0..folded.len], root_id, .next, &collapsed, 100).id);
+}
+
+test "tree navigation: into and out expand, enter and leave a branch" {
+    const testing = std.testing;
+    const scene_mod = @import("../scene/scene.zig");
+    const components = @import("../scene/components.zig");
+    const Scene = scene_mod.Scene(.{scene_mod.Component(components.Transform, "transform")});
+
+    var scene = try Scene.init(testing.allocator, "level");
+    defer scene.deinit();
+    var collapsed = Collapsed{};
+    const root = try scene.createEntity("root", null);
+    const root_id = scene.idOf(root).?;
+    const kid = try scene.createEntity("kid", root_id);
+    const kid_id = scene.idOf(kid).?;
+
+    // Into on a folded branch unfolds it (no selection change).
+    _ = collapsed.toggle(root_id);
+    const unfold = step(&scene, &.{}, root_id, .into, &collapsed, 100);
+    try testing.expect(unfold.folded);
+    try testing.expectEqual(@as(u64, 0), unfold.id);
+    try testing.expect(!collapsed.contains(root_id));
+
+    // Into again enters the first child.
+    const enter = step(&scene, &.{}, root_id, .into, &collapsed, 100);
+    try testing.expectEqual(kid_id, enter.id);
+
+    // Out on a leaf goes to its parent; out on an open branch folds it first.
+    try testing.expectEqual(root_id, step(&scene, &.{}, kid_id, .out, &collapsed, 100).id);
+    const fold = step(&scene, &.{}, root_id, .out, &collapsed, 100);
+    try testing.expect(fold.folded);
+    try testing.expect(collapsed.contains(root_id));
+    // A folded root has nowhere to go out to.
+    try testing.expectEqual(@as(u64, 0), step(&scene, &.{}, root_id, .out, &collapsed, 100).id);
+}
+
+test "tree navigation: nothing selected starts at the first visible row" {
+    const testing = std.testing;
+    const scene_mod = @import("../scene/scene.zig");
+    const components = @import("../scene/components.zig");
+    const Scene = scene_mod.Scene(.{scene_mod.Component(components.Transform, "transform")});
+
+    var scene = try Scene.init(testing.allocator, "level");
+    defer scene.deinit();
+    var collapsed = Collapsed{};
+    const root = try scene.createEntity("root", null);
+    const root_id = scene.idOf(root).?;
+
+    try testing.expectEqual(root_id, step(&scene, &.{}, 0, .next, &collapsed, 100).id);
+    try testing.expectEqual(root_id, step(&scene, &.{}, 0, .out, &collapsed, 100).id);
+    try testing.expectEqual(@as(u64, 0), step(&scene, &.{}, 0, .into, &collapsed, 100).id);
+
+    var empty = try Scene.init(testing.allocator, "empty");
+    defer empty.deinit();
+    try testing.expectEqual(@as(u64, 0), step(&empty, &.{}, 0, .next, &collapsed, 100).id);
+}
+
+test "tree navigation: down past the caller's window still finds the next row" {
+    const testing = std.testing;
+    const scene_mod = @import("../scene/scene.zig");
+    const components = @import("../scene/components.zig");
+    const Scene = scene_mod.Scene(.{scene_mod.Component(components.Transform, "transform")});
+
+    var scene = try Scene.init(testing.allocator, "level");
+    defer scene.deinit();
+    var collapsed = Collapsed{};
+    var ids: [8]u64 = @splat(0);
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        const e = try scene.createEntity("row", null);
+        ids[i] = scene.idOf(e).?;
+    }
+
+    // A window that only holds the first two rows: `next` from the second must find the
+    // third, which is outside the window.
+    var rows: [2]Row = undefined;
+    var list = List{ .rows = &rows, .visible = 2, .collapsed = &collapsed };
+    build(&scene, &list);
+    try testing.expectEqual(@as(usize, 2), list.len);
+    try testing.expectEqual(ids[2], step(&scene, list.rows[0..list.len], ids[1], .next, &collapsed, 100).id);
+    // And `previous` from the first row of a scrolled window finds the row above it.
+    list.offset = 2;
+    build(&scene, &list);
+    try testing.expectEqual(ids[2], list.rows[0].id);
+    try testing.expectEqual(ids[1], step(&scene, list.rows[0..list.len], ids[2], .previous, &collapsed, 100).id);
+}

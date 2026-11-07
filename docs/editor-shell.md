@@ -80,6 +80,31 @@ history command (one `Ctrl+Z` undoes exactly what one click did):
 | reparent to a root | `P` | `reparent` with a null parent |
 | fold / unfold | the disclosure, `Enter` on a row with children | none (view only) |
 
+### Keyboard navigation
+
+The arrow keys walk the tree by **visible line**, not by entity
+(`tree.step(scene, rows, current, what, collapsed, limit)`): with folders, "the row under
+this one" is not "the next entity in the scene".
+
+| Key | Effect |
+| --- | --- |
+| `Down` / `Up` | next / previous visible row, skipping the hidden children of a folded branch |
+| `Right` | unfold a folded branch; on an open branch, step into its first child |
+| `Left` | fold an open branch; on a folded row or a leaf, step out to its parent |
+| `Enter` | fold / unfold the selected row |
+
+Two details make it behave rather than nearly behave:
+
+- **Fold state comes from the set, not from the painted row**, so a step works even when
+  the current row is scrolled out of the caller's window; and `Down`/`Up` past the window
+  fall back to a bounded walk of the whole tree (`indexOf` / `lineAt`) instead of stopping
+  at the edge of the screen.
+- **A step never enters the history.** Navigation and folding are view state; only create,
+  delete and reparent record commands. The selection a step produces is scrolled into view
+  by the same `revealSelection` a click uses.
+- **Arrows in a text field are text keys.** The inspector holds the keyboard, so `Left` /
+  `Right` move the caret and the tree selection does not move.
+
 A refused action is never silent: `tree.apply` returns the failure, and the status bar
 shows it as `! ParentCycle` (or whichever error) for the frame instead of leaving the user
 with a click that appeared to do nothing. A new entity is selected immediately and the
@@ -250,8 +275,10 @@ behaviour, not a workaround.
 - **No drag-and-drop reparenting.** Reparenting is `P` (to root) or a `tree.apply`
   call; a pointer drag needs hover-target tracking across rows, which the GUI can already
   report, but the interaction is a separate step.
-- **No keyboard tree navigation.** Clicking selects, the wheel scrolls; arrow keys and
-  Tab order are not wired, so `N`/`P`/`Enter` act on the click selection.
+- **No Tab focus traversal.** The tree answers arrow keys, but moving focus between the
+  hierarchy, the inspector and the viewport is not wired (the GUI reports Tab; nothing
+  consumes it). Arrows act on the tree whenever no text field holds the keyboard.
+- **No Home/End, PageUp/PageDown or multi-select in the tree.** One selected entity.
 - **No inline rename in the tree.** Renaming goes through the inspector's name field.
 - **Fold state is not persisted.** It lives in `shell.State`, so reopening a project
   starts unfolded.

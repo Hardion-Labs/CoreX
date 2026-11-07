@@ -8,6 +8,18 @@ declared yet.
 
 ### Added
 
+- **Keyboard navigation in the hierarchy** (`tree.step`, `tree.Step`, `tree.Move`).
+  - `Down`/`Up` move by **visible line**, skipping the hidden children of a folded branch;
+    `Right` unfolds a folded branch and then steps into it; `Left` folds an open branch and
+    then steps out to the parent; `Enter` folds the selected row.
+  - Fold state is read from the collapsed **set**, not from the painted row, so a step
+    behaves the same when the current row is scrolled out of the caller's window; `Down`/
+    `Up` past the window fall back to a bounded walk (`indexOf`/`lineAt`) instead of
+    stopping at the edge of the screen.
+  - Navigation and folding record **nothing** in the history; the resulting selection is
+    scrolled into view by the same path a click uses, and arrows inside a text field stay
+    text keys.
+
 - **Tree actions and per-branch folding** in the hierarchy.
   - `tree.apply(action, row, collapsed, scene, history)` is the single path a click, a key
     and a test take: add a child (or a root), delete, reparent to root, fold. Each scene

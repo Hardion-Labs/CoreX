@@ -4,6 +4,50 @@ Permanent record of real progress, decisions, pending items and the next priorit
 task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
+## Cycle 2026-11-07 (n) — Keyboard navigation in the hierarchy
+
+**Diagnosis first.** Cycle (m) made the tree an editing surface, but every action needed a
+click first: there was no way to move the selection except the pointer. The recorded next
+priority was keyboard navigation. Window/swapchain remains blocked (unchanged; not
+attempted).
+
+**Delivered (validated):**
+
+- **`tree.Step` / `tree.Move` / `tree.step(scene, rows, current, what, collapsed, limit)`**
+  — navigation over *visible lines*: `next`, `previous`, `into`, `out`. With folders,
+  "the row under this one" is not "the next entity in the scene", so the step is resolved
+  against the same flat row list the panel paints.
+  - Fold semantics: `Right` unfolds a folded branch, then enters its first child; `Left`
+    folds an open branch, then leaves to the parent.
+  - Fold state is read from the **collapsed set**, not from the painted row, so a step
+    behaves correctly when the current row is outside the caller's window.
+  - `next`/`previous` fall back to a bounded whole-tree walk (`indexOf` / `lineAt`), so
+    Down at the bottom of the window reaches the row past it instead of stopping.
+  - Nothing selected: any step with a destination starts at the first visible row.
+- **Shell** — arrows wired in the shortcut pass through `navigateTree`, which rebuilds a
+  bounded window (no 512-entry array kept alive across the frame) and reuses
+  `revealSelection` so a step's selection is always on screen. Arrows are only reached
+  when no text field holds the keyboard, so in the inspector they move the caret.
+
+**Bug found and fixed while validating:** `into`/`out` first looked the fold state up in
+the painted rows, so a step from a row outside the caller's window silently did nothing.
+They now consult `Collapsed` directly — which is also the simpler contract.
+
+**Suite:** **876/876** tests (clean cache), fmt clean, `zig build` OK, validate, runtime,
+`gui-frame`, `editor-frame` (640x360, 13 widgets), `qoi-decode`, `bench-extract
+-Doptimize=ReleaseFast`.
+
+**Decisions:** navigation is a pure function over the row list, so a key, a click and a
+test take the same path; folding and selection are view state and never enter the history;
+a step must work from any row, not only from rows the caller happened to paint.
+
+**Pending / not in this cycle:** Tab focus traversal between docks, Home/End and
+PageUp/PageDown, multi-select, drag-and-drop reparenting, rotation/camera fields.
+
+**Next priority:** Tab focus traversal between the hierarchy, inspector and viewport (the
+last piece of "usable without a pointer"), then drag-and-drop reparenting — and the window
+layer when the sandbox allows it.
+
 ## Cycle 2026-11-07 (m) — Tree actions and per-branch folding
 
 **Diagnosis first.** Cycle (l) gave the tree a flat, bounded, scrollable row model, and
