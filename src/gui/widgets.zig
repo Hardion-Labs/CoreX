@@ -194,6 +194,24 @@ pub const Context = struct {
         self.focus = id;
     }
 
+    /// Whether `key` was pressed this frame.
+    ///
+    /// `Input` carries one key per frame (the host reports the last one it saw), so this
+    /// is a single comparison rather than a queue: a UI that must not miss two keys in
+    /// one frame is a UI with two handlers, and the host decides which one wins.
+    pub fn keyPressed(self: Context, key: input_mod.Key) bool {
+        const got = self.input.key orelse return false;
+        return got == key;
+    }
+
+    /// Declare that a widget consumed this frame's typed bytes, so a host does not also
+    /// treat them as a shortcut. Returns whether there was anything typed.
+    pub fn claimTextInput(self: *Context) bool {
+        const had = self.input.text.len > 0;
+        self.input.text = "";
+        return had;
+    }
+
     /// Slots left in this frame's table. A host can check it to warn instead of
     /// silently losing a widget's hit area.
     pub fn remainingSlots(self: Context) usize {

@@ -84,4 +84,19 @@ pub fn build(b: *std.Build) void {
     const editor_frame_run = b.addRunArtifact(editor_frame);
     editor_frame_run.addPassthruArgs();
     b.step("editor-frame", "Render one headless editor frame of a project (zig build editor-frame -- <project.corex> out.qoi)").dependOn(&editor_frame_run.step);
+
+    // QOI decode: a one-off helper for inspecting frames in tests and docs. Kept as a
+    // build step rather than a checked-in asset so the repo carries no generated images.
+    const qoi_decode = b.addExecutable(.{
+        .name = "qoi-decode",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/qoi_decode.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "corex", .module = corex_module }},
+        }),
+    });
+    const qoi_decode_run = b.addRunArtifact(qoi_decode);
+    qoi_decode_run.addPassthruArgs();
+    b.step("qoi-decode", "Decode a QOI file to raw RGBA (zig build qoi-decode -- in.qoi out.rgba)").dependOn(&qoi_decode_run.step);
 }

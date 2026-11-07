@@ -32,6 +32,7 @@ const text = @import("../gui/text.zig");
 const input_mod = @import("../gui/input.zig");
 const theme_mod = @import("../gui/theme.zig");
 const widgets = @import("../gui/widgets.zig");
+const edit = @import("edit.zig");
 const scene_mod = @import("../scene/scene.zig");
 const render_scene = @import("../scene/render_scene.zig");
 
@@ -80,6 +81,18 @@ pub const State = struct {
     /// Set when the user clicked an entity this frame, so a caller can react
     /// (re-frame the camera, save the selection, ...) without diffing by hand.
     selection_changed: bool = false,
+
+    /// The inspector's text field for the selected entity's name. Owned here because
+    /// the field is editor state, not scene data: the scene only changes when the edit
+    /// is committed with Enter.
+    name_buffer: [edit.max_name_bytes]u8 = @splat(0),
+    name_len: usize = 0,
+    name_caret: usize = 0,
+    /// The field is focused (clicked into) and receives typing this frame.
+    name_focused: bool = false,
+    /// Entity the buffer currently mirrors, so a selection change reloads it. 0 means
+    /// "resynchronize on the next frame".
+    name_owner: u64 = 0,
 };
 
 /// The dock geometry of one frame, as rectangles. Exposed (rather than kept private)
@@ -129,7 +142,13 @@ pub const Dock = struct {
 /// Returns whether anything the caller must act on happened this frame — today, a
 /// selection change. Painting is the whole side effect otherwise: no state is
 /// allocated, and `State` is the only thing written back.
-pub fn draw(ctx: *widgets.Context, state: *State, scene: anytype, frame: Frame) bool {
+pub fn draw(
+    ctx: *widgets.Context,
+    state: *State,
+    scene: anytype,
+    history: anytype,
+    frame: Frame,
+) bool {
     const total = ctx.canvas.bounds();
     if (total.isEmpty()) return false;
     const dock = Dock.compute(total);
@@ -150,8 +169,10 @@ pub fn draw(ctx: *widgets.Context, state: *State, scene: anytype, frame: Frame) 
     }
 
     if (!dock.hierarchy.isEmpty()) drawHierarchy(ctx, state, scene, dock.hierarchy);
-    if (!dock.inspector.isEmpty()) drawInspector(ctx, state, scene, dock.inspector);
-    if (!dock.status.isEmpty()) drawStatus(ctx, state, frame, dock.status, dock.viewport);
+    if (!dock.inspector.isEmpty()) drawInspector(ctx, state, scene, history, dock.inspector);
+    if (!dock.status.isEmpty()) drawStatus(ctx, state, history, frame, dock.status, dock.viewport);
+
+    if (!state.name_focused) applyShortcuts(ctx, state, scene, history);
     return state.selection_changed;
 }
 
@@ -237,10 +258,20 @@ fn drawEntityRow(
     return drawn;
 }
 
-/// The inspector: name, stable ID, local transform and the components the scene
-/// actually stores. Read-only in this cycle — editing needs an undo model, which is
-/// its own coherent step and not something to bolt on here.
-fn drawInspector(ctx: *widgets.Context, state: *State, scene: anytype, rect: Rect) void {
+/// The inspector: the selected entity's name as an editable field, its stable ID, local
+/// transform and the components the scene actually stores.
+///
+/// The name field is the editor's first *input*: typing edits a local buffer, Enter
+/// commits it through the history as a `rename` command, Escape drops it. Committing
+/// through the history is what makes the change undoable, and going through a buffer is
+/// what makes a half-typed name never a scene edit.
+fn drawInspector(
+    ctx: *widgets.Context,
+    state: *State,
+    scene: anytype,
+    history: anytype,
+    rect: Rect,
+) void {
     const content = widgets.panel(ctx, rect, "Inspector");
     var stack = layout.Layout.init(content, .vertical).withSpacing(2);
     const line_h: i32 = @intCast(font.line_height);
@@ -248,6 +279,7 @@ fn drawInspector(ctx: *widgets.Context, state: *State, scene: anytype, rect: Rec
 
     const entity = if (state.selected != 0) scene.entityById(state.selected) else null;
     const ent = entity orelse {
+        state.name_focused = false;
         const slot = stack.measure(.{ .w = content.w, .h = line_h });
         _ = text.draw(ctx.canvas, slot.x, slot.y, "no selection", .{ .color = theme.text_muted, .clip = slot });
         ctx.blockBelow(rect);
@@ -255,8 +287,8 @@ fn drawInspector(ctx: *widgets.Context, state: *State, scene: anytype, rect: Rec
     };
 
     var buf: [96]u8 = undefined;
-    const name = scene.nameOf(ent) orelse "(unnamed)";
-    fieldRow(ctx, &stack, content, "name", name);
+    drawNameField(ctx, state, scene, history, ent, &stack, content);
+
     const id_line = std.fmt.bufPrint(&buf, "{d}", .{state.selected}) catch "?";
     fieldRow(ctx, &stack, content, "id", id_line);
 
@@ -284,7 +316,156 @@ fn drawInspector(ctx: *widgets.Context, state: *State, scene: anytype, rect: Rec
 
     const parent = scene.parent(ent);
     fieldRow(ctx, &stack, content, "parent", if (parent) |p| (scene.nameOf(p) orelse "?") else "root");
+
     ctx.blockBelow(rect);
+}
+
+/// The `name:` row of the inspector: a real text field.
+///
+/// Typing edits `State.name_buffer`; **Enter** commits the buffer through the history
+/// as a `rename` command, **Escape** abandons it. Going through a buffer is what keeps a
+/// half-typed name out of the scene; going through the history is what makes the commit
+/// undoable and what marks the project dirty.
+fn drawNameField(
+    ctx: *widgets.Context,
+    state: *State,
+    scene: anytype,
+    history: anytype,
+    entity: anytype,
+    stack: *layout.Layout,
+    content: Rect,
+) void {
+    const theme = ctx.theme;
+    const line_h: i32 = @intCast(font.line_height);
+    const row = stack.measure(.{ .w = content.w, .h = line_h });
+    if (row.isEmpty()) return;
+    const key_w: i32 = 40;
+    const key_rect = Rect.init(row.x, row.y, @min(key_w, row.w), line_h);
+    const value_rect = Rect.init(row.x + key_rect.w, row.y, @max(row.w - key_rect.w, 0), line_h);
+    _ = text.draw(ctx.canvas, key_rect.x, key_rect.y, "name", .{ .color = theme.text_muted, .clip = key_rect });
+
+    const id = widgets.Id.from(0x6e61_6d65, "inspector.name");
+    const focused = ctx.focus.eql(id);
+
+    // The buffer mirrors the scene whenever the field is *not* being typed into, and
+    // whenever focus moves to a different entity. Doing it here, before the widget runs,
+    // is what makes the first keystroke land at the end of the current name instead of
+    // replacing it with whatever the previous selection left behind.
+    if (!focused or state.name_owner != state.selected) {
+        reloadName(state, scene, entity);
+        state.name_owner = state.selected;
+    }
+    state.name_focused = focused;
+
+    var field = widgets.TextField{
+        .buffer = &state.name_buffer,
+        .len = state.name_len,
+        .caret = state.name_caret,
+    };
+    const r = widgets.textField(ctx, id, value_rect, &field);
+    state.name_len = field.len;
+    state.name_caret = field.caret;
+    state.name_focused = r.focused;
+
+    if (!r.focused) return;
+
+    // The field holds the keyboard this frame: a host must not also read these bytes as
+    // shortcuts.
+    _ = ctx.claimTextInput();
+
+    // Ctrl+Z and friends are frame-level shortcuts, handled after the panels are
+    // painted: while this field holds focus they must not fire.
+    if (ctx.input.modifiers.ctrl) return;
+    if (ctx.keyPressed(.enter)) {
+        commitName(state, history, scene, entity);
+        state.name_owner = 0; // resync the buffer with whatever the scene now holds
+    } else if (ctx.keyPressed(.escape)) {
+        reloadName(state, scene, entity);
+    }
+}
+
+/// Write the field's buffer to the scene through the history, unless it is unchanged.
+fn commitName(state: *State, history: anytype, scene: anytype, entity: anytype) void {
+    const typed = state.name_buffer[0..state.name_len];
+    const current = scene.nameOf(entity) orelse "";
+    if (std.mem.eql(u8, typed, current)) return;
+    const id = scene.idOf(entity) orelse return;
+    const name: ?edit.Name = if (state.name_len == 0) null else edit.Name.init(typed) orelse return;
+    history.apply(scene, .{ .rename = .{ .id = id, .name = name } }) catch {};
+}
+
+/// Point the field at the entity's current name, so the next keystroke starts from what
+/// is on screen rather than from another entity's text.
+pub fn reloadName(state: *State, scene: anytype, entity: anytype) void {
+    const name = scene.nameOf(entity) orelse "";
+    const n = @min(name.len, state.name_buffer.len);
+    @memcpy(state.name_buffer[0..n], name[0..n]);
+    state.name_len = n;
+    state.name_caret = n;
+}
+
+/// Frame-level editing shortcuts. Only reached while the name field does not hold the
+/// keyboard, so a user typing a name never triggers a delete.
+///
+/// Shortcuts are a *convenience* over the same three functions a menu or a test would
+/// call — they add no behaviour of their own.
+fn applyShortcuts(ctx: *widgets.Context, state: *State, scene: anytype, history: anytype) void {
+    if (ctx.input.modifiers.ctrl) {
+        const key = ctx.input.key orelse return;
+        switch (key) {
+            .z => if (ctx.input.modifiers.shift) {
+                _ = redo(history, scene);
+            } else {
+                _ = undo(history, scene);
+            },
+            .y => _ = redo(history, scene),
+            else => {},
+        }
+        pruneSelection(state, scene);
+        return;
+    }
+    if (ctx.keyPressed(.delete)) {
+        _ = deleteSelected(state, history, scene);
+        return;
+    }
+    if (ctx.keyPressed(.escape)) state.selected = 0;
+}
+
+/// Drop a selection that no longer resolves — undoing a create, or a redo of a delete,
+/// leaves the ID pointing at nothing, and the inspector must not keep claiming it.
+fn pruneSelection(state: *State, scene: anytype) void {
+    if (state.selected == 0) return;
+    if (scene.entityById(state.selected) == null) {
+        state.selected = 0;
+        state.name_owner = 0;
+    }
+}
+
+/// Undo one edit. Returns whether anything changed, so a host can repaint only then.
+pub fn undo(history: anytype, scene: anytype) bool {
+    if (!history.canUndo()) return false;
+    history.undo(scene) catch return false;
+    return true;
+}
+
+/// Redo one undone edit.
+pub fn redo(history: anytype, scene: anytype) bool {
+    if (!history.canRedo()) return false;
+    history.redo(scene) catch return false;
+    return true;
+}
+
+/// Delete the selected entity through the history, clearing the selection. The undo
+/// restores the entity with its ID, so a later selection of the same ID still works.
+pub fn deleteSelected(state: *State, history: anytype, scene: anytype) bool {
+    if (state.selected == 0) return false;
+    const entity = scene.entityById(state.selected) orelse return false;
+    _ = entity;
+    history.apply(scene, .{ .delete = .{ .id = state.selected } }) catch return false;
+    state.selected = 0;
+    state.name_len = 0;
+    state.name_caret = 0;
+    return true;
 }
 
 /// A `key: value` row, clipped to the panel. The key column is fixed so values line
@@ -303,27 +484,33 @@ fn fieldRow(ctx: *widgets.Context, stack: *layout.Layout, content: Rect, key: []
     _ = text.draw(ctx.canvas, value_rect.x, value_rect.y, value, .{ .color = theme.text, .clip = value_rect });
 }
 
-/// The status bar: project, scene, viewport size and the last frame's real
-/// accounting. Every number comes from the render report, so the bar cannot claim
-/// something the renderer did not do.
-fn drawStatus(ctx: *widgets.Context, state: *State, frame: Frame, rect: Rect, viewport: Rect) void {
+/// The status bar: project, scene, save state, undo depth, viewport size and the last
+/// frame's real accounting. Every number comes from the render report or the history, so
+/// the bar cannot claim something that did not happen.
+fn drawStatus(ctx: *widgets.Context, state: *State, history: anytype, frame: Frame, rect: Rect, viewport: Rect) void {
     const theme = ctx.theme;
     ctx.canvas.fillRect(rect, theme.button);
     ctx.canvas.hline(rect.x, rect.y, rect.w, theme.border);
 
-    var buf: [220]u8 = undefined;
+    // The save marker is the one piece of status that changes while editing, so it is
+    // painted first and in the normal text colour: an unsaved project must be visible at
+    // a glance, not read out of a run of numbers.
+    var buf: [240]u8 = undefined;
+    const h = history;
     const line = std.fmt.bufPrint(
         &buf,
         // ASCII only: the built-in font draws anything else as `?`, so a separator
         // like `·` would appear as a literal question mark in the bar.
-        "{s}{s}{s}  |  {d} cmds  {d} draws  {d} kpx  |  vp {d}x{d}",
+        "{s}{s}{s}{s} | u{d} r{d} | {d} cmds {d} draws | vp {d}x{d}",
         .{
             frame.project_name,
             if (frame.project_name.len > 0 and frame.scene_name.len > 0) " / " else "",
             frame.scene_name,
+            if (h.dirty) " *" else "",
+            h.undoDepth(),
+            h.redoDepth(),
             frame.report.commands,
             frame.report.draws,
-            frame.report.pixels / 1000,
             @max(viewport.w, 0),
             @max(viewport.h, 0),
         },
@@ -370,6 +557,7 @@ const Harness = struct {
     buffer: [380 * 160 * 4]u8 = @splat(0),
     ctx: widgets.Context = undefined,
     state: State = .{},
+    history: edit.History(render_scene.EngineRenderScene) = undefined,
     root_id: u64 = 0,
     child_id: u64 = 0,
     loose_id: u64 = 0,
@@ -377,6 +565,7 @@ const Harness = struct {
     fn init(self: *Harness) !void {
         const gpa = testing.allocator;
         self.scene = try render_scene.EngineRenderScene.init(gpa, "level1");
+        self.history = edit.History(render_scene.EngineRenderScene).init(gpa);
         const root = try self.scene.createEntity("root", null);
         self.root_id = self.scene.idOf(root).?;
         try self.scene.addComponent(root, render_scene.Transform{ .position = .{ 1, 2, 3 } });
@@ -404,6 +593,7 @@ const Harness = struct {
     }
 
     fn deinit(self: *Harness) void {
+        self.history.deinit();
         self.scene.deinit();
     }
 
@@ -418,7 +608,7 @@ const Harness = struct {
             .scene_name = "level1",
         };
         self.ctx.beginFrame(frame_input);
-        _ = draw(&self.ctx, &self.state, &self.scene, frame);
+        _ = draw(&self.ctx, &self.state, &self.scene, &self.history, frame);
         self.ctx.endFrame();
     }
 
@@ -615,4 +805,216 @@ test "editor: the shell allocates nothing per frame" {
     // that a frame runs to completion against fixed tables.
     h.runFrames(1);
     try testing.expect(h.ctx.remainingSlots() > 0);
+}
+
+/// Find the inspector's name field on the last painted frame, so a test can click it
+/// without hard-coding panel arithmetic.
+fn nameFieldRect(h: *Harness) Rect {
+    const id = widgets.Id.from(0x6e61_6d65, "inspector.name");
+    var i: usize = 0;
+    while (i < h.ctx.entry_count) : (i += 1) {
+        if (h.ctx.entries[i].id.eql(id)) return h.ctx.entries[i].rect;
+    }
+    return Rect.none;
+}
+
+test "editor: typing a name and pressing Enter commits one undoable rename" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.state.selected = h.child_id;
+    h.runFrames(2);
+
+    const field = nameFieldRect(&h);
+    try testing.expect(!field.isEmpty());
+
+    // Click into the field's right end: focus, and the buffer starts from the current
+    // name with the caret after it, so typing appends.
+    const cx = field.right() - 3;
+    h.hover(cx, field.y + 3);
+    h.click(cx, field.y + 3);
+    h.release(cx, field.y + 3);
+    try testing.expect(h.state.name_focused);
+
+    // Typing edits the buffer only: the scene is untouched until Enter.
+    h.frameInput(.{ .text = "renamed" }, &h.state);
+    try testing.expectEqualStrings("childrenamed", h.state.name_buffer[0..h.state.name_len]);
+    const child = h.scene.entityById(h.child_id).?;
+    try testing.expectEqualStrings("child", h.scene.nameOf(child).?);
+
+    // Enter commits through the history: the scene changes, the project is dirty.
+    h.frameInput(.{ .key = .enter }, &h.state);
+    try testing.expectEqualStrings("childrenamed", h.scene.nameOf(h.scene.entityById(h.child_id).?).?);
+    try testing.expect(h.history.dirty);
+    try testing.expectEqual(@as(usize, 1), h.history.undoDepth());
+
+    // And it is exactly undoable.
+    try testing.expect(undo(&h.history, &h.scene));
+    try testing.expectEqualStrings("child", h.scene.nameOf(h.scene.entityById(h.child_id).?).?);
+    try testing.expect(redo(&h.history, &h.scene));
+    try testing.expectEqualStrings("childrenamed", h.scene.nameOf(h.scene.entityById(h.child_id).?).?);
+}
+
+test "editor: Enter on an unchanged name records nothing" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.state.selected = h.child_id;
+    h.runFrames(2);
+
+    const field = nameFieldRect(&h);
+    h.hover(field.x + 3, field.y + 3);
+    h.click(field.x + 3, field.y + 3);
+    h.release(field.x + 3, field.y + 3);
+    h.frameInput(.{ .key = .enter }, &h.state);
+
+    try testing.expectEqual(@as(usize, 0), h.history.undoDepth());
+    try testing.expect(!h.history.dirty);
+}
+
+test "editor: a rename the scene rejects leaves both the scene and the history alone" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.state.selected = h.child_id;
+    h.runFrames(2);
+
+    const field = nameFieldRect(&h);
+    h.hover(field.x + 3, field.y + 3);
+    h.click(field.x + 3, field.y + 3);
+    h.release(field.x + 3, field.y + 3);
+    // A path separator is a name the validation layer refuses.
+    h.frameInput(.{ .text = "a/b" }, &h.state);
+    h.frameInput(.{ .key = .enter }, &h.state);
+
+    try testing.expectEqualStrings("child", h.scene.nameOf(h.scene.entityById(h.child_id).?).?);
+    try testing.expectEqual(@as(usize, 0), h.history.undoDepth());
+    try testing.expect(!h.history.dirty);
+}
+
+test "editor: deleting the selection is undoable and restores the same ID" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.state.selected = h.loose_id;
+    h.runFrames(1);
+
+    try testing.expect(deleteSelected(&h.state, &h.history, &h.scene));
+    try testing.expectEqual(@as(u64, 0), h.state.selected);
+    try testing.expect(h.scene.entityById(h.loose_id) == null);
+
+    try testing.expect(undo(&h.history, &h.scene));
+    const restored = h.scene.entityById(h.loose_id).?;
+    try testing.expectEqualStrings("loose", h.scene.nameOf(restored).?);
+    // The restored entity is selectable again, which is what "stable ID" buys: the
+    // inspector resolves it and paints its name rather than "no selection".
+    h.state.selected = h.loose_id;
+    h.runFrames(1);
+    try testing.expect(h.state.selected == h.loose_id);
+}
+
+test "editor: the status bar shows the save marker only when there is something to save" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.runFrames(2);
+    // No history yet drawn with a dirty flag: the bar renders.
+    try testing.expect(!h.history.dirty);
+    h.history.dirty = true;
+    h.runFrames(1);
+    const dock = Dock.compute(h.ctx.canvas.bounds());
+    try testing.expect(!dock.status.isEmpty());
+    // The marker is painted: at least one pixel of the bar's text row differs from the
+    // bar fill, which is the same assertion as "a status line is drawn".
+    var differs = false;
+    var x = dock.status.x + 1;
+    while (x < dock.status.right() - 1) : (x += 1) {
+        const px = h.pixel(x, dock.status.y + 6);
+        const fill = h.state.theme.button;
+        if (!std.mem.eql(u8, &px, &fill)) differs = true;
+    }
+    try testing.expect(differs);
+}
+
+test "editor: Ctrl+Z undoes an edit and Ctrl+Y redoes it, without the field holding focus" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.state.selected = h.child_id;
+    h.runFrames(2);
+
+    try h.history.apply(&h.scene, .{ .rename = .{ .id = h.child_id, .name = edit.Name.init("byCmd").? } });
+    try testing.expectEqualStrings("byCmd", h.scene.nameOf(h.scene.entityById(h.child_id).?).?);
+
+    h.frameInput(.{ .key = .z, .modifiers = .{ .ctrl = true } }, &h.state);
+    try testing.expectEqualStrings("child", h.scene.nameOf(h.scene.entityById(h.child_id).?).?);
+
+    h.frameInput(.{ .key = .y, .modifiers = .{ .ctrl = true } }, &h.state);
+    try testing.expectEqualStrings("byCmd", h.scene.nameOf(h.scene.entityById(h.child_id).?).?);
+
+    // Shift+Ctrl+Z is the other redo binding.
+    h.frameInput(.{ .key = .z, .modifiers = .{ .ctrl = true } }, &h.state);
+    h.frameInput(.{ .key = .z, .modifiers = .{ .ctrl = true, .shift = true } }, &h.state);
+    try testing.expectEqualStrings("byCmd", h.scene.nameOf(h.scene.entityById(h.child_id).?).?);
+}
+
+test "editor: Delete removes the selection and Escape clears it" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.state.selected = h.loose_id;
+    h.runFrames(1);
+
+    h.frameInput(.{ .key = .delete }, &h.state);
+    try testing.expect(h.scene.entityById(h.loose_id) == null);
+    try testing.expectEqual(@as(u64, 0), h.state.selected);
+
+    h.frameInput(.{ .key = .z, .modifiers = .{ .ctrl = true } }, &h.state);
+    try testing.expect(h.scene.entityById(h.loose_id) != null);
+
+    h.state.selected = h.child_id;
+    h.frameInput(.{ .key = .escape }, &h.state);
+    try testing.expectEqual(@as(u64, 0), h.state.selected);
+}
+
+test "editor: a shortcut does not fire while the name field has focus" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.state.selected = h.child_id;
+    h.runFrames(2);
+
+    const field = nameFieldRect(&h);
+    const cx = field.right() - 3;
+    h.hover(cx, field.y + 3);
+    h.click(cx, field.y + 3);
+    h.release(cx, field.y + 3);
+    try testing.expect(h.state.name_focused);
+
+    // Delete is a text-editing key here, not "destroy the entity".
+    h.frameInput(.{ .key = .delete }, &h.state);
+    try testing.expect(h.scene.entityById(h.child_id) != null);
+    // Ctrl+Z is a shortcut, and while typing it belongs to the field (ignored, not applied).
+    try h.history.apply(&h.scene, .{ .rename = .{ .id = h.child_id, .name = edit.Name.init("typed").? } });
+    h.frameInput(.{ .key = .z, .modifiers = .{ .ctrl = true } }, &h.state);
+    try testing.expectEqualStrings("typed", h.scene.nameOf(h.scene.entityById(h.child_id).?).?);
+}
+
+test "editor: an undo that removes the selected entity drops the selection" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.runFrames(1);
+
+    // Create, select it, undo the create: the ID no longer resolves.
+    const new_id: u64 = 999;
+    try h.history.apply(&h.scene, .{ .create = .{ .id = new_id, .name = edit.Name.init("tmp").? } });
+    h.state.selected = new_id;
+    h.runFrames(1);
+    try testing.expect(h.scene.entityById(new_id) != null);
+
+    h.frameInput(.{ .key = .z, .modifiers = .{ .ctrl = true } }, &h.state);
+    try testing.expect(h.scene.entityById(new_id) == null);
+    try testing.expectEqual(@as(u64, 0), h.state.selected);
+    try testing.expectEqual(@as(u64, 0), h.state.name_owner);
 }

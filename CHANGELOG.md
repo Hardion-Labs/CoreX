@@ -8,6 +8,48 @@ declared yet.
 
 ### Added
 
+- Editor **editing model** (`src/editor/edit.zig`, exposed as `corex.editor.edit`), the
+  layer that turns the read-only inspector into an editor. Headless, renderer-free and
+  fully tested.
+  - **`Command(Scene)`** — six reversible operations as *plain values*, not closures:
+    `set_component`, `remove_component`, `rename`, `reparent`, `create`, `delete`. Each
+    names an entity by **stable ID**, never by the recyclable ECS handle, so a command
+    recorded earlier still names the right entity.
+  - **`History(Scene)`** — `apply` / `undo` / `redo` / `truncateRedo`,
+    `canUndo`/`canRedo`, `undoDepth`/`redoDepth`, `dirty`, `markSaved`. Undo is **exact
+    by snapshot**: the entity's full prior state (name, parent, every schema component)
+    is captured before the edit and restored by the inverse — one rule for all six
+    commands. Undoing a *delete* therefore restores the entity with its **original
+    stable ID**, its parent and its components, so a selection survives the round trip.
+  - **Failure changes nothing.** An invalid command records no entry and leaves the
+    scene untouched; a scene-level failure mid-apply is rolled back from the snapshot
+    taken immediately before.
+  - **`undo`/`redo` allocate nothing** (measured with a counting allocator), so binding
+    them to a key press inside a frame is safe.
+  - **`ValueUnion(schema)`** — a comptime union with one *typed* arm per schema
+    component, so a command carries a component's real type instead of a byte blob.
+  - **`saveScene`** — stages the serialized document in a dot-prefixed sibling and
+    renames it over the target, so an interrupted or failed save leaves the old project
+    intact instead of truncated. Success marks the project clean and **keeps** both
+    stacks; failure leaves it dirty.
+- **`Scene.createEntityWithExactId`, `Scene.setName`, `Scene.component_types` /
+  `Scene.component_count`** (`src/scene/scene.zig`) — what a restore needs: recreate an
+  entity with an ID that was previously in use, rename with an arena-owned copy, and
+  address a component by its schema position without naming its type.
+- **Editable inspector name** — the inspector's name row is a real text field: typing
+  edits a buffer, `Enter` commits a `rename` through the history, `Escape` discards it.
+  The status bar gained `*` (unsaved), `u<n>` (undo depth) and `r<n>` (redo depth).
+  Shortcuts: `Ctrl+Z` undo, `Ctrl+Y`/`Ctrl+Shift+Z` redo, `Delete` delete the selection,
+  `Escape` clear it — all routed through `shell.undo`/`redo`/`deleteSelected`, so a menu
+  or a test uses the same functions. A selection whose entity no longer resolves is
+  dropped instead of left pointing at nothing. A focused text field holds the keyboard,
+  so `Delete` never destroys an entity while a name is being typed.
+- **`gui.widgets.Context.keyPressed` / `claimTextInput`** — the two questions a focused
+  field and its host need from one frame's input.
+- **`tools/qoi_decode.zig`**, `zig build qoi-decode -- in.qoi out.rgba` — inspect a
+  headless frame without adding an image decoder to the library's surface.
+- `editor-frame` accepts an optional `dirty` argument and paints the status bar from a
+  real history.
 - Graphical editor *shell* (`src/editor/`, exposed as `corex.editor`) — one complete
   editor frame painted with the engine's own GUI, over a session the startup pipeline
   already prepared. It owns no scene, renderer or surface (all borrowed for the frame),
@@ -351,13 +393,19 @@ declared yet.
 
 ### Fixed
 
+- Two `@memcpy` aliasing panics in the save path (a `bufPrint` whose format embedded its
+  own buffer, and an overlapping field-buffer copy) — replaced by a second buffer and a
+  backward copy.
+- The inspector's name buffer is resynchronized before the field runs, so the first
+  keystroke appends to the current name instead of prepending to a stale one.
+- `componentEql` compares array fields (`[3]f32` positions, which have no `==`)
+  element-wise, and no longer relies on the pre-0.17 `@typeInfo` `fields` field.
 - A frame's draw list was compared **byte by byte** to decide whether it had
   changed, which reported every frame as changed: `DrawCommand` has padding the
   compiler may leave undefined, so two lists identical in every field that is read
   usually differ in the bytes that are not. `draw.commandsEqual` compares field by
   field (`entity`, handles, world matrix, bounds, depth), so `RenderFrame.refill`
   now answers "is this frame different from the last one?" correctly.
-
 - **`DrawResources.fromComptime` returned a dangling pointer.** It took the
   provider by value and stored the address of its own parameter, so every field
   read afterwards came from a dead stack slot: correct at `-O Debug` (nothing
