@@ -8,6 +8,9 @@ zig-out/
 # Compiled objects, libraries, and executables
 *.o
 *.obj
+# ...but a Wavefront OBJ is *source* geometry the asset loader decodes, not a
+# compiled object, and example projects ship it as text.
+!examples/**/assets/*.obj
 *.a
 *.lib
 *.so

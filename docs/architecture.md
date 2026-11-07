@@ -74,7 +74,8 @@ src/
 │   ├── transform.zig     # Column-major Mat4 + quaternion math         [implemented]
 │   ├── scene.zig         # Versioned scene document + ECS/hierarchy    [implemented]
 │   ├── prefab.zig        # Single-root reusable subtrees (.prefab)     [implemented]
-│   └── stream.zig        # Sector residency streaming (.corexstream) [implemented]
+│   ├── stream.zig        # Sector residency streaming (.corexstream) [implemented]
+│   └── render_scene.zig  # Renderable schema, assets, per-frame engine [implemented]
 ├── assets.zig            # Asset public module; index + cache + importers + pipeline
 ├── assets/
 │   ├── cache.zig         # Content-addressed derived-data cache + GC   [implemented]
@@ -173,6 +174,21 @@ a tier without textures is a rejected draw rather than a flat one. The CPU drive
 `SoftwareBackend` implements the contract on top of the rasterizer, and a test
 proves it is **byte-identical** to calling the rasterizer directly — so a GPU
 backend replacing that value must reproduce exactly that behaviour.
+
+The **scene renderer** (`src/scene/render_scene.zig`) connects a project to that
+pipeline, which was the missing half: the engine's own scene schema
+(`EngineScene`) carried only `transform`, so a `.scene` file could not reference a
+mesh and nothing owned a camera. `EngineRenderScene` adds `renderable` +
+`camera`; `planSlots` gives every renderable asset a deterministic table slot (hash
+start, linear probing, single namespace for meshes and textures), so a handle
+stored in a scene file is reproducible from the project's content alone;
+`loadAssets` loads `.mesh` artifacts, `.obj` sources and PNG/BMP/TGA/QOI textures
+into the pipeline's `AssetTable`; `EngineRenderer` owns the reusable `RenderFrame`
+and renders a frame with the scene's own camera, reporting commands, draws,
+skipped handles, pixels and culling. The binary renders one headless frame at
+startup and prints that accounting. See
+[render-extraction.md](render-extraction.md) and
+[render-backend.md](render-backend.md).
 
 The **backend-independent extraction layer** is implemented (`src/render/`,
 re-exported as `corex.render`, `docs/render-extraction.md`): right-handed camera

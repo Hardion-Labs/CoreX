@@ -84,7 +84,60 @@ pub fn main(init: std.process.Init) u8 {
     defer result.deinit();
 
     printSummary(io, &result);
+    renderFirstFrame(gpa, io, &result);
     return 0;
+}
+
+/// Draw one frame of the prepared scene and report it.
+///
+/// Presentation (a window and a swapchain) does not exist yet, so the frame is
+/// rendered into a headless surface and only its accounting is reported: this is
+/// the documented headless behaviour, not a stub that pretends to show an image.
+/// `validate` prepares no session and renders nothing.
+fn renderFirstFrame(gpa: std.mem.Allocator, io: Io, result: *startup.StartupResult) void {
+    const scene = if (result.scene_data) |*s| s else return;
+    const tier = result.render_tier orelse return;
+    const cfg = result.config;
+
+    var engine = corex.scene.EngineRenderer.init(gpa, tier) catch return;
+    defer engine.deinit();
+
+    var render_assets = corex.scene.render_scene.loadAssets(
+        gpa,
+        io,
+        result.project_root,
+        result.asset_index,
+        .{ .capacity = 64, .vertices_per_slot = 65536, .indices_per_slot = 98304 },
+    ) catch |err| {
+        std.log.scoped(.startup).warn("renderer assets unavailable: {s}", .{@errorName(err)});
+        return;
+    };
+    defer render_assets.deinit();
+
+    // A scene without a camera has nothing to frame; that is reported rather than
+    // silently drawn as an empty image.
+    const report = engine.renderSceneFrame(
+        scene,
+        .{ .width = cfg.window_width, .height = cfg.window_height },
+        render_assets.table.resources(true),
+        .{},
+    ) catch |err| {
+        std.log.scoped(.startup).warn("frame render failed: {s}", .{@errorName(err)});
+        return;
+    } orelse {
+        std.log.scoped(.startup).info("no camera in the scene; nothing to render", .{});
+        return;
+    };
+
+    var buf: [256]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf,
+        \\Frame: {d}x{d} {s} ({d} commands, {d} draws, {d} skipped, {d} pixels, {d} culled)
+        \\
+    , .{
+        cfg.window_width,     cfg.window_height,   @tagName(tier), report.commands, report.stats.draws,
+        report.stats.skipped, report.stats.pixels, report.culled,
+    }) catch return;
+    writeOut(io, line);
 }
 
 fn printSummary(io: Io, result: *const startup.StartupResult) void {

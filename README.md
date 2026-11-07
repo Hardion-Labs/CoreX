@@ -105,9 +105,12 @@ zig build run -- --project examples/hello-project/HelloProject.corex --mode vali
 zig build run -- --project examples/hello-project/HelloProject.corex --headless
 ```
 
-These commands are validated with Zig 0.17.0. The graphical editor, GUI and
-renderers are not implemented yet, so editor/runtime sessions currently open
-headless and report readiness.
+These commands are validated with Zig 0.17.0. Editor/runtime sessions open headless
+and report readiness, then render one frame of the project's own scene and print
+its accounting, e.g. `Frame: 1280x720 medium (1 commands, 1 draws, 0 skipped, 43264
+pixels, 0 culled)` — the example project ships a quad and a camera, so that frame
+draws real geometry. The graphical editor, GUI and GPU renderers are not
+implemented yet; there is no window and no frame loop.
 
 ## ECS
 
@@ -357,6 +360,15 @@ camera view/projection matrices, frustum-culls renderables, and produces a sorte
 draw list from a scene. A **CPU software rasterizer** then turns that list into an
 RGBA8 framebuffer with a depth buffer. Neither has a GPU dependency, so both run
 and are fully tested headlessly. The Low/Medium GPU backends are planned.
+
+A scene file can author it directly: `corex.scene.render_scene` provides
+`EngineRenderScene` (`transform` + `renderable` + `camera`), loads a project's
+meshes (`.mesh` artifacts and `.obj` sources) and textures into a renderer table
+through a deterministic path-to-handle layout, and drives a frame with the scene's
+own camera (`EngineRenderer.render` / `renderSceneFrame`). The engine binary uses it
+to render the startup frame, so `renderable`/`camera` in a `.scene` are real, not
+documentation.
+
 
 ```zig
 const corex = @import("corex");

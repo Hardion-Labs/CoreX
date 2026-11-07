@@ -62,21 +62,94 @@ pub const SortMode = enum {
 };
 
 /// An owned, sorted draw list plus culling diagnostics.
+///
+/// The list is double-buffered so `refill` can compare this frame's commands with
+/// the previous ones while extracting the new ones, without a steady-state
+/// allocation and without ever reading a buffer that a grow may have moved.
 pub const RenderFrame = struct {
     gpa: Allocator,
+    /// The current frame's commands (a view of the active buffer).
     commands: []DrawCommand,
     /// Number of renderables rejected by frustum culling this extraction.
     culled: usize,
+    /// The exact allocations behind `commands` and the inactive buffer. Kept
+    /// apart from the views so every free uses the length that was allocated.
+    active: []DrawCommand,
+    spare: []DrawCommand,
 
     pub fn deinit(self: *RenderFrame) void {
-        self.gpa.free(self.commands);
+        self.gpa.free(self.active);
+        self.gpa.free(self.spare);
         self.* = undefined;
+    }
+
+    /// An empty list that `extractDrawList` can grow in place, or that a caller
+    /// keeps across frames and refills with `refill`.
+    pub fn init(gpa: Allocator) !RenderFrame {
+        const empty = try gpa.alloc(DrawCommand, 0);
+        errdefer gpa.free(empty);
+        return .{ .gpa = gpa, .commands = empty, .culled = 0, .active = empty, .spare = try gpa.alloc(DrawCommand, 0) };
+    }
+
+    /// Refill this frame in place, reusing the existing buffers.
+    ///
+    /// The new list is extracted into the inactive buffer and compared with the
+    /// current one; then the two swap. In a steady state (same scene, same
+    /// camera) nothing is allocated and nothing is copied — only the commands are
+    /// re-emitted and compared.
+    ///
+    /// Returns the culled count and `changed = false` when the resulting list is
+    /// field-for-field identical to the previous one.
+    ///
+    /// `changed` is advisory: `DrawCommand.world` is a `[16]f32` that the matrix
+    /// math may leave partially undefined padding in, so two frames that render
+    /// identically can still compare as changed (the comparison never reports a
+    /// change that did not happen, only sometimes misses that none did).
+    pub fn refill(
+        self: *RenderFrame,
+        scene: anytype,
+        cam: Camera,
+        mode: SortMode,
+    ) !struct { culled: usize, changed: bool } {
+        var next: std.ArrayList(DrawCommand) = .fromOwnedSlice(self.spare);
+        next.capacity = self.spare.len;
+        // `extractInto` clears the list first, so the spare's previous contents
+        // are never read; only its capacity is reused.
+        const culled = try extractInto(&next, scene, cam, mode, self.gpa);
+        const changed = self.culled != culled or !commandsEqual(next.items, self.commands);
+        // `next.items` was just written, so the comparison above must happen
+        // before the swap; afterwards the old active buffer becomes the spare.
+        // The allocation and the view are recorded separately: `items` is the
+        // used length, `allocatedSlice()` the one a free must use.
+        const old_active = self.active;
+        self.active = next.allocatedSlice();
+        self.commands = next.items;
+        self.spare = old_active;
+        self.culled = culled;
+        return .{ .culled = culled, .changed = changed };
     }
 
     pub fn count(self: RenderFrame) usize {
         return self.commands.len;
     }
 };
+
+/// Field-by-field comparison of two draw lists.
+///
+/// Not a byte comparison: `DrawCommand` has padding the compiler may leave
+/// undefined, so comparing raw bytes reports a change between two lists that are
+/// identical in every field that is actually read.
+pub fn commandsEqual(a: []const DrawCommand, b: []const DrawCommand) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (!x.entity.eql(y.entity)) return false;
+        if (x.mesh != y.mesh or x.material != y.material) return false;
+        if (!std.mem.eql(f32, &x.world, &y.world)) return false;
+        if (!std.meta.eql(x.bounds, y.bounds)) return false;
+        if (x.depth != y.depth) return false;
+    }
+    return true;
+}
 
 fn sortCommands(items: []DrawCommand, mode: SortMode) void {
     switch (mode) {
@@ -110,11 +183,41 @@ fn sortCommands(items: []DrawCommand, mode: SortMode) void {
 /// Fails only on allocation failure (the scene is already valid). Entities whose
 /// world matrix is absent from the snapshot are skipped defensively.
 pub fn extractDrawList(scene: anytype, cam: Camera, mode: SortMode, gpa: Allocator) !RenderFrame {
-    var wt = try scene.computeWorldTransforms(gpa);
-    defer wt.deinit();
-
     var commands: std.ArrayList(DrawCommand) = .empty;
     errdefer commands.deinit(gpa);
+    const culled = try extractInto(&commands, scene, cam, mode, gpa);
+    const owned = try commands.toOwnedSlice(gpa);
+    errdefer gpa.free(owned);
+    return .{
+        .gpa = gpa,
+        .commands = owned,
+        .culled = culled,
+        .active = owned,
+        .spare = try gpa.alloc(DrawCommand, 0),
+    };
+}
+
+/// Fill `out` with the same sorted draw list `extractDrawList` produces, reusing
+/// `out`'s capacity.
+///
+/// This is the entry point for a frame loop: the buffer is allocated once and
+/// reused, so a steady-state frame performs no draw-list allocation (the only
+/// remaining per-frame allocation is the world-transform snapshot, which belongs
+/// to the scene). Leftover entries are dropped before the frame fills it again, so
+/// the list never carries a stale command. Returns the number of culled
+/// renderables.
+pub fn extractInto(
+    out: *std.ArrayList(DrawCommand),
+    scene: anytype,
+    cam: Camera,
+    mode: SortMode,
+    gpa: Allocator,
+) !usize {
+    out.clearRetainingCapacity();
+    errdefer out.clearRetainingCapacity();
+
+    var wt = try scene.computeWorldTransforms(gpa);
+    defer wt.deinit();
 
     const frustum = culling.Frustum.fromMat4(cam.view_projection);
     var culled: usize = 0;
@@ -130,7 +233,7 @@ pub fn extractDrawList(scene: anytype, cam: Camera, mode: SortMode, gpa: Allocat
             continue;
         }
         const view_center = transform.transformPoint(cam.view, world_bounds.center);
-        try commands.append(gpa, .{
+        try out.append(gpa, .{
             .entity = e,
             .mesh = rend.mesh,
             .material = rend.material,
@@ -140,12 +243,8 @@ pub fn extractDrawList(scene: anytype, cam: Camera, mode: SortMode, gpa: Allocat
         });
     }
 
-    sortCommands(commands.items, mode);
-    return RenderFrame{
-        .gpa = gpa,
-        .commands = try commands.toOwnedSlice(gpa),
-        .culled = culled,
-    };
+    sortCommands(out.items, mode);
+    return culled;
 }
 
 // --- tests -----------------------------------------------------------------
