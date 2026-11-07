@@ -97,6 +97,13 @@ automatic asset upload/eviction from the asset index; mip generation for `CXTX`
 (the artifact has no levels yet); GUI library and graphical editor; Lua VM;
 export templates; native module API; audio device backends.
 
+**Integrated:** commit `82ffebf`, PR #39, CI green (Build & test 23s), merged into
+`main` as **`8a054f2`** (merge commit, no conflicts, no force). `main` re-tested
+after the merge in a clean worktree at `origin/main`: **696/696 in Debug** and
+**696/696 in ReleaseSafe**, `zig fmt --check` clean, `zig build` OK, headless smoke
+OK (`Renderer tier: medium`), `--version` OK; merged tree `ff6680e…` identical to
+the branch tree.
+
 **Next priority:** the runtime/window presentation layer — own a swapchain and a
 frame loop, select the backend with the now-wired tier, and call `renderScene` per
 frame. It must stay behind the existing `Backend` vtable and the pipeline, and the
