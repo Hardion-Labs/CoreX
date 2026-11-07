@@ -394,17 +394,53 @@ pub fn Scene(comptime schemas: anytype) type {
             return self.entityById(pid);
         }
 
+        /// Sorted stable IDs of the direct children of `parent_id` (the roots when
+        /// `parent_id` is null), written into `out` in ascending order.
+        ///
+        /// Returns how many IDs were written, which is `min(match_count, out.len)`:
+        /// the buffer is never overflowed. When a parent has more children than the
+        /// buffer holds, the **smallest** stable IDs are kept, so the result is a
+        /// deterministic prefix rather than whatever the hash map happened to visit
+        /// first. Allocation-free — the scan is over the scene's own records — which
+        /// is what lets a tree view ask for one node's children per frame.
+        pub fn childIdsInto(self: *const Self, parent_id: ?u64, out: []u64) usize {
+            var written: usize = 0;
+            var it = self.records.iterator();
+            while (it.next()) |entry| {
+                const record_parent = entry.value_ptr.parent;
+                const matches = if (parent_id) |want| (record_parent != null and record_parent.? == want) else record_parent == null;
+                if (!matches) continue;
+                const id = entry.key_ptr.*;
+                if (written < out.len) {
+                    // Insertion sort into the window: a node usually has a handful
+                    // of children, so this is cheaper than collecting and sorting.
+                    var i = written;
+                    while (i > 0 and out[i - 1] > id) : (i -= 1) out[i] = out[i - 1];
+                    out[i] = id;
+                    written += 1;
+                } else if (written > 0 and id < out[written - 1]) {
+                    var i = written - 1;
+                    while (i > 0 and out[i - 1] > id) : (i -= 1) out[i] = out[i - 1];
+                    out[i] = id;
+                }
+            }
+            return written;
+        }
+
         /// Sorted stable IDs of all root entities (entities without a parent).
         /// Caller owns the returned slice and frees it with `gpa`.
         pub fn rootIds(self: *const Self, gpa: Allocator) Error![]u64 {
-            var ids: std.ArrayList(u64) = .empty;
-            errdefer ids.deinit(gpa);
+            // The order is defined by `childIdsInto`; this only sizes the slice.
+            var total: usize = 0;
             var it = self.records.iterator();
             while (it.next()) |entry| {
-                if (entry.value_ptr.parent == null) try ids.append(gpa, entry.key_ptr.*);
+                if (entry.value_ptr.parent == null) total += 1;
             }
-            std.mem.sort(u64, ids.items, {}, lessU64);
-            return ids.toOwnedSlice(gpa);
+            const ids = try gpa.alloc(u64, total);
+            errdefer gpa.free(ids);
+            const written = self.childIdsInto(null, ids);
+            std.debug.assert(written == total);
+            return ids;
         }
 
         /// Result of cloning a subtree into a scene.
@@ -871,6 +907,51 @@ test "scene: create entities with stable IDs and names" {
     try std.testing.expectEqualStrings("Root", s.nameOf(a).?);
     try std.testing.expect(s.parent(b).?.eql(a));
     try std.testing.expectEqual(@as(usize, 2), s.count());
+}
+
+test "scene: child ids are sorted, bounded and prefix-stable" {
+    var s = try TestScene.init(std.testing.allocator, "main");
+    defer s.deinit();
+    const root = try s.createEntity("Root", null);
+    const other = try s.createEntity("Other", null);
+    // Created out of order on purpose: the answer must not depend on insertion.
+    _ = try s.createEntity("c3", s.idOf(root));
+    const c1 = try s.createEntity("c1", s.idOf(root));
+    const c2 = try s.createEntity("c2", s.idOf(root));
+
+    var buf: [8]u64 = @splat(0);
+    const roots = s.childIdsInto(null, &buf);
+    try std.testing.expectEqual(@as(usize, 2), roots);
+    try std.testing.expectEqual(@as(u64, 1), buf[0]);
+    try std.testing.expectEqual(@as(u64, 2), buf[1]);
+
+    // root = 1, other = 2, then its children 3, 4, 5 in creation order.
+    const kids = s.childIdsInto(s.idOf(root), &buf);
+    try std.testing.expectEqual(@as(usize, 3), kids);
+    try std.testing.expectEqual(@as(u64, 3), buf[0]);
+    try std.testing.expectEqual(s.idOf(c1).?, buf[1]);
+    try std.testing.expectEqual(s.idOf(c2).?, buf[2]);
+    try std.testing.expectEqual(@as(u64, 5), buf[2]);
+
+    // A buffer too small keeps the smallest IDs, never overflows, and reports the
+    // number written rather than the number that matched.
+    var small: [2]u64 = @splat(0);
+    try std.testing.expectEqual(@as(usize, 2), s.childIdsInto(s.idOf(root), &small));
+    try std.testing.expectEqual(@as(u64, 3), small[0]);
+    try std.testing.expectEqual(s.idOf(c1).?, small[1]);
+
+    // A leaf has no children; an unknown parent has none either.
+    try std.testing.expectEqual(@as(usize, 0), s.childIdsInto(s.idOf(c1), &buf));
+    try std.testing.expectEqual(@as(usize, 0), s.childIdsInto(9_999, &buf));
+    try std.testing.expectEqual(@as(usize, 0), s.childIdsInto(null, small[0..0]));
+
+    // `rootIds` agrees with the allocating path exactly.
+    const owned = try s.rootIds(std.testing.allocator);
+    defer std.testing.allocator.free(owned);
+    try std.testing.expectEqual(@as(usize, 2), owned.len);
+    try std.testing.expectEqual(@as(u64, 1), owned[0]);
+    try std.testing.expectEqual(@as(u64, 2), owned[1]);
+    _ = other;
 }
 
 test "scene: add/get/remove transform component" {

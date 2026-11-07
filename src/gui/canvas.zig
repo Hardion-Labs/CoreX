@@ -289,6 +289,42 @@ pub const Canvas = struct {
         self.fillRect(.{ .x = x, .y = y0, .w = 1, .h = h }, color);
     }
 
+    /// Blit an RGBA8 image scaled to fill `dst`, nearest-neighbour, clipped to both
+    /// the destination and the canvas.
+    ///
+    /// This is how a rendered frame is shown inside a smaller viewport: the scene
+    /// is drawn at the surface resolution and sampled down here, so the viewport
+    /// shows the whole frame rather than a crop of it. Nearest-neighbour is the
+    /// deliberate choice — it is one memory read per pixel, has no ringing, and a
+    /// pixel-art editor wants exactly this. Pixels outside `dst` are never touched,
+    /// which is what makes it safe to call with a destination that overlaps the
+    /// editor's own panels.
+    pub fn blitScaled(
+        self: Canvas,
+        dst: Rect,
+        src: []const u8,
+        src_w: u32,
+        src_h: u32,
+    ) void {
+        if (dst.isEmpty() or src_w == 0 or src_h == 0) return;
+        const need = @as(usize, src_w) * src_h * 4;
+        if (src.len < need) return;
+        const clip = dst.intersect(self.bounds());
+        if (clip.isEmpty()) return;
+        const sw: i64 = @intCast(src_w);
+        const sh: i64 = @intCast(src_h);
+        var y = clip.y;
+        while (y < clip.bottom()) : (y += 1) {
+            const sy = @divFloor(@as(i64, y - dst.y) * sh, @as(i64, dst.h));
+            var x = clip.x;
+            while (x < clip.right()) : (x += 1) {
+                const sx = @divFloor(@as(i64, x - dst.x) * sw, @as(i64, dst.w));
+                const si = (@as(usize, @intCast(sy)) * src_w + @as(usize, @intCast(sx))) * 4;
+                self.blendPixel(x, y, .{ src[si], src[si + 1], src[si + 2], src[si + 3] });
+            }
+        }
+    }
+
     /// Blit an RGBA8 image at `(dx, dy)`, clipped, honouring the source alpha by
     /// compositing rather than replacing. `src_w`/`src_h` describe the source so a
     /// sub-rectangle can be copied without building a view.
@@ -445,6 +481,40 @@ test "canvas: blit composites a source image and ignores an inconsistent one" {
     // A source shorter than its stated size is rejected outright.
     c.blit(0, 0, src[0..4], 2, 2);
     try testing.expectEqual(Color{ 255, 0, 0, 255 }, c.get(0, 0).?);
+}
+
+test "canvas: a scaled blit fills the destination, samples nearest and clips" {
+    // 2x2 source: red, green / blue, white.
+    const src = [_]u8{
+        255, 0, 0,   255, 0,   255, 0,   255,
+        0,   0, 255, 255, 255, 255, 255, 255,
+    };
+    var buf: [8 * 8 * 4]u8 = @splat(0);
+    var c = try Canvas.init(8, 8, &buf);
+
+    // 4x4 destination starting at (2,2): each source pixel becomes a 2x2 block.
+    c.blitScaled(Rect.init(2, 2, 4, 4), &src, 2, 2);
+    try testing.expectEqual(Color{ 255, 0, 0, 255 }, c.get(2, 2).?);
+    try testing.expectEqual(Color{ 255, 0, 0, 255 }, c.get(3, 3).?);
+    try testing.expectEqual(Color{ 0, 255, 0, 255 }, c.get(4, 2).?);
+    try testing.expectEqual(Color{ 0, 0, 255, 255 }, c.get(2, 4).?);
+    try testing.expectEqual(Color{ 255, 255, 255, 255 }, c.get(5, 5).?);
+    // Outside the destination nothing was written.
+    try testing.expectEqual(Color{ 0, 0, 0, 0 }, c.get(1, 2).?);
+    try testing.expectEqual(Color{ 0, 0, 0, 0 }, c.get(6, 2).?);
+
+    // A destination that runs off the canvas writes only the visible part.
+    var small: [2 * 2 * 4]u8 = @splat(0);
+    var c2 = try Canvas.init(2, 2, &small);
+    c2.blitScaled(Rect.init(1, 1, 8, 8), &src, 2, 2);
+    try testing.expectEqual(Color{ 255, 0, 0, 255 }, c2.get(1, 1).?);
+    try testing.expectEqual(Color{ 0, 0, 0, 0 }, c2.get(0, 0).?);
+
+    // Degenerate and truncated inputs are no-ops, not errors.
+    c2.blitScaled(Rect.none, &src, 2, 2);
+    c2.blitScaled(Rect.init(0, 0, 2, 2), src[0..4], 2, 2);
+    c2.blitScaled(Rect.init(0, 0, 2, 2), &src, 0, 2);
+    try testing.expectEqual(Color{ 255, 0, 0, 255 }, c2.get(1, 1).?);
 }
 
 test "canvas: shade and withAlpha keep the alpha and scale the colour" {

@@ -40,8 +40,8 @@ control, and maintainable code.
 > biquad/compressor/delay/reverb/limiter/saturator insert chains, plus
 > spatialization and the `AudioSource` scene bridge) are
 > implemented and tested. The larger
-> subsystems (GPU renderer backends, GUI, editor, Lua, export, native modules) are
-> in scope and either contract-defined or planned. See
+> subsystems (GPU renderer backends, editor editing model and window, Lua, export,
+> native modules) are in scope and either contract-defined or planned. See
 > [`docs/architecture.md`](docs/architecture.md) for the per-subsystem status.
 
 ## Overview
@@ -131,8 +131,9 @@ Pacing: 60 fps — 0 late of 60 frames, 0 resyncs, 794.372 ms slept, 993.652 ms 
 
 The pacer sleeps against the monotonic clock, anchored so overshoot does not accumulate;
 it is **not** vsync (there is no swapchain yet), and the docs say so. The example project ships a quad and a camera, so the frames
-draw real geometry. The GUI library is implemented headlessly (see [GUI](#gui)); the graphical editor
-and the GPU renderers are not, and there is no window — the loop renders into a surface it owns
+draw real geometry. The GUI library and the editor shell are implemented headlessly
+(see [GUI](#gui) and [Editor](#editor)); editing itself and the GPU renderers are not,
+and there is no window — the loop renders into a surface it owns
 ([docs/presentation.md](docs/presentation.md)).
 
 ## ECS
@@ -595,6 +596,7 @@ CoreX/
 │   ├── audio-effects.md        # Insert DSP: biquads, compressor, chains
 │   ├── audio-spatial.md        # Spatial audio + AudioSource/AudioSystem
 │   ├── gui-foundation.md       # Built-in GUI: font, canvas, layout, widgets
+│   ├── editor-shell.md         # Editor shell: docks, hierarchy, viewport, inspector
 │   ├── versioning.md           # Versioning and compatibility policy
 │   ├── native-module-api.md    # C++ native module ABI contract
 │   ├── development/            # Coding standards, commit guidelines
@@ -670,7 +672,8 @@ Indicative; subject to change as technical decisions are validated.
 - [x] Rasterizer anisotropic filtering: up to 8 footprint-aligned taps, `Mipmap.anisotropic`.
 - [x] Per-material LOD bias and anisotropic tap cap (`Sampling`, frame default + per-material override).
 - [x] GUI library foundation: built-in font, RGBA8 canvas, text, layout, immediate-mode widgets, headless frame renderer.
-- [ ] Graphical editor on top of the GUI library.
+- [x] Editor shell: docked hierarchy, scene viewport, read-only inspector, status bar, headless frame renderer.
+- [ ] Editor editing model (undo/redo, dirty tracking, save) and a window.
 - [ ] Lua VM and gameplay scripting.
 - [ ] Native Module API loader (C++).
 - [ ] Runtime player and export system / Export Templates.
@@ -736,6 +739,51 @@ Limits: no window/swapchain (blocked in this environment), no text shaping beyon
 ASCII, no wrapping, no automatic Tab traversal, bounded hit-test tables. The design,
 contracts and limitations are in [`docs/gui-foundation.md`](docs/gui-foundation.md).
 
+## Editor
+
+The graphical editor's shell (`corex.editor`) is built on that GUI. It paints one
+complete editor frame over a session the startup pipeline already prepared: a docked
+**hierarchy** (depth-first, clickable, stable entity IDs), a **scene viewport** showing
+the engine's own rendered surface, a **read-only inspector** for the selected entity,
+and a **status bar** carrying the renderer's real per-frame accounting.
+
+```sh
+zig build editor-frame -- examples/hello-project/HelloProject.corex editor.qoi 3  # 3 = entity to inspect
+```
+
+![Editor frame rendered headlessly by corex.editor.shell](editor-frame-preview.png)
+
+```zig
+const corex = @import("corex");
+const shell = corex.editor.shell;
+
+// `scene` is the prepared EngineRenderScene; `pixels` is the rendered frame.
+var state = shell.State{};
+var ctx = corex.gui.widgets.Context.init(canvas, state.theme, .{}, &entries, &next);
+ctx.beginFrame(input);
+const selection_changed = shell.draw(&ctx, &state, scene, .{
+    .scene_pixels = pixels,
+    .scene_width = 640,
+    .scene_height = 360,
+    .report = engine.last,
+    .project_name = "HelloProject",
+    .scene_name = scene.name,
+});
+ctx.endFrame();
+```
+
+The shell owns no scene, renderer or surface — all are borrowed for the frame — so the
+same call serves a headless tool, a test and, once the window layer exists, a windowed
+editor. Dock geometry (`shell.Dock.compute`) drops panels rather than letting the
+viewport vanish; the hierarchy reads entities through an allocation-free, sorted,
+bounded `Scene.childIdsInto`; the viewport samples the render with `Canvas.blitScaled`;
+and `shell.projectToViewport` reuses the renderer's own view-projection, so a marker
+cannot drift from the pixels.
+
+Limits: no window or real input, **read-only inspector** (no undo, no save), no tree
+scrolling, no gizmos or camera controls, fixed dock widths. See
+[`docs/editor-shell.md`](docs/editor-shell.md).
+
 ## Development
 
 Before contributing, read [`CONTRIBUTING.md`](CONTRIBUTING.md),
@@ -753,6 +801,7 @@ zig build
 zig build test
 zig fmt --check src/ build.zig tools/
 zig build gui-frame -- frame.qoi   # headless GUI frame, for visual inspection
+zig build editor-frame -- examples/hello-project/HelloProject.corex editor.qoi
 ```
 
 ## Contributions

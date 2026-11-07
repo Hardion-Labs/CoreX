@@ -4,6 +4,77 @@ Permanent record of real progress, decisions, pending items and the next priorit
 task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
+## Cycle 2026-11-07 (i) — Editor shell on the GUI foundation
+
+**Diagnosis first.** Window/swapchain re-checked: **still blocked** (no
+`/usr/include/X11`, no `pkg-config`, no `Xvfb`, `DISPLAY` empty) — not attempted. The
+queued next priority was the graphical editor shell over the GUI foundation merged in
+cycle (h). Everything an editor *does* with pixels before it can edit anything — docks,
+a hierarchy, a viewport showing the rendered scene, an inspector, a status bar — is
+headless and verifiable, so that is the coherent step; the editing model (undo, dirty
+tracking, save) is a separate, larger change and was **not** bolted on.
+
+**Delivered (validated):**
+
+- **`editor/shell.zig`** (`corex.editor.shell`) — `Dock.compute` splits the canvas into
+  hierarchy / viewport / inspector / status with no gap or overlap, admitting a panel
+  only when a ≥60 px viewport still fits (both → hierarchy only → neither). `draw(ctx,
+  state, scene, frame) -> bool` paints a whole frame and reports selection changes;
+  it borrows the scene, renderer and surface and owns none of them.
+- **Hierarchy** — depth-first, indented, clickable rows keyed by stable entity ID, bounded
+  by `State.rows_per_frame`.
+- **`Scene.childIdsInto(parent, out)`** (new, `src/scene/scene.zig`) — allocation-free,
+  ascending stable IDs, never overflows `out`, keeps the smallest IDs on a full buffer.
+  `Scene.rootIds` is now defined in terms of it, so the two cannot drift.
+- **`Canvas.blitScaled(dst, src, w, h)`** (new, `src/gui/canvas.zig`) — nearest-neighbour
+  scaled blit clipped to destination and canvas; this is how the rendered frame fills
+  the viewport.
+- **`shell.projectToViewport`** — world point → viewport pixel through the renderer's own
+  `view_projection`; rejects `w <= 0` and points outside the clip volume instead of
+  dividing through.
+- **Inspector** — read-only: name, stable ID, transform, renderable handles, camera fov,
+  parent, clipped per column.
+- **Status bar** — project, scene, commands, draws, pixels, viewport size, all from the
+  renderer's report.
+- **`tools/editor_frame.zig`** + `zig build editor-frame -- <project> out.qoi [id]` — the
+  documented startup pipeline, one real rendered frame, the editor painted around it,
+  written as QOI. This is the editor's smoke test and its visual reference.
+
+**Decisions:**
+
+- **The shell borrows, never owns.** Scene, renderer and surface belong to the caller, so
+  the same `draw` serves a headless tool, a test and (later) a window, with no second
+  implementation and no per-frame allocation.
+- **Read-only inspector.** Editing without undo/redo and dirty tracking would be a stub
+  dressed as a feature. It is the next coherent step instead, deliberately.
+- **Panel rules favour the viewport.** Dropping the inspector, then the hierarchy, is
+  better than a two-pixel viewport; the docks are fixed width because a scaling panel
+  makes a text-heavy surface jump.
+- **`childIdsInto` replaces the ad-hoc scan.** One bounded, sorted, allocation-free
+  primitive serves the tree and `rootIds`, which removes the possibility of the two
+  disagreeing.
+
+**Bugs found by validation (mine, fixed):** the status bar used a `·` separator, which
+the ASCII-only font renders as `?` — the first render showed it; the inspector's key
+column was 34 px while `parent` is 35 px wide, so the value overlaid the key; the dock
+rule as first written dropped the inspector at 240 px width because it reserved both
+panels before checking; and `childIdsInto` underflowed on a zero-length buffer.
+
+**Suite:** **816/816** (`zig build test --summary all`, cleared cache), `zig fmt --check
+src build.zig tools` clean, `zig build` OK, headless smoke and `--mode validate` OK,
+`zig build gui-frame` unchanged, `zig build editor-frame` renders 640x360 / 4 entities /
+11,344 bytes for the example project.
+
+**Pending:** window/swapchain/vsync + real input (blocked here); GPU backends; editor
+**editing** model (undo/redo, dirty tracking, save back to `.scene`), tree scrolling,
+asset browser, gizmos, camera controls, resizable/resizable docks, automatic focus
+traversal; text shaping/wrapping in the GUI; Lua VM; native module API; export templates.
+
+**Next priority:** the **editor editing model** — a command/undo stack over the scene
+plus dirty tracking and selection-safe save — because it is the first thing that turns
+the read-only inspector into an editor, and it is headless and fully testable. The window
+stays blocked in this sandbox for the same reason as in every prior cycle.
+
 ## Cycle 2026-11-07 (h) — Built-in GUI foundation (font, canvas, layout, widgets)
 
 **Diagnosis first.** Window/swapchain re-checked and **still blocked** (no
