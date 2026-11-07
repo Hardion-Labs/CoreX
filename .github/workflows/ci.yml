@@ -32,5 +32,8 @@ jobs:
           ./zig-out/bin/corex-engine --project examples/hello-project/HelloProject.corex --mode validate
           ./zig-out/bin/corex-engine --project examples/hello-project/HelloProject.corex --headless
           ./zig-out/bin/corex-engine --project examples/hello-project/HelloProject.corex --mode runtime --headless
-          # The editor shell renders a real frame of the example project headlessly.
-          zig build editor-frame -- examples/hello-project/HelloProject.corex "$RUNNER_TEMP/editor.qoi"
+          # The editor shell renders a real frame of the example project headlessly,
+          # with the save marker on, proving the status bar reads a real history.
+          zig build editor-frame -- examples/hello-project/HelloProject.corex "$RUNNER_TEMP/editor.qoi" 2 dirty
+          # And that frame decodes: the QOI the editor wrote is a valid image.
+          zig build qoi-decode -- "$RUNNER_TEMP/editor.qoi" "$RUNNER_TEMP/editor.rgba"
