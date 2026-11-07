@@ -4,6 +4,74 @@ Permanent record of real progress, decisions, pending items and the next priorit
 task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
+## Cycle 2026-11-07 (x) — Viewport gizmo rotate and scale
+
+**Diagnosis first.** Cycle (w) delivered the viewport translate gizmo: drag the
+selected entity along X/Y/Z axis handles, committed as one undoable
+`set_component`. But rotate and scale were still missing — the user could only
+move, not rotate or resize entities from the viewport. The recorded next
+priority was exactly this: gizmo rotate and scale. Window/swapchain remains
+blocked (unchanged; not attempted).
+
+**Delivered (validated):**
+
+- **`src/editor/shell.zig`**:
+  - **`GizmoMode`** expanded to `.translate`, `.rotate`, `.scale` — which tool is
+    active.
+  - **`Gizmo`** struct expanded with `drag_start_rotation: [4]f32` (quaternion,
+    used in rotate mode) and `drag_start_scale: [3]f32` (used in scale mode);
+    `begin` now accepts rotation and scale initial values.
+  - **`drawViewportGizmo`** draws per mode: translate/scale show three coloured
+    axis handles (X red, Y green, Z blue) from the projected position; rotate
+    shows three coloured axis rings (circles in the plane perpendicular to each
+    axis), approximated with 24 Bresenham line segments via the new
+    `drawWorldCircle` helper. The active axis/ring is drawn brighter.
+  - **`applyGizmoDrag`** expanded with a `switch` on mode:
+    - `.translate`: drag plane perpendicular to camera look direction;
+      displacement along axis changes position (existing behaviour).
+    - `.rotate`: drag plane perpendicular to rotation axis; projects drag start
+      and current pointer onto the plane, measures signed angle swept around
+      the axis via `atan2(cross(v1,v2)·axis, dot(v1,v2))`, creates
+      `quatFromAxisAngle` and composes with `drag_start_rotation` via
+      `quatMultiply`. Writes the new rotation directly to the entity's
+      `Transform`.
+    - `.scale`: drag plane perpendicular to camera look direction; displacement
+      along axis changes scale via `factor = 1 + displacement * 0.01`, applied
+      only to the selected axis.
+  - **`applyShortcuts`** wiring unchanged: press on an axis handle/ring starts
+    the gizmo drag (mode determined by `state.viewport_gizmo.mode`, set
+    externally before the press); release commits one undoable `set_component`;
+    press on nothing starts drag-to-orbit as before.
+- **Tests:** 2 new tests in `shell.zig` — gizmo rotate rotates entity around X
+  axis and is undoable; gizmo scale scales entity along X axis (Y/Z unchanged)
+  and is undoable. All 937 tests pass (935 pre-existing + 2 new), fmt clean,
+  `zig build` OK, `editor-frame` OK.
+
+**Decisions:**
+
+- Rotate uses world-space axes (not the entity's local axes), matching how the
+  translate handles are drawn world-aligned. This keeps the gizmo predictable
+  regardless of the entity's current rotation.
+- The rotate angle is measured from the drag start point to the current
+  pointer, both projected onto the plane perpendicular to the rotation axis.
+  This gives a natural "trackball-like" feel for a single axis.
+- Scale factor is `1 + displacement * 0.01` (1% per screen pixel), applied
+  multiplicatively to the starting scale along the selected axis only.
+- The move/rotate/scale is written directly to the scene during the drag
+  (immediate feedback) and committed as one undoable `set_component` on
+  release — the history is not flooded with one entry per pointer frame.
+
+**Pending / not in this cycle:** gizmo pick for rotate/scale rings (currently
+rotate/scale must be activated by setting `state.viewport_gizmo.mode` directly;
+pickGizmoAxis only targets line handles), Home/End and PageUp/PageDown in the
+tree, multi-select, persisted fold state, sibling ordering; and the window
+layer when the sandbox allows it.
+
+**Next priority:** gizmo pick for rotate/scale rings (so the user can select
+which axis to rotate/scale by clicking); then Home/End and PageUp/PageDown in
+the tree; sibling ordering if the scene gains a child order; and the window
+layer when the sandbox allows it.
+
 ## Cycle 2026-11-07 (w) — Viewport translate gizmo (drag-to-move)
 
 **Diagnosis first.** Cycle (v) delivered viewport selection highlight via
