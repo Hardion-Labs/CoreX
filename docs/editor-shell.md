@@ -44,11 +44,29 @@ deliberate:
 ## Hierarchy
 
 One row per entity, depth-first from the roots, indented by depth, clickable to select
-(selection is a stable entity ID, so it survives handle recycling). Rows come from
-`Scene.childIdsInto(parent, out)`, which:
+(selection is a stable entity ID, so it survives handle recycling).
+
+Rows come from the hierarchy's own model, `editor/tree.zig`, not from the paint loop:
+
+- **Flat and caller-owned.** `tree.build(scene, list)` writes one `Row{id, depth}` per
+  visible line into an array the caller provides; the panel paints that array. Nothing
+  allocates, and painting cannot descend into a branch the window has cut off.
+- **Bounded work.** The walk stops as soon as the window is full (plus one row, to know
+  whether a "more..." hint is needed), so a scene with a hundred thousand entities costs
+  the same per frame as one with ten.
+- **Depth-limited.** `max_depth = 32` is checked while descending, so a corrupt parent
+  chain cannot overflow the stack. The walk is recursive, but its depth is a constant.
+- **Scrollable.** `State.tree_offset` is the first painted row; the wheel moves it by
+  three rows and it clamps at both ends. Selecting an entity that is off screen
+  (`tree.indexOf`, a bounded search) centres the window on it, so a selection restored by
+  an undo or moved by a shortcut is never invisible.
+
+Underneath it, each node's children come from `Scene.childIdsInto(parent, out)`, which:
 
 - is **allocation-free** — a single scan of the scene's own records;
 - writes **ascending stable IDs**, so the tree does not depend on hash-map visit order;
+- keeps the **smallest** IDs when a node has more children than the buffer holds, and
+  `Scene.parentIdOf(id)` answers a row's parent without resolving the parent entity;
 - never overflows `out`, and when a node has more children than fit it keeps the
   **smallest** IDs, so the visible prefix is deterministic.
 
@@ -204,8 +222,13 @@ behaviour, not a workaround.
 - **The history is in-memory and per-session.** It is not persisted, and there is no
   "reopen and undo" — deliberate for now.
 - **No multi-select, no copy/paste, no grouping.**
-- **No scrolling in the tree.** Beyond `rows_per_frame` the hierarchy shows a hint;
-  the row budget is a bound, not a scroll model.
+- **No expand/collapse per node.** Every row of the visible window is painted; folding a
+  subtree is a state model (which IDs are collapsed, restored on reload) that the row
+  list does not carry yet. `State.roots_expanded` is the only fold.
+- **No keyboard tree navigation.** Clicking selects, the wheel scrolls; arrow keys and
+  Tab order are not wired.
+- **No create/rename/delete/reparent from the tree.** The commands exist in
+  `corex.editor.edit`; the tree has no context menu or inline editor for them yet.
 - **No drag/drop, no viewport camera controls, no gizmos.** The camera is whatever the
   scene authors.
 - **No keyboard focus traversal.** Clicking a row selects; Tab order is not

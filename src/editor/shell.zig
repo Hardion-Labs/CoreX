@@ -34,6 +34,7 @@ const theme_mod = @import("../gui/theme.zig");
 const widgets = @import("../gui/widgets.zig");
 const edit = @import("edit.zig");
 const inspector = @import("inspector.zig");
+const tree = @import("tree.zig");
 const scene_mod = @import("../scene/scene.zig");
 const render_scene = @import("../scene/render_scene.zig");
 
@@ -78,6 +79,9 @@ pub const State = struct {
     rows_per_frame: usize = 24,
     /// Expand/collapse state of the hierarchy root.
     roots_expanded: bool = true,
+    /// First tree row painted. Scrolling moves this, and selecting an entity that is off
+    /// screen moves it to bring that row back into view.
+    tree_offset: usize = 0,
     theme: Theme = .{},
     /// Set when the user clicked an entity this frame, so a caller can react
     /// (re-frame the camera, save the selection, ...) without diffing by hand.
@@ -197,20 +201,45 @@ fn drawHierarchy(ctx: *widgets.Context, state: *State, scene: anytype, rect: Rec
     const row_h: i32 = @intCast(theme.row_height);
     var stack = layout.Layout.init(content, .vertical);
 
-    // Depth-first from the roots, depth-limited by the row budget. A stack of
-    // (id, depth) pairs would be recursion; two parallel fixed arrays keep it flat.
-    var ids: [64]u64 = @splat(0);
-    const roots = scene.childIdsInto(null, &ids);
+    // How many rows the panel can hold, and therefore where the scroll window ends.
+    const visible = @max(@divTrunc(content.h, row_h), 0);
+    var rows: [tree.max_rows]tree.Row = undefined;
+    var list = tree.List{ .rows = &rows, .visible = @intCast(@min(visible, state.rows_per_frame)) };
+
+    // Keep the selection on screen before painting: a keyboard step or a restore can
+    // select an entity that the current window does not show.
+    revealSelection(state, scene, list.visible);
+
+    // Scrolling: the wheel moves by whole rows, and the offset is clamped so the panel
+    // cannot be scrolled into emptiness.
+    if (ctx.input.wheel != 0 and ctx.input.pointer_in_window and content.containsPoint(ctx.input.pointer)) {
+        const delta: usize = @intCast(@abs(ctx.input.wheel) * 3);
+        if (ctx.input.wheel < 0) {
+            state.tree_offset +|= delta;
+        } else {
+            state.tree_offset -|= delta;
+        }
+    }
+    list.offset = state.tree_offset;
+    tree.build(scene, &list);
+    // A wheel past the end must not leave the list scrolled into blank rows: the walk
+    // reports nothing visible, so pull the offset back to the last full window.
+    if (list.len == 0 and state.tree_offset > 0) {
+        state.tree_offset = 0;
+        list.offset = 0;
+        tree.build(scene, &list);
+    }
+
     var shown: usize = 0;
-    var r: usize = 0;
-    while (r < roots and shown < state.rows_per_frame) : (r += 1) {
-        shown += drawEntityRow(ctx, state, scene, &stack, ids[r], 0, row_h, content);
+    for (list.rows[0..list.len]) |row| {
+        const slot = stack.measure(.{ .w = content.w, .h = row_h });
+        if (slot.isEmpty()) break;
+        if (drawTreeRow(ctx, state, scene, slot, row, row_h, content)) shown += 1;
     }
 
     if (shown == 0) {
         _ = widgets.label(ctx, stack.measure(.{ .w = content.w, .h = @intCast(font.line_height) }), "(empty scene)");
-    }
-    if (shown >= state.rows_per_frame) {
+    } else if (tree.hasMore(list)) {
         const hint = stack.measure(.{ .w = content.w, .h = @intCast(font.line_height) });
         _ = text.draw(ctx.canvas, hint.x, hint.y, "more...", .{ .color = theme.text_muted, .clip = hint });
     }
@@ -219,54 +248,62 @@ fn drawHierarchy(ctx: *widgets.Context, state: *State, scene: anytype, rect: Rec
     ctx.blockBelow(rect);
 }
 
-/// One row, recursing into its children. Returns the number of rows drawn.
-fn drawEntityRow(
+/// Scroll the window so the selected row is inside it, if the selection is far enough out
+/// to need it. One bounded search per frame only when the selection is not visible.
+fn revealSelection(state: *State, scene: anytype, visible: usize) void {
+    if (state.selected == 0 or visible == 0) return;
+    var rows: [tree.max_rows]tree.Row = undefined;
+    var list = tree.List{ .rows = &rows, .visible = visible, .offset = state.tree_offset };
+    tree.build(scene, &list);
+    for (list.rows[0..list.len]) |row| {
+        if (row.id == state.selected) return;
+    }
+    // Not in the window: ask the whole tree where it is and centre it.
+    const line = tree.indexOf(scene, state.selected, tree.max_rows) orelse return;
+    state.tree_offset = line -| (visible / 2);
+}
+
+/// One tree row: hit area, selection highlight and the indented name.
+///
+/// A single flat function, driven by `tree.Row`, instead of a recursion that re-derives
+/// depth on every level: the row list already knows the depth, and painting must not be
+/// allowed to descend into a branch the window has cut off.
+fn drawTreeRow(
     ctx: *widgets.Context,
     state: *State,
     scene: anytype,
-    stack: *layout.Layout,
-    id: u64,
-    depth: usize,
+    slot: Rect,
+    row: tree.Row,
     row_h: i32,
     content: Rect,
-) usize {
+) bool {
+    _ = content;
     const theme = ctx.theme;
-    const entity = scene.entityById(id) orelse return 0;
-    const indent: i32 = @intCast(4 + depth * 8);
-    const row = stack.measure(.{ .w = content.w, .h = row_h });
-    if (row.isEmpty()) return 0;
+    const entity = scene.entityById(row.id) orelse return false;
+    const indent: i32 = @intCast(4 + @as(i32, @intCast(row.depth)) * 8);
+    const row_rect = Rect.init(slot.x, slot.y, slot.w, row_h);
 
-    const id_hash = Id.from(id, "tree");
-    const r = ctx.interact(id_hash, row);
-    const selected = state.selected == id;
+    const id_hash = Id.from(row.id, "tree");
+    const r = ctx.interact(id_hash, row_rect);
+    const selected = state.selected == row.id;
     if (selected) {
-        ctx.canvas.fillRect(row, theme.accent);
+        ctx.canvas.fillRect(row_rect, theme.accent);
     } else if (r.isHovered()) {
-        ctx.canvas.fillRect(row, theme.button_hover);
+        ctx.canvas.fillRect(row_rect, theme.button_hover);
     }
     if (r.clicked and !selected) {
-        state.selected = id;
+        state.selected = row.id;
         state.selection_changed = true;
     }
 
     const name = scene.nameOf(entity) orelse "(unnamed)";
-    const label_rect = Rect.init(row.x + indent, row.y, @max(row.w - indent, 0), row_h);
-    const y = row.y + @divTrunc(@max(row_h - @as(i32, @intCast(font.line_height)), 0), 2);
+    const label_rect = Rect.init(row_rect.x + indent, row_rect.y, @max(row_rect.w - indent, 0), row_h);
+    const y = row_rect.y + @divTrunc(@max(row_h - @as(i32, @intCast(font.line_height)), 0), 2);
     _ = text.draw(ctx.canvas, label_rect.x, y, name, .{
         .color = if (selected) theme.textOn(theme.accent) else theme.text,
         .clip = label_rect,
     });
-
-    // Count and draw children, until the frame's row budget is used.
-    var child_ids: [64]u64 = @splat(0);
-    const kids = scene.childIdsInto(id, &child_ids);
-    var drawn: usize = 1;
-    var i: usize = 0;
-    while (i < kids) : (i += 1) {
-        if (stack.cursor + row_h > stack.rect.h) break;
-        drawn += drawEntityRow(ctx, state, scene, stack, child_ids[i], depth + 1, row_h, content);
-    }
-    return drawn;
+    return true;
 }
 
 /// The inspector: the selected entity's name as an editable field, its stable ID, local
@@ -1268,4 +1305,99 @@ test "editor: the numeric fields follow the selection instead of the previous en
     h.runFrames(2);
     try testing.expectEqualStrings("0", h.state.transform_pos.fields[0].text());
     try testing.expectEqualStrings("1", h.state.transform_scale.fields[0].text());
+}
+
+test "editor: the hierarchy scrolls by the wheel and clamps at the ends" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    // Create more roots than the panel can show, so scrolling has somewhere to go.
+    var i: usize = 0;
+    while (i < 40) : (i += 1) {
+        const e = try h.scene.createEntity("row", null);
+        _ = e;
+    }
+    h.runFrames(2);
+
+    const dock = Dock.compute(h.ctx.canvas.bounds());
+    const x = dock.hierarchy.x + 20;
+    const y = dock.hierarchy.y + 40;
+    try testing.expectEqual(@as(usize, 0), h.state.tree_offset);
+
+    // Wheel down scrolls a few rows; the offset never exceeds what the tree holds.
+    h.frameInput(.{ .pointer = .{ .x = x, .y = y }, .pointer_in_window = true, .wheel = 1 }, &h.state);
+    try testing.expectEqual(@as(usize, 0), h.state.tree_offset); // wheel up at the top
+    h.frameInput(.{ .pointer = .{ .x = x, .y = y }, .pointer_in_window = true, .wheel = -1 }, &h.state);
+    try testing.expectEqual(@as(usize, 3), h.state.tree_offset);
+    h.frameInput(.{ .pointer = .{ .x = x, .y = y }, .pointer_in_window = true, .wheel = -1 }, &h.state);
+    try testing.expectEqual(@as(usize, 6), h.state.tree_offset);
+
+    // Wheel up walks back and stops at the first row rather than underflowing.
+    h.frameInput(.{ .pointer = .{ .x = x, .y = y }, .pointer_in_window = true, .wheel = 1 }, &h.state);
+    h.frameInput(.{ .pointer = .{ .x = x, .y = y }, .pointer_in_window = true, .wheel = 1 }, &h.state);
+    h.frameInput(.{ .pointer = .{ .x = x, .y = y }, .pointer_in_window = true, .wheel = 1 }, &h.state);
+    try testing.expectEqual(@as(usize, 0), h.state.tree_offset);
+}
+
+test "editor: the tree window follows the scroll offset and still selects" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    var ids: [40]u64 = @splat(0);
+    var i: usize = 0;
+    while (i < 40) : (i += 1) {
+        const e = try h.scene.createEntity("row", null);
+        ids[i] = h.scene.idOf(e).?;
+    }
+    h.runFrames(2);
+
+    // Scroll past the first rows and click the first painted row: it must select the
+    // entity at the new offset, not the tree's first entity.
+    h.state.tree_offset = 5;
+    h.runFrames(2);
+    const dock = Dock.compute(h.ctx.canvas.bounds());
+    const theme = h.state.theme;
+    const title_h = @as(i32, @intCast(font.line_height)) + 2 * theme.panel_padding.top + 1;
+    const row0_y = dock.hierarchy.y + title_h + theme.panel_padding.top + 1;
+    const x = dock.hierarchy.x + 20;
+    h.hover(x, row0_y);
+    h.click(x, row0_y);
+    h.release(x, row0_y);
+
+    // The row that was clicked is the first one the tree model paints at this offset,
+    // computed from the same model rather than guessed from the scene's creation order.
+    var rows: [tree.max_rows]tree.Row = undefined;
+    var list = tree.List{ .rows = &rows, .visible = 5, .offset = 5 };
+    tree.build(&h.scene, &list);
+    try testing.expect(list.len > 0);
+    try testing.expectEqual(list.rows[0].id, h.state.selected);
+}
+
+test "editor: selecting an entity that is off screen scrolls it into view" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    var ids: [40]u64 = @splat(0);
+    var i: usize = 0;
+    while (i < 40) : (i += 1) {
+        const e = try h.scene.createEntity("row", null);
+        ids[i] = h.scene.idOf(e).?;
+    }
+    h.runFrames(2);
+    try testing.expectEqual(@as(usize, 0), h.state.tree_offset);
+
+    // Selecting the last entity (a keyboard step, a restore) moves the window.
+    h.state.selected = ids[39];
+    h.runFrames(2);
+    try testing.expect(h.state.tree_offset > 0);
+
+    // And the window really contains it: a rebuild with the new offset shows that ID.
+    var rows: [tree.max_rows]tree.Row = undefined;
+    var list = tree.List{ .rows = &rows, .visible = 5, .offset = h.state.tree_offset };
+    tree.build(&h.scene, &list);
+    var found = false;
+    for (list.rows[0..list.len]) |row| {
+        if (row.id == ids[39]) found = true;
+    }
+    try testing.expect(found);
 }

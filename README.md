@@ -674,7 +674,7 @@ Indicative; subject to change as technical decisions are validated.
 - [x] GUI library foundation: built-in font, RGBA8 canvas, text, layout, immediate-mode widgets, headless frame renderer.
 - [x] Editor shell: docked hierarchy, scene viewport, inspector, status bar, headless frame renderer.
 - [x] Editor editing model: reversible commands, undo/redo, dirty tracking, atomic save.
-- [ ] Editor window and real input; rotation/camera fields, tree scrolling, gizmos, asset browser.
+- [ ] Editor window and real input; rotation/camera fields, per-node collapse, gizmos, asset browser.
 - [ ] Lua VM and gameplay scripting.
 - [ ] Native Module API loader (C++).
 - [ ] Runtime player and export system / Export Templates.
@@ -787,8 +787,9 @@ ctx.endFrame();
 The shell owns no scene, renderer or surface — all are borrowed for the frame — so the
 same call serves a headless tool, a test and, once the window layer exists, a windowed
 editor. Dock geometry (`shell.Dock.compute`) drops panels rather than letting the
-viewport vanish; the hierarchy reads entities through an allocation-free, sorted,
-bounded `Scene.childIdsInto`; the viewport samples the render with `Canvas.blitScaled`;
+viewport vanish; the hierarchy is a flat, allocation-free, bounded row list
+(`corex.editor.tree`) built on a sorted `Scene.childIdsInto`, with wheel scrolling and
+scroll-to-selection; the viewport samples the render with `Canvas.blitScaled`;
 and `shell.projectToViewport` reuses the renderer's own view-projection, so a marker
 cannot drift from the pixels.
 
@@ -806,7 +807,8 @@ one undoable step (`Escape` discards it); `Ctrl+Z` undo, `Ctrl+Y` / `Ctrl+Shift+
 
 Limits: no window or real input, rotation and camera fields are read-only (the model
 already carries `set_component`), the history is in-memory and not persisted, no field
-scrubbing, no tree scrolling, no gizmos or camera controls, fixed dock widths. See
+scrubbing, no per-node collapse or keyboard tree navigation, no gizmos or camera
+controls, fixed dock widths. See
 [`docs/editor-shell.md`](docs/editor-shell.md).
 
 ## Development

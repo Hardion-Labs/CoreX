@@ -8,107 +8,6 @@ declared yet.
 
 ### Added
 
-- Editable **position and scale** in the inspector (`src/editor/inspector.zig`, exposed
-  through `corex.editor.shell`), over the editing model.
-  - Three numeric fields per row, with parsing that refuses what a scene cannot hold
-    (empty, `abc`, `nan`, overflow to infinity) instead of deferring the failure to
-    serialization.
-  - A commit builds the whole `Transform` (edited row + untouched row) and sends **one**
-    `set_component`, so one undo steps back over the whole value and untouched axes are
-    never rewritten. Leaving a field after an edit commits; `Escape` reverts the row.
-  - Rows reload from the scene when the entity or the values change (undo, another
-    command, a selection change) but never while the user is typing.
-- `edit.componentIndexOf` and `edit.valueFor` — the shell names a component by **type**
-  and the schema decides which union arm that is; a schema without the component is a
-  compile error, not a runtime no-op.
-- `State.text_focused` — one flag for "an inspector field holds the keyboard", so frame
-  shortcuts cannot fire for any focused field. Fixes `Delete` inside a numeric field
-  deleting the selected entity.
-- Edit failures are no longer swallowed: a store the history refuses is reported on
-  stderr after the field is reverted.
-
-### Fixed
-
-- `inspector.Field.text()`/`parsed()` and `Row.values()` took `self` **by value**, so the
-  returned slice pointed at a temporary copy. They take a pointer now; the by-value
-  version could hand back garbage or a dead slice.
-- `Delete` while a numeric field had focus destroyed the selected entity (the shortcut
-  gate only knew about the name field).
-- Editor **editing model** (`src/editor/edit.zig`, exposed as `corex.editor.edit`), the
-  layer that turns the read-only inspector into an editor. Headless, renderer-free and
-  fully tested.
-  - **`Command(Scene)`** — six reversible operations as *plain values*, not closures:
-    `set_component`, `remove_component`, `rename`, `reparent`, `create`, `delete`. Each
-    names an entity by **stable ID**, never by the recyclable ECS handle, so a command
-    recorded earlier still names the right entity.
-  - **`History(Scene)`** — `apply` / `undo` / `redo` / `truncateRedo`,
-    `canUndo`/`canRedo`, `undoDepth`/`redoDepth`, `dirty`, `markSaved`. Undo is **exact
-    by snapshot**: the entity's full prior state (name, parent, every schema component)
-    is captured before the edit and restored by the inverse — one rule for all six
-    commands. Undoing a *delete* therefore restores the entity with its **original
-    stable ID**, its parent and its components, so a selection survives the round trip.
-  - **Failure changes nothing.** An invalid command records no entry and leaves the
-    scene untouched; a scene-level failure mid-apply is rolled back from the snapshot
-    taken immediately before.
-  - **`undo`/`redo` allocate nothing** (measured with a counting allocator), so binding
-    them to a key press inside a frame is safe.
-  - **`ValueUnion(schema)`** — a comptime union with one *typed* arm per schema
-    component, so a command carries a component's real type instead of a byte blob.
-  - **`saveScene`** — stages the serialized document in a dot-prefixed sibling and
-    renames it over the target, so an interrupted or failed save leaves the old project
-    intact instead of truncated. Success marks the project clean and **keeps** both
-    stacks; failure leaves it dirty.
-- **`Scene.createEntityWithExactId`, `Scene.setName`, `Scene.component_types` /
-  `Scene.component_count`** (`src/scene/scene.zig`) — what a restore needs: recreate an
-  entity with an ID that was previously in use, rename with an arena-owned copy, and
-  address a component by its schema position without naming its type.
-- **Editable inspector name** — the inspector's name row is a real text field: typing
-  edits a buffer, `Enter` commits a `rename` through the history, `Escape` discards it.
-  The status bar gained `*` (unsaved), `u<n>` (undo depth) and `r<n>` (redo depth).
-  Shortcuts: `Ctrl+Z` undo, `Ctrl+Y`/`Ctrl+Shift+Z` redo, `Delete` delete the selection,
-  `Escape` clear it — all routed through `shell.undo`/`redo`/`deleteSelected`, so a menu
-  or a test uses the same functions. A selection whose entity no longer resolves is
-  dropped instead of left pointing at nothing. A focused text field holds the keyboard,
-  so `Delete` never destroys an entity while a name is being typed.
-- **`gui.widgets.Context.keyPressed` / `claimTextInput`** — the two questions a focused
-  field and its host need from one frame's input.
-- **`tools/qoi_decode.zig`**, `zig build qoi-decode -- in.qoi out.rgba` — inspect a
-  headless frame without adding an image decoder to the library's surface.
-- `editor-frame` accepts an optional `dirty` argument and paints the status bar from a
-  real history.
-- Graphical editor *shell* (`src/editor/`, exposed as `corex.editor`) — one complete
-  editor frame painted with the engine's own GUI, over a session the startup pipeline
-  already prepared. It owns no scene, renderer or surface (all borrowed for the frame),
-  so the same call serves a headless tool, a test and a future windowed editor.
-  - **Docks** (`shell.Dock.compute`): hierarchy (left), scene viewport (centre),
-    inspector (right) and status bar (bottom), tiling the canvas with no gap or
-    overlap. Side panels are fixed width; a panel is admitted only if a viewport of at
-    least 60 px still fits — both, then the hierarchy alone, then neither, because an
-    editor without a viewport is not an editor.
-  - **Hierarchy**: depth-first rows, indented, clickable, keyed by stable entity ID
-    (survives handle recycling). Rows come from the new `Scene.childIdsInto`, an
-    allocation-free scan that writes **ascending** IDs, never overflows the caller's
-    buffer and keeps the smallest IDs when a node has more children than fit — so the
-    visible prefix does not depend on hash-map visit order. `Scene.rootIds` is now
-    defined in terms of it. A per-frame row budget bounds large scenes.
-  - **Viewport**: the scene is rendered by the engine's own renderer into its RGBA8
-    surface and sampled into the viewport with the new `Canvas.blitScaled` —
-    nearest-neighbour, clipped to both the destination and the canvas, so a viewport
-    smaller than the render is a downsample of the whole frame rather than a crop.
-    `shell.projectToViewport` maps a world point through the renderer's own
-    `view_projection`; a point at or behind the eye (`w <= 0`) or outside the clip
-    volume returns null instead of landing on the wrong side of the screen.
-  - **Inspector**: name, stable ID, transform, renderable handles, camera fov and
-    parent, read from the scene and clipped per column. Read-only by design: editing
-    needs undo/redo, dirty tracking and write-back, which is its own step.
-  - **Status bar**: project, scene, command/draw counts, pixels and viewport size, all
-    taken from the renderer's own report. ASCII only — the built-in font draws anything
-    else as `?`, which the first render of this bar made obvious.
-  - **`tools/editor_frame.zig`** + `zig build editor-frame -- <project> out.qoi`: runs
-    the documented startup pipeline, renders one frame of the project through
-    `EngineRenderer`, paints the editor around it and writes it as QOI (preview in the
-    README).
-
 - Built-in GUI foundation (`src/gui/`, exposed as `corex.gui`) — the layer the
   graphical editor will sit on. No window, no system font, no external toolkit:
   everything paints into a caller-owned RGBA8 buffer in the same layout as
@@ -416,9 +315,125 @@ declared yet.
   free of an asset-layer dependency. Startup step 7 now selects and logs the tier
   and fails the session when the tier has no backend; the launch summary prints
   the selected tier.
+- **Hierarchy row model** (`src/editor/tree.zig`, `corex.editor.tree`) and **wheel
+  scrolling** in the tree.
+  - `tree.build(scene, list)` produces a **flat, caller-owned** list of
+    `Row{id, depth}` for the visible window: no allocation per frame, work bounded by the
+    panel height (not by scene size), depth capped at `max_depth = 32` so a corrupt
+    parent chain cannot overflow the stack.
+  - `State.tree_offset` scrolls the window; the wheel moves it by three rows and clamps
+    at both ends. `tree.indexOf` finds a row's line with a bounded search, and selecting
+    an entity that is off screen centres the window on it — so a selection restored by
+    undo or moved by a shortcut is never invisible.
+  - Painting is now one flat loop over the row list instead of a recursion that
+    re-derived depth at every level and could descend past the window.
+- `Scene.parentIdOf(id)` — an entity's parent ID without resolving the parent entity, so
+  a tree walk costs one lookup per row instead of two.
+- `corex.editor.inspector` is now exported from `corex.editor` alongside `tree`.
+- Editable **position and scale** in the inspector (`src/editor/inspector.zig`, exposed
+  through `corex.editor.shell`), over the editing model.
+  - Three numeric fields per row, with parsing that refuses what a scene cannot hold
+    (empty, `abc`, `nan`, overflow to infinity) instead of deferring the failure to
+    serialization.
+  - A commit builds the whole `Transform` (edited row + untouched row) and sends **one**
+    `set_component`, so one undo steps back over the whole value and untouched axes are
+    never rewritten. Leaving a field after an edit commits; `Escape` reverts the row.
+  - Rows reload from the scene when the entity or the values change (undo, another
+    command, a selection change) but never while the user is typing.
+- `edit.componentIndexOf` and `edit.valueFor` — the shell names a component by **type**
+  and the schema decides which union arm that is; a schema without the component is a
+  compile error, not a runtime no-op.
+- `State.text_focused` — one flag for "an inspector field holds the keyboard", so frame
+  shortcuts cannot fire for any focused field. Fixes `Delete` inside a numeric field
+  deleting the selected entity.
+- Edit failures are no longer swallowed: a store the history refuses is reported on
+  stderr after the field is reverted.
+- Graphical editor *shell* (`src/editor/`, exposed as `corex.editor`) — one complete
+  editor frame painted with the engine's own GUI, over a session the startup pipeline
+  already prepared. It owns no scene, renderer or surface (all borrowed for the frame),
+  so the same call serves a headless tool, a test and a future windowed editor.
+  - **Docks** (`shell.Dock.compute`): hierarchy (left), scene viewport (centre),
+    inspector (right) and status bar (bottom), tiling the canvas with no gap or
+    overlap. Side panels are fixed width; a panel is admitted only if a viewport of at
+    least 60 px still fits — both, then the hierarchy alone, then neither, because an
+    editor without a viewport is not an editor.
+  - **Hierarchy**: depth-first rows, indented, clickable, keyed by stable entity ID
+    (survives handle recycling). Rows come from the new `Scene.childIdsInto`, an
+    allocation-free scan that writes **ascending** IDs, never overflows the caller's
+    buffer and keeps the smallest IDs when a node has more children than fit — so the
+    visible prefix does not depend on hash-map visit order. `Scene.rootIds` is now
+    defined in terms of it. A per-frame row budget bounds large scenes.
+  - **Viewport**: the scene is rendered by the engine's own renderer into its RGBA8
+    surface and sampled into the viewport with the new `Canvas.blitScaled` —
+    nearest-neighbour, clipped to both the destination and the canvas, so a viewport
+    smaller than the render is a downsample of the whole frame rather than a crop.
+    `shell.projectToViewport` maps a world point through the renderer's own
+    `view_projection`; a point at or behind the eye (`w <= 0`) or outside the clip
+    volume returns null instead of landing on the wrong side of the screen.
+  - **Inspector**: name, stable ID, transform, renderable handles, camera fov and
+    parent, read from the scene and clipped per column. Read-only by design: editing
+    needs undo/redo, dirty tracking and write-back, which is its own step.
+  - **Status bar**: project, scene, command/draw counts, pixels and viewport size, all
+    taken from the renderer's own report. ASCII only — the built-in font draws anything
+    else as `?`, which the first render of this bar made obvious.
+  - **`tools/editor_frame.zig`** + `zig build editor-frame -- <project> out.qoi`: runs
+    the documented startup pipeline, renders one frame of the project through
+    `EngineRenderer`, paints the editor around it and writes it as QOI (preview in the
+    README).
+- Editor **editing model** (`src/editor/edit.zig`, exposed as `corex.editor.edit`), the
+  layer that turns the read-only inspector into an editor. Headless, renderer-free and
+  fully tested.
+  - **`Command(Scene)`** — six reversible operations as *plain values*, not closures:
+    `set_component`, `remove_component`, `rename`, `reparent`, `create`, `delete`. Each
+    names an entity by **stable ID**, never by the recyclable ECS handle, so a command
+    recorded earlier still names the right entity.
+  - **`History(Scene)`** — `apply` / `undo` / `redo` / `truncateRedo`,
+    `canUndo`/`canRedo`, `undoDepth`/`redoDepth`, `dirty`, `markSaved`. Undo is **exact
+    by snapshot**: the entity's full prior state (name, parent, every schema component)
+    is captured before the edit and restored by the inverse — one rule for all six
+    commands. Undoing a *delete* therefore restores the entity with its **original
+    stable ID**, its parent and its components, so a selection survives the round trip.
+  - **Failure changes nothing.** An invalid command records no entry and leaves the
+    scene untouched; a scene-level failure mid-apply is rolled back from the snapshot
+    taken immediately before.
+  - **`undo`/`redo` allocate nothing** (measured with a counting allocator), so binding
+    them to a key press inside a frame is safe.
+  - **`ValueUnion(schema)`** — a comptime union with one *typed* arm per schema
+    component, so a command carries a component's real type instead of a byte blob.
+  - **`saveScene`** — stages the serialized document in a dot-prefixed sibling and
+    renames it over the target, so an interrupted or failed save leaves the old project
+    intact instead of truncated. Success marks the project clean and **keeps** both
+    stacks; failure leaves it dirty.
+- **`Scene.createEntityWithExactId`, `Scene.setName`, `Scene.component_types` /
+  `Scene.component_count`** (`src/scene/scene.zig`) — what a restore needs: recreate an
+  entity with an ID that was previously in use, rename with an arena-owned copy, and
+  address a component by its schema position without naming its type.
+- **Editable inspector name** — the inspector's name row is a real text field: typing
+  edits a buffer, `Enter` commits a `rename` through the history, `Escape` discards it.
+  The status bar gained `*` (unsaved), `u<n>` (undo depth) and `r<n>` (redo depth).
+  Shortcuts: `Ctrl+Z` undo, `Ctrl+Y`/`Ctrl+Shift+Z` redo, `Delete` delete the selection,
+  `Escape` clear it — all routed through `shell.undo`/`redo`/`deleteSelected`, so a menu
+  or a test uses the same functions. A selection whose entity no longer resolves is
+  dropped instead of left pointing at nothing. A focused text field holds the keyboard,
+  so `Delete` never destroys an entity while a name is being typed.
+- **`gui.widgets.Context.keyPressed` / `claimTextInput`** — the two questions a focused
+  field and its host need from one frame's input.
+- **`tools/qoi_decode.zig`**, `zig build qoi-decode -- in.qoi out.rgba` — inspect a
+  headless frame without adding an image decoder to the library's surface.
+- `editor-frame` accepts an optional `dirty` argument and paints the status bar from a
+  real history.
 
 ### Fixed
 
+- `inspector.Field.text()`/`parsed()` and `Row.values()` took `self` **by value**, so the
+  returned slice pointed at a temporary copy. They take a pointer now; the by-value
+  version could hand back garbage or a dead slice.
+- `Delete` while a numeric field had focus destroyed the selected entity (the shortcut
+  gate only knew about the name field).
+- The hierarchy's "more..." hint could appear on a full window with nothing after it;
+  the walk now records whether a row exists past the window (`List.more`).
+- Scrolling past the end left the panel showing blank rows; the offset is pulled back to
+  the last full window when the walk returns nothing.
 - Two `@memcpy` aliasing panics in the save path (a `bufPrint` whose format embedded its
   own buffer, and an overlapping field-buffer copy) — replaced by a second buffer and a
   backward copy.
