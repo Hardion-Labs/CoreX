@@ -105,6 +105,14 @@ continuation. Newest cycle first.
 `EngineRenderer.render` repeatedly with owned colour/depth buffers and a
 per-frame allocator hand-off (then asset upload/eviction and CXTX mips).
 
+**Merged:** PR **#41** → `main` `fd45a92`, CI green (`Build & test (Zig 0.17.0)`
+pass, 24 s). Re-tested on the merge: clean `.zig-cache`, **707/707** on `main`.
+Note for continuation: `origin/main` was re-rooted onto an identical tree (Arena
+replays the branch history), so `main` and this branch shared no common ancestor
+and every file showed as an add/add conflict despite **zero** tree difference
+(`git diff --stat 3893758 7328182` empty). The merge was done with `-s ours` —
+the correct result for identical content, no file lost.
+
 **Integration:** startup step 6/7 → `EngineRenderScene.load` → `planSlots` +
 `loadAssets` → `findCamera` → `renderSceneFrame` → `pipeline.renderFrame` →
 `SoftwareBackend` → rasterizer. `render` still depends on no asset code; only
