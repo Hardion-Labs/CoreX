@@ -63,6 +63,11 @@ cycle makes that a mode instead of a limitation.
 
 Suite: **741/741** (was 734; 7 new), `zig fmt --check src tools build.zig` clean.
 
+**Merged:** PR **#51** → `main` `8b1c2ec`, CI green (`Build & test (Zig 0.17.0)`, 31 s).
+Post-merge re-test on `main` in a clean worktree with a cleared cache: **741/741**,
+`zig fmt --check` clean, `zig build` OK, headless smoke prints the assets and frame
+lines unchanged.
+
 **Two bugs found while validating, both in my own first attempt:**
 
 1. I first took the long axis from the *x* column unconditionally and the anisotropy
