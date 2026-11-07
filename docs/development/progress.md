@@ -4,6 +4,13 @@ Permanent record of real progress, decisions, pending items and the next priorit
 task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
+**Current state:** Branch `arena/77f8b78f-corex` active. Commit `6b83ebf` merges
+cycles (z) Home/End/PageUp/PageDown tree navigation and sibling ordering
+(move_up/move_down). Zig is not installed in this sandbox so `zig build`/`zig
+test` could not be re-run here; validation was done in a prior session
+(940/941 tests pass, 1 pre-existing stream allocation test sensitive to Scene
+struct size). Window/swapchain remains blocked in this sandbox.
+
 ## Cycle 2026-11-07 — Sibling ordering in the entity tree (move_up/move_down)
 
 **Diagnosis first.** Children of the same parent were painted in ascending stable-ID
