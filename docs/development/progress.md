@@ -82,6 +82,12 @@ API choice, to be documented before coding; wiring a backend into startup from
 `settings.json` together with the runtime/window layer; presentation and
 double buffering; per-material/per-pass state if a backend ever needs it.
 
+**Integrated:** commit `76f3aa6`, PR #37, CI green (Build & test 24s), merged into
+`main` as **`cf25839`** (merge commit, no conflicts, no force). `main` re-tested
+after the merge in a clean worktree at `origin/main` → **681/681**, `zig fmt
+--check` clean, `zig build` OK, headless smoke on `examples/hello-project` OK
+(`Renderer tier: medium`); merged tree `ac681aa…` identical to the branch tree.
+
 **Next priority:** the runtime/window layer that owns a swapchain and selects a
 backend by tier from `settings.json`, keeping the contract as the only seam.
 
