@@ -81,6 +81,11 @@ the pending "asset upload/eviction and CXTX mips" entry.
 16.574 ms/frame, `Assets uploaded: … 484 bytes`; Debug suite **734/734**; `zig build`
 OK; `zig fmt --check` clean.
 
+**Merged:** PR **#49** → `main` `657bd0b`, CI green (`Build & test (Zig 0.17.0)`, 22 s).
+Post-merge re-test on `main` in a clean worktree: **734/734**, `zig fmt --check` clean,
+`zig build` OK, `--frames 5` → `Assets uploaded: 1 meshes, 0 textures (0 mipmapped), 0
+skipped, 144 bytes` and the frame line unchanged.
+
 **Pending:** window/surface backend, swapchain, vsync (still blocked here); a texture
 budget / automatic residency policy once a GPU backend exists; `CXTX` levels if
 authoring-time mips ever beat the deterministic filter; input/event loop; GUI/editor.
