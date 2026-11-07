@@ -152,6 +152,26 @@ comparing lists. The comparison is **field by field** (`commandsEqual`), not a b
 compare: `DrawCommand` has padding the compiler may leave undefined, so a byte
 compare reports a change between two frames identical in every field that is read.
 
+### Where a frame's memory comes from
+
+Extraction needs a world-transform snapshot per frame: two arrays, two lookup maps
+and three work arrays, all thrown away before it returns. Those come from a
+**scratch arena** owned by `RenderFrame` and reset once per `refill`
+(`extractIntoScratch(list_gpa, scratch)`), while the draw-list buffers stay in the
+general-purpose allocator because they persist across frames. `refill` then reports
+`allocated_last_frame`: false means the frame asked the general allocator for
+nothing. A counting-allocator test asserts exactly that (0 calls, 0 bytes), and the
+positive case — a scene that grows — simply grows the arena.
+
+Two consequences worth knowing:
+
+- A frame reaches its steady state after **two** passes, because `refill` extracts
+  into the spare buffer: both buffers must have grown once. That is the price of
+  comparing this frame with the last, paid twice per session.
+- `changed` (content) and `allocated` (memory) are independent facts. A frame can be
+  identical in content and still allocate once while a buffer grows to the size the
+  scene now needs.
+
 ## Authoring and driving a frame
 
 `corex.scene.render_scene` (see [scene-format.md](scene-format.md) for the file

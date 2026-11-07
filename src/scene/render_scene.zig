@@ -160,8 +160,12 @@ pub const EngineFrameReport = struct {
     draws: usize = 0,
     skipped: usize = 0,
     pixels: usize = 0,
-    /// The new draw list is byte-identical to the previous frame's.
+    /// The new draw list is field-identical to the previous frame's.
     unchanged: bool = false,
+    /// Whether this frame changed (and grew) the reusable buffers. A steady-state
+    /// frame is `false`: the draw list came out of the double buffer and the
+    /// world-transform snapshot out of the per-frame arena.
+    allocated: bool = false,
 };
 
 /// A camera found in a scene: the entity, its authored lens and the view the lens
@@ -230,6 +234,10 @@ pub const EngineRenderer = struct {
             .draws = report.stats.draws,
             .skipped = report.stats.skipped,
             .pixels = report.stats.pixels,
+            .allocated = self.frame.allocated_last_frame,
+            // Two independent facts: did the content change, and did emitting it
+            // cost memory. A frame can be identical in content and still allocate
+            // once, when a buffer grows to the size the scene needs.
             .unchanged = !refilled.changed,
         };
         return report;
@@ -958,6 +966,15 @@ test "render_scene: the renderer frames a scene through its own camera" {
 
     // Zero-sized surfaces are refused rather than rendering nothing silently.
     try testing.expectError(error.InvalidSurface, engine.renderSceneFrame(&scene, .{ .width = 0, .height = 10 }, table.resources(true), .{}));
+
+    // The per-frame hand-off, end to end: the first frames grow the buffers and the
+    // scratch arena, and from then on the same scene renders without allocating.
+    try testing.expect(engine.last.allocated);
+    _ = (try engine.renderSceneFrame(&scene, .{ .width = 24, .height = 18 }, table.resources(true), .{ .antialias = .none })).?;
+    const settled = (try engine.renderSceneFrame(&scene, .{ .width = 24, .height = 18 }, table.resources(true), .{ .antialias = .none })).?;
+    try testing.expect(!engine.last.allocated);
+    try testing.expect(engine.last.unchanged);
+    try testing.expectEqual(@as(usize, 1), settled.commands);
 
     // Two camera entities: the first (lowest stable ID) frames the view, so the
     // outcome does not depend on hash-map iteration order.

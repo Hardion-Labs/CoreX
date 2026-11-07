@@ -4,6 +4,64 @@ Permanent record of real progress, decisions, pending items and the next priorit
 task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
+## Cycle 2026-11-07 (a) — Merge cleanup, stale-branch sweep, per-frame allocator hand-off
+
+**Delivered (validated):**
+
+- **Housekeeping requested by the user**, nothing merged blindly:
+  - No PR was open (all 42 merged), so nothing to merge.
+  - The 12 remaining remote `arena/*` branches were each verified as **merged**
+    (`gh pr list --state all --head <branch>` → all `MERGED`) *and* empty against
+    `main` (`git diff --stat origin/main..origin/<branch>` → nothing). Deleted all
+    12; the remote now holds only `main` (plus this session's branch).
+  - `main` (`1e6e71f`, PR #42) re-validated in a separate worktree: **707/707**
+    Debug, **707/707** ReleaseFast, `zig fmt --check` clean, `zig build` OK,
+    headless smoke prints the frame line, CI green on `main`.
+- **Per-frame allocator hand-off** (`src/render/draw.zig`):
+  - `RenderFrame` owns a `std.heap.ArenaAllocator` reset once per `refill`
+    (`.retain_capacity`), and `extractIntoScratch(out, scene, cam, mode, list_gpa,
+    scratch)` splits "the list that survives the frame" from "the snapshot that does
+    not". `extractInto` is now the same call with one allocator.
+  - `RenderFrame.allocated_last_frame` records whether the frame had to allocate
+    (scratch capacity or spare-list capacity grew); `EngineFrameReport.allocated`
+    carries it out of `EngineRenderer.render`.
+  - `unchanged` (content) and `allocated` (memory) are deliberately **independent**:
+    a frame can be content-identical and still allocate once while a buffer grows to
+    the size the scene now needs. Conflating them broke an existing test — the test
+    was right.
+- Docs: CHANGELOG, `render-extraction.md` (where a frame's memory comes from + the
+  two consequences), `render-backend.md` (limitations: drive `render`, own the
+  surface), this log.
+
+**Validation:**
+
+- `zig build test --summary all` → **708/708** (clean `.zig-cache`); **708/708** with
+  `-Doptimize=ReleaseFast`; `zig fmt --check src build.zig` clean; `zig build` OK;
+  headless smoke unchanged (`Frame: 1280x720 medium (1 commands, 1 draws, 0 skipped,
+  43264 pixels, 0 culled)`).
+- New test `RenderFrame: a steady-state frame takes no allocation from the general
+  allocator`: a wrapping allocator counts bytes/calls and asserts **0/0** on the
+  third refill of an unchanged scene, then grows the scene to 68 renderables and
+  confirms it still renders. Second assertion added to the `EngineRenderer` test:
+  first frame `allocated == true`, settled frames `allocated == false`.
+
+**Errors found and fixed:**
+
+- The steady-state assertion initially failed with "expected 0, found 2" *by
+  design*, not by bug: `refill` extracts into the spare buffer, so both buffers need
+  one warm-up pass. The test now warms twice and documents why, which is the honest
+  shape of a double-buffered frame.
+- First attempt folded "did it allocate" into `unchanged`, which made an existing
+  renderer test expect `unchanged == false` on an identical frame. Split into two
+  fields — a frame's content and its memory cost are different questions.
+- Toolchain: this sandbox had no Zig; installed `ziglang==0.17.1` from PyPI
+  (`0.17.0` is yanked/missing its binary). CI still pins 0.17.0 and is green, so the
+  engine does not depend on the patch version.
+
+**Next priority:** presentation — a window + event loop driving
+`EngineRenderer.render` with owned colour/depth and the now-implemented per-frame
+arena (then asset upload/eviction and CXTX mips).
+
 ## Cycle 2026-11-06 (f) — A scene file renders: renderable schema, asset layout, headless frame
 
 **Delivered (validated):**

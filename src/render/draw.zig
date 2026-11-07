@@ -76,8 +76,19 @@ pub const RenderFrame = struct {
     /// apart from the views so every free uses the length that was allocated.
     active: []DrawCommand,
     spare: []DrawCommand,
+    /// Whether the last `refill` had to allocate (draw list or scratch arena).
+    /// Exposed so a frame loop can report "this frame was free" instead of guessing;
+    /// a steady-state frame sets it to false.
+    allocated_last_frame: bool = false,
+    /// The per-frame allocator hand-off: every transient allocation of a frame
+    /// (the world-transform snapshot and its work arrays) comes from here and is
+    /// released by one `reset` per `refill`, so a steady-state frame never touches
+    /// the general-purpose allocator. The draw-list buffers themselves live in
+    /// `gpa` because they persist across frames.
+    scratch: std.heap.ArenaAllocator,
 
     pub fn deinit(self: *RenderFrame) void {
+        self.scratch.deinit();
         self.gpa.free(self.active);
         self.gpa.free(self.spare);
         self.* = undefined;
@@ -88,7 +99,15 @@ pub const RenderFrame = struct {
     pub fn init(gpa: Allocator) !RenderFrame {
         const empty = try gpa.alloc(DrawCommand, 0);
         errdefer gpa.free(empty);
-        return .{ .gpa = gpa, .commands = empty, .culled = 0, .active = empty, .spare = try gpa.alloc(DrawCommand, 0) };
+        return .{
+            .gpa = gpa,
+            .commands = empty,
+            .culled = 0,
+            .active = empty,
+            .spare = try gpa.alloc(DrawCommand, 0),
+            .allocated_last_frame = false,
+            .scratch = std.heap.ArenaAllocator.init(gpa),
+        };
     }
 
     /// Refill this frame in place, reusing the existing buffers.
@@ -113,9 +132,16 @@ pub const RenderFrame = struct {
     ) !struct { culled: usize, changed: bool } {
         var next: std.ArrayList(DrawCommand) = .fromOwnedSlice(self.spare);
         next.capacity = self.spare.len;
-        // `extractInto` clears the list first, so the spare's previous contents
-        // are never read; only its capacity is reused.
-        const culled = try extractInto(&next, scene, cam, mode, self.gpa);
+        // One reset per frame is the whole point of the hand-off: everything the
+        // previous frame borrowed from the scratch arena is released at once, and a
+        // frame that needs no more memory than last time allocates nothing.
+        const scratch_before = self.scratch.queryCapacity();
+        const list_capacity_before = next.capacity;
+        _ = self.scratch.reset(.retain_capacity);
+        // `extractIntoScratch` clears the list first, so the spare's previous
+        // contents are never read; only its capacity is reused.
+        const culled = try extractIntoScratch(&next, scene, cam, mode, self.gpa, self.scratch.allocator());
+        self.allocated_last_frame = self.scratch.queryCapacity() != scratch_before or next.capacity != list_capacity_before;
         const changed = self.culled != culled or !commandsEqual(next.items, self.commands);
         // `next.items` was just written, so the comparison above must happen
         // before the swap; afterwards the old active buffer becomes the spare.
@@ -194,6 +220,8 @@ pub fn extractDrawList(scene: anytype, cam: Camera, mode: SortMode, gpa: Allocat
         .culled = culled,
         .active = owned,
         .spare = try gpa.alloc(DrawCommand, 0),
+        .allocated_last_frame = false,
+        .scratch = std.heap.ArenaAllocator.init(gpa),
     };
 }
 
@@ -213,10 +241,29 @@ pub fn extractInto(
     mode: SortMode,
     gpa: Allocator,
 ) !usize {
+    return extractIntoScratch(out, scene, cam, mode, gpa, gpa);
+}
+
+/// `extractInto`, but with the transient per-frame work taken from `scratch`.
+///
+/// The draw list itself grows in `list_gpa` (it survives the frame), while the
+/// world-transform snapshot — a matrix array, an entity array, two lookup maps and
+/// three work arrays, all thrown away before this function returns — comes from
+/// `scratch`. A frame loop hands in an arena and resets it once per frame, so a
+/// steady-state frame allocates nothing at all from the general-purpose allocator.
+/// Passing the same allocator for both is exactly `extractInto`.
+pub fn extractIntoScratch(
+    out: *std.ArrayList(DrawCommand),
+    scene: anytype,
+    cam: Camera,
+    mode: SortMode,
+    list_gpa: Allocator,
+    scratch: Allocator,
+) !usize {
     out.clearRetainingCapacity();
     errdefer out.clearRetainingCapacity();
 
-    var wt = try scene.computeWorldTransforms(gpa);
+    var wt = try scene.computeWorldTransforms(scratch);
     defer wt.deinit();
 
     const frustum = culling.Frustum.fromMat4(cam.view_projection);
@@ -233,7 +280,7 @@ pub fn extractInto(
             continue;
         }
         const view_center = transform.transformPoint(cam.view, world_bounds.center);
-        try out.append(gpa, .{
+        try out.append(list_gpa, .{
             .entity = e,
             .mesh = rend.mesh,
             .material = rend.material,
@@ -440,4 +487,106 @@ test "extract: survives every allocation failure without leaking" {
             frame.deinit();
         }
     }.f, .{});
+}
+
+/// A counting allocator wrapper: how many bytes a stretch of code asked the
+/// general-purpose allocator for. Used to prove the per-frame hand-off works.
+const Counter = struct {
+    parent: Allocator,
+    bytes: usize = 0,
+    calls: usize = 0,
+
+    fn allocator(self: *Counter) Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *Counter = @ptrCast(@alignCast(ctx));
+        const out = self.parent.rawAlloc(len, alignment, ret_addr) orelse return null;
+        self.bytes += len;
+        self.calls += 1;
+        return out;
+    }
+
+    fn resize(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *Counter = @ptrCast(@alignCast(ctx));
+        if (self.parent.rawResize(buf, alignment, new_len, ret_addr)) {
+            self.bytes += new_len -| buf.len;
+            self.calls += 1;
+            return true;
+        }
+        return false;
+    }
+
+    fn remap(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *Counter = @ptrCast(@alignCast(ctx));
+        const out = self.parent.rawRemap(buf, alignment, new_len, ret_addr) orelse return null;
+        self.bytes += new_len -| buf.len;
+        self.calls += 1;
+        return out;
+    }
+
+    fn free(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *Counter = @ptrCast(@alignCast(ctx));
+        self.parent.rawFree(buf, alignment, ret_addr);
+    }
+};
+
+test "RenderFrame: a steady-state frame takes no allocation from the general allocator" {
+    // The per-frame hand-off, stated as a property: after a warm-up frame has grown
+    // the draw list and the scratch arena to the size this scene needs, refilling
+    // the same scene asks the general-purpose allocator for nothing at all — the
+    // world-transform snapshot comes from the arena, which one reset per frame
+    // releases.
+    const gpa = testing.allocator;
+    var counter = Counter{ .parent = gpa };
+    const counting = counter.allocator();
+
+    var s = try TestScene.init(gpa, "main");
+    defer s.deinit();
+    for (0..4) |i| {
+        var buf: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&buf, "e{d}", .{i});
+        const e = try s.createEntity(name, null);
+        try s.addComponent(e, components.Transform{ .position = .{ @as(f32, @floatFromInt(i)), 0, 0 } });
+        try s.addComponent(e, Renderable{ .mesh = @intCast(i + 1) });
+    }
+
+    var frame = try RenderFrame.init(counting);
+    defer frame.deinit();
+
+    // Warm-up: this frame is allowed to allocate (the buffers and the arena grow).
+    // Two passes, not one: `refill` extracts into the *spare* buffer, so a
+    // double-buffered frame reaches its steady size only after both buffers have
+    // been grown once. That is the honest cost of comparing this frame with the
+    // last, and it is paid twice per session, never per frame.
+    const warm = try frame.refill(&s, testCamera(), .front_to_back);
+    try testing.expectEqual(@as(usize, 4), frame.commands.len);
+    _ = try frame.refill(&s, testCamera(), .front_to_back);
+
+    // Steady state: same scene, same camera. Nothing new may be requested.
+    counter.bytes = 0;
+    counter.calls = 0;
+    const steady = try frame.refill(&s, testCamera(), .front_to_back);
+    try testing.expectEqual(@as(usize, 0), counter.calls);
+    try testing.expectEqual(@as(usize, 0), counter.bytes);
+    try testing.expectEqual(warm.culled, steady.culled);
+    try testing.expect(!steady.changed);
+    try testing.expectEqual(@as(usize, 4), frame.commands.len);
+
+    // A scene that outgrows the arena still renders: the arena simply grows.
+    for (0..64) |i| {
+        var buf: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&buf, "g{d}", .{i});
+        const e = try s.createEntity(name, null);
+        try s.addComponent(e, components.Transform{ .position = .{ 0, @as(f32, @floatFromInt(i)) * 0.01, 0 } });
+        try s.addComponent(e, Renderable{ .mesh = 7 });
+    }
+    _ = try frame.refill(&s, testCamera(), .front_to_back);
+    try testing.expectEqual(@as(usize, 68), frame.commands.len);
 }

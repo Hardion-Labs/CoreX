@@ -248,10 +248,14 @@ Presentation — a window, a swapchain, a frame loop — is still the next layer
   prints its accounting, but no window, swapchain or frame loop exists: there is no
   per-frame content on screen yet, and colour/depth are allocated per frame instead
   of being owned by a loop.
-- **One frame in, one frame out.** No sub-frame pipelining, no double buffering,
-  no per-pass API; `renderScene` extracts and draws in one call and allocates the
-  draw list per call (a per-frame allocator hand-off is the obvious next step once
-  a loop owns the memory).
+- **One frame in, one frame out.** No sub-frame pipelining and no per-pass API;
+  `renderScene` extracts and draws in one call. A frame loop should drive
+  `EngineRenderer.render` (reusable draw list + per-frame scratch arena, so a
+  steady-state frame allocates nothing) rather than `renderScene`, which allocates
+  its draw list per call.
+- **The surface is the caller's.** Colour and depth are owned by whoever renders;
+  the engine binary allocates them per headless frame because it has no loop to own
+  them. A window layer will keep one pair and clear once per frame.
 - **Resource table is manual.** Slots are bound by the caller; there is no
   automatic upload/eviction from the asset index, and no mip generation for `CXTX`
   textures (the artifact carries no levels yet).
