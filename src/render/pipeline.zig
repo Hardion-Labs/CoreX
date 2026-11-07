@@ -110,6 +110,11 @@ pub const FrameParams = struct {
     /// Frame-wide refinement of the mip choice. A material can override it through
     /// the resource provider's `sampling()`; the default biases nothing.
     sampling: raster.Sampling = .{},
+    /// Extraction-time occlusion culling. `null` (the default) keeps the frustum-only
+    /// extraction exactly as it was; `.{}` enables the pass with its default grid.
+    /// It can only remove geometry that is provably hidden, so the pixels of every
+    /// kept draw are identical either way — this is a cost knob, not a look knob.
+    occlusion: ?draw.Occlusion = null,
     /// Edge antialiasing. Coerced to `.none` when the tier lacks it.
     antialias: raster.Antialias = .edge,
     /// Directional Lambert light, applied when the tier has lighting.
@@ -129,6 +134,8 @@ pub const FrameReport = struct {
     commands: usize,
     /// Commands the extraction layer culled, when `renderScene` produced the list.
     culled: usize,
+    /// Of those, how many the occlusion pass rejected (zero without it).
+    occlusion_culled: usize = 0,
     /// Backend frame statistics.
     stats: backend.FrameStats,
     /// The frame options that were accepted, after the tier coercion. Useful for
@@ -140,6 +147,7 @@ pub const FrameReport = struct {
             .tier = self.tier,
             .commands = self.commands,
             .culled = self.culled,
+            .occlusion_culled = self.occlusion_culled,
             .drawn = self.stats.draws,
             .skipped = self.stats.skipped,
             .pixels = self.stats.pixels,
@@ -153,6 +161,8 @@ pub const ReportSummary = struct {
     tier: backend.Tier,
     commands: usize,
     culled: usize,
+    /// Of `culled`, how many the occlusion pass rejected.
+    occlusion_culled: usize = 0,
     drawn: usize,
     skipped: usize,
     pixels: usize,
@@ -241,13 +251,14 @@ pub fn renderScene(
     resources: DrawResources,
     params: FrameParams,
 ) Error!FrameReport {
-    var frame = draw.extractDrawList(scene, cam, mode, gpa) catch |err| switch (err) {
+    var frame = draw.extractDrawListOcclusion(scene, cam, mode, gpa, params.occlusion) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.Internal,
     };
     defer frame.deinit();
     var report = try renderFrame(gpa, tier, surface, cam.view_projection, frame.commands, resources, params, blendHint(mode));
     report.culled = frame.culled;
+    report.occlusion_culled = frame.culled_occluded;
     return report;
 }
 
@@ -785,6 +796,57 @@ test "pipeline: the pipeline result equals driving the backend by hand" {
 
     try testing.expectEqualSlices(u8, &a.color, &b.color);
     try testing.expectEqualSlices(f32, &a.depth, &b.depth);
+}
+
+test "pipeline: occlusion changes which commands are drawn, never the pixels" {
+    // The claim the pass is sold on: it removes geometry that cannot be seen, so the
+    // frame is byte-identical with it on and off. A big near quad hides a small far
+    // one; the far one is drawn opaque *after* nothing, so its absence can only be
+    // detected by comparing the two frames.
+    const gpa = testing.allocator;
+    var scene = try TestScene.init(gpa, "main");
+    defer scene.deinit();
+    var table = try ResourceTable.init(gpa, 4);
+    defer table.deinit(gpa);
+    const mesh_handle = table.setMesh(0, .{ .positions = &quad_positions, .indices = &quad_indices, .uvs = &quad_uvs });
+    const red = table.setColor(0, .{ 1, 0, 0, 1 });
+    const blue = table.setColor(1, .{ 0, 0, 1, 1 });
+
+    // Near, large, covering the view.
+    const near = try scene.createEntity("near", null);
+    try scene.addComponent(near, transform.Transform{ .position = .{ 0, 0, 1.0 } });
+    try scene.addComponent(near, draw.Renderable{
+        .mesh = mesh_handle.toBits(),
+        .material = red.toBits(),
+        .bounds = .{ .center = .{ 0, 0, 0 }, .extents = .{ 2, 2, 0.05 } },
+    });
+    // Far, small, directly behind the near one, drawn with its own colour.
+    const far = try scene.createEntity("far", null);
+    try scene.addComponent(far, transform.Transform{ .position = .{ 0, 0, -3.0 } });
+    try scene.addComponent(far, draw.Renderable{
+        .mesh = mesh_handle.toBits(),
+        .material = blue.toBits(),
+        .bounds = .{ .center = .{ 0, 0, 0 }, .extents = .{ 0.4, 0.4, 0.05 } },
+    });
+
+    var plain_scratch = Scratch{};
+    try plain_scratch.init();
+    var occluded_scratch = Scratch{};
+    try occluded_scratch.init();
+
+    plain_scratch.target.clear(.{ 9, 9, 9, 255 }, 1.0);
+    occluded_scratch.target.clear(.{ 9, 9, 9, 255 }, 1.0);
+    const plain = try renderScene(gpa, .medium, plain_scratch.surface, &scene, frontCam(), .front_to_back, table.resources(true), .{ .antialias = .none });
+    const occluded = try renderScene(gpa, .medium, occluded_scratch.surface, &scene, frontCam(), .front_to_back, table.resources(true), .{ .antialias = .none, .occlusion = .{} });
+
+    try testing.expectEqual(@as(usize, 2), plain.commands);
+    try testing.expectEqual(@as(usize, 0), plain.occlusion_culled);
+    // The pass found the hidden quad: one command fewer reaches the backend.
+    try testing.expectEqual(@as(usize, 1), occluded.commands);
+    try testing.expectEqual(@as(usize, 1), occluded.occlusion_culled);
+    try testing.expectEqual(@as(usize, 1), occluded.culled);
+    // And the pixels are untouched — the whole justification for enabling it.
+    try testing.expectEqualSlices(u8, &plain_scratch.color, &occluded_scratch.color);
 }
 
 test "pipeline: a malformed surface is refused before any draw" {

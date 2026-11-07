@@ -4,6 +4,75 @@ Permanent record of real progress, decisions, pending items and the next priorit
 task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
+## Cycle 2026-11-07 (g) — Conservative occlusion culling in render extraction
+
+**Diagnosis first.** Window/swapchain re-checked and **still blocked** (no
+`/usr/include/X11`, no `pkg-config`, no `Xvfb`, `DISPLAY` empty) — not attempted.
+The queued next priority was extraction-level occlusion culling / batching, the last
+renderer item before GUI/editor. Batching was already covered in the sense that
+`by_material` sorts and `RenderFrame` already double-buffers; the open, documented
+gap was that extraction could not reject geometry that is *inside* the frustum but
+hidden — the wall in front of the room. That is what this cycle closes.
+
+**Delivered (validated):**
+
+- **`render/occlusion.zig`** — `Buffer` (tile depth buffer), `projectAabb`,
+  `tileCoverage`, convex hull + point-in-hull. A bound claims a tile only when **all
+  four tile corners** are inside the hull of its 8 projected corners, with the
+  **maximum** corner depth as the bound; a bound is culled only when **every** tile of
+  its conservative screen rectangle is claimed by strictly nearer geometry.
+- **`draw.Occlusion`** (+ `OcclusionScratch`, `RenderFrame.refillWithOcclusion`,
+  `extractDrawListOcclusion`, `RenderFrame.culled_occluded`) — the pass inside the
+  existing extraction, opt-in, reusing one buffer and two queues for the frame's life.
+- **`pipeline.FrameParams.occlusion`**, `FrameReport.occlusion_culled`, wired through
+  `renderScene` and `EngineRenderer.render` (which now refills with the pass), plus
+  `EngineFrameReport.occlusion_culled`.
+- **`tools/bench_extract.zig`** + `zig build bench-extract`.
+
+**Measured** (ReleaseFast, best of five, 2,008 renderables = 8 walls × 250 hidden
+objects): frustum only **0.404 ms / 2,008 commands**; occlusion 64×36 **0.561 ms /
+2 commands** (2,006 culls); 128×72 → 1 command; 32×18 → 4. The pass costs ~0.16 ms
+and removes ~99.9% of the draw list in the shape it exists for.
+
+**A real design bug found by validation, in my own first version.** I first claimed
+*every* occluder and then tested the commands. That lets a bound be occluded by the
+one behind it (its own tiles are already in the buffer) and lets a farther bound
+loosen a tile a nearer one had set. The pipeline test — which asserts the pass never
+changes a pixel — caught it on a two-quad scene. Fixed by interleaving: sort nearest
+first, **test each command, then claim it**, which also makes the result independent
+of ECS iteration order.
+
+**Decisions:**
+
+- **Conservative box bounds, not triangle rasterization.** Claiming only fully covered
+  tiles from the projected hull keeps the correctness argument one line long and makes
+  "byte-identical frames with the pass on or off" provable and tested. A per-triangle
+  software depth raster would cull more and cost more; it is a separate, larger change.
+- **Opt-in (`null` default).** Same rule as every other quality knob in this project:
+  the caller asks. The pass is safe to enable, but it is extra per-frame work on a
+  scene with nothing to hide.
+- **No temporal reprojection or hierarchical-Z.** Both need frame history and a much
+  larger correctness story; the measured win already comes from this one pass. Listed
+  as a limitation instead of half-implemented.
+- **Grid is a knob, not a contract.** A zero axis is clamped to one tile in
+  `Occlusion.sanitized`, so a quality setting cannot turn a frame into an error;
+  `occlusion.Buffer` keeps the strict `InvalidGrid` for direct callers.
+- Also fixed on the way: `FrameLoop.init` leaked the renderer when `target_fps` was
+  invalid (validation now precedes construction, with an `errdefer`).
+
+**Suite:** **761/761** (`zig build test --summary all`, cleared cache), `zig fmt
+--check src build.zig tools` clean, `zig build` OK, headless smoke (1 draw, 43,264
+px) and `--mode validate` OK.
+
+**Pending:** window/swapchain/vsync (blocked here); GPU backend; per-triangle
+occlusion (software depth raster) or hierarchical-Z if the box bounds prove too loose;
+batching/LOD; GUI/editor; Lua VM; native module API; export templates.
+
+**Next priority:** the **GUI library / graphical editor** foundation — the last
+renderer-adjacent item is done and the editor is the largest remaining headless-
+verifiable subsystem (immediate-mode UI with its own tests). The GPU backend stays
+blocked in this sandbox for the same reason as the window.
+
 ## Cycle 2026-11-07 (f) — Per-material LOD bias and anisotropic tap cap
 
 **Diagnosis first.** Window/swapchain was re-checked and is **still blocked** (no

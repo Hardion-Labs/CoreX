@@ -39,6 +39,9 @@ pub const camera = @import("render/camera.zig");
 pub const culling = @import("render/culling.zig");
 /// Draw-list extraction from a scene.
 pub const draw = @import("render/draw.zig");
+/// Conservative software occlusion culling (tile depth buffer built from a
+/// frame's large occluders).
+pub const occlusion = @import("render/occlusion.zig");
 /// CPU software rasterizer (fixed-point coverage + f32 depth buffer).
 pub const raster = @import("render/raster.zig");
 

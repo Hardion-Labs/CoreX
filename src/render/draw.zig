@@ -12,6 +12,7 @@
 const std = @import("std");
 const camera = @import("camera.zig");
 const culling = @import("culling.zig");
+const occlusion = @import("occlusion.zig");
 const transform = @import("../scene/transform.zig");
 const ecs = @import("../ecs.zig");
 
@@ -61,6 +62,111 @@ pub const SortMode = enum {
     by_material,
 };
 
+/// Extraction-time depth culling: a conservative software occlusion pass on top of
+/// the frustum test.
+///
+/// The pass is **two-pass by construction**. Visible-ordered occluders (those whose
+/// world bounds cover at least `min_coverage` tiles) are claimed into a tile depth
+/// buffer front to back, and only *then* is every remaining renderable tested
+/// against it. Testing while claiming would make the result depend on entity
+/// iteration order — a wall listed after the room would cull nothing — so the order
+/// is fixed by depth instead.
+///
+/// It can only ever reject geometry; a bound it keeps is rendered as before. That
+/// is what makes the option safe to enable by default and what the tests assert:
+/// every cull is a conservative one, so switching it off changes performance, never
+/// pixels.
+pub const Occlusion = struct {
+    /// Tile grid of the depth buffer. 64x36 keeps the per-occluder cost to a few
+    /// hundred point-in-hull tests while staying finer than most on-screen props;
+    /// the grid is a pure accuracy/cost knob, never a correctness one.
+    tiles_x: u16 = 64,
+    tiles_y: u16 = 36,
+    /// Smallest screen footprint, in tiles, for a bound to be used as an occluder.
+    /// 1 would let every visible triangle claim tiles it does not fully cover and
+    /// buy nothing; 16 needs a bound covering roughly a thirtieth of the screen.
+    min_coverage: u32 = 16,
+    /// Safety margin subtracted from a tested object's nearest depth, in NDC z.
+    /// Keeps geometry that is coplanar with (or a rounding step in front of) an
+    /// occluder visible.
+    depth_bias: f32 = 0.0025,
+
+    /// The grid actually usable: a zero axis is clamped to one tile rather than
+    /// turned into an error. Extraction is not the place to reject a frame over a
+    /// quality knob — `occlusion.Buffer` keeps its own `InvalidGrid` for callers
+    /// that build a buffer directly.
+    pub fn sanitized(self: Occlusion) Occlusion {
+        var out = self;
+        out.tiles_x = @max(self.tiles_x, 1);
+        out.tiles_y = @max(self.tiles_y, 1);
+        return out;
+    }
+};
+
+/// `occlusion.Buffer.init` narrowed to the one error extraction can report.
+/// `Occlusion.sanitized` has already clamped both axes to at least one tile, so the
+/// buffer's own `InvalidGrid` is unreachable here by construction.
+fn allocTiles(gpa: Allocator, config: Occlusion) error{OutOfMemory}!occlusion.Buffer {
+    return occlusion.Buffer.init(gpa, config.tiles_x, config.tiles_y) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.InvalidGrid => unreachable,
+    };
+}
+
+/// Per-frame scratch for the occlusion pass.
+///
+/// Owns the tile buffer and one reusable command list, so a frame loop allocates
+/// nothing per frame: sized once by a warm-up frame, then only `clear`ed. Both
+/// slices are grown in `gpa` and freed by `deinit`.
+pub const OcclusionScratch = struct {
+    gpa: Allocator,
+    buffer: occlusion.Buffer,
+    /// The occluders, in submission order, reused as the claim queue.
+    claims: []DrawCommand = &.{},
+    /// The survivors of the frustum pass that still have to be tested.
+    pending: []DrawCommand = &.{},
+
+    pub fn init(gpa: Allocator, config: Occlusion) !OcclusionScratch {
+        const safe = config.sanitized();
+        return .{
+            .gpa = gpa,
+            .buffer = try allocTiles(gpa, safe),
+        };
+    }
+
+    pub fn deinit(self: *OcclusionScratch) void {
+        self.buffer.deinit(self.gpa);
+        self.gpa.free(self.claims);
+        self.gpa.free(self.pending);
+        self.* = undefined;
+    }
+
+    fn reset(self: *OcclusionScratch, config: Occlusion) !void {
+        const safe = config.sanitized();
+        // A different grid is honoured by rebuilding, so the knob really is per
+        // frame rather than fixed at construction.
+        if (self.buffer.tiles_x != safe.tiles_x or self.buffer.tiles_y != safe.tiles_y) {
+            self.buffer.deinit(self.gpa);
+            self.buffer = try allocTiles(self.gpa, safe);
+        }
+        self.buffer.clear();
+    }
+
+    fn sizeClaims(self: *OcclusionScratch, n: usize) !void {
+        if (self.claims.len >= n) return;
+        const grown = try self.gpa.alloc(DrawCommand, n);
+        self.gpa.free(self.claims);
+        self.claims = grown;
+    }
+
+    fn sizePending(self: *OcclusionScratch, n: usize) !void {
+        if (self.pending.len >= n) return;
+        const grown = try self.gpa.alloc(DrawCommand, n);
+        self.gpa.free(self.pending);
+        self.pending = grown;
+    }
+};
+
 /// An owned, sorted draw list plus culling diagnostics.
 ///
 /// The list is double-buffered so `refill` can compare this frame's commands with
@@ -70,8 +176,12 @@ pub const RenderFrame = struct {
     gpa: Allocator,
     /// The current frame's commands (a view of the active buffer).
     commands: []DrawCommand,
-    /// Number of renderables rejected by frustum culling this extraction.
+    /// Number of renderables rejected this extraction: the frustum pass plus the
+    /// occlusion pass.
     culled: usize,
+    /// Of those, how many the occlusion pass rejected. Zero when occlusion is off,
+    /// so `culled - culled_occluded` is always the frustum count.
+    culled_occluded: usize = 0,
     /// The exact allocations behind `commands` and the inactive buffer. Kept
     /// apart from the views so every free uses the length that was allocated.
     active: []DrawCommand,
@@ -86,8 +196,12 @@ pub const RenderFrame = struct {
     /// the general-purpose allocator. The draw-list buffers themselves live in
     /// `gpa` because they persist across frames.
     scratch: std.heap.ArenaAllocator,
+    /// The occlusion pass's persistent buffer and queues. Present even when the
+    /// caller never enables occlusion: it is sized by the first frame that does.
+    occlusion_scratch: OcclusionScratch,
 
     pub fn deinit(self: *RenderFrame) void {
+        self.occlusion_scratch.deinit();
         self.scratch.deinit();
         self.gpa.free(self.active);
         self.gpa.free(self.spare);
@@ -99,14 +213,19 @@ pub const RenderFrame = struct {
     pub fn init(gpa: Allocator) !RenderFrame {
         const empty = try gpa.alloc(DrawCommand, 0);
         errdefer gpa.free(empty);
+        const spare = try gpa.alloc(DrawCommand, 0);
+        errdefer gpa.free(spare);
+        var oscratch = try OcclusionScratch.init(gpa, .{});
+        errdefer oscratch.deinit();
         return .{
             .gpa = gpa,
             .commands = empty,
             .culled = 0,
             .active = empty,
-            .spare = try gpa.alloc(DrawCommand, 0),
+            .spare = spare,
             .allocated_last_frame = false,
             .scratch = std.heap.ArenaAllocator.init(gpa),
+            .occlusion_scratch = oscratch,
         };
     }
 
@@ -124,12 +243,16 @@ pub const RenderFrame = struct {
     /// math may leave partially undefined padding in, so two frames that render
     /// identically can still compare as changed (the comparison never reports a
     /// change that did not happen, only sometimes misses that none did).
-    pub fn refill(
+    /// `occlusion` is opt-in per frame: `null` (the default in `refillOff`) keeps
+    /// the frustum-only extraction, so a caller that wants the byte-identical
+    /// pre-occlusion behaviour gets it by asking for nothing.
+    pub fn refillWithOcclusion(
         self: *RenderFrame,
         scene: anytype,
         cam: Camera,
         mode: SortMode,
-    ) !struct { culled: usize, changed: bool } {
+        config: ?Occlusion,
+    ) !struct { culled: usize, occlusion_culled: usize, changed: bool } {
         var next: std.ArrayList(DrawCommand) = .fromOwnedSlice(self.spare);
         next.capacity = self.spare.len;
         // One reset per frame is the whole point of the hand-off: everything the
@@ -137,12 +260,27 @@ pub const RenderFrame = struct {
         // frame that needs no more memory than last time allocates nothing.
         const scratch_before = self.scratch.queryCapacity();
         const list_capacity_before = next.capacity;
+        const queue_before = self.occlusion_scratch.claims.len + self.occlusion_scratch.pending.len;
         _ = self.scratch.reset(.retain_capacity);
         // `extractIntoScratch` clears the list first, so the spare's previous
         // contents are never read; only its capacity is reused.
-        const culled = try extractIntoScratch(&next, scene, cam, mode, self.gpa, self.scratch.allocator());
-        self.allocated_last_frame = self.scratch.queryCapacity() != scratch_before or next.capacity != list_capacity_before;
-        const changed = self.culled != culled or !commandsEqual(next.items, self.commands);
+        const result = try extractIntoScratchOccluded(
+            &next,
+            scene,
+            cam,
+            mode,
+            self.gpa,
+            self.scratch.allocator(),
+            &self.occlusion_scratch,
+            config,
+        );
+        const culled = result.culled;
+        self.allocated_last_frame = self.scratch.queryCapacity() != scratch_before or
+            next.capacity != list_capacity_before or
+            queue_before != self.occlusion_scratch.claims.len + self.occlusion_scratch.pending.len;
+        const changed = self.culled != culled or
+            self.culled_occluded != result.occlusion_culled or
+            !commandsEqual(next.items, self.commands);
         // `next.items` was just written, so the comparison above must happen
         // before the swap; afterwards the old active buffer becomes the spare.
         // The allocation and the view are recorded separately: `items` is the
@@ -152,7 +290,20 @@ pub const RenderFrame = struct {
         self.commands = next.items;
         self.spare = old_active;
         self.culled = culled;
-        return .{ .culled = culled, .changed = changed };
+        self.culled_occluded = result.occlusion_culled;
+        return .{ .culled = culled, .occlusion_culled = result.occlusion_culled, .changed = changed };
+    }
+
+    /// Frustum-only refill: the pre-occlusion extraction, byte for byte. Kept as a
+    /// named entry point so call sites read as what they ask for.
+    pub fn refill(
+        self: *RenderFrame,
+        scene: anytype,
+        cam: Camera,
+        mode: SortMode,
+    ) !struct { culled: usize, changed: bool } {
+        const r = try self.refillWithOcclusion(scene, cam, mode, null);
+        return .{ .culled = r.culled, .changed = r.changed };
     }
 
     pub fn count(self: RenderFrame) usize {
@@ -209,19 +360,51 @@ fn sortCommands(items: []DrawCommand, mode: SortMode) void {
 /// Fails only on allocation failure (the scene is already valid). Entities whose
 /// world matrix is absent from the snapshot are skipped defensively.
 pub fn extractDrawList(scene: anytype, cam: Camera, mode: SortMode, gpa: Allocator) !RenderFrame {
+    return extractDrawListOcclusion(scene, cam, mode, gpa, null);
+}
+
+/// `extractDrawList` with the optional occlusion stage. A one-shot list has no
+/// frame-to-frame state to reuse, so the pass owns a throwaway buffer here; a frame
+/// loop should keep a `RenderFrame` and call `refillWithOcclusion` instead, which
+/// reuses it and allocates nothing in the steady state.
+pub fn extractDrawListOcclusion(
+    scene: anytype,
+    cam: Camera,
+    mode: SortMode,
+    gpa: Allocator,
+    config: ?Occlusion,
+) !RenderFrame {
     var commands: std.ArrayList(DrawCommand) = .empty;
     errdefer commands.deinit(gpa);
-    const culled = try extractInto(&commands, scene, cam, mode, gpa);
+    // The pass needs somewhere to keep its tile buffer. When it is asked for, that
+    // buffer is this frame's own scratch and is handed back with the list, so it is
+    // built once and not thrown away.
+    var oscratch = try OcclusionScratch.init(gpa, config orelse .{});
+    errdefer oscratch.deinit();
+    const result = try extractIntoScratchOccluded(
+        &commands,
+        scene,
+        cam,
+        mode,
+        gpa,
+        gpa,
+        if (config != null) &oscratch else null,
+        config,
+    );
     const owned = try commands.toOwnedSlice(gpa);
     errdefer gpa.free(owned);
+    const spare = try gpa.alloc(DrawCommand, 0);
+    errdefer gpa.free(spare);
     return .{
         .gpa = gpa,
         .commands = owned,
-        .culled = culled,
+        .culled = result.culled,
+        .culled_occluded = result.occlusion_culled,
         .active = owned,
-        .spare = try gpa.alloc(DrawCommand, 0),
+        .spare = spare,
         .allocated_last_frame = false,
         .scratch = std.heap.ArenaAllocator.init(gpa),
+        .occlusion_scratch = oscratch,
     };
 }
 
@@ -244,14 +427,6 @@ pub fn extractInto(
     return extractIntoScratch(out, scene, cam, mode, gpa, gpa);
 }
 
-/// `extractInto`, but with the transient per-frame work taken from `scratch`.
-///
-/// The draw list itself grows in `list_gpa` (it survives the frame), while the
-/// world-transform snapshot — a matrix array, an entity array, two lookup maps and
-/// three work arrays, all thrown away before this function returns — comes from
-/// `scratch`. A frame loop hands in an arena and resets it once per frame, so a
-/// steady-state frame allocates nothing at all from the general-purpose allocator.
-/// Passing the same allocator for both is exactly `extractInto`.
 pub fn extractIntoScratch(
     out: *std.ArrayList(DrawCommand),
     scene: anytype,
@@ -260,6 +435,26 @@ pub fn extractIntoScratch(
     list_gpa: Allocator,
     scratch: Allocator,
 ) !usize {
+    return (try extractIntoScratchOccluded(out, scene, cam, mode, list_gpa, scratch, null, null)).culled;
+}
+
+/// The extraction proper, with the optional occlusion stage.
+///
+/// Frustum culling runs first and fills `out`. With `config` set and a
+/// `occ_scratch` to hold the tile buffer, a second stage then claims visible
+/// occluders front to back and tests what is left; occlusion culls are removed from
+/// `out` in place and counted separately. Without them this is exactly the
+/// pre-occlusion function: same commands, same order, same `culled`.
+pub fn extractIntoScratchOccluded(
+    out: *std.ArrayList(DrawCommand),
+    scene: anytype,
+    cam: Camera,
+    mode: SortMode,
+    list_gpa: Allocator,
+    scratch: Allocator,
+    occ_scratch: ?*OcclusionScratch,
+    config: ?Occlusion,
+) !struct { culled: usize, occlusion_culled: usize } {
     out.clearRetainingCapacity();
     errdefer out.clearRetainingCapacity();
 
@@ -290,11 +485,66 @@ pub fn extractIntoScratch(
         });
     }
 
+    var occlusion_culled: usize = 0;
+    if (config != null and occ_scratch != null) {
+        occlusion_culled = try applyOcclusion(out, cam, config.?, occ_scratch.?);
+    }
+
     sortCommands(out.items, mode);
-    return culled;
+    // `culled` is the total the caller sees; the occlusion split is reported beside
+    // it so a frame can say *why* something disappeared.
+    return .{ .culled = culled + occlusion_culled, .occlusion_culled = occlusion_culled };
 }
 
-// --- tests -----------------------------------------------------------------
+/// Occlusion pass: walk the frame front to back, testing each command against the
+/// buffer built from the commands already passed, then claiming its own tiles.
+///
+/// Interleaving is what keeps the pass honest. Claiming *every* occluder first would
+/// let a command occlude itself (its own tiles are in the buffer by the time it is
+/// tested) and would let a farther occluder's depth bound compete with a nearer one's.
+/// Ordering by depth, nearest first, removes both: a command is only ever tested
+/// against strictly nearer geometry, and each bound claims tiles at most once.
+///
+/// Sorting first also makes the result independent of entity iteration order: the
+/// same scene produces the same survivors whatever order the ECS hands the
+/// components out in.
+fn applyOcclusion(out: *std.ArrayList(DrawCommand), cam: Camera, config: Occlusion, scratch: *OcclusionScratch) !usize {
+    try scratch.reset(config);
+    const vp = cam.view_projection;
+    if (out.items.len == 0) return 0;
+    try scratch.sizeClaims(out.items.len);
+    try scratch.sizePending(out.items.len);
+    @memcpy(scratch.claims[0..out.items.len], out.items);
+    const ordered = scratch.claims[0..out.items.len];
+    // Ascending depth is nearest first (`depth` is positive in front). The entity key
+    // breaks ties, so the order is total and reproducible.
+    std.mem.sort(DrawCommand, ordered, {}, struct {
+        fn less(_: void, a: DrawCommand, b: DrawCommand) bool {
+            if (a.depth != b.depth) return a.depth < b.depth;
+            return a.entity.key() < b.entity.key();
+        }
+    }.less);
+
+    var kept: usize = 0;
+    var removed: usize = 0;
+    for (ordered) |cmd| {
+        // Test first: at this point the buffer holds strictly nearer geometry only.
+        if (scratch.buffer.isOccluded(vp, cmd.bounds, config.depth_bias)) {
+            removed += 1;
+            continue;
+        }
+        scratch.pending[kept] = cmd;
+        kept += 1;
+        // Then claim, so the commands that follow are tested against this bound too —
+        // but only when it covers enough of the screen to be worth the tiles.
+        const coverage = scratch.buffer.tileCoverage(vp, cmd.bounds) orelse continue;
+        if (coverage < config.min_coverage) continue;
+        scratch.buffer.add(vp, cmd.bounds);
+    }
+    @memcpy(out.items[0..kept], scratch.pending[0..kept]);
+    out.shrinkRetainingCapacity(kept);
+    return removed;
+}
 
 const testing = std.testing;
 const scene_mod = @import("../scene/scene.zig");
@@ -473,6 +723,143 @@ test "Renderable: isValid rejects non-finite and negative extents" {
     bad = Renderable{};
     bad.bounds.center[1] = std.math.nan(f32);
     try testing.expect(!bad.isValid());
+}
+
+test "extract: occlusion removes only what a nearer bound hides" {
+    // A wall at z = 5 (2 units in front of the camera at z = 10) covering the whole
+    // view, one small object behind it and one in front. The camera is at the
+    // origin of the scene's view axis, so "in front" means a bigger z.
+    var s = try TestScene.init(testing.allocator, "main");
+    defer s.deinit();
+
+    const wall = try s.createEntity("wall", null);
+    try s.addComponent(wall, components.Transform{ .position = .{ 0, 0, 5 } });
+    // Half-extents 3 in x and y: at 5 units from the camera the wall's silhouette
+    // stops at NDC 0.6, leaving room for a bound that is inside the frustum but
+    // clear of the wall.
+    try s.addComponent(wall, Renderable{ .mesh = 1, .bounds = .{ .extents = .{ 3, 3, 0.25 } } });
+
+    const hidden = try s.createEntity("hidden", null);
+    try s.addComponent(hidden, components.Transform{ .position = .{ 0, 0, 0 } });
+    try s.addComponent(hidden, Renderable{ .mesh = 2, .bounds = .{ .extents = .{ 0.2, 0.2, 0.2 } } });
+
+    const near = try s.createEntity("near", null);
+    try s.addComponent(near, components.Transform{ .position = .{ 0, 0, 8 } });
+    try s.addComponent(near, Renderable{ .mesh = 3, .bounds = .{ .extents = .{ 0.2, 0.2, 0.2 } } });
+
+    // Off to the side of the wall, still inside the frustum: unoccluded.
+    const beside = try s.createEntity("beside", null);
+    try s.addComponent(beside, components.Transform{ .position = .{ 8, 0, 0 } });
+    try s.addComponent(beside, Renderable{ .mesh = 4, .bounds = .{ .extents = .{ 0.2, 0.2, 0.2 } } });
+
+    var plain = try extractDrawList(&s, testCamera(), .front_to_back, testing.allocator);
+    defer plain.deinit();
+    try testing.expectEqual(@as(usize, 4), plain.count());
+    try testing.expectEqual(@as(usize, 0), plain.culled_occluded);
+
+    var occluded = try extractDrawListOcclusion(&s, testCamera(), .front_to_back, testing.allocator, .{});
+    defer occluded.deinit();
+    // The one behind the wall is gone, the three others survive, and the totals add
+    // up: the occlusion pass never loses a command silently.
+    try testing.expectEqual(@as(usize, 3), occluded.count());
+    try testing.expectEqual(@as(usize, 1), occluded.culled_occluded);
+    try testing.expectEqual(@as(usize, 1), occluded.culled);
+    for (occluded.commands) |c| try testing.expect(!c.entity.eql(hidden));
+    // The order and every field of the survivors are untouched by the pass, so the
+    // frame renders identically: only the hidden command is missing.
+    var j: usize = 0;
+    for (plain.commands) |c| {
+        if (c.entity.eql(hidden)) continue;
+        try testing.expect(c.entity.eql(occluded.commands[j].entity));
+        try testing.expect(std.mem.eql(f32, &c.world, &occluded.commands[j].world));
+        try testing.expectEqual(c.depth, occluded.commands[j].depth);
+        j += 1;
+    }
+    try testing.expectEqual(occluded.count(), j);
+}
+
+test "extract: a slightly smaller occluder than the min_coverage keeps everything" {
+    // The wall is visible but its footprint is under the default 16-tile threshold,
+    // so it is never claimed and nothing is culled: the knob limits what may act as
+    // an occluder, and a bound below it is only ever a *victim*.
+    var s = try TestScene.init(testing.allocator, "main");
+    defer s.deinit();
+    const wall = try s.createEntity("wall", null);
+    try s.addComponent(wall, components.Transform{ .position = .{ 0, 0, 5 } });
+    try s.addComponent(wall, Renderable{ .mesh = 1, .bounds = .{ .extents = .{ 6, 6, 0.25 } } });
+    const hidden = try s.createEntity("hidden", null);
+    try s.addComponent(hidden, components.Transform{ .position = .{ 0, 0, 0 } });
+    try s.addComponent(hidden, Renderable{ .mesh = 2, .bounds = .{ .extents = .{ 0.2, 0.2, 0.2 } } });
+
+    const high = draw_config: {
+        var c = Occlusion{};
+        c.min_coverage = 100_000;
+        break :draw_config c;
+    };
+    var untouched = try extractDrawListOcclusion(&s, testCamera(), .front_to_back, testing.allocator, high);
+    defer untouched.deinit();
+    try testing.expectEqual(@as(usize, 2), untouched.count());
+    try testing.expectEqual(@as(usize, 0), untouched.culled_occluded);
+}
+
+test "extract: occlusion stays conservative for coincident and touching bounds" {
+    // The "hidden" object sits exactly on the wall's far face: with the default
+    // depth bias it must survive, because the pass cannot prove it is behind.
+    var s = try TestScene.init(testing.allocator, "main");
+    defer s.deinit();
+    const wall = try s.createEntity("wall", null);
+    try s.addComponent(wall, components.Transform{ .position = .{ 0, 0, 5 } });
+    try s.addComponent(wall, Renderable{ .mesh = 1, .bounds = .{ .extents = .{ 6, 6, 0.25 } } });
+    const coplanar = try s.createEntity("coplanar", null);
+    try s.addComponent(coplanar, components.Transform{ .position = .{ 0, 0, 4.75 } });
+    try s.addComponent(coplanar, Renderable{ .mesh = 2, .bounds = .{ .extents = .{ 0.2, 0.2, 0.2 } } });
+
+    var occluded = try extractDrawListOcclusion(&s, testCamera(), .front_to_back, testing.allocator, .{});
+    defer occluded.deinit();
+    try testing.expectEqual(@as(usize, 2), occluded.count());
+    try testing.expectEqual(@as(usize, 0), occluded.culled_occluded);
+}
+
+test "RenderFrame: occlusion refill reuses its buffer and reports the split" {
+    const gpa = testing.allocator;
+    var counter = Counter{ .parent = gpa };
+    const counting = counter.allocator();
+
+    var s = try TestScene.init(gpa, "main");
+    defer s.deinit();
+    const wall = try s.createEntity("wall", null);
+    try s.addComponent(wall, components.Transform{ .position = .{ 0, 0, 5 } });
+    try s.addComponent(wall, Renderable{ .mesh = 1, .bounds = .{ .extents = .{ 6, 6, 0.25 } } });
+    for (0..8) |i| {
+        var buf: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&buf, "h{d}", .{i});
+        const e = try s.createEntity(name, null);
+        try s.addComponent(e, components.Transform{ .position = .{ 0, 0, @as(f32, @floatFromInt(i)) * 0.1 } });
+        try s.addComponent(e, Renderable{ .mesh = 2, .bounds = .{ .extents = .{ 0.01, 0.01, 0.01 } } });
+    }
+
+    var frame = try RenderFrame.init(counting);
+    defer frame.deinit();
+    // Warm up both double buffers and the occlusion queues.
+    _ = try frame.refillWithOcclusion(&s, testCamera(), .front_to_back, .{});
+    _ = try frame.refillWithOcclusion(&s, testCamera(), .front_to_back, .{});
+
+    counter.bytes = 0;
+    counter.calls = 0;
+    const steady = try frame.refillWithOcclusion(&s, testCamera(), .front_to_back, .{});
+    try testing.expectEqual(@as(usize, 0), counter.calls);
+    try testing.expectEqual(@as(usize, 0), counter.bytes);
+    // The wall and the eight hidden things: only the wall survives.
+    try testing.expectEqual(@as(usize, 1), frame.count());
+    try testing.expectEqual(@as(usize, 8), steady.occlusion_culled);
+    try testing.expectEqual(frame.culled_occluded, steady.occlusion_culled);
+    try testing.expect(!steady.changed);
+
+    // Turning the pass off restores the nine commands, and the buffer is reusable.
+    const off = try frame.refill(&s, testCamera(), .front_to_back);
+    try testing.expectEqual(@as(usize, 9), frame.count());
+    try testing.expectEqual(@as(usize, 0), frame.culled_occluded);
+    try testing.expect(off.changed);
 }
 
 test "extract: survives every allocation failure without leaking" {

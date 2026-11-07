@@ -266,7 +266,13 @@ with one final round (trilinear). A constant perspective denominator — any
 orthographic projection — hoists the level to once per triangle, and with
 `raster.Mipmap.anisotropic` an elongated footprint is sampled with up to eight
 taps along its long axis at the level matching its short one (same fast path when
-the footprint is constant). `raster.Sampling` carries the two per-material knobs
+the footprint is constant). Extraction can additionally run a **tile-based
+occlusion pass** (`render/occlusion.zig`, opt-in through `FrameParams.occlusion`):
+large visible bounds claim the tiles their projected convex hull fully covers, and a
+bound whose whole screen rectangle is claimed by strictly nearer geometry never
+becomes a draw command. It is conservative by construction — with it enabled the
+frame is byte-identical, only shorter — and it reuses one buffer, so a steady-state
+frame still allocates nothing. `raster.Sampling` carries the two per-material knobs
 (level bias and tap cap) as plain data: the bias is added after the level rule and
 clamped to the chain, the cap only limits the tap count, `{}` reproduces every
 pre-existing frame byte for byte, and `pipeline.resolve` zeroes both on a tier that

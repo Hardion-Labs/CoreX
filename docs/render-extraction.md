@@ -75,12 +75,104 @@ iteration — low coupling and cache-friendly.
   - `back_to_front` — farthest first (required for alpha blending).
   - `by_material` — groups by material, then mesh (minimizes state changes).
   Ties are broken by `entity.key()` for **determinism**.
-- `RenderFrame { commands, culled }` — a sorted draw list plus culling diagnostics;
-  the caller owns it and calls `deinit`.
+- `RenderFrame { commands, culled, culled_occluded }` — a sorted draw list plus
+  culling diagnostics; the caller owns it and calls `deinit`. `culled` is the total
+  (frustum + occlusion) and `culled_occluded` the occlusion part of it, so
+  `culled - culled_occluded` is always the frustum count.
 - `extractDrawList(scene, cam, mode, gpa)` — generic over any `*Scene(schema)` with
   `Transform` + `Renderable`. Computes the world-transform snapshot once, culls each
   renderable's world AABB and sorts the survivors. Fails only on allocation (the
   scene is already valid).
+- `extractDrawListOcclusion(scene, cam, mode, gpa, config)` — the same list with the
+  optional occlusion stage (below). A frame loop should keep a `RenderFrame` and call
+  `refillWithOcclusion` instead: same result, persistent buffers.
+
+## Occlusion culling (`corex.render.occlusion`)
+
+Frustum culling cannot reject what is *inside* the view but completely hidden behind
+something nearer — the wall in front of the room. `draw.Occlusion` adds that test as
+an **opt-in** second stage on top of the frustum pass.
+
+The mechanism is a coarse **tile depth buffer** built from the frame's own large
+occluders (`occlusion.Buffer`):
+
+1. A bound is projected to NDC. If any corner is at or behind the near plane, or
+   outside `[-1, 1]` in NDC `z`, the bound has no bounded projection and is skipped —
+   it neither claims tiles nor gets culled. (The `w > 0` test alone would not catch an
+   **orthographic** camera, whose `w` is always 1; the NDC-`z` test catches both.)
+2. The 8 projected corners are reduced to their convex hull — perspective projection
+   maps a convex body in front of the camera onto a convex polygon.
+3. A tile is claimed **only when all four of its corners lie inside that hull**, and
+   the depth stored is the **maximum** NDC `z` over the box's corners: every point of
+   the box in that tile is at least that near. A partially covered tile is never
+   claimed, so the buffer never invents coverage.
+4. A tested bound is occluded only when **every** tile of its conservative screen
+   rectangle is claimed by a bound strictly nearer than its own nearest point minus
+   `depth_bias`.
+
+The pass is therefore **conservative by construction**: it may keep something hidden
+(only a cost) and can never remove something visible. That is what the tests assert,
+and it is why the option is safe to enable: with it on, the frame is **byte-identical**
+to the same frame with it off — one pipeline test compares the two rendered surfaces.
+
+### Order: front to back, test-then-claim
+
+The commands are sorted by depth (nearest first, entity key as the tie-break) and
+each one is **tested before it claims**:
+
+- testing against the buffer built so far means a command is only ever compared with
+  **strictly nearer** geometry, which rules out a bound occluding itself;
+- claiming after the test fills the buffer once, so a farther bound cannot loosen a
+  tile a nearer one already tightened;
+- sorting first makes the survivors independent of ECS iteration order.
+
+Claiming every occluder before testing anything (the obvious, wrong version) let a
+small object be hidden by the *nearer* object behind it in the first version of this
+pass — the pipeline test below caught it, and it is the reason the loop is
+interleaved rather than two-phase.
+
+### Knobs
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `tiles_x`, `tiles_y` | 64, 36 | Tile grid. Accuracy/cost only, never correctness: a zero axis is clamped to one. |
+| `min_coverage` | 16 | Smallest screen footprint, in tiles, for a bound to act as an occluder. Below it, a bound is only ever a *victim*. |
+| `depth_bias` | 0.0025 | Safety margin in NDC `z`, subtracted from a tested bound's nearest depth, so coplanar geometry stays visible. |
+
+### Cost and benefit, measured
+
+`tools/bench_extract.zig` (`zig build bench-extract -Doptimize=ReleaseFast`) builds
+the shape the pass exists for: 8 large walls with 250 small objects behind each —
+2,008 renderables in total:
+
+| Configuration | Extraction time | Commands emitted | Occlusion culls |
+| --- | --- | --- | --- |
+| frustum only | 0.404 ms | 2,008 | 0 |
+| occlusion, 64×36 | 0.561 ms | **2** | 2,006 |
+| occlusion, 128×72 | 0.572 ms | 1 | 2,007 |
+| occlusion, 32×18 | 0.537 ms | 4 | 2,004 |
+
+The pass costs ~0.16 ms per frame here and removes 2,006 of 2,008 draw commands.
+Those commands would otherwise each be rasterized, shaded and depth-tested in full
+before losing the depth test — the measured saving is on the backend side, not just
+in the list. A coarser grid is slightly cheaper and slightly less precise (4 survivors
+at 32×18), which is exactly the trade the grid knob is meant to expose.
+
+`RenderFrame` keeps the tile buffer and the two queues for the life of the frame, so
+in steady state the pass allocates nothing: the queues are grown once and reused and
+`refillWithOcclusion` reports `allocated_last_frame` accordingly (asserted by a test
+that counts allocator calls).
+
+### What it does not do
+
+- **No temporal reprojection.** There is no previous-frame depth, no persistent
+  buffer across frames and no two-pass hierarchical depth. Each frame's buffer comes
+  from that frame's own occluders, which keeps the correctness story to the one above.
+- **Box bounds only.** An occluder's bound claims what its *box* covers, not its
+  actual triangles: a thin diagonal wall claims less than its box does, so the pass
+  culls less than a per-triangle rasterizer would — never more.
+- **No per-mesh occlusion queries.** Nothing is asked of the backend; the decision is
+  made before any draw command is emitted.
 
 ## Example
 
@@ -116,6 +208,12 @@ defer frame.deinit();
   perspective camera discards what is behind, to the side and beyond the far plane.
 - **Classification**: inside/intersecting/outside for AABBs and spheres;
   `transformAabb` bounds all 8 corners under rotation (explicitly verified).
+- **Occlusion**: a wall hides exactly the bounds whose screen rectangle is fully
+  inside its silhouette (and nothing in front of it, beside it, or straddling either
+  clip plane); edge tiles that are only partly covered stay unclaimed; a bound exactly
+  on the occluder's far face survives the default bias; `tileCoverage` is the pure
+  footprint helper. `RenderFrame.refillWithOcclusion` reuses the buffer with **zero
+  allocations** in steady state, and turning the pass off restores the full list.
 - **Extraction**: an empty scene → an empty frame; an off-screen object is
   discarded (`culled`); an entity without `Renderable` is not drawn; the world matrix
   reflects the hierarchy; front/back and by-material sorting are correct;
@@ -206,8 +304,10 @@ format) is the piece that connects a project to this layer:
 - There is no GPU backend yet (Low/Medium/Advanced are planned). Extraction itself
   only produces the draw list; the CPU software rasterizer in
   [render-raster.md](render-raster.md) consumes it and writes pixels.
-- No LOD, occlusion culling, instancing or automatic batching; `by_material` only
-  sorts to reduce state changes.
+- No LOD, instancing or automatic batching; `by_material` only sorts to reduce state
+  changes. Occlusion culling exists but is **opt-in** (`FrameParams.occlusion`) and
+  box-bounded — see [Occlusion culling](#occlusion-culling-corexrenderocclusion); it
+  is not a hierarchical-Z or temporal pass.
 - `Renderable` uses opaque mesh/material handles. The software rasterizer resolves
   them through a caller-supplied duck-typed provider, and `render_scene` fills that
   table from the project's assets, with mip chains generated at upload. We have no GPU
