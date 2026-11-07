@@ -8,6 +8,24 @@ declared yet.
 
 ### Added
 
+- **Tree actions and per-branch folding** in the hierarchy.
+  - `tree.apply(action, row, collapsed, scene, history)` is the single path a click, a key
+    and a test take: add a child (or a root), delete, reparent to root, fold. Each scene
+    action is **exactly one** history command, so one undo reverses exactly what one click
+    did; a fold is a view preference and never enters the history.
+  - Additive UI: a `+` control in the panel title (`N`), `P` to make the selection a root,
+    and a disclosure control (`>` / `v`) per row with its own hit area, registered before
+    the row so a fold click does not select. `Enter` folds the selected row when it has
+    children.
+  - `tree.Collapsed` — a fixed inline set of up to 64 folded IDs. A full set **refuses a
+    new fold** rather than evicting one; a new child under a folded parent unfolds it.
+  - A refused action is reported, not swallowed: `tree.apply` returns the failure and the
+    status bar shows it as `! ParentCycle` instead of the click looking like a no-op.
+  - Creating selects the new entity and reloads the inspector, so it can be named at once.
+- `tree.Row.has_children` / `collapsed` — the row list knows both, so the painter never
+  re-scans the scene to decide whether to draw a disclosure control.
+- `Input.Key` gained `n` and `p`, listed only because something now consumes them.
+
 - Built-in GUI foundation (`src/gui/`, exposed as `corex.gui`) — the layer the
   graphical editor will sit on. No window, no system font, no external toolkit:
   everything paints into a caller-owned RGBA8 buffer in the same layout as

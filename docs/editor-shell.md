@@ -58,8 +58,33 @@ Rows come from the hierarchy's own model, `editor/tree.zig`, not from the paint 
   chain cannot overflow the stack. The walk is recursive, but its depth is a constant.
 - **Scrollable.** `State.tree_offset` is the first painted row; the wheel moves it by
   three rows and it clamps at both ends. Selecting an entity that is off screen
-  (`tree.indexOf`, a bounded search) centres the window on it, so a selection restored by
-  an undo or moved by a shortcut is never invisible.
+  (`tree.indexOf`, a bounded search) unfolds the chain above it and centres the window on
+  it, so a selection restored by an undo or moved by a shortcut is never invisible.
+- **Foldable.** A row with children draws a disclosure control (`>` / `v`) with its own
+  hit area, registered before the row so clicking it folds instead of selecting.
+  `tree.Collapsed` is a fixed inline set of up to 64 folded IDs: a full set **refuses a new
+  fold** instead of evicting one, because silently unfolding a branch the user folded is
+  worse than not folding. Folding is a view preference and never enters the history —
+  undoing an edit must not also unfold the tree.
+
+### Tree actions
+
+The tree is an editing surface, not just a selector. Every action is one `tree.apply`
+call, so a click, a key and a test take the same path and each one becomes **exactly one**
+history command (one `Ctrl+Z` undoes exactly what one click did):
+
+| Action | Where | Command |
+| --- | --- | --- |
+| add a child (or a root) | the panel's `+` control, `N` | `create`, named `entity`, selected afterwards |
+| delete | `Delete` | `delete` |
+| reparent to a root | `P` | `reparent` with a null parent |
+| fold / unfold | the disclosure, `Enter` on a row with children | none (view only) |
+
+A refused action is never silent: `tree.apply` returns the failure, and the status bar
+shows it as `! ParentCycle` (or whichever error) for the frame instead of leaving the user
+with a click that appeared to do nothing. A new entity is selected immediately and the
+inspector reloads, so it can be named straight away; a new child under a folded parent
+unfolds it, because the point of creating something is to see it.
 
 Underneath it, each node's children come from `Scene.childIdsInto(parent, out)`, which:
 
@@ -222,13 +247,14 @@ behaviour, not a workaround.
 - **The history is in-memory and per-session.** It is not persisted, and there is no
   "reopen and undo" — deliberate for now.
 - **No multi-select, no copy/paste, no grouping.**
-- **No expand/collapse per node.** Every row of the visible window is painted; folding a
-  subtree is a state model (which IDs are collapsed, restored on reload) that the row
-  list does not carry yet. `State.roots_expanded` is the only fold.
+- **No drag-and-drop reparenting.** Reparenting is `P` (to root) or a `tree.apply`
+  call; a pointer drag needs hover-target tracking across rows, which the GUI can already
+  report, but the interaction is a separate step.
 - **No keyboard tree navigation.** Clicking selects, the wheel scrolls; arrow keys and
-  Tab order are not wired.
-- **No create/rename/delete/reparent from the tree.** The commands exist in
-  `corex.editor.edit`; the tree has no context menu or inline editor for them yet.
+  Tab order are not wired, so `N`/`P`/`Enter` act on the click selection.
+- **No inline rename in the tree.** Renaming goes through the inspector's name field.
+- **Fold state is not persisted.** It lives in `shell.State`, so reopening a project
+  starts unfolded.
 - **No drag/drop, no viewport camera controls, no gizmos.** The camera is whatever the
   scene authors.
 - **No keyboard focus traversal.** Clicking a row selects; Tab order is not

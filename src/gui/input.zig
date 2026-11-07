@@ -38,6 +38,9 @@ pub const Key = enum {
     /// `a`..`z` share the platform's scancode order, so adding neighbours is free.
     z,
     y,
+    /// `n` = "new", `p` = "reparent to root": the two tree actions that need a key.
+    n,
+    p,
 };
 
 pub const PointerButton = enum { left, right, middle };

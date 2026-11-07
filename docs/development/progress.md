@@ -4,6 +4,60 @@ Permanent record of real progress, decisions, pending items and the next priorit
 task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
+## Cycle 2026-11-07 (m) — Tree actions and per-branch folding
+
+**Diagnosis first.** Cycle (l) gave the tree a flat, bounded, scrollable row model, and
+recorded the next priority as turning it from a selector into an editing surface:
+create/delete/reparent through the same history commands, plus per-branch folding.
+Window/swapchain remains blocked (unchanged; not attempted).
+
+**Delivered (validated):**
+
+- **`tree.Collapsed`** — a fixed inline set of up to `max_collapsed = 64` folded IDs with
+  `contains` / `toggle` / `expand`. A full set refuses a new fold instead of evicting one.
+- **`tree.Row.has_children` / `collapsed`** — the walk looks each node's children up once
+  and records both, so the painter never re-scans the scene to decide whether a disclosure
+  control belongs on a row.
+- **`tree.Action` / `tree.apply`** — `toggle_collapse`, `add_child`, `reparent`, `delete`
+  as functions over `(state, scene, history)`, returning `Effect{changed, select,
+  failure}`. Every scene action is one history command; folding is view-only. Add uses
+  `Scene.nextStableId()` so the new entity can be selected before the command records it,
+  and unfolds a folded parent so the new child is visible.
+- **Shell** — a `+` control in the panel title, `N`/`P`/`Enter` shortcuts, a per-row
+  disclosure with its own hit area (registered before the row so a fold click does not
+  select), `revealSelection` now unfolds the chain above an off-screen selection, and the
+  status bar reports a refused action as `! ErrorName` for the frame.
+- No scene changes were needed this cycle: `nextStableId`, `parentIdOf`, `childIdsInto`
+  and the history commands already carried everything the tree needed.
+
+**Bugs found and fixed while validating:**
+
+- `tree.apply` treated "already a root" as a change: the same-parent test only compared
+  when a parent was expected. It now compares both directions, so `P` on a root records
+  nothing.
+- Three test expectations were wrong rather than the code (an undo had already emptied the
+  stack; a "cycle" was attempted on a tree that had no cycle yet) — corrected to assert the
+  real contract: a refused move records nothing.
+- The frame-widget count test needed updating for the disclosure and `+` controls, which is
+  the test doing its job.
+
+**Suite:** **869/869** tests (clean cache), fmt clean, `zig build` OK, validate, runtime,
+`gui-frame`, `editor-frame` (640x360, **13** hit-testable widgets), `qoi-decode`,
+`bench-extract -Doptimize=ReleaseFast`; preview refreshed and inspected (disclosure arrows
+and `+` visible).
+
+**Decisions:** tree actions are functions, not code inside the paint loop, so a click, a
+key and a test cannot diverge; folding is a view preference and never enters the history;
+a refused action is reported, never silent; creating selects the new entity and unfolds its
+parent.
+
+**Pending / not in this cycle:** drag-and-drop reparenting, keyboard tree navigation
+(arrow keys), inline rename in the tree, persisted fold state, rotation/camera fields.
+
+**Next priority:** keyboard navigation in the tree (arrow up/down/left/right mapping to
+select/fold/reparent) so the tree is usable without a pointer, then drag-and-drop
+reparenting — and the window layer when the sandbox allows it.
+
 ## Cycle 2026-11-07 (l) — Hierarchy row model: scrolling and scroll-to-selection
 
 **Diagnosis first.** Cycle (k) left the tree exactly as cycle (i) wrote it: a recursion

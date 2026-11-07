@@ -82,6 +82,12 @@ pub const State = struct {
     /// First tree row painted. Scrolling moves this, and selecting an entity that is off
     /// screen moves it to bring that row back into view.
     tree_offset: usize = 0,
+    /// Branches whose children are hidden. A view preference, so it never enters the
+    /// history: undoing an edit must not also unfold the tree.
+    collapsed: tree.Collapsed = .{},
+    /// Last tree action that failed, so the status bar can say why instead of the click
+    /// appearing to do nothing.
+    edit_error: ?anyerror = null,
     theme: Theme = .{},
     /// Set when the user clicked an entity this frame, so a caller can react
     /// (re-frame the camera, save the selection, ...) without diffing by hand.
@@ -183,7 +189,7 @@ pub fn draw(
         ctx.canvas.strokeRect(dock.viewport, state.theme.border);
     }
 
-    if (!dock.hierarchy.isEmpty()) drawHierarchy(ctx, state, scene, dock.hierarchy);
+    if (!dock.hierarchy.isEmpty()) drawHierarchy(ctx, state, scene, history, dock.hierarchy);
     if (!dock.inspector.isEmpty()) drawInspector(ctx, state, scene, history, dock.inspector);
     if (!dock.status.isEmpty()) drawStatus(ctx, state, history, frame, dock.status, dock.viewport);
 
@@ -195,20 +201,37 @@ pub fn draw(
 ///
 /// Rows come from `childIdsInto`, which sorts and bounds in one allocation-free
 /// scan, so the panel cannot overflow its table or depend on hash-map visit order.
-fn drawHierarchy(ctx: *widgets.Context, state: *State, scene: anytype, rect: Rect) void {
+fn drawHierarchy(ctx: *widgets.Context, state: *State, scene: anytype, history: anytype, rect: Rect) void {
     const content = widgets.panel(ctx, rect, "Hierarchy");
     const theme = ctx.theme;
     const row_h: i32 = @intCast(theme.row_height);
     var stack = layout.Layout.init(content, .vertical);
 
+    // "+" adds a root, or a child when something is selected: one hit area in the panel's
+    // title row, which is otherwise empty space.
+    {
+        const line_h: i32 = @intCast(font.line_height);
+        const plus = Rect.init(rect.right() - 14, rect.y + theme.panel_padding.top, 10, line_h);
+        const pr = ctx.interact(Id.from(0, "tree.add"), plus);
+        _ = text.draw(ctx.canvas, plus.x + 1, plus.y, "+", .{
+            .color = if (pr.isHovered()) theme.text else theme.text_muted,
+            .clip = plus,
+        });
+        if (pr.clicked) runTreeAction(state, scene, history, .add_child, state.selected);
+    }
+
     // How many rows the panel can hold, and therefore where the scroll window ends.
     const visible = @max(@divTrunc(content.h, row_h), 0);
     var rows: [tree.max_rows]tree.Row = undefined;
-    var list = tree.List{ .rows = &rows, .visible = @intCast(@min(visible, state.rows_per_frame)) };
+    var list = tree.List{
+        .rows = &rows,
+        .visible = @intCast(@min(visible, state.rows_per_frame)),
+        .collapsed = &state.collapsed,
+    };
 
     // Keep the selection on screen before painting: a keyboard step or a restore can
     // select an entity that the current window does not show.
-    revealSelection(state, scene, list.visible);
+    revealSelection(state, scene, list.visible, &state.collapsed);
 
     // Scrolling: the wheel moves by whole rows, and the offset is clamped so the panel
     // cannot be scrolled into emptiness.
@@ -234,7 +257,7 @@ fn drawHierarchy(ctx: *widgets.Context, state: *State, scene: anytype, rect: Rec
     for (list.rows[0..list.len]) |row| {
         const slot = stack.measure(.{ .w = content.w, .h = row_h });
         if (slot.isEmpty()) break;
-        if (drawTreeRow(ctx, state, scene, slot, row, row_h, content)) shown += 1;
+        if (drawTreeRow(ctx, state, scene, history, slot, row, row_h, content)) shown += 1;
     }
 
     if (shown == 0) {
@@ -250,13 +273,35 @@ fn drawHierarchy(ctx: *widgets.Context, state: *State, scene: anytype, rect: Rec
 
 /// Scroll the window so the selected row is inside it, if the selection is far enough out
 /// to need it. One bounded search per frame only when the selection is not visible.
-fn revealSelection(state: *State, scene: anytype, visible: usize) void {
+fn revealSelection(state: *State, scene: anytype, visible: usize, collapsed: *tree.Collapsed) void {
     if (state.selected == 0 or visible == 0) return;
     var rows: [tree.max_rows]tree.Row = undefined;
-    var list = tree.List{ .rows = &rows, .visible = visible, .offset = state.tree_offset };
+    var list = tree.List{ .rows = &rows, .visible = visible, .offset = state.tree_offset, .collapsed = collapsed };
     tree.build(scene, &list);
     for (list.rows[0..list.len]) |row| {
         if (row.id == state.selected) return;
+    }
+    // The selection may be hidden by a fold rather than by the window: unfold the chain
+    // above it first, or scrolling would land on a row that is still not there.
+    var changed = true;
+    var guard: usize = 0;
+    while (changed and guard < tree.max_depth) : (guard += 1) {
+        changed = false;
+        var chain: [tree.max_rows]u64 = @splat(0);
+        var len: usize = 0;
+        var cursor = scene.parentIdOf(state.selected);
+        while (cursor) |pid| {
+            if (len == chain.len) break;
+            chain[len] = pid;
+            len += 1;
+            cursor = scene.parentIdOf(pid);
+        }
+        for (chain[0..len]) |pid| {
+            if (collapsed.contains(pid)) {
+                collapsed.expand(pid);
+                changed = true;
+            }
+        }
     }
     // Not in the window: ask the whole tree where it is and centre it.
     const line = tree.indexOf(scene, state.selected, tree.max_rows) orelse return;
@@ -272,16 +317,36 @@ fn drawTreeRow(
     ctx: *widgets.Context,
     state: *State,
     scene: anytype,
+    history: anytype,
     slot: Rect,
     row: tree.Row,
     row_h: i32,
     content: Rect,
 ) bool {
-    _ = content;
     const theme = ctx.theme;
     const entity = scene.entityById(row.id) orelse return false;
     const indent: i32 = @intCast(4 + @as(i32, @intCast(row.depth)) * 8);
     const row_rect = Rect.init(slot.x, slot.y, slot.w, row_h);
+
+    // The disclosure control is its own hit area *before* the row, so clicking it folds
+    // the branch instead of selecting the entity. It is painted (and registered) first so
+    // the row underneath still receives clicks everywhere else.
+    var disclosure_w: i32 = 0;
+    if (row.has_children) {
+        disclosure_w = 8;
+        const tri = Rect.init(row_rect.x + indent - 8, row_rect.y, disclosure_w, row_h);
+        const dr = ctx.interact(Id.from(row.id, "tree.disclosure"), tri);
+        const glyph: []const u8 = if (row.collapsed) ">" else "v";
+        const ty = row_rect.y + @divTrunc(@max(row_h - @as(i32, @intCast(font.line_height)), 0), 2);
+        _ = text.draw(ctx.canvas, tri.x + 1, ty, glyph, .{
+            .color = if (dr.isHovered()) theme.text else theme.text_muted,
+            .clip = tri,
+        });
+        if (dr.clicked) {
+            _ = tree.apply(.toggle_collapse, row.id, &state.collapsed, scene, history);
+            return true;
+        }
+    }
 
     const id_hash = Id.from(row.id, "tree");
     const r = ctx.interact(id_hash, row_rect);
@@ -303,7 +368,33 @@ fn drawTreeRow(
         .color = if (selected) theme.textOn(theme.accent) else theme.text,
         .clip = label_rect,
     });
+    _ = content;
     return true;
+}
+
+/// Run a tree action and fold its result back into the editor state.
+///
+/// One place decides what a tree click does, so a click, a key and a test go through the
+/// same path: the action becomes one history command, a failure is reported rather than
+/// swallowed, and a new entity is selected so the user can name it immediately.
+fn runTreeAction(
+    state: *State,
+    scene: anytype,
+    history: anytype,
+    action: tree.Action,
+    row: u64,
+) void {
+    const effect = tree.apply(action, row, &state.collapsed, scene, history);
+    state.edit_error = effect.failure;
+    if (effect.select != 0) {
+        state.selected = effect.select;
+        state.name_owner = 0; // the inspector must reload for the new entity
+        state.selection_changed = true;
+    }
+    if (effect.changed and state.selected != 0 and scene.entityById(state.selected) == null) {
+        state.selected = 0;
+        state.name_owner = 0;
+    }
 }
 
 /// The inspector: the selected entity's name as an editable field, its stable ID, local
@@ -603,7 +694,31 @@ fn applyShortcuts(ctx: *widgets.Context, state: *State, scene: anytype, history:
         _ = deleteSelected(state, history, scene);
         return;
     }
+    // Tree actions on the selection: the same `tree.apply` a click uses, so a key and a
+    // click cannot diverge in what they record.
+    if (ctx.keyPressed(.n)) {
+        runTreeAction(state, scene, history, .add_child, state.selected);
+        return;
+    }
+    if (ctx.keyPressed(.p)) {
+        runTreeAction(state, scene, history, .{ .reparent = null }, state.selected);
+        return;
+    }
+    // Enter on a selection folds or unfolds its branch, if it has one.
+    if (ctx.keyPressed(.enter)) {
+        const selected = if (state.selected != 0) scene.entityById(state.selected) else null;
+        if (selected != null and hasChildren(scene, state.selected)) {
+            runTreeAction(state, scene, history, .toggle_collapse, state.selected);
+        }
+        return;
+    }
     if (ctx.keyPressed(.escape)) state.selected = 0;
+}
+
+/// Whether an entity has any children, which is what decides if Enter has anything to fold.
+fn hasChildren(scene: anytype, id: u64) bool {
+    var kids: [1]u64 = @splat(0);
+    return scene.childIdsInto(id, &kids) > 0;
 }
 
 /// Drop a selection that no longer resolves — undoing a create, or a redo of a delete,
@@ -693,7 +808,18 @@ fn drawStatus(ctx: *widgets.Context, state: *State, history: anytype, frame: Fra
     const pad: i32 = 4;
     const inner = Rect.init(rect.x + pad, rect.y + 3, @max(rect.w - 2 * pad, 0), rect.h);
     _ = text.draw(ctx.canvas, inner.x, inner.y, line, .{ .color = theme.text_muted, .clip = inner });
-    _ = state;
+
+    // A refused edit replaces the counter tail for a frame: "the click did nothing" is the
+    // one status an editor must never leave the user with. It is reported once, so the bar
+    // returns to its counters as soon as the next frame paints.
+    if (state.edit_error) |err| {
+        var err_buf: [64]u8 = undefined;
+        const msg = std.fmt.bufPrint(&err_buf, "! {s}", .{@errorName(err)}) catch "!";
+        const w = text.width(msg, 1) + 2 * pad;
+        const box = Rect.init(rect.right() - @min(w, rect.w), rect.y, @min(w, rect.w), rect.h);
+        ctx.canvas.fillRect(box, theme.button);
+        _ = text.draw(ctx.canvas, box.x + pad, inner.y, msg, .{ .color = theme.accent, .clip = box });
+    }
 }
 
 /// Where the selected entity is on screen, or null when it is behind the camera or
@@ -857,8 +983,10 @@ test "editor: a frame paints the docks, the viewport and a status line" {
     // The status bar is painted even before any click.
     try testing.expectEqual(h.state.theme.button, h.pixel(dock.status.x + 6, dock.status.y + 4));
 
-    // The frame recorded one hit area per entity row: the tree's three entities.
-    try testing.expectEqual(@as(usize, 3), h.ctx.entry_count);
+    // One hit area per entity row (three), the disclosure control of the one row that has
+    // children, and the panel's "+" control: the frame's widget table holds exactly what
+    // was painted.
+    try testing.expectEqual(@as(usize, 5), h.ctx.entry_count);
 }
 
 test "editor: clicking a hierarchy row selects that entity, and only that one" {
@@ -1400,4 +1528,104 @@ test "editor: selecting an entity that is off screen scrolls it into view" {
         if (row.id == ids[39]) found = true;
     }
     try testing.expect(found);
+}
+
+test "editor: the disclosure control folds a branch without selecting it" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.runFrames(2);
+
+    // Find the disclosure of the root row and click it.
+    const id = widgets.Id.from(h.root_id, "tree.disclosure");
+    var rect = Rect.none;
+    var i: usize = 0;
+    while (i < h.ctx.entry_count) : (i += 1) {
+        if (h.ctx.entries[i].id.eql(id)) rect = h.ctx.entries[i].rect;
+    }
+    try testing.expect(!rect.isEmpty());
+
+    h.hover(rect.x + 2, rect.y + 2);
+    h.click(rect.x + 2, rect.y + 2);
+    h.release(rect.x + 2, rect.y + 2);
+
+    // The branch folded, and the selection did not move to the row.
+    try testing.expect(h.state.collapsed.contains(h.root_id));
+    try testing.expectEqual(@as(u64, 0), h.state.selected);
+    // Nothing entered the history: a fold is a view preference.
+    try testing.expectEqual(@as(usize, 0), h.history.undoDepth());
+    try testing.expect(!h.history.dirty);
+}
+
+test "editor: the + control creates an undoable entity and selects it" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.state.selected = h.root_id;
+    h.runFrames(2);
+
+    const id = widgets.Id.from(0, "tree.add");
+    var rect = Rect.none;
+    var i: usize = 0;
+    while (i < h.ctx.entry_count) : (i += 1) {
+        if (h.ctx.entries[i].id.eql(id)) rect = h.ctx.entries[i].rect;
+    }
+    try testing.expect(!rect.isEmpty());
+    const before = h.scene.count();
+
+    h.hover(rect.x + 2, rect.y + 2);
+    h.click(rect.x + 2, rect.y + 2);
+    h.release(rect.x + 2, rect.y + 2);
+
+    try testing.expectEqual(before + 1, h.scene.count());
+    // The new entity is the selection, under the row that was selected.
+    try testing.expect(h.state.selected != 0);
+    try testing.expectEqual(h.root_id, h.scene.parentIdOf(h.state.selected).?);
+    try testing.expectEqual(@as(usize, 1), h.history.undoDepth());
+    try testing.expect(h.history.dirty);
+
+    try testing.expect(undo(&h.history, &h.scene));
+    try testing.expectEqual(before, h.scene.count());
+}
+
+test "editor: N creates, P makes the selection a root, Enter folds it" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.state.selected = h.root_id;
+    h.runFrames(2);
+
+    // N: a child of the selected row.
+    h.frameInput(.{ .key = .n }, &h.state);
+    try testing.expectEqual(h.root_id, h.scene.parentIdOf(h.state.selected).?);
+
+    // P: back to the root level; one command each.
+    const depth = h.history.undoDepth();
+    h.frameInput(.{ .key = .p }, &h.state);
+    try testing.expect(h.scene.parentIdOf(h.state.selected) == null);
+    try testing.expectEqual(depth + 1, h.history.undoDepth());
+
+    // Enter on a row with children folds it.
+    h.state.selected = h.root_id;
+    h.runFrames(1);
+    h.frameInput(.{ .key = .enter }, &h.state);
+    try testing.expect(h.state.collapsed.contains(h.root_id));
+    // Enter again unfolds.
+    h.frameInput(.{ .key = .enter }, &h.state);
+    try testing.expect(!h.state.collapsed.contains(h.root_id));
+}
+
+test "editor: a failed tree action is reported instead of looking like a no-op" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.state.selected = h.root_id;
+    h.runFrames(1);
+
+    // Reparent the root under its own child: the scene refuses the cycle.
+    runTreeAction(&h.state, &h.scene, &h.history, .{ .reparent = h.child_id }, h.root_id);
+    try testing.expect(h.state.edit_error != null);
+    // The tree did not change and nothing was recorded.
+    try testing.expect(h.scene.parentIdOf(h.root_id) == null);
+    try testing.expectEqual(@as(usize, 0), h.history.undoDepth());
 }

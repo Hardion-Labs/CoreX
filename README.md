@@ -674,7 +674,7 @@ Indicative; subject to change as technical decisions are validated.
 - [x] GUI library foundation: built-in font, RGBA8 canvas, text, layout, immediate-mode widgets, headless frame renderer.
 - [x] Editor shell: docked hierarchy, scene viewport, inspector, status bar, headless frame renderer.
 - [x] Editor editing model: reversible commands, undo/redo, dirty tracking, atomic save.
-- [ ] Editor window and real input; rotation/camera fields, per-node collapse, gizmos, asset browser.
+- [ ] Editor window and real input; rotation/camera fields, tree drag-and-drop, gizmos, asset browser.
 - [ ] Lua VM and gameplay scripting.
 - [ ] Native Module API loader (C++).
 - [ ] Runtime player and export system / Export Templates.
@@ -803,12 +803,14 @@ try edit.saveScene(&history, scene, io, dir, "scenes/main.scene", gpa); // stage
 
 In the shell: click the name, a position or a scale field, type, press `Enter` to commit
 one undoable step (`Escape` discards it); `Ctrl+Z` undo, `Ctrl+Y` / `Ctrl+Shift+Z` redo,
-`Delete` delete the selection, `Escape` clear it.
+`Delete` delete the selection, `Escape` clear it. In the hierarchy, `+` (or `N`) adds a
+child, `P` makes the selection a root, `Enter` folds/unfolds a branch, the disclosure
+arrow and the wheel work with the pointer.
 
 Limits: no window or real input, rotation and camera fields are read-only (the model
 already carries `set_component`), the history is in-memory and not persisted, no field
-scrubbing, no per-node collapse or keyboard tree navigation, no gizmos or camera
-controls, fixed dock widths. See
+scrubbing, no keyboard tree navigation or drag-and-drop reparenting, no persisted fold
+state, no gizmos or camera controls, fixed dock widths. See
 [`docs/editor-shell.md`](docs/editor-shell.md).
 
 ## Development
