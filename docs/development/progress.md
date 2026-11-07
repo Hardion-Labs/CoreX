@@ -4,6 +4,77 @@ Permanent record of real progress, decisions, pending items and the next priorit
 task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
+## Cycle 2026-11-07 (h) — Built-in GUI foundation (font, canvas, layout, widgets)
+
+**Diagnosis first.** Window/swapchain re-checked and **still blocked** (no
+`/usr/include/X11`, no `pkg-config`, no `Xvfb`, `DISPLAY` empty) — not attempted.
+The queued next priority was the GUI library / graphical editor. The editor needs a
+GUI, and everything a GUI needs (font, canvas, layout, widgets) is headless and
+purely arithmetic, so the foundation is the coherent, fully verifiable step; the
+editor itself comes next on top of it.
+
+**Delivered (validated):**
+
+- **`gui/font.zig`** — built-in 8x8 bitmap font, printable ASCII 0x20–0x7E,
+  authored on a 6x7 grid inside the cell (`cell_width 6`, `line_height 8`,
+  `glyph_height 7`, empty descender row). `measure` is the **advance**
+  (`(len-1)*cell_width + inkWidth(last)`), with a trailing space still advancing so
+  a padded label does not measure as if the space were absent; `inkWidth` is the
+  inked column count; anything outside the table is `'?'`.
+- **`gui/text.zig`** — text on a canvas: newlines, integer pixel scale, clip rect,
+  and `width`/`height` that agree with `draw`.
+- **`gui/canvas.zig`** — `Color` (straight-alpha RGBA8), `Rect` (extent-based,
+  non-inverting slices, `containsRect`), allocation-free clipped `Canvas` with
+  `fillRect`, `fillOutside`, `strokeRect` (inside the rect), `hline`, `vline`,
+  `plot`, `blit`; source-over quantized once per channel, opaque = exact store,
+  alpha 0 = exact no-op; `shade` rounds half up.
+- **`gui/layout.zig`** — `Size`, `Padding`, a forward-only stacking `Layout` that
+  truncates instead of overflowing, and `textSize`. (A `Scroll` helper was written
+  first and **removed**: nothing used it, so it was speculative code.)
+- **`gui/input.zig`**, **`gui/theme.zig`** — frame input (`endFrame` clears
+  one-frame events), and widget colours/metrics in dark and light.
+- **`gui/widgets.zig`** — immediate-mode `Context`/`Id`/`Entry`/`Response` and
+  `panel`, `label`, `button`, `checkbox`, `slider`, `textField` (caller-owned fixed
+  buffer). Pointer ownership is resolved from the **previous** frame's paint order,
+  walking the table from the end, so the last-painted (topmost) widget wins a click
+  and everything else it covers is `blocked`; `blockBelow` makes a modal block what
+  it covers while its own children stay reachable. Clicks fire on release inside the
+  pressed widget; sliders follow the pointer outside their row and pin at the ends.
+- **`tools/gui_frame.zig`** + `zig build gui-frame -- out.qoi` — renders one frame
+  of real widgets headlessly through the existing QOI encoder; preview in the README.
+
+**Decisions:**
+
+- **Own font, own canvas.** A system font/toolkit would be a new external contract
+  for the launch and export pipelines to carry; a bitmap table and an RGBA8 buffer
+  are data. The buffer is the engine's existing pixel layout, so compositing over a
+  rendered frame needs no conversion.
+- **Identity is a hash, not a pointer.** `Id.from(seed, name)` keeps hot/active/
+  focus stable across frames without retaining widget objects, so there is no
+  widget tree and no per-widget allocation.
+- **Pointer ownership from the previous frame.** The winner is the last-painted
+  widget, which is only known after the frame is built. Using last frame's table is
+  exact, allocation-free and deterministic; the cost is one frame of hover latency,
+  which a window pipeline pays before its first input anyway. Documented rather than
+  hidden.
+- **Truncate, never overflow.** `Layout.measure` and every canvas primitive clamp;
+  a caller asking for too much loses pixels, never correctness.
+- **No speculative widgets.** Only the five an editor sidebar needs today, plus
+  panel/label; no tree view, no tabs, no drag-and-drop until the editor needs them.
+
+**Suite:** **805/805** (`zig build test --summary all`, cleared cache), `zig fmt
+--check src build.zig tools` clean, `zig build` OK, headless smoke and `--mode
+validate` OK, `zig build gui-frame` renders 220x132 / 5 widgets / 3,253 bytes.
+
+**Pending:** window/swapchain/vsync (blocked here); GPU backend; graphical editor on
+top of this GUI (layout persistence, dock panels, viewport, gizmos); text shaping
+(proportional faces, kerning, non-Latin), wrapping, automatic Tab traversal, a
+scrollbar widget, wheel-wired scrolling; Lua VM; native module API; export templates.
+
+**Next priority:** the **graphical editor shell** — dock/panel layout over this GUI,
+a scene viewport that blits `raster.Target.color`, and the inspector wired to the ECS
+it just displays — still without a window, rendered through `zig build gui-frame`.
+
 ## Cycle 2026-11-07 (g) — Conservative occlusion culling in render extraction
 
 **Diagnosis first.** Window/swapchain re-checked and **still blocked** (no

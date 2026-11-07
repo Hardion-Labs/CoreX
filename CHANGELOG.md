@@ -8,6 +8,49 @@ declared yet.
 
 ### Added
 
+- Built-in GUI foundation (`src/gui/`, exposed as `corex.gui`) — the layer the
+  graphical editor will sit on. No window, no system font, no external toolkit:
+  everything paints into a caller-owned RGBA8 buffer in the same layout as
+  `assets.image.Image.pixels` and `raster.Target.color`, so a GUI frame composites
+  onto a rendered scene with no conversion.
+  - **`gui.font`** — built-in 8x8 bitmap font for printable ASCII (0x20–0x7E),
+    authored on a 6x7 grid (`cell_width 6`, `line_height 8`, always-empty descender
+    row). `measure` returns the *advance*, not a fixed cell grid: `(len-1)*6 + ink`,
+    with a trailing space still advancing, so padded labels do not collapse. Outside
+    the table renders as `'?'`.
+  - **`gui.text`** — drawing on a canvas: `
+` handling, integer pixel scale, an
+    optional clip rect so a label cannot spill out of its widget, `width`/`height`
+    that match what `draw` paints.
+  - **`gui.canvas`** — `Color` (straight-alpha RGBA8), `Rect` (extent, non-inverting
+    slices, `containsRect`), and an allocation-free, clipped `Canvas`:
+    `fillRect`/`fillOutside`/`strokeRect` (drawn inside the rect)/`hline`/`vline`/
+    `plot`/`blit`. Straight-alpha source-over quantized once per channel; an opaque
+    colour is an exact store and alpha 0 is an exact no-op. `shade` rounds half up.
+  - **`gui.layout`** — `Size`/`Padding` (clamped, never inverting) and a forward-only
+    stacking `Layout` that **truncates** a slot larger than the space left instead of
+    overflowing into its neighbour.
+  - **`gui.input`** — one frame of pointer/button/wheel/text/key state plus
+    `endFrame` to clear one-frame events; widgets never see a platform event.
+  - **`gui.theme`** — widget colours and metrics, dark and light.
+  - **`gui.widgets`** — immediate mode: `Context`, `Id` (Wyhash of a caller seed and
+    a name, so identity survives frames without retaining anything), `Entry`,
+    `Response`, and `panel`, `label`, `button`, `checkbox`, `slider`, `textField`
+    (caller-owned fixed buffer, never reallocates).
+    - **Pointer ownership by paint order.** The widget that wins a click is the one
+      painted last on top; because that is only known once the frame is built, the
+      hit test resolves the pointer against the **previous** frame's table, from the
+      end. Everything else under the pointer is reported `blocked` and does not
+      react, so a button inside a panel cannot fire with the panel behind it.
+    - **`blockBelow(rect)`** makes a modal unreachable-to-what-it-covers while
+      keeping widgets painted after it (its own controls) reachable.
+    - Clicks fire on release inside the pressed widget; sliders keep following the
+      pointer outside their row and pin at both ends; a full hit-test table drops
+      extras instead of allocating.
+  - **`tools/gui_frame.zig`** + `zig build gui-frame -- out.qoi`: renders one frame
+    of real widgets headlessly through the existing QOI encoder, with a preview in
+    the README. This is the GUI's smoke test.
+
 - Conservative software occlusion culling in render extraction (`src/render/occlusion.zig`,
   `draw.Occlusion`, `FrameParams.occlusion`): frustum culling cannot reject geometry
   that is inside the view but completely hidden behind something nearer — the wall in

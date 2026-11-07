@@ -131,8 +131,8 @@ Pacing: 60 fps — 0 late of 60 frames, 0 resyncs, 794.372 ms slept, 993.652 ms 
 
 The pacer sleeps against the monotonic clock, anchored so overshoot does not accumulate;
 it is **not** vsync (there is no swapchain yet), and the docs say so. The example project ships a quad and a camera, so the frames
-draw real geometry. The graphical editor, GUI and GPU renderers are not implemented yet,
-and there is no window — the loop renders into a surface it owns
+draw real geometry. The GUI library is implemented headlessly (see [GUI](#gui)); the graphical editor
+and the GPU renderers are not, and there is no window — the loop renders into a surface it owns
 ([docs/presentation.md](docs/presentation.md)).
 
 ## ECS
@@ -594,6 +594,7 @@ CoreX/
 │   ├── audio-mixer.md          # Device-independent audio mixer (voices/buses)
 │   ├── audio-effects.md        # Insert DSP: biquads, compressor, chains
 │   ├── audio-spatial.md        # Spatial audio + AudioSource/AudioSystem
+│   ├── gui-foundation.md       # Built-in GUI: font, canvas, layout, widgets
 │   ├── versioning.md           # Versioning and compatibility policy
 │   ├── native-module-api.md    # C++ native module ABI contract
 │   ├── development/            # Coding standards, commit guidelines
@@ -668,11 +669,72 @@ Indicative; subject to change as technical decisions are validated.
 - [x] Rasterizer mipmaps: integer box-filter chain, per-pixel LOD, trilinear sampling.
 - [x] Rasterizer anisotropic filtering: up to 8 footprint-aligned taps, `Mipmap.anisotropic`.
 - [x] Per-material LOD bias and anisotropic tap cap (`Sampling`, frame default + per-material override).
-- [ ] GUI library and graphical editor.
+- [x] GUI library foundation: built-in font, RGBA8 canvas, text, layout, immediate-mode widgets, headless frame renderer.
+- [ ] Graphical editor on top of the GUI library.
 - [ ] Lua VM and gameplay scripting.
 - [ ] Native Module API loader (C++).
 - [ ] Runtime player and export system / Export Templates.
 - [x] CI pipeline (build + test + launch-contract smoke on Zig 0.17.0).
+
+## GUI
+
+The engine ships its **own** GUI layer (`corex.gui`), the foundation the graphical
+editor will sit on: a built-in 8x8 bitmap font, an RGBA8 canvas, text drawing,
+stacking layout, and immediate-mode widgets (panel, label, button, checkbox,
+slider, single-line text field) with a theme.
+
+It has no window, no system font and no external toolkit dependency, and it paints
+into a caller-owned buffer in the **same layout the engine already speaks**
+(row-major, top-down, 4 bytes per pixel — `assets.image.Image.pixels`,
+`raster.Target.color`), so a GUI frame composites onto a rendered scene with no
+conversion and encodes straight to QOI.
+
+```zig
+const corex = @import("corex");
+const G = corex.gui;
+
+var pixels: [220 * 132 * 4]u8 = undefined;
+var canvas = try G.canvas.Canvas.init(220, 132, &pixels);
+canvas.clear(.{ 0x12, 0x12, 0x14, 0xff });
+
+// Two hit-test tables: the widget the pointer is over is resolved from the
+// previous frame's paint order, so the last-painted widget on top wins the click.
+var entries: [32]G.widgets.Entry = @splat(undefined);
+var next: [32]G.widgets.Entry = @splat(undefined);
+var ctx = G.widgets.Context.init(canvas, .{}, .{ .pointer = .{ .x = 10, .y = 10 }, .pointer_in_window = true }, &entries, &next);
+
+ctx.beginFrame(.{ .pointer = .{ .x = 10, .y = 10 }, .pointer_in_window = true });
+const content = G.widgets.panel(&ctx, G.canvas.Rect.init(8, 8, 204, 116), "Inspector");
+var stack = G.layout.Layout.init(content, .vertical).withSpacing(4);
+const row = G.layout.Size.init(content.w, 16);
+
+_ = G.widgets.label(&ctx, stack.measure(.{ .w = row.w, .h = 8 }), "immediate mode, no window");
+if (G.widgets.button(&ctx, G.widgets.Id.from(1, "apply"), stack.measure(row), "Apply").clicked) {
+    // the action fires on release inside the button
+}
+var snap = false;
+_ = G.widgets.checkbox(&ctx, G.widgets.Id.from(2, "snap"), stack.measure(row), "snap to grid", &snap);
+var scale: i32 = 35;
+_ = G.widgets.slider(&ctx, G.widgets.Id.from(3, "scale"), stack.measure(row), "scale", 0, 100, &scale);
+ctx.endFrame();
+```
+
+`zig build gui-frame -- frame.qoi` paints one frame of real widgets headlessly and
+writes it as QOI — the GUI's smoke test:
+
+![Headless GUI frame rendered by `zig build gui-frame`](gui-frame-preview.png)
+
+The font is printable ASCII in an 8x7 grid with `cell_width = 6`; `measure` returns
+the advance (`(len-1)*6 + ink`), so labels are not padded to a fixed grid. The canvas
+is allocation-free and clips every primitive; opaque fills are exact stores and
+alpha-zero is a no-op. Layout is a forward-only cursor that **truncates** rather than
+overflowing, and widget identity is a Wyhash of a caller seed plus a name, so no
+widget object has to be retained. `blockBelow` lets a modal block the panel behind it
+without disabling its own controls.
+
+Limits: no window/swapchain (blocked in this environment), no text shaping beyond
+ASCII, no wrapping, no automatic Tab traversal, bounded hit-test tables. The design,
+contracts and limitations are in [`docs/gui-foundation.md`](docs/gui-foundation.md).
 
 ## Development
 
@@ -689,7 +751,8 @@ Local checks:
 ```sh
 zig build
 zig build test
-zig fmt --check src/ build.zig
+zig fmt --check src/ build.zig tools/
+zig build gui-frame -- frame.qoi   # headless GUI frame, for visual inspection
 ```
 
 ## Contributions
