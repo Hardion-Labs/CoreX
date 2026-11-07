@@ -180,8 +180,7 @@ is bit-exactly reproducible and shared edges are watertight. Geometry and
 materials arrive through a duck-typed provider, so `render` has no dependency
 on the asset layer, and the pixel path takes no allocator (`antialias = .edge`
 is the sole exception and only through the caller's allocator). It is a CPU
-reference path, **not** a renderer tier: mipmaps and the GPU backends remain
-planned. Texture-mapped shading: perspective-correct
+reference path, **not** a renderer tier: the GPU backends remain planned. Texture-mapped shading: perspective-correct
 UVs, repeat wrap, nearest/bilinear sampling of borrowed RGBA8 textures, tint
 multiply; `Mesh` carries optional `uvs` and the provider's optional `texture()`
 (a `pub` decl, detected at comptime) binds the material — absent, the path
@@ -205,7 +204,13 @@ coverage folded into the source alpha. Fully covered pixels take the
 un-antialiased path and stay byte-identical; partial pixels never write depth.
 Because it needs that scratch, antialiasing is only reachable through
 `rasterizeAlloc` / `drawMeshAlloc`; the allocator-free entry points force
-`antialias = .none`. Cross-layer integration tests
+`antialias = .none`. **Minification** uses a mip chain (`Texture.mips`, built by
+`render.mipmap.Chain` with an integer box filter) plus per-pixel level selection:
+the level comes from the exact derivative of the perspective UV mapping, which is
+six constants per triangle, and the two neighbouring levels are mixed in `f64`
+with one final round (trilinear). A constant perspective denominator — any
+orthographic projection — hoists the level to once per triangle. Cross-layer
+integration tests
 (`src/render/raster_image_test.zig`) prove the whole chain — scene, world
 transforms, extraction, rasterizer — with a world-rotated face lit
 ambient-only and the explicit-options-over-provider priority intact.

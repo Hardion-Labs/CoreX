@@ -8,6 +8,26 @@ declared yet.
 
 ### Added
 
+- Mipmaps and LOD selection in the software rasterizer (`Texture.mips`,
+  `corex.render.MipLevel`, `Options.mipmap` = `trilinear`/`level0`,
+  `corex.render.mipmap.Chain`, `docs/render-raster.md`): a texture may now carry
+  the levels below level 0, largest first, and `mipmap = .trilinear` (the default)
+  picks the level per pixel from the exact derivative of the perspective UV
+  mapping — six constants per triangle from the same per-pixel edge steps the
+  coverage loop uses — then mixes the two neighbouring levels in `f64` with one
+  final round. `mipmap.Chain.generate` builds the chain with an **integer box
+  filter** (`(sum + count/2) / count`, one round-half-up, odd axes share their
+  last row/column), and `Texture.validate()` rejects any chain that is not exactly
+  repeated halving. A constant perspective denominator (any orthographic
+  projection) hoists the `log2` to once per triangle, so the orthographic
+  benchmark costs ~1.2x over level 0 instead of ~2x; a texture without `mips`, or
+  `mipmap = .level0`, stays byte-identical to the pre-mipmap path. Verified by 34
+  new reference frames in `src/render/raster_texture_vectors.zig` (78 total,
+  1094 covered pixels, all bit-exact) covering minification, anisotropy,
+  magnification, perspective, repeat and `.level0`, plus unit tests for the chain
+  (odd axes, 1x1, allocation failure), LOD clamps, the analytic gradient, the
+  trilinear mix and a checkerboard aliasing test. Benchmarked at 1024x1024
+  (128 texels/pixel): level 0 68.6 ms, trilinear 79.8 ms.
 - Edge antialiasing in the software rasterizer (`Options.antialias`,
   `corex.render.Antialias` = `none`/`edge`, `docs/render-raster.md`): `edge`
   supersamples each pixel with a 4x4 grid of 16 **exact integer** sub-samples at
