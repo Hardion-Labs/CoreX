@@ -1025,8 +1025,14 @@ fn applyShortcuts(ctx: *widgets.Context, state: *State, scene: anytype, history:
                 return;
             };
             const world_pos: [3]f32 = .{ m[12], m[13], m[14] };
+            const rotation: [4]f32 = .{ m[3], m[7], m[11], m[15] };
+            const scale: [3]f32 = .{
+                @sqrt(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]),
+                @sqrt(m[4] * m[4] + m[5] * m[5] + m[6] * m[6]),
+                @sqrt(m[8] * m[8] + m[9] * m[9] + m[10] * m[10]),
+            };
             world.deinit();
-            state.viewport_gizmo.begin(a, ctx.input.pointer, world_pos);
+            state.viewport_gizmo.begin(a, ctx.input.pointer, world_pos, rotation, scale);
             return;
         }
         state.viewport_drag.begin(ctx.input.pointer);
@@ -1250,14 +1256,15 @@ pub const ViewportDrag = struct {
 
 /// Which gizmo tool is active. Only translate exists in this cycle; rotate and
 /// scale follow once the translate path is proven.
-pub const GizmoMode = enum { translate };
+/// Which gizmo tool is active: translate, rotate or scale.
+pub const GizmoMode = enum { translate, rotate, scale };
 
 /// Which axis of the gizmo is being dragged: X (red), Y (green), Z (blue).
 pub const GizmoAxis = enum { x, y, z };
 
-/// The viewport gizmo gesture: which axis is being dragged, where the drag
-/// started, and the entity's world position when the drag began. Kept as a value
-/// so it is testable without a pointer, like `ViewportDrag` and `tree.Drag`.
+/// The viewport gizmo gesture: which mode and axis are being dragged, where the
+/// drag started, and the entity's world transform when the drag began. Kept as a
+/// value so it is testable without a pointer, like `ViewportDrag` and `tree.Drag`.
 /// The shell owns the state; this owns the meaning.
 pub const Gizmo = struct {
     mode: GizmoMode = .translate,
@@ -1267,15 +1274,29 @@ pub const Gizmo = struct {
     drag_start: canvas.Point = .{},
     /// The entity's world position when the drag began (column 4 of its matrix).
     drag_start_world: [3]f32 = .{ 0, 0, 0 },
+    /// The entity's world rotation (quaternion) when the drag began, used in
+    /// rotate mode.
+    drag_start_rotation: [4]f32 = .{ 0, 0, 0, 1 },
+    /// The entity's world scale when the drag began, used in scale mode.
+    drag_start_scale: [3]f32 = .{ 1, 1, 1 },
     /// Whether a drag is currently in progress.
     active: bool = false,
 
     /// Start a drag on `axis` from `pos` (canvas coords), remembering the entity's
-    /// current world position so the drag can be measured against it.
-    pub fn begin(self: *Gizmo, axis: GizmoAxis, start: canvas.Point, world: [3]f32) void {
+    /// current world transform so the drag can be measured against it.
+    pub fn begin(
+        self: *Gizmo,
+        axis: GizmoAxis,
+        start: canvas.Point,
+        world: [3]f32,
+        rotation: [4]f32,
+        scale: [3]f32,
+    ) void {
         self.axis = axis;
         self.drag_start = start;
         self.drag_start_world = world;
+        self.drag_start_rotation = rotation;
+        self.drag_start_scale = scale;
         self.active = true;
     }
 
@@ -1494,13 +1515,53 @@ fn drawViewportSelected(
     ctx.canvas.strokeRect(cross, state.theme.accent);
 }
 
-/// Draws the translate gizmo on the selected entity's projected position in the
-/// viewport, if any. Projects the entity's world position and one unit along each
-/// axis through the camera's view-projection matrix and paints three coloured
-/// axis handles (X red, Y green, Z blue) from the projected position. When an
-/// axis is being dragged its handle is drawn brighter so the user knows which
-/// axis the drag affects. The handle length is fixed in world units, so it
-/// shrinks with distance like the scene itself.
+/// Draws a circle in world space, centered at `center`, lying in the plane
+/// spanned by orthonormal vectors `u` and `v`, with the given `radius`.
+/// Projects each point through the camera and connects consecutive points with
+/// lines. Approximates the circle with `segments` line segments. Used for the
+/// rotate gizmo's axis rings.
+fn drawWorldCircle(
+    ctx: *widgets.Context,
+    cam_view_projection: [16]f32,
+    viewport: Rect,
+    center: [3]f32,
+    u: [3]f32,
+    v: [3]f32,
+    radius: f32,
+    color: canvas.Color,
+    segments: usize,
+) void {
+    var i: usize = 0;
+    var prev: ?canvas.Point = null;
+    while (i <= segments) : (i += 1) {
+        const angle = @as(f32, @floatFromInt(i)) * 2.0 * std.math.pi / @as(f32, @floatFromInt(segments));
+        const c = std.math.cos(angle);
+        const s = std.math.sin(angle);
+        const p: [3]f32 = .{
+            center[0] + u[0] * radius * c + v[0] * radius * s,
+            center[1] + u[1] * radius * c + v[1] * radius * s,
+            center[2] + u[2] * radius * c + v[2] * radius * s,
+        };
+        const pt = projectToViewport(cam_view_projection, p, viewport) orelse {
+            prev = null;
+            continue;
+        };
+        if (prev) |p0| {
+            ctx.canvas.line(p0.x, p0.y, pt.x, pt.y, color);
+        }
+        prev = pt;
+    }
+}
+
+/// Draws the gizmo on the selected entity's projected position in the viewport,
+/// if any. The visual depends on `state.viewport_gizmo.mode`:
+/// - translate: three coloured axis handles (X red, Y green, Z blue) from the
+///   projected position, one unit long in world space.
+/// - rotate: three coloured axis rings around the projected position, one per
+///   axis of rotation.
+/// - scale: three coloured axis handles like translate, with a larger tip so the
+///   user knows dragging changes scale rather than position.
+/// When an axis is being dragged its handle is drawn brighter.
 fn drawViewportGizmo(
     ctx: *widgets.Context,
     state: *State,
@@ -1522,33 +1583,74 @@ fn drawViewportGizmo(
 
     const origin = projectToViewport(cam.view_projection, world_pos, viewport) orelse return;
 
-    const axes: [3]struct {
-        axis: GizmoAxis,
-        delta: [3]f32,
-        color: canvas.Color,
-    } = .{
-        .{ .axis = .x, .delta = .{ 0.5, 0, 0 }, .color = .{ 255, 0, 0, 255 } },
-        .{ .axis = .y, .delta = .{ 0, 0.5, 0 }, .color = .{ 0, 255, 0, 255 } },
-        .{ .axis = .z, .delta = .{ 0, 0, 0.5 }, .color = .{ 0, 0, 255, 255 } },
-    };
+    const gizmo = state.viewport_gizmo;
+    const is_active = gizmo.active;
+    const active_axis = gizmo.axis;
 
-    var i: usize = 0;
-    while (i < 3) : (i += 1) {
-        const axis = axes[i];
-        const tip_world: [3]f32 = .{
-            world_pos[0] + axis.delta[0],
-            world_pos[1] + axis.delta[1],
-            world_pos[2] + axis.delta[2],
-        };
-        const tip = projectToViewport(cam.view_projection, tip_world, viewport) orelse continue;
-        const color = if (state.viewport_gizmo.active and state.viewport_gizmo.axis == axis.axis)
-            canvas.shade(axis.color, 150)
-        else
-            axis.color;
-        ctx.canvas.line(origin.x, origin.y, tip.x, tip.y, color);
-        // A small filled square at the tip makes the handle easier to hit.
-        const tip_box = Rect.init(tip.x - 2, tip.y - 2, 4, 4);
-        if (tip_box.intersects(viewport)) ctx.canvas.fillRect(tip_box, color);
+    const handle_len: f32 = 0.5;
+    const ring_radius: f32 = 0.5;
+
+    switch (gizmo.mode) {
+        .translate, .scale => {
+            const axes: [3]struct {
+                axis: GizmoAxis,
+                delta: [3]f32,
+                color: canvas.Color,
+            } = .{
+                .{ .axis = .x, .delta = .{ handle_len, 0, 0 }, .color = .{ 255, 0, 0, 255 } },
+                .{ .axis = .y, .delta = .{ 0, handle_len, 0 }, .color = .{ 0, 255, 0, 255 } },
+                .{ .axis = .z, .delta = .{ 0, 0, handle_len }, .color = .{ 0, 0, 255, 255 } },
+            };
+
+            var i: usize = 0;
+            while (i < 3) : (i += 1) {
+                const axis = axes[i];
+                const tip_world: [3]f32 = .{
+                    world_pos[0] + axis.delta[0],
+                    world_pos[1] + axis.delta[1],
+                    world_pos[2] + axis.delta[2],
+                };
+                const tip = projectToViewport(cam.view_projection, tip_world, viewport) orelse continue;
+                const highlighted = is_active and active_axis == axis.axis;
+                const color = if (highlighted) canvas.shade(axis.color, 150) else axis.color;
+                ctx.canvas.line(origin.x, origin.y, tip.x, tip.y, color);
+                // A small filled square at the tip makes the handle easier to hit.
+                const tip_size: i32 = if (gizmo.mode == .scale) 6 else 4;
+                const tip_box = Rect.init(tip.x - @divTrunc(tip_size, 2), tip.y - @divTrunc(tip_size, 2), tip_size, tip_size);
+                if (tip_box.intersects(viewport)) ctx.canvas.fillRect(tip_box, color);
+            }
+        },
+        .rotate => {
+            // One ring per axis, lying in the plane perpendicular to that axis.
+            const rings: [3]struct {
+                axis: GizmoAxis,
+                u: [3]f32,
+                v: [3]f32,
+                color: canvas.Color,
+            } = .{
+                .{ .axis = .x, .u = .{ 0, 1, 0 }, .v = .{ 0, 0, 1 }, .color = .{ 255, 0, 0, 255 } },
+                .{ .axis = .y, .u = .{ 1, 0, 0 }, .v = .{ 0, 0, 1 }, .color = .{ 0, 255, 0, 255 } },
+                .{ .axis = .z, .u = .{ 1, 0, 0 }, .v = .{ 0, 1, 0 }, .color = .{ 0, 0, 255, 255 } },
+            };
+
+            var i: usize = 0;
+            while (i < 3) : (i += 1) {
+                const ring = rings[i];
+                const highlighted = is_active and active_axis == ring.axis;
+                const color = if (highlighted) canvas.shade(ring.color, 150) else ring.color;
+                drawWorldCircle(
+                    ctx,
+                    cam.view_projection,
+                    viewport,
+                    world_pos,
+                    ring.u,
+                    ring.v,
+                    ring_radius,
+                    color,
+                    24,
+                );
+            }
+        },
     }
 }
 
@@ -1629,10 +1731,17 @@ fn pickGizmoAxis(
 }
 
 /// Applies one frame of gizmo drag: projects the pointer through the camera onto the
-/// drag plane (perpendicular to the camera's look direction, passing through the
-/// entity), measures the displacement along the selected axis, and writes the new
-/// position to the entity's Transform directly — for immediate feedback during the
-/// drag. The undoable history entry is recorded once, on release (in `applyShortcuts`).
+/// drag plane, measures the displacement along the selected axis, and writes the new
+/// transform to the entity directly — for immediate feedback during the drag. The
+/// undoable history entry is recorded once, on release (in `applyShortcuts`).
+///
+/// The behaviour depends on `state.viewport_gizmo.mode`:
+/// - translate: drag plane is perpendicular to the camera's look direction; displacement
+///   along the axis changes position.
+/// - rotate: drag plane is perpendicular to the rotation axis; displacement around the
+///   axis changes rotation (angle measured from the drag start point).
+/// - scale: drag plane is perpendicular to the camera's look direction; displacement
+///   along the axis changes scale (factor = 1 + displacement * sensitivity).
 fn applyGizmoDrag(
     state: *State,
     scene: anytype,
@@ -1640,6 +1749,7 @@ fn applyGizmoDrag(
     pointer: canvas.Point,
     viewport: Rect,
 ) void {
+    const mode = state.viewport_gizmo.mode;
     const axis = state.viewport_gizmo.axis orelse return;
     const camera = findCameraEntity(scene) orelse return;
     const cam = render_scene.EngineRenderer.cameraOf(scene, camera, gpa) catch return orelse return;
@@ -1647,14 +1757,18 @@ fn applyGizmoDrag(
     var world = scene.computeWorldTransforms(gpa) catch return;
     defer world.deinit();
 
-    const cam_entity = camera;
     const entity = scene.entityById(state.selected) orelse return;
-    const cam_m = world.get(cam_entity) orelse return;
     const m = world.get(entity) orelse return;
 
+    const eix: [3]f32 = switch (axis) {
+        .x => .{ 1, 0, 0 },
+        .y => .{ 0, 1, 0 },
+        .z => .{ 0, 0, 1 },
+    };
+
     // Camera look direction in world space: local -Z transformed by the camera's
-    // world matrix. The drag plane is perpendicular to this, passing through the
-    // entity, so screen drag maps to movement on that plane.
+    // world matrix. Used for the translate/scale drag plane.
+    const cam_m = world.get(camera) orelse return;
     const view_dir = transform_mod.transformDirection(cam_m, .{ 0, 0, -1 });
 
     // NDC from pointer, relative to the viewport.
@@ -1664,31 +1778,106 @@ fn applyGizmoDrag(
     const inv_vp = transform_mod.mat4Inverse(cam.view_projection) orelse return;
     const ray = frame_camera.pickRay(ndc_x, ndc_y, inv_vp, cam.position) orelse return;
 
-    const plane_point: [3]f32 = .{ m[12], m[13], m[14] };
-    const t = frame_camera.rayIntersectsPlane(ray, plane_point, view_dir) orelse return;
+    const start_world = state.viewport_gizmo.drag_start_world;
 
-    const hit: [3]f32 = .{
-        ray.origin[0] + ray.direction[0] * t,
-        ray.origin[1] + ray.direction[1] * t,
-        ray.origin[2] + ray.direction[2] * t,
-    };
+    switch (mode) {
+        .translate => {
+            // Drag plane is perpendicular to the camera's look direction, passing
+            // through the entity.
+            const plane_point: [3]f32 = .{ m[12], m[13], m[14] };
+            const t = frame_camera.rayIntersectsPlane(ray, plane_point, view_dir) orelse return;
+            const hit: [3]f32 = .{
+                ray.origin[0] + ray.direction[0] * t,
+                ray.origin[1] + ray.direction[1] * t,
+                ray.origin[2] + ray.direction[2] * t,
+            };
+            const delta = transform_mod.dot(transform_mod.sub(hit, start_world), eix);
+            const new_pos: [3]f32 = .{
+                start_world[0] + delta * eix[0],
+                start_world[1] + delta * eix[1],
+                start_world[2] + delta * eix[2],
+            };
+            const comp = scene.getComponent(render_scene.Transform, entity) orelse return;
+            comp.* = render_scene.Transform{
+                .position = new_pos,
+                .rotation = comp.rotation,
+                .scale = comp.scale,
+            };
+        },
+        .rotate => {
+            // Drag plane is perpendicular to the rotation axis, passing through the
+            // entity. Project the drag start and current pointer onto this plane,
+            // then measure the angle swept around the axis.
+            const plane_normal = eix;
+            const plane_point: [3]f32 = .{ m[12], m[13], m[14] };
+            // Re-cast the ray for the current pointer (the ray was built from it).
+            const t = frame_camera.rayIntersectsPlane(ray, plane_point, plane_normal) orelse return;
+            const hit: [3]f32 = .{
+                ray.origin[0] + ray.direction[0] * t,
+                ray.origin[1] + ray.direction[1] * t,
+                ray.origin[2] + ray.direction[2] * t,
+            };
+            // The drag start point in world space: project the drag start screen
+            // position onto the same plane. We rebuild a ray from drag_start.
+            const start_ndc_x = @as(f32, @floatFromInt(2 * (state.viewport_gizmo.drag_start.x - viewport.x))) / @as(f32, @floatFromInt(viewport.w)) - 1.0;
+            const start_ndc_y = 1.0 - @as(f32, @floatFromInt(2 * (state.viewport_gizmo.drag_start.y - viewport.y))) / @as(f32, @floatFromInt(viewport.h));
+            const start_ray = frame_camera.pickRay(start_ndc_x, start_ndc_y, inv_vp, cam.position) orelse return;
+            const t2 = frame_camera.rayIntersectsPlane(start_ray, plane_point, plane_normal) orelse return;
+            const start_hit: [3]f32 = .{
+                start_ray.origin[0] + start_ray.direction[0] * t2,
+                start_ray.origin[1] + start_ray.direction[1] * t2,
+                start_ray.origin[2] + start_ray.direction[2] * t2,
+            };
 
-    const eix: [3]f32 = switch (axis) {
-        .x => .{ 1, 0, 0 },
-        .y => .{ 0, 1, 0 },
-        .z => .{ 0, 0, 1 },
-    };
-    const delta = transform_mod.dot(transform_mod.sub(hit, state.viewport_gizmo.drag_start_world), eix);
-    const new_pos: [3]f32 = .{
-        state.viewport_gizmo.drag_start_world[0] + delta * eix[0],
-        state.viewport_gizmo.drag_start_world[1] + delta * eix[1],
-        state.viewport_gizmo.drag_start_world[2] + delta * eix[2],
-    };
+            // Vectors from the entity to the start and current hit points, on the
+            // plane perpendicular to the axis.
+            const v_start = transform_mod.sub(start_hit, start_world);
+            const v_cur = transform_mod.sub(hit, start_world);
+            // Signed angle from v_start to v_cur around the axis.
+            const cross = transform_mod.cross(v_start, v_cur);
+            const sin_angle = transform_mod.dot(cross, plane_normal);
+            const cos_angle = transform_mod.dot(v_start, v_cur);
+            var angle = std.math.atan2(sin_angle, cos_angle);
+            // Normalize to [-pi, pi].
+            while (angle > std.math.pi) angle -= 2 * std.math.pi;
+            while (angle < -std.math.pi) angle += 2 * std.math.pi;
 
-    // Write directly to the scene for immediate feedback; the undoable entry is
-    // recorded once on release, in applyShortcuts.
-    const comp = scene.getComponent(render_scene.Transform, entity) orelse return;
-    comp.* = render_scene.Transform{ .position = new_pos, .rotation = comp.rotation, .scale = comp.scale };
+            const dq = transform_mod.quatFromAxisAngle(plane_normal, angle);
+            const new_rot = transform_mod.quatMultiply(dq, state.viewport_gizmo.drag_start_rotation);
+            const comp = scene.getComponent(render_scene.Transform, entity) orelse return;
+            comp.* = render_scene.Transform{
+                .position = .{ m[12], m[13], m[14] },
+                .rotation = new_rot,
+                .scale = comp.scale,
+            };
+        },
+        .scale => {
+            // Drag plane is perpendicular to the camera's look direction, passing
+            // through the entity. Displacement along the axis changes scale.
+            const plane_point: [3]f32 = .{ m[12], m[13], m[14] };
+            const t = frame_camera.rayIntersectsPlane(ray, plane_point, view_dir) orelse return;
+            const hit: [3]f32 = .{
+                ray.origin[0] + ray.direction[0] * t,
+                ray.origin[1] + ray.direction[1] * t,
+                ray.origin[2] + ray.direction[2] * t,
+            };
+            const delta = transform_mod.dot(transform_mod.sub(hit, start_world), eix);
+            // Sensitivity: 1% scale change per screen pixel of drag.
+            const sensitivity: f32 = 0.01;
+            const factor = 1.0 + delta * sensitivity;
+            const new_scale: [3]f32 = .{
+                state.viewport_gizmo.drag_start_scale[0] * if (axis == .x) factor else 1.0,
+                state.viewport_gizmo.drag_start_scale[1] * if (axis == .y) factor else 1.0,
+                state.viewport_gizmo.drag_start_scale[2] * if (axis == .z) factor else 1.0,
+            };
+            const comp = scene.getComponent(render_scene.Transform, entity) orelse return;
+            comp.* = render_scene.Transform{
+                .position = .{ m[12], m[13], m[14] },
+                .rotation = comp.rotation,
+                .scale = new_scale,
+            };
+        },
+    }
 }
 
 /// Whether an entity has any children, which is what decides if Enter has anything to fold.
@@ -3667,4 +3856,137 @@ test "editor: gizmo drag moves entity along the selected axis" {
     try testing.expectEqual(world_pos[0], undone_pos[0]);
     try testing.expectEqual(world_pos[1], undone_pos[1]);
     try testing.expectEqual(world_pos[2], undone_pos[2]);
+}
+
+test "editor: gizmo rotate rotates entity around selected axis" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.runFrames(1);
+    h.state.selected = h.root_id;
+    h.state.dock_focus = .viewport;
+
+    const dock = Dock.compute(h.ctx.canvas.bounds());
+
+    // Project the root's world position to get a screen point inside the viewport.
+    const camera = findCameraEntity(&h.scene) orelse return;
+    const cam = render_scene.EngineRenderer.cameraOf(&h.scene, camera, testing.allocator) catch return orelse return;
+    var world = h.scene.computeWorldTransforms(testing.allocator) catch return;
+    defer world.deinit();
+    const entity = h.scene.entityById(h.root_id) orelse return;
+    const m = world.get(entity) orelse return;
+    const world_pos: [3]f32 = .{ m[12], m[13], m[14] };
+    const origin = projectToViewport(cam.view_projection, world_pos, dock.viewport) orelse return;
+    const start_rot: [4]f32 = .{ m[3], m[7], m[11], m[15] };
+
+    // Configure the gizmo for rotate around X, without going through pickGizmoAxis
+    // (which targets line handles for translate/scale).
+    h.state.viewport_gizmo.mode = .rotate;
+    h.state.viewport_gizmo.axis = .x;
+    h.state.viewport_gizmo.active = true;
+    h.state.viewport_gizmo.drag_start = origin;
+    h.state.viewport_gizmo.drag_start_world = world_pos;
+    h.state.viewport_gizmo.drag_start_rotation = start_rot;
+
+    // Move the pointer slightly: applyGizmoDrag projects onto the plane perpendicular to X.
+    h.frameInput(.{
+        .pointer = .{ .x = origin.x + 10, .y = origin.y },
+        .pointer_in_window = true,
+        .pointer_down = true,
+    }, &h.state);
+    try testing.expect(h.state.viewport_gizmo.active);
+
+    // Release records one undoable set_component.
+    h.frameInput(.{
+        .pointer = .{ .x = origin.x + 10, .y = origin.y },
+        .pointer_in_window = true,
+        .pointer_released = true,
+    }, &h.state);
+    try testing.expect(!h.state.viewport_gizmo.active);
+
+    // Rotation should have changed from identity.
+    world = h.scene.computeWorldTransforms(testing.allocator) catch return;
+    const m2 = world.get(entity) orelse return;
+    const new_rot: [4]f32 = .{ m2[3], m2[7], m2[11], m2[15] };
+    try testing.expect(new_rot[0] != start_rot[0] or new_rot[1] != start_rot[1] or new_rot[2] != start_rot[2] or new_rot[3] != start_rot[3]);
+
+    // Undo restores the original rotation.
+    try testing.expectEqual(@as(usize, 1), h.history.undoDepth());
+    try h.history.undo(&h.scene);
+    world = h.scene.computeWorldTransforms(testing.allocator) catch return;
+    const m3 = world.get(entity) orelse return;
+    const undone_rot: [4]f32 = .{ m3[3], m3[7], m3[11], m3[15] };
+    try testing.expectEqual(start_rot[0], undone_rot[0]);
+    try testing.expectEqual(start_rot[1], undone_rot[1]);
+    try testing.expectEqual(start_rot[2], undone_rot[2]);
+    try testing.expectEqual(start_rot[3], undone_rot[3]);
+}
+
+test "editor: gizmo scale scales entity along selected axis" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.runFrames(1);
+    h.state.selected = h.root_id;
+    h.state.dock_focus = .viewport;
+
+    const dock = Dock.compute(h.ctx.canvas.bounds());
+
+    // Project the root's world position to get a screen point inside the viewport.
+    const camera = findCameraEntity(&h.scene) orelse return;
+    const cam = render_scene.EngineRenderer.cameraOf(&h.scene, camera, testing.allocator) catch return orelse return;
+    var world = h.scene.computeWorldTransforms(testing.allocator) catch return;
+    defer world.deinit();
+    const entity = h.scene.entityById(h.root_id) orelse return;
+    const m = world.get(entity) orelse return;
+    const world_pos: [3]f32 = .{ m[12], m[13], m[14] };
+    const origin = projectToViewport(cam.view_projection, world_pos, dock.viewport) orelse return;
+    const start_scale: [3]f32 = .{
+        @sqrt(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]),
+        @sqrt(m[4] * m[4] + m[5] * m[5] + m[6] * m[6]),
+        @sqrt(m[8] * m[8] + m[9] * m[9] + m[10] * m[10]),
+    };
+
+    // Configure the gizmo for scale along X.
+    h.state.viewport_gizmo.mode = .scale;
+    h.state.viewport_gizmo.axis = .x;
+    h.state.viewport_gizmo.active = true;
+    h.state.viewport_gizmo.drag_start = origin;
+    h.state.viewport_gizmo.drag_start_world = world_pos;
+    h.state.viewport_gizmo.drag_start_scale = start_scale;
+
+    // Move the pointer to the right: positive X displacement increases X scale.
+    h.frameInput(.{
+        .pointer = .{ .x = origin.x + 10, .y = origin.y },
+        .pointer_in_window = true,
+        .pointer_down = true,
+    }, &h.state);
+    try testing.expect(h.state.viewport_gizmo.active);
+
+    // Release records one undoable set_component.
+    h.frameInput(.{
+        .pointer = .{ .x = origin.x + 10, .y = origin.y },
+        .pointer_in_window = true,
+        .pointer_released = true,
+    }, &h.state);
+    try testing.expect(!h.state.viewport_gizmo.active);
+
+    // X scale should have changed.
+    world = h.scene.computeWorldTransforms(testing.allocator) catch return;
+    const m2 = world.get(entity) orelse return;
+    const new_scale_x = @sqrt(m2[0] * m2[0] + m2[1] * m2[1] + m2[2] * m2[2]);
+    try testing.expect(new_scale_x > start_scale[0]);
+    // Y and Z scale should be unchanged.
+    const new_scale_y = @sqrt(m2[4] * m2[4] + m2[5] * m2[5] + m2[6] * m2[6]);
+    const new_scale_z = @sqrt(m2[8] * m2[8] + m2[9] * m2[9] + m2[10] * m2[10]);
+    try testing.expectEqual(start_scale[1], new_scale_y);
+    try testing.expectEqual(start_scale[2], new_scale_z);
+
+    // Undo restores the original scale.
+    try testing.expectEqual(@as(usize, 1), h.history.undoDepth());
+    try h.history.undo(&h.scene);
+    world = h.scene.computeWorldTransforms(testing.allocator) catch return;
+    const m3 = world.get(entity) orelse return;
+    const undone_scale_x = @sqrt(m3[0] * m3[0] + m3[1] * m3[1] + m3[2] * m3[2]);
+    try testing.expectEqual(start_scale[0], undone_scale_x);
 }
