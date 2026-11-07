@@ -84,23 +84,28 @@ pub fn main(init: std.process.Init) u8 {
     defer result.deinit();
 
     printSummary(io, &result);
-    renderFirstFrame(gpa, io, &result);
+    runFrameLoop(gpa, io, opts, &result);
     return 0;
 }
 
-/// Draw one frame of the prepared scene and report it.
+/// Run the prepared scene's frame loop and report it.
 ///
-/// Presentation (a window and a swapchain) does not exist yet, so the frame is
-/// rendered into a headless surface and only its accounting is reported: this is
-/// the documented headless behaviour, not a stub that pretends to show an image.
-/// `validate` prepares no session and renders nothing.
-fn renderFirstFrame(gpa: std.mem.Allocator, io: Io, result: *startup.StartupResult) void {
+/// There is no window or swapchain yet, so the loop renders into a surface it owns
+/// and reports accounting only: the documented headless behaviour, not a stub that
+/// pretends to show an image. `--frames` bounds the loop (default: one frame) because
+/// nothing can close a headless run — there is no input, so a bounded count is the
+/// honest form of "run for a while". `validate` prepares no session and renders
+/// nothing.
+///
+/// The surface is created **once** and reused by every frame, and the loop's own
+/// per-frame arenas are reset rather than reallocated, so frames after the warm-up
+/// ask the general-purpose allocator for nothing. The report says how many frames were
+/// actually rendered and how many of those had to allocate.
+fn runFrameLoop(gpa: std.mem.Allocator, io: Io, opts: cli.LaunchOptions, result: *startup.StartupResult) void {
     const scene = if (result.scene_data) |*s| s else return;
     const tier = result.render_tier orelse return;
     const cfg = result.config;
-
-    var engine = corex.scene.EngineRenderer.init(gpa, tier) catch return;
-    defer engine.deinit();
+    const frames = opts.frames orelse 1;
 
     var render_assets = corex.scene.render_scene.loadAssets(
         gpa,
@@ -114,28 +119,31 @@ fn renderFirstFrame(gpa: std.mem.Allocator, io: Io, result: *startup.StartupResu
     };
     defer render_assets.deinit();
 
-    // A scene without a camera has nothing to frame; that is reported rather than
-    // silently drawn as an empty image.
-    const report = engine.renderSceneFrame(
-        scene,
-        .{ .width = cfg.window_width, .height = cfg.window_height },
-        render_assets.table.resources(true),
-        .{},
-    ) catch |err| {
-        std.log.scoped(.startup).warn("frame render failed: {s}", .{@errorName(err)});
-        return;
-    } orelse {
-        std.log.scoped(.startup).info("no camera in the scene; nothing to render", .{});
+    // The loop owns the surface and the renderer; every frame reuses both.
+    var loop = corex.runtime.presentation.FrameLoop.init(gpa, tier, cfg.window_width, cfg.window_height) catch |err| {
+        std.log.scoped(.startup).warn("cannot open the frame surface: {s}", .{@errorName(err)});
         return;
     };
+    defer loop.deinit();
 
-    var buf: [256]u8 = undefined;
+    const report = loop.run(scene, render_assets.table.resources(true), frames) catch |err| {
+        std.log.scoped(.startup).warn("frame loop failed: {s}", .{@errorName(err)});
+        return;
+    };
+    if (report.frames == 0) {
+        std.log.scoped(.startup).info("no camera in the scene; nothing to render", .{});
+        return;
+    }
+    const last = report.last;
+
+    var buf: [320]u8 = undefined;
     const line = std.fmt.bufPrint(&buf,
-        \\Frame: {d}x{d} {s} ({d} commands, {d} draws, {d} skipped, {d} pixels, {d} culled)
+        \\Frames: {d} of {d} ({d} allocating) at {d}x{d} {s} — last frame: {d} commands, {d} draws, {d} skipped, {d} pixels, {d} culled
         \\
     , .{
-        cfg.window_width,     cfg.window_height,   @tagName(tier), report.commands, report.stats.draws,
-        report.stats.skipped, report.stats.pixels, report.culled,
+        report.frames,      frames,         report.allocating_frames, loop.target.width,
+        loop.target.height, @tagName(tier), last.commands,            last.draws,
+        last.skipped,       last.pixels,    last.culled,
     }) catch return;
     writeOut(io, line);
 }
@@ -179,6 +187,7 @@ fn usageMessage(err: cli.ParseError) []const u8 {
         error.InvalidMode => "error: invalid --mode (expected editor, runtime or validate)\n",
         error.InvalidLogLevel => "error: invalid --log-level (expected error, warn, info or debug)\n",
         error.InvalidJobs => "error: invalid --jobs (expected a positive integer)\n",
+        error.InvalidFrames => "error: invalid --frames (expected a positive integer)\n",
     };
 }
 

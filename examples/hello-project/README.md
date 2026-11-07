@@ -22,11 +22,14 @@ hello-project/
 ```
 
 The scene draws `assets/quad.obj` (a text OBJ — no binary artifact needed) seen by
-a camera entity, so the engine's startup frame is a real one:
+a camera entity, so the frame loop renders real geometry:
 
 ```text
-Frame: 1280x720 medium (1 commands, 1 draws, 0 skipped, 43264 pixels, 0 culled)
+Frames: 120 of 120 (2 allocating) at 1280x720 medium — last frame: 1 commands, 1 draws, 0 skipped, 43264 pixels, 0 culled
 ```
+
+Only the two warm-up frames allocate; every frame after them reuses the surface, the
+draw list and the per-frame arenas.
 
 The `renderable.mesh`/`material` handles in `main.scene` come from the project's
 deterministic asset layout (`render_scene.planSlots(...).handleOf("assets/quad.obj")`
@@ -47,6 +50,9 @@ From the repository root, after `zig build`:
 
 # Simulate a CoreXHub launch:
 ./zig-out/bin/corex-engine --project examples/hello-project/HelloProject.corex --hub-launch --engine-version 0.1.0
+
+# Run 120 frames headless (default is one frame):
+./zig-out/bin/corex-engine --project examples/hello-project/HelloProject.corex --headless --frames 120
 
 # Run the runtime headless with 4 workers:
 ./zig-out/bin/corex-engine --project examples/hello-project/HelloProject.corex --mode runtime --headless --jobs 4

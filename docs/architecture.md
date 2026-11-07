@@ -89,6 +89,9 @@ src/
 │   ├── flac.zig          # FLAC decoder, same Audio/CXAW artifact      [implemented]
 │   ├── changes.zig       # Change detection + hot-reload baseline      [implemented]
 │   └── pipeline.zig      # Parallel import orchestration + report      [implemented]
+├── runtime.zig           # Runtime public module; presentation + frame loop
+├── runtime/
+│   └── presentation.zig  # Owned frame surface + bounded headless frame loop [implemented]
 ├── render.zig            # Render public module; extraction + CPU rasterizer
 ├── render/
 │   ├── camera.zig        # View/projection math (right-handed)         [implemented]
@@ -142,10 +145,11 @@ Lifecycle, CLI, logging, configuration, versioning, diagnostics and the startup
 pipeline are implemented. Memory policies beyond explicit allocators are still
 to be formalized.
 
-### Independent runtime — planned
+### Independent runtime — frame loop implemented, window planned
 A standalone runtime that loads and runs an exported project without the
-editor. The `runtime` launch mode currently prepares the session headless; the
-loop, subsystems and player are planned.
+editor. The `runtime` launch mode prepares the session headless and now drives a
+real bounded frame loop (`corex.runtime.presentation`, `--frames`); the window,
+swapchain and player are planned.
 
 ### First-party graphical editor — planned
 The graphical editor. The startup pipeline already opens an editor *session*
@@ -174,6 +178,14 @@ a tier without textures is a rejected draw rather than a flat one. The CPU drive
 `SoftwareBackend` implements the contract on top of the rasterizer, and a test
 proves it is **byte-identical** to calling the rasterizer directly — so a GPU
 backend replacing that value must reproduce exactly that behaviour.
+
+The **runtime layer** (`src/runtime/`, re-exported as `corex.runtime`,
+`docs/presentation.md`) owns the frame: `presentation.SurfaceTarget` holds the RGBA8
+colour and `f32` depth buffers for a whole run and reallocates only when the size
+changes, and `presentation.FrameLoop` drives `EngineRenderer` over `--frames` frames
+with a per-frame scratch arena for camera lookup. Steady-state frames allocate nothing
+(measured: 2 allocating frames out of 120), and repeated frames of an unchanged scene are
+pixel-identical. A window, swapchain, vsync and input remain the next platform step.
 
 The **scene renderer** (`src/scene/render_scene.zig`) connects a project to that
 pipeline, which was the missing half: the engine's own scene schema

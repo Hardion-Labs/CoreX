@@ -103,14 +103,23 @@ Try the bundled example project:
 ```sh
 zig build run -- --project examples/hello-project/HelloProject.corex --mode validate
 zig build run -- --project examples/hello-project/HelloProject.corex --headless
+zig build run -- --project examples/hello-project/HelloProject.corex --headless --frames 120
 ```
 
-These commands are validated with Zig 0.17.0. Editor/runtime sessions open headless
-and report readiness, then render one frame of the project's own scene and print
-its accounting, e.g. `Frame: 1280x720 medium (1 commands, 1 draws, 0 skipped, 43264
-pixels, 0 culled)` — the example project ships a quad and a camera, so that frame
-draws real geometry. The graphical editor, GUI and GPU renderers are not
-implemented yet; there is no window and no frame loop.
+These commands are validated with Zig 0.17.0. Editor/runtime sessions open headless,
+report readiness, then run a **frame loop** over the project's own scene and print its
+accounting:
+
+```text
+Frames: 120 of 120 (2 allocating) at 1280x720 medium — last frame: 1 commands, 1 draws, 0 skipped, 43264 pixels, 0 culled
+```
+
+`--frames` bounds the loop (default 1), and "2 allocating" is the whole warm-up: only the
+two draw-list buffers ever touch the general-purpose allocator, so every steady-state
+frame is allocation-free. The example project ships a quad and a camera, so the frames
+draw real geometry. The graphical editor, GUI and GPU renderers are not implemented yet,
+and there is no window — the loop renders into a surface it owns
+([docs/presentation.md](docs/presentation.md)).
 
 ## ECS
 

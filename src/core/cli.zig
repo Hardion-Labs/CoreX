@@ -52,6 +52,10 @@ pub const LaunchOptions = struct {
     hub_engine_version: ?[]const u8 = null,
     scene_override: ?[]const u8 = null,
     headless: bool = false,
+    /// How many frames a session renders before exiting. `null` keeps the documented
+    /// default: one frame, then exit. There is no window to close yet, so a loop must
+    /// be bounded by the caller.
+    frames: ?usize = null,
     /// null means "choose automatically" (logical cores minus one, min 1).
     jobs: ?usize = null,
     log_level: LogLevel = .info,
@@ -67,6 +71,7 @@ pub const ParseError = error{
     InvalidMode,
     InvalidLogLevel,
     InvalidJobs,
+    InvalidFrames,
 };
 
 /// Parse launch arguments (excluding argv[0]).
@@ -95,6 +100,12 @@ pub fn parse(args: []const []const u8) ParseError!LaunchOptions {
         } else if (eq(arg, "--scene")) {
             if (opts.scene_override != null) return error.DuplicateArgument;
             opts.scene_override = try nextValue(args, &i);
+        } else if (eq(arg, "--frames")) {
+            if (opts.frames != null) return error.DuplicateArgument;
+            const value = try nextValue(args, &i);
+            const n = std.fmt.parseInt(usize, value, 10) catch return error.InvalidFrames;
+            if (n == 0) return error.InvalidFrames;
+            opts.frames = n;
         } else if (eq(arg, "--jobs")) {
             const value = try nextValue(args, &i);
             const n = std.fmt.parseInt(usize, value, 10) catch return error.InvalidJobs;
@@ -139,6 +150,7 @@ pub const help_text =
     \\  -m, --mode <mode>          editor (default) | runtime | validate
     \\      --scene <path>         Override the initial scene (project-relative).
     \\      --headless             Run without a graphical window.
+    \\      --frames <n>           Render n frames before exiting (default: 1).
     \\      --jobs <n>             Worker count for the job system (default: auto).
     \\      --log-level <level>    error | warn | info (default) | debug
     \\  -v, --version              Print the engine version and exit.
@@ -220,6 +232,17 @@ test "parse: invalid mode" {
 
 test "parse: invalid log level" {
     try std.testing.expectError(error.InvalidLogLevel, parse(&.{ "--project", "a.corex", "--log-level", "loud" }));
+}
+
+test "parse: --frames bounds the run and must be positive" {
+    const opts = try parse(&.{ "--project", "game.corex", "--frames", "12" });
+    try std.testing.expectEqual(@as(?usize, 12), opts.frames);
+    // Absent means the documented default of one frame, expressed as null.
+    try std.testing.expectEqual(@as(?usize, null), (try parse(&.{ "--project", "game.corex" })).frames);
+    try std.testing.expectError(error.InvalidFrames, parse(&.{ "--project", "a.corex", "--frames", "0" }));
+    try std.testing.expectError(error.InvalidFrames, parse(&.{ "--project", "a.corex", "--frames", "many" }));
+    try std.testing.expectError(error.MissingValue, parse(&.{ "--project", "a.corex", "--frames" }));
+    try std.testing.expectError(error.DuplicateArgument, parse(&.{ "--project", "a.corex", "--frames", "1", "--frames", "2" }));
 }
 
 test "parse: invalid jobs" {

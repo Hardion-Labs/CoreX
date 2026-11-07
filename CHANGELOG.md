@@ -8,6 +8,27 @@ declared yet.
 
 ### Added
 
+- Presentation layer (`src/runtime/presentation.zig`, `corex.runtime`,
+  `docs/presentation.md`): the engine now has a **frame loop** instead of a single
+  frame. `SurfaceTarget` owns the RGBA8 colour and `f32` depth buffers for a whole run
+  and reallocates only when the size actually changes — and never destroys the current
+  frame on a failed or rejected resize, since both allocations happen before either
+  slice is replaced. Zero-sized and oversized surfaces are refused rather than
+  accepted. `FrameLoop` drives `EngineRenderer` over a bounded number of frames,
+  owning the target, the renderer and a per-frame arena for camera lookup (finding the
+  camera resolves a world matrix and would otherwise allocate every frame); its
+  `RunReport` counts rendered frames, empty frames (a scene with no camera stops the
+  loop rather than repeating an unchangeable answer) and allocating frames. Two
+  properties are tested, not asserted in prose: a counting allocator proves
+  steady-state frames take **0 calls / 0 bytes**, and five repeated frames of an
+  unchanged scene are **pixel-identical** byte for byte while a moved quad changes
+  them. Measured on the shipped example: `--frames 120` reports **2 allocating** — one
+  per draw-list buffer, the entire warm-up.
+- Launch contract: `--frames <n>` bounds a run (default `1`, the previous behaviour);
+  `--frames 0` is a usage error. The binary now prints
+  `Frames: N of N (N allocating) at WxH <tier> — last frame: …` instead of the
+  single-frame line. 6 new tests (718 total).
+
 - Per-frame allocator hand-off (`src/render/draw.zig`,
   `corex.render.draw.extractIntoScratch`): the draw list keeps growing in the
   caller's general-purpose allocator (it survives the frame), while every transient
