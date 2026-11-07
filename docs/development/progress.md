@@ -72,6 +72,11 @@ continuation. Newest cycle first.
 **Pending:** window/surface backend, swapchain and vsync (then `target_fps` can be
 honoured), input/event loop, frame timing statistics.
 
+**Merged:** PR **#45** → `main` `78258ae`, CI green (1 m 56 s). Post-merge re-test on
+`main` in a clean worktree: **718/718**, `zig fmt --check` clean, `zig build` OK,
+`--frames 120` → `Frames: 120 of 120 (2 allocating) …`, `--mode validate` OK,
+`--frames 0` rejected with a usage message.
+
 **Next priority:** a window + swapchain backend that presents the surface the loop
 already owns, so the loop becomes visible and can be paced by the real present.
 
