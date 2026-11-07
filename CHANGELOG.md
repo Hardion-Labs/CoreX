@@ -8,6 +8,32 @@ declared yet.
 
 ### Added
 
+- Frame pacing (`src/runtime/pacing.zig`, `corex.runtime.pacing`,
+  `docs/presentation.md`): a `Pacer` that holds a frame loop to a target rate, and the
+  frame timing statistics the loop was missing. `FramePacing` reports each frame's
+  `work_ns`, `slept_ns` and whether it was `late`; `RunReport` aggregates `slept_ns`,
+  `elapsed_ns` and `late_frames`. The budget is the integer reciprocal `1e9 / fps`
+  (60 fps = exactly `16_666_666 ns`), the deadline is anchored to
+  `previous_deadline + budget` so timer overshoot does not accumulate into a loop that
+  slowly runs slower than asked, and a frame that overruns never sleeps and never tries
+  to catch up a burst — it is counted and the schedule re-anchors on the instant the
+  frame ended. That last detail is pinned by a test: re-anchoring one budget *past* the
+  overrun would hand the next frame two budgets of slack and report half the late
+  frames the loop really has. A wait beyond `max_wait_ns` (1 s) means the deadline is in
+  the wrong epoch, so it re-anchors and counts a resync instead of blocking the process.
+  `Pacer.disabled` never reads the clock: the headless default. This is a sleep-based
+  pacer and the module, the docs and this entry say so — without a presentable surface
+  there is no vsync signal, but the deadline computed is the one `FIFO` would impose, so
+  the accounting stays valid when a swapchain lands. Measured on the shipped example in
+  `ReleaseFast`: `--frames 60 --fps 60` → 0 late, 16.561 ms/frame; `--fps 120` → 0 late,
+  8.225 ms/frame. 10 new tests.
+- Launch contract: `--fps <n>` paces the loop; `--fps 0` is a usage error, not a synonym
+  for unpaced. A paced run prints a second line,
+  `Pacing: <fps> fps — <n> late of <n> frames, <n> resyncs, <ms> slept, <ms> elapsed,
+  <ms>/frame`; an unpaced run prints nothing extra, because a line of zeros would look
+  like a measurement of something that never happened. `FrameLoop.init/frame/run` gained
+  the rate and an `?Io` (`null` renders without reading the clock, which is how the loop
+  tests measure work rather than wall-clock time). (729 total)
 - Presentation layer (`src/runtime/presentation.zig`, `corex.runtime`,
   `docs/presentation.md`): the engine now has a **frame loop** instead of a single
   frame. `SurfaceTarget` owns the RGBA8 colour and `f32` depth buffers for a whole run

@@ -185,7 +185,12 @@ colour and `f32` depth buffers for a whole run and reallocates only when the siz
 changes, and `presentation.FrameLoop` drives `EngineRenderer` over `--frames` frames
 with a per-frame scratch arena for camera lookup. Steady-state frames allocate nothing
 (measured: 2 allocating frames out of 120), and repeated frames of an unchanged scene are
-pixel-identical. A window, swapchain, vsync and input remain the next platform step.
+pixel-identical. `presentation.FrameLoop` is paced by `pacing.Pacer`, which holds the
+loop to a target rate with a deadline anchored so overshoot does not accumulate and
+counts frames it cannot keep up with instead of sleeping past them; a paced run reports
+`Pacing: …` with real work/sleep/late measurements. It is sleep-based, not vsync — there
+is no present to synchronise with yet. A window, swapchain, vsync and input remain the
+next platform step.
 
 The **scene renderer** (`src/scene/render_scene.zig`) connects a project to that
 pipeline, which was the missing half: the engine's own scene schema

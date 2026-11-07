@@ -30,13 +30,19 @@ const r = @import("../render.zig");
 const pipeline = r.pipeline;
 const scene_render = @import("../scene/render_scene.zig");
 const EngineFrameReport = scene_render.EngineFrameReport;
+const Pacer = @import("pacing.zig").Pacer;
 
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
 
 pub const Error = error{
     /// Zero, or larger than the rasterizer's `max_dimension`.
     InvalidSurface,
     OutOfMemory,
+    /// The pacer was asked for a zero rate.
+    InvalidTargetFps,
+    /// A waited frame was interrupted; the caller decides whether to keep looping.
+    Canceled,
 };
 
 /// A frame-sized colour + depth target owned across frames.
@@ -127,6 +133,12 @@ pub const RunReport = struct {
     allocating_frames: usize = 0,
     /// The last frame's accounting, for a caller that wants the final state.
     last: EngineFrameReport = .{},
+    /// Total time the loop spent waiting for frame deadlines. Zero when unpaced.
+    slept_ns: u64 = 0,
+    /// Total duration of all rendered frames, waiting included.
+    elapsed_ns: u64 = 0,
+    /// Frames that overran their budget (only possible when paced).
+    late_frames: usize = 0,
 };
 
 /// Drives the engine's renderer over a sequence of frames into an owned surface.
@@ -149,18 +161,31 @@ pub const FrameLoop = struct {
     camera_scratch: std.heap.ArenaAllocator,
     /// Frame parameters applied to every frame (clear colour, antialiasing, light).
     params: pipeline.FrameParams = .{},
+    /// Frame pacing. Disabled by default: with nothing on screen, rendering as fast as
+    /// possible is the useful default for a scripted run.
+    pacer: Pacer = Pacer.disabled,
     /// What `run` accumulated; reset at the start of every `run`.
     report: RunReport = .{},
 
-    pub fn init(gpa: Allocator, tier: r.Tier, width: u32, height: u32) Error!FrameLoop {
+    /// `target_fps` paces the loop; `null` renders as fast as the machine can. A zero
+    /// rate is refused rather than silently meaning "unpaced": the two are different
+    /// requests and confusing them hides a configuration mistake.
+    pub fn init(gpa: Allocator, tier: r.Tier, width: u32, height: u32, target_fps: ?u32) Error!FrameLoop {
         var target = try SurfaceTarget.init(gpa, width, height);
         errdefer target.deinit();
-        return .{
+        var loop = FrameLoop{
             .gpa = gpa,
             .target = target,
             .renderer = try scene_render.EngineRenderer.init(gpa, tier),
             .camera_scratch = std.heap.ArenaAllocator.init(gpa),
         };
+        if (target_fps) |fps| loop.pacer = try Pacer.init(fps);
+        return loop;
+    }
+
+    /// The rate the loop is paced at, or null when unpaced.
+    pub fn targetFps(self: FrameLoop) ?u32 {
+        return self.pacer.targetFps();
     }
 
     pub fn deinit(self: *FrameLoop) void {
@@ -177,13 +202,20 @@ pub const FrameLoop = struct {
         return self.target.resize(width, height);
     }
 
-    /// Render exactly one frame into the owned target.
+    /// Render exactly one frame into the owned target, waiting for the frame budget
+    /// afterwards when the loop is paced.
     ///
     /// Returns null when the scene authors no camera: there is nothing to frame, and
     /// drawing a cleared surface would be a lie about the project's content. The
     /// target is not cleared in that case either, so a caller inspecting the pixels
     /// sees exactly what the last real frame wrote.
-    pub fn frame(self: *FrameLoop, scene: anytype, resources: r.DrawResources) !?pipeline.FrameReport {
+    pub fn frame(self: *FrameLoop, scene: anytype, resources: r.DrawResources, io: ?Io) !?pipeline.FrameReport {
+        // The pacing clock starts before the work, so the wait covers the whole frame.
+        // `io == null` renders without ever sleeping: the headless tests measure work,
+        // not wall-clock time.
+        const started = if (io) |io_| self.pacer.begin(io_) else null;
+        defer if (io) |io_| self.paceAfter(io_, started);
+
         _ = self.camera_scratch.reset(.retain_capacity);
         const found = try scene_render.EngineRenderer.findCamera(scene, self.camera_scratch.allocator()) orelse return null;
         const surface = self.target.surface();
@@ -202,16 +234,32 @@ pub const FrameLoop = struct {
         return report;
     }
 
+    /// Wait out the rest of the frame budget and fold the result into `report`.
+    fn paceAfter(self: *FrameLoop, io: Io, started: ?Io.Clock.Timestamp) void {
+        const pacing = self.pacer.end(io, started) catch |err| switch (err) {
+            // An interrupted wait ends the pacing for this frame, not the loop: the
+            // frame was rendered, it just was not held back.
+            error.Canceled => return,
+            // `end` only reports a bad rate, which `init` already refused at
+            // construction, so reaching it is a programming error with no recovery.
+            error.InvalidTargetFps => unreachable,
+        };
+        self.report.slept_ns += pacing.slept_ns;
+        self.report.elapsed_ns += pacing.work_ns + pacing.slept_ns;
+        if (pacing.late) self.report.late_frames += 1;
+    }
+
     /// Render `count` frames of the same scene, accumulating `report`.
     ///
     /// A scene with no camera stops the loop: nothing is rendered, `frames` stays 0 and
     /// `empty_frames` reports the frames the loop declined to draw. Repeating an answer
     /// that cannot change would only cost time, and calling those frames "rendered"
     /// would misreport what happened.
-    pub fn run(self: *FrameLoop, scene: anytype, resources: r.DrawResources, count: usize) !RunReport {
+    pub fn run(self: *FrameLoop, scene: anytype, resources: r.DrawResources, count: usize, io: ?Io) !RunReport {
         self.report = .{};
+        self.pacer.reschedule();
         for (0..count) |_| {
-            if (try self.frame(scene, resources) == null) {
+            if (try self.frame(scene, resources, io) == null) {
                 self.report.empty_frames = count - self.report.frames;
                 break;
             }
@@ -371,11 +419,11 @@ test "presentation: the loop renders frames into the surface it owns" {
     defer table.deinit(gpa);
     try buildScene(&scene, &table);
 
-    var loop = try FrameLoop.init(gpa, .medium, 32, 24);
+    var loop = try FrameLoop.init(gpa, .medium, 32, 24, null);
     defer loop.deinit();
     loop.params.antialias = .none;
 
-    const report = try loop.run(&scene, table.resources(true), 3);
+    const report = try loop.run(&scene, table.resources(true), 3, null);
     try testing.expectEqual(@as(usize, 3), report.frames);
     try testing.expectEqual(@as(usize, 0), report.empty_frames);
     try testing.expect(report.last.commands == 1 and report.last.draws == 1);
@@ -404,7 +452,7 @@ test "presentation: frames after the warm-up allocate nothing" {
     try buildScene(&scene, &table);
     const resources = table.resources(true);
 
-    var loop = try FrameLoop.init(counter.allocator(), .medium, 16, 16);
+    var loop = try FrameLoop.init(counter.allocator(), .medium, 16, 16, null);
     defer {
         loop.gpa = gpa; // the counter borrows local state; free with the real one
         loop.deinit();
@@ -412,12 +460,12 @@ test "presentation: frames after the warm-up allocate nothing" {
     loop.params.antialias = .none;
 
     // Warm-up: the surface is allocated once and both draw-list buffers grow once.
-    _ = try loop.run(&scene, resources, 3);
+    _ = try loop.run(&scene, resources, 3, null);
     try testing.expect(loop.report.allocating_frames > 0);
 
     counter.bytes = 0;
     counter.calls = 0;
-    const steady = try loop.run(&scene, resources, 8);
+    const steady = try loop.run(&scene, resources, 8, null);
     try testing.expectEqual(@as(usize, 8), steady.frames);
     try testing.expectEqual(@as(usize, 0), steady.allocating_frames);
     try testing.expectEqual(@as(usize, 0), counter.calls);
@@ -433,18 +481,18 @@ test "presentation: a resize keeps the loop rendering, only when the size change
     try buildScene(&scene, &table);
     const resources = table.resources(true);
 
-    var loop = try FrameLoop.init(gpa, .medium, 16, 16);
+    var loop = try FrameLoop.init(gpa, .medium, 16, 16, null);
     defer loop.deinit();
     loop.params.antialias = .none;
-    _ = try loop.run(&scene, resources, 2);
+    _ = try loop.run(&scene, resources, 2, null);
 
     // Same size: no reallocation, and the frame still renders.
     try testing.expect(!try loop.resize(16, 16));
-    _ = try loop.run(&scene, resources, 2);
+    _ = try loop.run(&scene, resources, 2, null);
 
     // A new size reallocates once and every later frame keeps that size.
     try testing.expect(try loop.resize(40, 20));
-    const report = try loop.run(&scene, resources, 2);
+    const report = try loop.run(&scene, resources, 2, null);
     try testing.expectEqual(@as(usize, 2), report.frames);
     try testing.expectEqual(@as(u32, 40), loop.target.width);
     try testing.expectEqual(@as(u32, 20), loop.target.height);
@@ -454,7 +502,7 @@ test "presentation: a resize keeps the loop rendering, only when the size change
     // A rejected resize leaves the loop usable at its current size.
     try testing.expectError(error.InvalidSurface, loop.resize(0, 20));
     try testing.expectEqual(@as(u32, 40), loop.target.width);
-    _ = try loop.run(&scene, resources, 1);
+    _ = try loop.run(&scene, resources, 1, null);
 }
 
 test "presentation: a scene without a camera renders no frames and says so" {
@@ -467,20 +515,20 @@ test "presentation: a scene without a camera renders no frames and says so" {
     var table = try pipeline.ResourceTable.init(gpa, 1);
     defer table.deinit(gpa);
 
-    var loop = try FrameLoop.init(gpa, .medium, 8, 8);
+    var loop = try FrameLoop.init(gpa, .medium, 8, 8, null);
     defer loop.deinit();
-    const report = try loop.run(&scene, table.resources(false), 5);
+    const report = try loop.run(&scene, table.resources(false), 5, null);
     try testing.expectEqual(@as(usize, 0), report.frames);
     try testing.expectEqual(@as(usize, 5), report.empty_frames);
     // Nothing was drawn, so the loop is still ready for a scene that has a camera.
-    try testing.expect(try loop.frame(&scene, table.resources(false)) == null);
+    try testing.expect(try loop.frame(&scene, table.resources(false), null) == null);
 
     var with_camera = try testing_scene.EngineRenderScene.init(gpa, "cam");
     defer with_camera.deinit();
     var table2 = try pipeline.ResourceTable.init(gpa, 1);
     defer table2.deinit(gpa);
     try buildScene(&with_camera, &table2);
-    try testing.expect(try loop.frame(&with_camera, table2.resources(true)) != null);
+    try testing.expect(try loop.frame(&with_camera, table2.resources(true), null) != null);
 }
 
 test "presentation: repeated frames of an unchanged scene are pixel-identical" {
@@ -494,23 +542,106 @@ test "presentation: repeated frames of an unchanged scene are pixel-identical" {
     try buildScene(&scene, &table);
     const resources = table.resources(true);
 
-    var loop = try FrameLoop.init(gpa, .medium, 24, 18);
+    var loop = try FrameLoop.init(gpa, .medium, 24, 18, null);
     defer loop.deinit();
     loop.params.antialias = .none;
 
-    _ = try loop.frame(&scene, resources);
+    _ = try loop.frame(&scene, resources, null);
     const first = try gpa.dupe(u8, loop.target.color);
     defer gpa.free(first);
 
     for (0..4) |_| {
-        _ = try loop.frame(&scene, resources);
+        _ = try loop.frame(&scene, resources, null);
         try testing.expectEqualSlices(u8, first, loop.target.color);
     }
 
     // A change to the scene shows up in the next frame: the reuse is not hiding it.
     // Moving the quad off-centre changes where the pixels land.
     scene.getComponent(testing_scene.Transform, scene.entityById(1).?).?.position = .{ 0.8, 0, 0 };
-    _ = try loop.frame(&scene, resources);
+    _ = try loop.frame(&scene, resources, null);
     try testing.expect(!std.mem.eql(u8, first, loop.target.color));
     try testing.expectEqual(@as(usize, 1), loop.report.last.draws);
+}
+
+test "presentation: a zero target rate is refused at construction" {
+    // Zero is not \"unpaced\" — that is `null` — so it must be rejected instead of
+    // quietly rendering flat out.
+    try testing.expectError(error.InvalidTargetFps, FrameLoop.init(testing.allocator, .medium, 8, 8, 0));
+}
+
+test "presentation: an unpaced loop neither sleeps nor reports timing" {
+    const gpa = testing.allocator;
+    var scene = try testing_scene.EngineRenderScene.init(gpa, "main");
+    defer scene.deinit();
+    var table = try pipeline.ResourceTable.init(gpa, 1);
+    defer table.deinit(gpa);
+    try buildScene(&scene, &table);
+
+    var loop = try FrameLoop.init(gpa, .medium, 16, 16, null);
+    defer loop.deinit();
+    loop.params.antialias = .none;
+    try testing.expectEqual(@as(?u32, null), loop.targetFps());
+
+    // `io` is passed, so the clock is available; pacing being off is what decides that
+    // nothing is measured or waited for.
+    const report = try loop.run(&scene, table.resources(true), 3, testing.io);
+    try testing.expectEqual(@as(usize, 3), report.frames);
+    try testing.expectEqual(@as(u64, 0), report.slept_ns);
+    try testing.expectEqual(@as(u64, 0), report.elapsed_ns);
+    try testing.expectEqual(@as(usize, 0), report.late_frames);
+}
+
+test "presentation: a paced loop holds every frame for its budget" {
+    // The end-to-end behaviour of this cycle: with a rate, the loop waits, and the
+    // accumulated statistics are real measurements of that wait. 100 fps keeps the test
+    // short (10 ms per frame) while leaving the wait large enough to observe.
+    const gpa = testing.allocator;
+    var scene = try testing_scene.EngineRenderScene.init(gpa, "main");
+    defer scene.deinit();
+    var table = try pipeline.ResourceTable.init(gpa, 1);
+    defer table.deinit(gpa);
+    try buildScene(&scene, &table);
+
+    var loop = try FrameLoop.init(gpa, .medium, 16, 16, 100);
+    defer loop.deinit();
+    loop.params.antialias = .none;
+    try testing.expectEqual(@as(?u32, 100), loop.targetFps());
+
+    const report = try loop.run(&scene, table.resources(true), 2, testing.io);
+    try testing.expectEqual(@as(usize, 2), report.frames);
+    // Two frames at 10 ms: the loop cannot finish faster than one budget, and in
+    // practice it waits out both.
+    try testing.expect(report.slept_ns > 0);
+    try testing.expectEqual(@as(u64, 10_000_000), loop.pacer.budget_ns.?);
+    try testing.expect(report.elapsed_ns >= report.slept_ns);
+    try testing.expect(report.elapsed_ns >= 10_000_000);
+    // Rendering a 16x16 quad is far inside 10 ms, so nothing should be late.
+    try testing.expectEqual(@as(usize, 0), report.late_frames);
+    try testing.expectEqual(@as(usize, 0), loop.pacer.resyncs);
+}
+
+test "presentation: an absurd rate overruns and is counted, not slept away" {
+    // A budget too small for the work is the common misconfiguration. The loop must
+    // keep drawing, count the frames as late, and never block on a past deadline.
+    const gpa = testing.allocator;
+    var scene = try testing_scene.EngineRenderScene.init(gpa, "main");
+    defer scene.deinit();
+    var table = try pipeline.ResourceTable.init(gpa, 1);
+    defer table.deinit(gpa);
+    try buildScene(&scene, &table);
+
+    // One billion fps: a one-nanosecond budget, which no frame can meet.
+    var loop = try FrameLoop.init(gpa, .medium, 16, 16, 1_000_000_000);
+    defer loop.deinit();
+    loop.params.antialias = .none;
+    try testing.expectEqual(@as(?u64, 1), loop.pacer.budget_ns);
+
+    const report = try loop.run(&scene, table.resources(true), 3, testing.io);
+    // Every frame still rendered — a missed deadline slows the loop, it does not stop it.
+    try testing.expectEqual(@as(usize, 3), report.frames);
+    try testing.expectEqual(@as(usize, 3), report.late_frames);
+    // Late frames do not sleep; their work time is still measured.
+    try testing.expectEqual(@as(u64, 0), report.slept_ns);
+    try testing.expect(report.elapsed_ns > 0);
+    try testing.expectEqual(@as(usize, 3), loop.pacer.late_frames);
 }
