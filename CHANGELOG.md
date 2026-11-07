@@ -8,6 +8,42 @@ declared yet.
 
 ### Added
 
+- Conservative software occlusion culling in render extraction (`src/render/occlusion.zig`,
+  `draw.Occlusion`, `FrameParams.occlusion`): frustum culling cannot reject geometry
+  that is inside the view but completely hidden behind something nearer — the wall in
+  front of the room — and extraction had no way to.
+  - **Tile depth buffer.** A bound is projected to NDC (skipped entirely if a corner is
+    at/behind the near plane or outside `[-1, 1]` in `z`, which also covers an
+    orthographic camera whose `w` is always 1), reduced to the convex hull of its 8
+    projected corners, and claims a tile **only when all four tile corners are inside
+    that hull**, with the **maximum** corner depth as the bound. A partially covered
+    tile is never claimed, so the buffer never invents coverage.
+  - **Conservative by construction.** A bound is culled only when *every* tile of its
+    conservative screen rectangle is claimed by strictly nearer geometry (minus
+    `depth_bias`). It can keep something hidden — cost only — and can never remove
+    something visible: a pipeline test renders the same scene with the pass on and off
+    and asserts the two frames are **byte-identical**.
+  - **Front to back, test-then-claim.** Commands are sorted by depth (nearest first)
+    and each is tested before it claims. Claiming every occluder first — the obvious
+    version, and the first one written — let a bound occlude itself and let a farther
+    bound loosen a nearer one's tile; the pipeline test caught it. Sorting also makes
+    the survivors independent of ECS iteration order.
+  - **No allocation in steady state.** The tile buffer and the two queues live in
+    `RenderFrame`, are grown once and reused; a test counts allocator calls across a
+    warmed-up `refillWithOcclusion` and asserts zero.
+  - **Measured** (`tools/bench_extract.zig`, new `zig build bench-extract`,
+    ReleaseFast, 2,008 renderables — 8 walls with 250 small objects behind each):
+    frustum only 0.404 ms / 2,008 commands → occlusion 0.561 ms / **2 commands**
+    (2,006 culls). A 32×18 grid is slightly cheaper and slightly less precise (4
+    survivors); 128×72 the other way (1). The saved commands would otherwise each be
+    rasterized, shaded and depth-tested in full before losing the depth test.
+  - Knobs: `tiles_x`/`tiles_y` (accuracy/cost), `min_coverage` (a bound below it is
+    only ever a victim), `depth_bias`. No temporal reprojection, no hierarchical-Z, and
+    no per-mesh queries — each frame's buffer comes from that frame's own occluders.
+  - 11 new tests (761 total): the occlusion primitives, clipping/degenerate bounds,
+    partial-tile conservatism, the bias, perspective, extraction with the pass on/off
+    (order and fields of survivors untouched), `min_coverage`, coplanar bounds, the
+    steady-state zero-allocation refill, and the pipeline's byte-identical frames.
 - Per-material sampling controls in the software rasterizer (`raster.Sampling`,
   `Options.sampling`, `src/render/raster.zig`): the footprint decides the level and
   the default tap count, but two knobs belong to the material, not to the geometry.

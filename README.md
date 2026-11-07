@@ -442,6 +442,14 @@ renderer exposes — a LOD bias and an anisotropic tap cap — as plain data on
 `sampling(handle)`; the default biases and caps nothing, so it changes no existing
 frame, and a tier without the capability renders with the uncorrected level.
 
+Extraction is frustum-culled by default and can additionally run a **conservative
+tile occlusion pass** (`FrameParams.occlusion`): large visible bounds claim the screen
+tiles their projected hull fully covers, and a bound whose entire screen rectangle is
+covered by strictly nearer geometry is dropped before it becomes a draw command. It
+can only remove hidden geometry, so the frame is byte-identical with it on or off —
+only shorter (2,006 of 2,008 commands removed on the benchmark scene, at ~0.16 ms of
+extraction cost).
+
 The extraction design and math conventions are documented in
 [`docs/render-extraction.md`](docs/render-extraction.md); the rasterizer, its
 verification and its limits in [`docs/render-raster.md`](docs/render-raster.md);
@@ -649,6 +657,7 @@ Indicative; subject to change as technical decisions are validated.
 - [ ] Audio device backends (ALSA/WASAPI/CoreAudio), HRTF/occlusion, effects, streaming.
 - [ ] Hot-reload event watcher (inotify/FSEvents), dependency graph, startup/editor integration.
 - [x] Backend-independent render extraction (camera, frustum culling, sorted draw lists).
+- [x] Extraction occlusion culling: conservative tile depth buffer, opt-in, byte-identical frames.
 - [x] CPU software rasterizer (fixed-point watertight coverage, depth buffer, textured shading).
 - [x] Rasterizer lighting: single directional Lambert (face normals, CPU reference path).
 - [x] Renderer tier contract (Low/Medium/Advanced capabilities + backend vtable, CPU driver).

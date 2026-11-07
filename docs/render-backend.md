@@ -187,6 +187,10 @@ renderScene(gpa, tier, surface, scene, camera, sort_mode, resources, params)
   Low and Medium map to `SoftwareBackend`; **Advanced has no backend**, so `run`
   refuses it (`error.PreparationFailed`, exit code 6) instead of silently rendering
   a tier lower.
+- `FrameParams.occlusion` enables the extraction-time occlusion pass (see
+  [render-extraction.md](render-extraction.md#occlusion-culling-corexrenderocclusion)).
+  It runs **before** the backend sees the list, so it needs no capability bit: the
+  frame either has fewer commands or the same ones, and never different pixels.
 - `resolve(tier, params, blend_hint)` turns a `FrameParams` into `FrameOptions`
   the tier can actually honour: antialiasing, mip selection, sampling controls,
   lighting and blending are switched off on a tier that lacks them. The pipeline never trips the gate it

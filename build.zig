@@ -42,4 +42,16 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.step("bench", "Run the rasterizer benchmark (use -Doptimize=ReleaseFast)").dependOn(&b.addRunArtifact(bench).step);
+
+    // Extraction benchmark: occlusion on/off through the real `RenderFrame`.
+    const bench_extract = b.addExecutable(.{
+        .name = "bench-extract",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/bench_extract.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "corex", .module = corex_module }},
+        }),
+    });
+    b.step("bench-extract", "Run the extraction/occlusion benchmark (use -Doptimize=ReleaseFast)").dependOn(&b.addRunArtifact(bench_extract).step);
 }

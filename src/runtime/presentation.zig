@@ -173,14 +173,20 @@ pub const FrameLoop = struct {
     pub fn init(gpa: Allocator, tier: r.Tier, width: u32, height: u32, target_fps: ?u32) Error!FrameLoop {
         var target = try SurfaceTarget.init(gpa, width, height);
         errdefer target.deinit();
-        var loop = FrameLoop{
+        // The pacer is validated before the renderer is built: an invalid rate must
+        // fail without leaving a renderer's buffers behind, and every exit below this
+        // point owns something that needs releasing.
+        var pacer: Pacer = Pacer.disabled;
+        if (target_fps) |fps| pacer = try Pacer.init(fps);
+        var renderer = try scene_render.EngineRenderer.init(gpa, tier);
+        errdefer renderer.deinit();
+        return .{
             .gpa = gpa,
             .target = target,
-            .renderer = try scene_render.EngineRenderer.init(gpa, tier),
+            .renderer = renderer,
             .camera_scratch = std.heap.ArenaAllocator.init(gpa),
+            .pacer = pacer,
         };
-        if (target_fps) |fps| loop.pacer = try Pacer.init(fps);
-        return loop;
     }
 
     /// The rate the loop is paced at, or null when unpaced.

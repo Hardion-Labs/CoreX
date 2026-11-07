@@ -239,6 +239,8 @@ pub fn probeSlot(path: []const u8, capacity: usize) usize {
 pub const EngineFrameReport = struct {
     commands: usize = 0,
     culled: usize = 0,
+    /// Of `culled`, how many the occlusion pass rejected this frame.
+    occlusion_culled: usize = 0,
     draws: usize = 0,
     skipped: usize = 0,
     pixels: usize = 0,
@@ -295,7 +297,7 @@ pub const EngineRenderer = struct {
         // and the surface supply the projection, so resizing reframes.
         const cam = r.Camera.init(view.view, projection, view.position);
 
-        const refilled = self.frame.refill(scene, cam, .front_to_back) catch |err| switch (err) {
+        const refilled = self.frame.refillWithOcclusion(scene, cam, .front_to_back, params.occlusion) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.Internal,
         };
@@ -310,9 +312,11 @@ pub const EngineRenderer = struct {
             .none,
         );
         report.culled = refilled.culled;
+        report.occlusion_culled = refilled.occlusion_culled;
         self.last = .{
             .commands = self.frame.commands.len,
             .culled = refilled.culled,
+            .occlusion_culled = refilled.occlusion_culled,
             .draws = report.stats.draws,
             .skipped = report.stats.skipped,
             .pixels = report.stats.pixels,
