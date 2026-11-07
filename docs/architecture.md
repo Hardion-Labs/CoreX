@@ -118,9 +118,10 @@ src/
 │   ├── input.zig         # One frame of pointer/keyboard/text input    [implemented]
 │   ├── theme.zig         # Widget colours + metrics (dark and light)   [implemented]
 │   └── widgets.zig       # Immediate-mode Context: panel/button/...    [implemented]
-├── editor.zig            # Editor public module; the graphical editor shell
+├── editor.zig            # Editor public module; the graphical editor
 └── editor/
-    └── shell.zig         # Docks, hierarchy, viewport, inspector, status [implemented]
+    ├── shell.zig         # Docks, hierarchy, viewport, inspector, status [implemented]
+    └── edit.zig          # Commands, undo/redo, dirty tracking, atomic save [implemented]
 ```
 
 Planned subsystems will be added as sibling modules (e.g. `src/script/`,
@@ -137,7 +138,15 @@ The editor shell ([editor-shell.md](editor-shell.md)) composes one editor frame 
 of that GUI — docked hierarchy/viewport/inspector plus a status bar — over a session the
 startup pipeline prepared, borrowing the scene, renderer and surface rather than owning
 them. `zig build editor-frame -- <project> out.qoi` renders one real editor frame of a
-project headlessly. Editing (undo, dirty tracking, save) and a window are still planned.
+project headlessly.
+
+The editing model ([editor-shell.md](editor-shell.md#editing-model)) sits under the shell:
+`corex.editor.edit` records each change as a plain `Command` value, snapshots the
+entity's prior state before applying it, and undoes by restoring that snapshot — so a
+deleted entity comes back with its **stable ID**, its parent and its components. Undo and
+redo allocate nothing, a failed edit changes nothing, and `saveScene` stages the document
+in a sibling file and renames it over the target, so an interrupted save cannot destroy a
+project. A window and real input are still planned.
 
 ## The startup spine (implemented)
 
@@ -176,13 +185,14 @@ editor. The `runtime` launch mode prepares the session headless and now drives a
 real bounded frame loop (`corex.runtime.presentation`, `--frames`); the window,
 swapchain and player are planned.
 
-### First-party graphical editor — shell implemented; editing and window planned
-The editor *shell* is implemented (`corex.editor.shell`,
-[editor-shell.md](editor-shell.md)): docked hierarchy, scene viewport, inspector and
-status bar painted over a prepared session, borrowing the scene, renderer and surface
-instead of owning them. `zig build editor-frame` renders one real editor frame of a
-project headlessly. Still planned: editing (undo/redo, dirty tracking, save), a window
-and real input, tree scrolling, asset browser, gizmos and the editor loop.
+### First-party graphical editor — shell and editing model implemented; window planned
+The editor *shell* (`corex.editor.shell`, [editor-shell.md](editor-shell.md)) paints a
+docked hierarchy, scene viewport, inspector and status bar over a prepared session,
+borrowing the scene, renderer and surface instead of owning them. The *editing model*
+(`corex.editor.edit`) adds reversible commands, an undo/redo stack, dirty tracking and an
+atomic save. `zig build editor-frame` renders one real editor frame of a project
+headlessly. Still planned: a window and real input, transform/camera fields, tree
+scrolling, asset browser, gizmos and the editor loop.
 
 ### First-party GUI library — implemented; text shaping planned
 The engine's own GUI toolkit (`corex.gui`, [gui-foundation.md](gui-foundation.md)):

@@ -4,6 +4,78 @@ Permanent record of real progress, decisions, pending items and the next priorit
 task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
+## Cycle 2026-11-07 (j) — Editing model: commands, undo/redo, dirty tracking, atomic save
+
+**Diagnosis first.** With the shell merged (#56) the editor could *show* a scene but not
+change one. The next coherent step is the model underneath editing — not widgets: a
+command representation, an undo/redo stack, dirty tracking and a save path that cannot
+destroy a project. Window/swapchain remains **blocked** (unchanged; not attempted), so
+nothing here depends on real input.
+
+**Delivered (validated):**
+
+- **`editor/edit.zig`** (`corex.editor.edit`) — the editing model, headless and
+  renderer-free.
+  - `Command(Scene)`: `set_component`, `remove_component`, `rename`, `reparent`,
+    `create`, `delete` — plain values naming an entity by **stable ID**, no closures.
+  - `History(Scene)`: `apply` / `undo` / `redo` / `truncateRedo`, `canUndo`/`canRedo`,
+    `undoDepth`/`redoDepth`, `dirty`, `markSaved`, `applied_total`.
+  - Undo is **exact, by snapshot**: before every edit the entity's full prior state
+    (name, parent, every schema component) is captured, and undo restores it. One rule
+    for all six commands, and undoing a delete restores the entity's **original stable
+    ID** (so a selection, or an older command, still resolves).
+  - Failures are atomic: an invalid command records nothing and leaves the scene
+    untouched; a scene-level failure mid-apply is rolled back from the snapshot taken
+    just before (`restore` is idempotent).
+  - `ValueUnion(schema)`: a comptime union with one **typed** arm per schema component,
+    named by index, so a command carries a component's real type instead of a byte blob.
+  - `undo`/`redo` allocate nothing (proved by a counting allocator in tests) — safe to
+    bind to a key press inside a frame.
+  - `saveScene(...)`: stages the serialized document in a dot-prefixed sibling and
+    renames it over the target — the file on disk is the old project or the new one,
+    never a truncated mix. Success calls `markSaved` and **keeps** both stacks.
+- **`scene/scene.zig`** — three additions, all in service of restores and edits:
+  `Scene.createEntityWithExactId` (public wrapper over the existing private path, for
+  IDs that were previously in use), `Scene.setName` (validated, arena-owned copy,
+  `null` removes) and `Scene.component_types` / `Scene.component_count` (the schema, in
+  declaration order, so an editor can name a component by position without knowing it).
+- **`editor/shell.zig`** — the inspector's name row is now a **real text field**
+  (`State.name_buffer`/`name_len`/`name_caret`/`name_owner`): Enter commits a `rename`
+  through the history, Escape discards, and the buffer mirrors the scene while unfocused.
+  Status bar gained `*` (unsaved), `u<n>` (undo depth) and `r<n>` (redo depth) from the
+  history. `shell.undo`, `shell.redo`, `shell.deleteSelected`, `shell.reloadName`.
+- **`gui/widgets.zig`** — `Context.keyPressed(key)` and `Context.claimTextInput()`, so a
+  focused field can hold the keyboard and a host knows not to read the bytes as shortcuts.
+- **`tools/editor_frame.zig`** — takes an optional fourth argument `dirty` and passes a
+  real history, so the rendered preview shows the status bar a real session shows.
+- **`tools/qoi_decode.zig`** + `zig build qoi-decode -- in.qoi out.rgba` — inspect a
+  headless frame without adding an image decoder to the library surface.
+
+**Bugs found and fixed while validating:** two `@memcpy` aliasing panics (a `bufPrint`
+whose format embedded its own buffer, and a `@memcpy` between overlapping field-buffer
+slices — replaced by a two-buffer format); a stale name buffer that made the first
+keystroke prepend instead of append (fixed by resynchronizing before the widget runs);
+`componentEql` comparing `[3]f32` with `==` (arrays compared per element); Zig 0.17
+`@typeInfo` struct/union now exposing `field_names`/`field_types` rather than a `fields`
+list; allocator vtable taking a `usize` return address.
+
+**Suite:** **838/838** tests (`zig build test`, clean cache), fmt clean, `zig build` OK,
+`editor-frame` 640x360 with 4 entities. Docs updated: `docs/editor-shell.md`,
+`docs/architecture.md`, `CHANGELOG.md`, this log.
+
+**Decisions:** a command is data, not a closure (inspectable, testable, saveable later);
+the history owns its memory and the scene owns its data; undo restores by snapshot rather
+than by per-command inverse formulas; a restore keeps stable IDs; a failed edit changes
+nothing; saving never clears undo.
+
+**Pending / not in this cycle:** field edits other than the name (transform numbers),
+multi-select, redo-tail trimming on demand, persisting the history. GUI hit-testing still
+resolves against the previous frame.
+
+**Next priority:** bind the model to real input — Ctrl+Z / Ctrl+Y / Delete / F2 shortcuts
+in the shell, then transform-field editing — followed by the window/real-input layer when
+the sandbox allows it.
+
 ## Cycle 2026-11-07 (i) — Editor shell on the GUI foundation
 
 **Diagnosis first.** Window/swapchain re-checked: **still blocked** (no

@@ -33,6 +33,11 @@ pub const Key = enum {
     down,
     home,
     end,
+    /// Letter keys are listed only as they get a meaning, so this enum stays a list of
+    /// the keys something in the engine actually consumes rather than a keyboard model.
+    /// `a`..`z` share the platform's scancode order, so adding neighbours is free.
+    z,
+    y,
 };
 
 pub const PointerButton = enum { left, right, middle };

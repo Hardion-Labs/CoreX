@@ -183,6 +183,16 @@ pub fn Scene(comptime schemas: anytype) type {
     return struct {
         const Self = @This();
 
+        /// The component types of this schema, in declaration order. Position `i` here
+        /// is position `i` in the serialized document, and the same position an editor
+        /// command uses to name a component without knowing its type by name.
+        pub const component_types = blk: {
+            var types: [schemas.len]type = undefined;
+            for (schemas, 0..) |S, i| types[i] = S.component_type;
+            break :blk types;
+        };
+        pub const component_count = schemas.len;
+
         gpa: Allocator,
         arena: *std.heap.ArenaAllocator,
         name: []const u8,
@@ -268,6 +278,34 @@ pub fn Scene(comptime schemas: anytype) type {
                 }
             }
             return entity;
+        }
+
+        /// Create an entity with a **caller-chosen** stable ID.
+        ///
+        /// This exists for restores: undoing a delete has to bring the entity back
+        /// with the ID it had, or every reference to it (a selection, a command
+        /// already in an undo stack) would dangle. IDs are still never reused by
+        /// `createEntity`, which only hands out IDs above `next_id`; a restored ID is
+        /// always one that was previously in use, and `next_id` is bumped past it.
+        pub fn createEntityWithExactId(self: *Self, id: u64, name: ?[]const u8, parent_id: ?u64) Error!ecs.Entity {
+            return self.createEntityWithId(id, name, parent_id);
+        }
+
+        /// Rename an entity. `name` is copied into the scene's arena, so the caller's
+        /// buffer may die immediately; `null` removes the name.
+        ///
+        /// Note: the previous name stays in the arena until the scene is destroyed.
+        /// Renaming in a loop therefore grows the arena by one name per rename — an
+        /// acceptable cost for an editor session, and the reason this is documented
+        /// rather than hidden.
+        pub fn setName(self: *Self, entity: ecs.Entity, name: ?[]const u8) Error!void {
+            if (!self.alive(entity)) return error.EntityNotAlive;
+            const id = self.entity_ids.get(entity.key()) orelse return error.EntityNotFound;
+            const owned: ?[]const u8 = if (name) |n| blk: {
+                validation.validateDisplayName(n) catch return error.InvalidName;
+                break :blk try self.arena.allocator().dupe(u8, n);
+            } else null;
+            self.records.getPtr(id).?.name = owned;
         }
 
         /// Destroy an entity. Direct children are reparented to the destroyed

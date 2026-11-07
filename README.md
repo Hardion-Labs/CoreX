@@ -596,7 +596,7 @@ CoreX/
 │   ├── audio-effects.md        # Insert DSP: biquads, compressor, chains
 │   ├── audio-spatial.md        # Spatial audio + AudioSource/AudioSystem
 │   ├── gui-foundation.md       # Built-in GUI: font, canvas, layout, widgets
-│   ├── editor-shell.md         # Editor shell: docks, hierarchy, viewport, inspector
+│   ├── editor-shell.md         # Editor: shell (docks, hierarchy, viewport) + editing model
 │   ├── versioning.md           # Versioning and compatibility policy
 │   ├── native-module-api.md    # C++ native module ABI contract
 │   ├── development/            # Coding standards, commit guidelines
@@ -672,8 +672,9 @@ Indicative; subject to change as technical decisions are validated.
 - [x] Rasterizer anisotropic filtering: up to 8 footprint-aligned taps, `Mipmap.anisotropic`.
 - [x] Per-material LOD bias and anisotropic tap cap (`Sampling`, frame default + per-material override).
 - [x] GUI library foundation: built-in font, RGBA8 canvas, text, layout, immediate-mode widgets, headless frame renderer.
-- [x] Editor shell: docked hierarchy, scene viewport, read-only inspector, status bar, headless frame renderer.
-- [ ] Editor editing model (undo/redo, dirty tracking, save) and a window.
+- [x] Editor shell: docked hierarchy, scene viewport, inspector, status bar, headless frame renderer.
+- [x] Editor editing model: reversible commands, undo/redo, dirty tracking, atomic save.
+- [ ] Editor window and real input; transform fields, tree scrolling, gizmos, asset browser.
 - [ ] Lua VM and gameplay scripting.
 - [ ] Native Module API loader (C++).
 - [ ] Runtime player and export system / Export Templates.
@@ -741,11 +742,17 @@ contracts and limitations are in [`docs/gui-foundation.md`](docs/gui-foundation.
 
 ## Editor
 
-The graphical editor's shell (`corex.editor`) is built on that GUI. It paints one
+The graphical editor (`corex.editor`) is built on that GUI. Its shell paints one
 complete editor frame over a session the startup pipeline already prepared: a docked
 **hierarchy** (depth-first, clickable, stable entity IDs), a **scene viewport** showing
-the engine's own rendered surface, a **read-only inspector** for the selected entity,
-and a **status bar** carrying the renderer's real per-frame accounting.
+the engine's own rendered surface, an **inspector** whose name field is editable, and a
+**status bar** carrying the save marker, the undo depth and the renderer's real
+per-frame accounting.
+
+Under the shell sits the **editing model** (`corex.editor.edit`): reversible commands
+over the scene, an undo/redo stack, dirty tracking and an atomic save. Undo restores an
+entity's exact prior state — including the **stable ID** of a deleted entity, so a
+selection survives the round trip — and neither undo nor redo allocates.
 
 ```sh
 zig build editor-frame -- examples/hello-project/HelloProject.corex editor.qoi 3  # 3 = entity to inspect
@@ -756,12 +763,16 @@ zig build editor-frame -- examples/hello-project/HelloProject.corex editor.qoi 3
 ```zig
 const corex = @import("corex");
 const shell = corex.editor.shell;
+const edit = corex.editor.edit;
 
 // `scene` is the prepared EngineRenderScene; `pixels` is the rendered frame.
 var state = shell.State{};
+var history = edit.History(@TypeOf(scene)).init(gpa); // owns the undo/redo entries
+defer history.deinit();
+
 var ctx = corex.gui.widgets.Context.init(canvas, state.theme, .{}, &entries, &next);
 ctx.beginFrame(input);
-const selection_changed = shell.draw(&ctx, &state, scene, .{
+const selection_changed = shell.draw(&ctx, &state, &history, scene, .{
     .scene_pixels = pixels,
     .scene_width = 640,
     .scene_height = 360,
@@ -780,8 +791,20 @@ bounded `Scene.childIdsInto`; the viewport samples the render with `Canvas.blitS
 and `shell.projectToViewport` reuses the renderer's own view-projection, so a marker
 cannot drift from the pixels.
 
-Limits: no window or real input, **read-only inspector** (no undo, no save), no tree
-scrolling, no gizmos or camera controls, fixed dock widths. See
+An edit goes through the same stack a menu or a test would use:
+
+```zig
+try history.apply(scene, .{ .rename = .{ .id = id, .name = edit.Name.init("Quad")? } });
+try history.undo(scene); // exact inverse, allocates nothing
+try edit.saveScene(&history, scene, io, dir, "scenes/main.scene", gpa); // staged + renamed
+```
+
+In the shell: `Ctrl+Z` undo, `Ctrl+Y` / `Ctrl+Shift+Z` redo, `Delete` delete the
+selection, `Escape` clear it, `Enter` in the name field commit a rename.
+
+Limits: no window or real input, only the name is editable (the model already carries
+`set_component`), the history is in-memory and not persisted, no tree scrolling, no
+gizmos or camera controls, fixed dock widths. See
 [`docs/editor-shell.md`](docs/editor-shell.md).
 
 ## Development

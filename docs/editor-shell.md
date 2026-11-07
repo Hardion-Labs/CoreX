@@ -4,10 +4,11 @@ The graphical editor's composition layer: one editor frame painted with the engi
 own GUI (`corex.gui`), over a session the startup pipeline already prepared. Code in
 `src/editor/`, exposed as `corex.editor`.
 
-> Status: **shell implemented and tested** (docks, hierarchy, viewport, inspector,
-> status bar, headless frame renderer). The platform parts of an editor — a window, a
-> swapchain, real input, and *editing* with undo — are **not** implemented. This
-> document says exactly where the line is.
+> Status: **shell and editing model implemented and tested** (docks, hierarchy,
+> viewport, inspector with an editable name, status bar, command stack with undo/redo,
+> dirty tracking, atomic save, headless frame renderer). The platform parts of an editor
+> — a window, a swapchain, real input — are **not** implemented. This document says
+> exactly where the line is.
 
 ## What the shell is
 
@@ -17,7 +18,7 @@ rendered surface (RGBA8, the renderer's own) ─┤─► editor.shell.draw ─�
 input frame + editor state                   ─┘
 ```
 
-`editor.shell.draw(ctx, state, scene, frame) -> bool` paints a complete editor frame
+`editor.shell.draw(ctx, state, history, scene, frame) -> bool` paints a complete editor frame
 into the GUI context's canvas and returns whether the selection changed. It owns no
 scene, no renderer and no surface: everything is borrowed for the duration of the
 frame. That is what lets the same call serve a headless tool (`zig build
@@ -79,23 +80,94 @@ copied. Values are clipped to their own rect so a long name cannot run into the 
 column. With nothing selected the panel says so; an entity with no components still
 shows its name, ID and parent.
 
-**The inspector is read-only in this cycle.** Editing needs an undo/redo model, dirty
-tracking and write-back to the `.scene` format; bolting a half version of that onto a
-read-only panel would be exactly the kind of speculative work this project avoids, so
-it is the next coherent step instead.
+The **name** is editable: clicking it focuses a text field, typing edits a buffer,
+**Enter** commits a `rename` command through the history and **Escape** discards the
+buffer. The buffer is what keeps a half-typed name out of the scene, and the history is
+what makes the commit undoable and marks the project dirty. The other rows stay
+read-only until the model grows a numeric field.
+
+The field holds the keyboard while focused: a focused field must not also treat the
+frame's bytes as shortcuts (`Delete` is a text key there, not "destroy the entity").
 
 ## Status bar
 
-Project, scene, command/draw count, thousands of pixels and the viewport size — every
-number comes from the renderer's own `EngineFrameReport`, so the bar cannot claim
-something the renderer did not do. The text is **ASCII only**: the built-in font draws
-anything else as `?`, which the first render of this bar made embarrassingly obvious.
+Project, scene, save state (`*` = unsaved), undo/redo depth (`u3 r1`), command/draw
+count and the viewport size. The render numbers come from the renderer's own
+`EngineFrameReport` and the depths from the history, so the bar cannot claim something
+that did not happen. The text is **ASCII only**: the built-in font draws anything else
+as `?`, which the first render of this bar made embarrassingly obvious.
+
+## Editing model
+
+`src/editor/edit.zig` (`corex.editor.edit`) is the layer that turns a read-only view
+into an editor. It imports no GUI and no renderer: the shell drives it, and so do the
+tests.
+
+```
+Command (a value)  ──apply──►  Scene          + an Entry {command, before} on the stack
+                   ◄─undo───   restore(before)
+```
+
+**A command is a description, not a closure.** Six arms, all plain data:
+`set_component`, `remove_component`, `rename`, `reparent`, `create`, `delete`. Each
+names an entity by **stable ID** — not by the generational ECS handle, which gets
+recycled — so a command recorded a frame ago still names the right entity.
+
+**Undo is exact, by snapshot.** Before every edit the history captures the entity's full
+prior state (name, parent, every schema component). Undo puts that state back. One rule
+for all six commands instead of six inverse formulas, and it is what makes the hard case
+right: undoing a **delete** restores the entity with its **original stable ID**, its
+parent and all its components, so a selection (or an older command) still resolves
+afterwards. A schema is the single source of truth — `History(Scene).ComponentValue` is
+a comptime union with one *typed* arm per schema component, so a value travels with its
+real type instead of as a byte blob.
+
+What the model guarantees, each point covered by a test:
+
+- **Failure changes nothing.** An invalid command records no entry and leaves the scene
+  alone; a scene-level failure mid-apply is rolled back from the snapshot taken just
+  before, so the scene is never half-edited.
+- **`undo` and `redo` allocate nothing** (measured with a counting allocator), which is
+  what makes it safe to bind them to a key press inside a frame.
+- **A new edit discards the redo tail** — the undone future is unreachable and its
+  memory is released.
+- **Saving never clears the stacks.** `markSaved` clears the dirty flag only.
+- **Redo keeps the original snapshot**, so undo after redo restores the same state.
+
+### Saving
+
+`edit.saveScene(history, scene, io, dir, path, gpa)` stages the serialized document in a
+dot-prefixed sibling and renames it over the target. `Scene.save` writes in place, which
+is right for a library call and wrong for an editor: a crash mid-write would destroy the
+user's only copy. With the staged rename the file on disk is the old project or the new
+one, never a truncated mix. A failed save leaves the project **dirty** — "retry the
+save" has a meaning only if the flag is honest.
+
+### Shortcuts
+
+Handled once per frame, after the panels are painted, and skipped while a text field
+holds focus:
+
+| Key | Action |
+| --- | --- |
+| `Ctrl+Z` | undo |
+| `Ctrl+Y`, `Ctrl+Shift+Z` | redo |
+| `Delete` | delete the selected entity (undoable) |
+| `Escape` | clear the selection |
+
+They are a convenience over `shell.undo`/`redo`/`deleteSelected`, which are the same
+functions a menu or a test calls — the shortcuts add no behaviour of their own. A
+selection whose entity no longer resolves (undoing a create, redoing a delete) is
+dropped rather than left pointing at nothing.
 
 ## Headless frame renderer
 
 ```bash
-zig build editor-frame -- examples/hello-project/HelloProject.corex out.qoi [selected-id]
+zig build editor-frame -- examples/hello-project/HelloProject.corex out.qoi [selected-id] [dirty]
 ```
+
+The tool passes a real `edit.History`, so the preview's status bar shows the same save
+marker and undo depth a session would; the optional `dirty` argument sets the marker.
 
 `tools/editor_frame.zig` runs the documented startup pipeline (`startup.run`) to
 prepare the session, loads the project's render assets, renders one frame of the scene
@@ -109,7 +181,11 @@ behaviour, not a workaround.
 - **No window, no swapchain, no real input.** Blocked in this environment (no X11
   headers, no `DISPLAY`). The shell paints into a caller-owned buffer; wiring it to a
   window is `present()` of that same buffer.
-- **Read-only inspector.** No editing, no undo, no dirty tracking, no save.
+- **Only the name is editable.** Transform/camera fields need numeric input widgets;
+  the model already carries `set_component`, so that is a UI step, not a model one.
+- **The history is in-memory and per-session.** It is not persisted, and there is no
+  "reopen and undo" — deliberate for now.
+- **No multi-select, no copy/paste, no grouping.**
 - **No scrolling in the tree.** Beyond `rows_per_frame` the hierarchy shows a hint;
   the row budget is a bound, not a scroll model.
 - **No drag/drop, no viewport camera controls, no gizmos.** The camera is whatever the

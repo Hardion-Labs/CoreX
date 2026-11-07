@@ -19,6 +19,7 @@ const cli = corex.core.cli;
 const startup = corex.core.startup;
 const splash = corex.core.splash;
 const shell = corex.editor.shell;
+const edit = corex.editor.edit;
 const gui = corex.gui;
 const render_scene = corex.scene.render_scene;
 
@@ -45,7 +46,7 @@ fn run(init: std.process.Init) !void {
     while (it.next()) |arg| try args_list.append(gpa, arg);
     const args = args_list.items;
     if (args.len == 0) {
-        std.debug.print("usage: editor-frame <project.corex> [out.qoi] [selected-id]\n", .{});
+        std.debug.print("usage: editor-frame <project.corex> [out.qoi] [selected-id] [dirty]\n", .{});
         return error.MissingProject;
     }
     const out_path = if (args.len > 1) args[1] else "editor-frame.qoi";
@@ -125,6 +126,13 @@ fn run(init: std.process.Init) !void {
     const canvas = try gui.canvas.Canvas.init(width, height, pixels);
     canvas.clear(.{ 0x1e, 0x1f, 0x24, 0xff });
 
+    // The editing model rides along even though this tool does not edit: the shell
+    // paints the save marker and the undo depth from it, so the image shows the status
+    // bar a real session shows rather than a second, imaginary variant.
+    var history = edit.History(render_scene.EngineRenderScene).init(gpa);
+    defer history.deinit();
+    if (args.len > 3) history.dirty = std.mem.eql(u8, args[3], "dirty");
+
     var entries: [128]gui.widgets.Entry = @splat(undefined);
     var next: [128]gui.widgets.Entry = @splat(undefined);
     var ctx = gui.widgets.Context.init(canvas, dockest.theme, .{}, &entries, &next);
@@ -148,7 +156,7 @@ fn run(init: std.process.Init) !void {
     var pass: usize = 0;
     while (pass < 2) : (pass += 1) {
         ctx.beginFrame(frame_input);
-        _ = shell.draw(&ctx, &dockest, shown, frame);
+        _ = shell.draw(&ctx, &dockest, shown, &history, frame);
         ctx.endFrame();
     }
 
