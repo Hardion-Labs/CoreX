@@ -88,6 +88,12 @@ the honest behaviour — the frames are still drawn and counted, not slept away.
 `settings.json` as the windowed default), input/event loop, a ring of frame timings for
 percentiles.
 
+**Merged:** PR **#47** → `main` `e7769c8`, CI green (`Build & test (Zig 0.17.0)`, 22 s).
+Post-merge re-test on `main` in a clean worktree: **729/729**, `zig fmt --check` clean,
+`zig build` OK, `--frames 30 --fps 30` → `Pacing: 30 fps — 0 late of 30 frames, 0
+resyncs, 129.733 ms slept, 996.802 ms elapsed, 33.227 ms/frame`, `--fps 0` → usage
+error (exit 2).
+
 **Next priority:** the same one cycle (b) recorded and this sandbox cannot validate —
 window + swapchain + vsync, to be attempted where a display and its dev headers exist.
 If it is still blocked, the next verifiable step is **asset upload/eviction** in the
