@@ -4,6 +4,112 @@ Permanent record of real progress, decisions, pending items and the next priorit
 task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
+## Cycle 2026-11-06 (f) — A scene file renders: renderable schema, asset layout, headless frame
+
+**Delivered (validated):**
+
+- `src/scene/render_scene.zig` (new, `corex.scene.render_scene`): the layer that was
+  missing between the scene document and the frame pipeline. `EngineScene` carried
+  only `transform`, so a `.scene` could not name a mesh and nothing owned a camera.
+  - `CameraComponent` (`fov`/`near`/`far`, `isValid`) = the lens; the entity's world
+    transform is the position and basis (forward `-Z`), so a camera parents and moves
+    like any entity.
+  - `EngineRenderScene` / `EngineRenderPrefab`: `transform` + `renderable` + `camera`,
+    so the whole document round-trips through the real serializer.
+  - `planSlots(gpa, index, capacity)` → `SlotPlan`: every renderable asset gets a
+    table slot by hash start + linear probing over the **sorted** index, in **one
+    namespace** for meshes and textures. Deterministic, content-only, so
+    `plan.handleOf(path)` is the handle a `.scene` stores — computable without
+    loading a byte. Single namespace was a correctness fix, not a preference: with
+    per-kind slots a mesh and a texture could land on one slot, and the second
+    `setColor` bumped the generation, so one asset's material handle no longer
+    resolved while its mesh handle did.
+  - `loadAssets`: loads `.mesh` artifacts (zero-copy) and `.obj` sources (decoded,
+    transient) plus PNG/BMP/TGA/QOI textures (artifact round-trip validates CXTX,
+    pixels copied into the blob list the table borrows). Every slot also gets a white
+    base colour, so a mesh's own handle is a valid material. The layout is planned
+    **before** bytes are read, so a broken file cannot shift later handles; decode
+    failures are counted in `skipped`, an exhausted table is `error.TableFull`.
+  - `EngineRenderer`: owns the reusable double-buffered `RenderFrame`; `render`
+    takes the lens + the view from `cameraOf` and rebuilds the projection from the
+    **surface aspect** (resizing reframes); `findCamera`/`renderSceneFrame` are the
+    headless per-frame path (surface alloc + clear + render) and return null when the
+    scene has no camera.
+  - `pipeline.AssetTable.setDecodedMesh`: the one conversion from a source decoder's
+    owned `Mesh` into the table, next to the existing `CXMH`-view path.
+- `src/render/draw.zig`: `RenderFrame` is double-buffered with a `commands` view and
+  `refill` reports `{ culled, changed }`. The comparison is `commandsEqual` (field by
+  field) after a **byte** compare proved wrong: `DrawCommand` padding is undefined,
+  so every frame looked changed. Documented on `refill`.
+- `src/core/startup.zig`: `scene_data` is `?EngineRenderScene` (startup loads the
+  render schema) and `StartupResult` carries `project_root` (+ the allocator that
+  owns it) so the binary can load assets after startup.
+- `src/main.zig`: renders one real frame of the project at startup through
+  `renderSceneFrame` and prints
+  `Frame: WxH <tier> (N commands, N draws, N skipped, N pixels, N culled)`, or
+  `no camera in the scene; nothing to render`.
+- Example project: `scenes/main.scene` now has a `Quad` with `renderable` and a
+  `Camera` entity; `assets/quad.obj` is plain text, so no binary asset is committed
+  and OBJ support is exercised by the shipped example.
+- Docs: `scene-format.md` (the `renderable` and `camera` components, handle rule,
+  accepted formats, a complete example), `render-extraction.md` (`RenderFrame` and
+  the authoring/driving API), `render-backend.md` (where it is wired in, the frame
+  line, revised limitation), `architecture.md`, `README.md`, `CHANGELOG.md`,
+  `examples/hello-project/README.md`.
+
+**Validation:**
+
+- `zig build test --summary all` → **707/707** (clean `.zig-cache`), also
+  **707/707** with `-Doptimize=ReleaseFast`.
+- `zig fmt --check src build.zig` → clean; `zig build` → OK.
+- Headless smoke on `examples/hello-project/HelloProject.corex`:
+  `Frame: 1280x720 medium (1 commands, 1 draws, 0 skipped, 43264 pixels, 0 culled)`;
+  `--mode runtime` same; `--mode validate` still prepares no session.
+
+**Errors found and fixed while doing this:**
+
+- Byte-comparing draw lists: padding makes identical frames "changed".
+- Hash-only slot mapping (`hash % capacity`) aliased two assets onto one slot in the
+  first test, because a fixed-capacity table cannot be addressed by a pure hash —
+  replaced by hash start + linear probing over the sorted index.
+- Per-kind slot namespaces let a mesh and a texture share a slot, bumping one
+  generation and breaking that asset's colour handle; unified.
+- Freeing the trimmed `plan.entries` slice panicked (the allocation was the full
+  index length); the plan now keeps `storage` for the free.
+- The frame line had escaped quotes (`\"medium\"`) from a multi-line format literal.
+- Zig 0.17 notes: a function-style struct literal needs a `const` binding before
+  `.method()`; `&resources.color(...).?` is a temporary (bind it first); `x ++ y`
+  requires symmetric whitespace.
+
+**Decisions:**
+
+- Handles are `(generation << 16) | slot` and a fresh table's live slots are at
+  generation 1, which is what `handleOf` returns. A slot is never shared between a
+  mesh and a texture, so that stays true for every loaded asset.
+- `.obj` is a supported mesh source in the loader: the importer's own decoder turns
+  it into geometry, so a project needs no external tool and no committed binaries
+  (the alternative — only `.mesh` artifacts — would have made the shipped example
+  depend on a binary blob).
+- The headless frame allocates colour/depth per call; that is documented as the
+  reason `renderSceneFrame` exists rather than being called "the loop".
+
+**Pending / known limits:**
+
+- No window, swapchain or frame loop: one frame at startup, then the process exits.
+- No per-frame allocator hand-off yet; the world-transform snapshot is still
+  per-frame.
+- One `Renderable` per entity, no instancing, no multi-material meshes, no CBOR/
+  binary scene format; texture upload/eviction and mip chains for assets are GPU work.
+
+**Next priority:** the presentation layer — a window + event loop that drives
+`EngineRenderer.render` repeatedly with owned colour/depth buffers and a
+per-frame allocator hand-off (then asset upload/eviction and CXTX mips).
+
+**Integration:** startup step 6/7 → `EngineRenderScene.load` → `planSlots` +
+`loadAssets` → `findCamera` → `renderSceneFrame` → `pipeline.renderFrame` →
+`SoftwareBackend` → rasterizer. `render` still depends on no asset code; only
+`render_scene` (a composition-root module) imports `assets`.
+
 ## Cycle 2026-11-06 (e) — Frame pipeline over the contract + rasterizer overflow fix
 
 **Delivered (validated):**

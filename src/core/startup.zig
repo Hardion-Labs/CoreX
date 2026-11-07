@@ -69,14 +69,20 @@ pub const StartupResult = struct {
     scene: ?SceneRequest,
     /// Loaded initial scene for `editor`/`runtime`. Null in `validate` mode.
     /// When no initial scene is requested, this is an empty scene.
-    scene_data: ?scene_mod.EngineScene,
+    scene_data: ?scene_mod.EngineRenderScene,
     mode: cli.Mode,
     /// The renderer tier the project asked for, mapped onto the render contract.
     /// `null` in `validate` mode, which prepares no session.
     render_tier: ?render_mod.Tier,
+    /// Absolute project directory, owned here. Asset paths in `asset_index` are
+    /// relative to it, so a caller that loads assets needs it after startup.
+    project_root: []u8,
+    /// The allocator `project_root` was allocated with.
+    project_root_allocator: Allocator,
 
     pub fn deinit(self: *StartupResult) void {
         if (self.scene_data) |*s| s.deinit();
+        self.project_root_allocator.free(self.project_root);
         self.manifest.deinit();
         self.asset_index.deinit();
         self.* = undefined;
@@ -106,6 +112,8 @@ pub fn run(
     const abs_path = paths.resolveAbsolute(gpa, io, project_path) catch return error.ProjectNotFound;
     defer gpa.free(abs_path);
     const project_root = std.fs.path.dirname(abs_path) orelse return error.InvalidManifest;
+    const project_root_owned = gpa.dupe(u8, project_root) catch return error.OutOfMemory;
+    errdefer gpa.free(project_root_owned);
 
     // Step 2: splash screen.
     splash.show(std.fs.path.basename(abs_path));
@@ -175,7 +183,7 @@ pub fn run(
     log.info("indexed {d} assets ({d} bytes)", .{ index.count(), index.totalBytes() });
 
     // Step 6: prepare and load the initial scene.
-    var scene_data: ?scene_mod.EngineScene = null;
+    var scene_data: ?scene_mod.EngineRenderScene = null;
     errdefer {
         if (scene_data) |*s| s.deinit();
     }
@@ -186,14 +194,18 @@ pub fn run(
         if (scene_req) |req| {
             var dir = Io.Dir.openDirAbsolute(io, project_root, .{}) catch return error.PreparationFailed;
             defer dir.close(io);
-            scene_data = scene_mod.EngineScene.load(gpa, io, dir, req.path) catch |err| {
+            // Loaded with the renderable schema: a scene may author `renderable`
+            // and `camera`, and the serializer rejects components the schema does
+            // not declare. `EngineScene` (transform only) is still the schema for
+            // documents that carry nothing else.
+            scene_data = scene_mod.EngineRenderScene.load(gpa, io, dir, req.path) catch |err| {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
                 log.warn("failed to load scene \"{s}\": {s}", .{ req.path, @errorName(err) });
                 return error.PreparationFailed;
             };
             log.info("scene \"{s}\" loaded ({d} entities)", .{ scene_data.?.name, scene_data.?.count() });
         } else {
-            scene_data = scene_mod.EngineScene.init(gpa, "empty") catch return error.OutOfMemory;
+            scene_data = scene_mod.EngineRenderScene.init(gpa, "empty") catch return error.OutOfMemory;
         }
         profiler.record("scene", stage_timer.elapsedNanoseconds());
         stage_timer.restart();
@@ -234,6 +246,8 @@ pub fn run(
         .scene_data = scene_data,
         .mode = opts.mode,
         .render_tier = render_tier,
+        .project_root = project_root_owned,
+        .project_root_allocator = gpa,
     };
 }
 

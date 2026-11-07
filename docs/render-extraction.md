@@ -132,6 +132,47 @@ defer frame.deinit();
   the result is deterministic regardless of sort stability.
 - `DrawCommand` is plain data and self-contained, cache-friendly for the backend.
 
+## The reusable frame buffer
+
+`RenderFrame` is the frame-loop shape of the same extraction: two command buffers
+(`active`/`spare`) plus the current `commands` view.
+
+```zig
+var frame = try R.draw.RenderFrame.init(gpa);
+defer frame.deinit();
+
+const result = try frame.refill(&scene, cam, .front_to_back); // { culled, changed }
+// frame.commands is the sorted list for this frame; a steady-state frame
+// allocates nothing.
+```
+
+`refill` extracts into the spare buffer, compares it with the active one and swaps,
+so `changed` answers "is this frame different from the last one?" without the caller
+comparing lists. The comparison is **field by field** (`commandsEqual`), not a byte
+compare: `DrawCommand` has padding the compiler may leave undefined, so a byte
+compare reports a change between two frames identical in every field that is read.
+
+## Authoring and driving a frame
+
+`corex.scene.render_scene` (see [scene-format.md](scene-format.md) for the file
+format) is the piece that connects a project to this layer:
+
+- `EngineRenderScene` — the scene schema with `transform` + `renderable` + `camera`.
+- `planSlots(gpa, asset_index, capacity)` — the deterministic path → table-slot
+  layout; `handleOf(path)` is the handle a `.scene` stores, computable without
+  loading any bytes.
+- `loadAssets(gpa, io, project_root, index, options)` — loads what the plan placed:
+  `.mesh` artifacts and `.obj` sources become meshes, `.png`/`.bmp`/`.tga`/`.qoi`
+  become textures; each mesh slot also gets a white base colour, so a mesh's own
+  handle is a valid material.
+- `EngineRenderer.render(surface, scene, camera, view, resources, params)` — one
+  frame through `RenderFrame.refill` + `pipeline.renderFrame`; the projection comes
+  from the surface's aspect, so resizing reframes.
+- `EngineRenderer.findCamera(scene, gpa)` / `renderSceneFrame(scene, dimensions,
+  resources, params)` — the headless frame path the binary drives: find the scene's
+  camera, size and clear a surface, render, report. Returns null when the scene has
+  no camera.
+
 ## Limitations and next steps
 
 - There is no GPU backend yet (Low/Medium/Advanced are planned). Extraction itself
@@ -140,8 +181,11 @@ defer frame.deinit();
 - No LOD, occlusion culling, instancing or automatic batching; `by_material` only
   sorts to reduce state changes.
 - `Renderable` uses opaque mesh/material handles. The software rasterizer resolves
-  them through a caller-supplied duck-typed provider; binding them to GPU
-  resources and the asset cache is work for the future GPU backend.
+  them through a caller-supplied duck-typed provider, and `render_scene` fills that
+  table from the project's assets; uploading them to GPU resources, mip chains and
+  eviction are work for the future GPU backend.
+- One `Renderable` per entity, one mesh per draw: no instancing, no multi-material
+  meshes, and a texture is addressed as the material of the slot it was loaded into.
 - No per-object transparency beyond `back_to_front` sorting; transparent/opaque
   materials are not yet split into sublists.
 

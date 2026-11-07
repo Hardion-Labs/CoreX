@@ -6,9 +6,11 @@ scenes; project creation remains out of the engine's scope (see
 [scope.md](scope.md)).
 
 > Status: `format_version = 1` implemented for the engine's default schema
-> (`corex.scene.EngineScene`), which currently contains the `transform`
-> component. Tools may define additional schemas with
-> `Scene(.{ Component(T, "name") })`.
+> (`corex.scene.EngineScene`, `transform` only) and, since the scene renderer
+> landed, for `corex.scene.EngineRenderScene`, which adds `renderable` and
+> `camera`. Startup loads the scene with the render schema, so a `.scene` may
+> author a mesh, a material and a camera today. Tools may define additional
+> schemas with `Scene(.{ Component(T, "name") })`.
 
 ## Structure
 
@@ -77,6 +79,90 @@ serialized into the `.scene` file — keeping the format local avoids redundancy
 and preserves the `format_version = 1` contract. See
 [scene-transforms.md](scene-transforms.md) for the math, the API and the
 guarantees.
+
+## The `renderable` component
+
+Marks an entity as drawn. `mesh` and `material` are opaque handles into the
+renderer's resource table (see [render-backend.md](render-backend.md)); the
+engine resolves them when it loads the project's assets.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `mesh` | `u32` | `0` | Mesh handle (slot index + generation). |
+| `material` | `u32` | `0` | Material handle: a base colour, or a texture. |
+| `bounds` | `{ center, extents }` | unit cube | **Local** axis-aligned bounding box used for frustum culling. |
+
+`bounds` is `{ "center": [x, y, z], "extents": [x, y, z] }`; extents are
+half-sizes and must be finite and non-negative, otherwise the component is
+rejected. Keep the bounds tight: an over-large box is never culled, an
+under-large one pops out while still on screen.
+
+Handles are `(generation << 16) | slot`. A `.scene` authored against a project's
+assets gets them from `corex.scene.render_scene.planSlots(...).handleOf(path)`:
+the mapping is a pure function of the project's asset paths and the renderer
+table capacity, so it is reproducible without loading anything. `assets/quad.obj`
+in a 64-slot table, for example, is `65589` (`0x10035`) as both `mesh` and
+`material` — the loader pairs every mesh with a white base colour, so a mesh's own
+handle is a valid material.
+
+## The `camera` component
+
+Turns an entity into a camera. Its **world transform** supplies the position and
+orientation (forward is `-Z`, as everywhere in this engine); the component is only
+the lens, so a camera can be parented and moved like any other entity.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `fov` | `f32` | `1.0471976` (60°) | Vertical field of view, radians, in `(0, π)`. |
+| `near` | `f32` | `0.1` | Near plane, `> 0`. |
+| `far` | `f32` | `500` | Far plane, `> near`. |
+
+The projection is **reversed-Z with an infinite far plane**, so `near` alone
+drives depth precision and `far` is the culling boundary. Only the first camera
+entity in the scene (ascending stable ID) frames the view; a scene without a
+camera renders nothing and says so.
+
+### A complete example
+
+`examples/hello-project/scenes/main.scene` draws a quad from a plain-text OBJ,
+seen by a camera entity:
+
+```json
+{
+  "id": 3,
+  "name": "Quad",
+  "parent": 1,
+  "components": {
+    "transform": { "position": [0, 1, 0] },
+    "renderable": {
+      "mesh": 65589,
+      "material": 65589,
+      "bounds": { "center": [0, 0, 0], "extents": [1, 1, 0] }
+    }
+  }
+},
+{
+  "id": 4,
+  "name": "Camera",
+  "components": {
+    "transform": { "position": [0, 0, 6] },
+    "camera": { "fov": 1.0471976, "near": 0.1, "far": 100 }
+  }
+}
+```
+
+## Asset formats the loader accepts
+
+| Extension | Treated as | Notes |
+|---|---|---|
+| `.mesh` | mesh artifact (`CXMH`) | The importer's derived artifact; parsed zero-copy. |
+| `.obj` | mesh source | Converted with the importer's own OBJ decoder, so a checkout needs no binary asset and no external tool. |
+| `.png`, `.bmp`, `.tga`, `.qoi` | texture | Decoded to RGBA8 and stored in the slot's texture. |
+| anything else | not renderable | Indexed at startup, never loaded by the renderer. |
+
+A file that fails to decode is counted as *skipped* and the frame still draws the
+rest; running out of table slots is `error.TableFull`, because a mesh that
+silently failed to load draws nothing at all.
 
 ## Validation rules
 

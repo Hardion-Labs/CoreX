@@ -23,6 +23,9 @@ pub const components = @import("scene/components.zig");
 /// Transform math (column-major Mat4 + quaternion helpers) used to propagate
 /// local transforms into world space. Reusable by the renderer/editor.
 pub const transform = @import("scene/transform.zig");
+/// Renderable scene schema (transform + renderable + camera), the asset loader
+/// behind it and the per-frame engine renderer.
+pub const render_scene = @import("scene/render_scene.zig");
 /// Reusable single-root entity subtrees (`.prefab`) built on the scene format.
 pub const prefab = @import("scene/prefab.zig");
 /// Sector residency streaming (`.corexstream`) over a live scene.
@@ -32,6 +35,13 @@ pub const Scene = scene.Scene;
 pub const Component = scene.Component;
 pub const Prefab = prefab.Prefab;
 pub const Transform = components.Transform;
+pub const Renderable = render_scene.Renderable;
+pub const CameraComponent = render_scene.CameraComponent;
+pub const EngineRenderScene = render_scene.EngineRenderScene;
+pub const EngineRenderPrefab = render_scene.EngineRenderPrefab;
+pub const RenderAssets = render_scene.LoadedAssets;
+pub const loadRenderAssets = render_scene.loadAssets;
+pub const EngineRenderer = render_scene.EngineRenderer;
 pub const Mat4 = transform.Mat4;
 pub const Vec3 = transform.Vec3;
 pub const Quat = transform.Quat;
@@ -44,6 +54,11 @@ pub const max_entities = scene.max_entities;
 /// `Transform` component; additional built-ins are added when the engine can
 /// actually consume them. Games/editor tools may define their own schema with
 /// `Scene(.{ Component(MyComponent, "my_component"), ... })`.
+///
+/// A scene that authors a **renderable** (or a camera) must be loaded with
+/// `render_scene.EngineRenderScene`, which declares those components; the
+/// serializer rejects components the schema does not know, so the schema is a
+/// property of the document, not of the loader.
 pub const EngineScene = Scene(.{Component(Transform, "transform")});
 
 /// The engine's default prefab schema (matches `EngineScene`).

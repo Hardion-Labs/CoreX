@@ -213,8 +213,21 @@ truncated mesh.
 `startup.run` step 7 selects the tier from `settings.json` after the configuration
 is loaded, logs it and fails the session when the tier has no backend; the launch
 summary prints the **selected** tier (`validate` mode prepares no session and
-reports the configured one). Presentation — a window, a swapchain, a frame loop —
-is still the next layer; nothing renders per frame in the engine binary yet.
+reports the configured one).
+
+The engine binary then renders **one real frame** of the project's own scene
+(`src/scene/render_scene.zig`, section *Authoring and driving a frame*): assets are
+loaded from the project's asset index, the scene's camera is found, a headless
+surface is sized from `settings.json`'s window size, and the frame is drawn through
+the tier. The accounting goes to stdout — always the same line shape:
+
+```text
+Frame: 1280x720 medium (1 commands, 1 draws, 0 skipped, 43264 pixels, 0 culled)
+```
+
+A scene with no camera prints `no camera in the scene; nothing to render` instead of
+drawing an empty image: nothing to frame is a fact about the scene, not a frame.
+Presentation — a window, a swapchain, a frame loop — is still the next layer.
 
 ## Limitations and next steps
 
@@ -231,9 +244,10 @@ is still the next layer; nothing renders per frame in the engine binary yet.
 - **`FrameStats.culled` counts triangles**, because that is what the rasterizer
   reports per draw; a GPU backend may report draw-level culling instead, so the
   number is documented as backend-reported diagnostics, not a contract value.
-- **No presentation.** The tier is selected at startup and the pipeline can render
-  a frame, but no window, swapchain or frame loop exists, so the engine binary
-  still opens a headless session and never calls `renderScene`.
+- **No presentation.** The engine binary renders one headless frame at startup and
+  prints its accounting, but no window, swapchain or frame loop exists: there is no
+  per-frame content on screen yet, and colour/depth are allocated per frame instead
+  of being owned by a loop.
 - **One frame in, one frame out.** No sub-frame pipelining, no double buffering,
   no per-pass API; `renderScene` extracts and draws in one call and allocates the
   draw list per call (a per-frame allocator hand-off is the obvious next step once

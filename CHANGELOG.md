@@ -8,6 +8,42 @@ declared yet.
 
 ### Added
 
+- Scene renderer (`src/scene/render_scene.zig`, `corex.scene.render_scene`,
+  `docs/scene-format.md`, `docs/render-extraction.md`): the layer that connects a
+  project's scene file to the render pipeline, which was the missing half.
+  `EngineRenderScene` / `EngineRenderPrefab` are the engine schema with
+  `transform` + `renderable` + `camera`, so a `.scene` can finally name a mesh and
+  own a camera; `CameraComponent` (`fov`/`near`/`far`, validated) is the lens and the
+  entity's world transform the position and basis. `planSlots(gpa, asset_index,
+  capacity)` assigns every renderable asset a deterministic table slot (hash start,
+  linear probing, **one namespace** for meshes and textures so no slot ever holds
+  both and every handle stays at generation 1), which makes a stored handle a pure
+  function of the project's content and table capacity — `plan.handleOf(path)` is
+  that handle, computable without loading anything. `loadAssets` fills the
+  pipeline's `AssetTable` from the plan: `.mesh` artifacts and `.obj` sources become
+  meshes, `.png`/`.bmp`/`.tga`/`.qoi` become textures, each slot also gets a white
+  base colour so a mesh's own handle is a valid material, and the layout is decided
+  **before** any bytes are read so one broken file cannot shift every later handle.
+  Failures are explicit and counted (`skipped`, `error.TableFull`), never a silently
+  missing mesh. `EngineRenderer` owns the reusable double-buffered `RenderFrame` and
+  renders a frame with the scene's own camera and the surface's aspect, reporting
+  commands/draws/skipped/pixels/culled and whether the list changed;
+  `findCamera`/`renderSceneFrame` are the headless per-frame path. The engine binary
+  now renders **one real frame** of the project at startup and prints
+  `Frame: WxH <tier> (N commands, N draws, N skipped, N pixels, N culled)`, or says
+  `no camera in the scene; nothing to render` when the scene authors none.
+  `AssetTable.setDecodedMesh` is the one conversion from a source decoder's owned
+  mesh into the table. 10 new tests: schema round-trip, lens validation, probe
+  stability, asset loading (mesh + texture + skipped file), OBJ decoding, slot
+  exhaustion, a broken file not shifting handles, the renderer's draw/reuse/change/
+  cull cycle, and the headless frame path including the no-camera and zero-size
+  surface cases (707 total).
+
+- The example project now renders: `examples/hello-project/scenes/main.scene` draws
+  a quad from a plain-text `assets/quad.obj` seen by a camera entity, so a checkout
+  carries no binary assets and the headless smoke run prints a real frame
+  (`1280x720 medium (1 commands, 1 draws, 0 skipped, 43264 pixels, 0 culled)`).
+
 - Renderer tier contract (`src/render/backend.zig`, `docs/render-backend.md`,
   `corex.render.backend`): the boundary every renderer tier implements, so a
   backend can be swapped without touching the scene or the extraction layer.
@@ -57,6 +93,13 @@ declared yet.
   the selected tier.
 
 ### Fixed
+
+- A frame's draw list was compared **byte by byte** to decide whether it had
+  changed, which reported every frame as changed: `DrawCommand` has padding the
+  compiler may leave undefined, so two lists identical in every field that is read
+  usually differ in the bytes that are not. `draw.commandsEqual` compares field by
+  field (`entity`, handles, world matrix, bounds, depth), so `RenderFrame.refill`
+  now answers "is this frame different from the last one?" correctly.
 
 - **`DrawResources.fromComptime` returned a dangling pointer.** It took the
   provider by value and stored the address of its own parameter, so every field

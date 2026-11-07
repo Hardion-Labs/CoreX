@@ -24,6 +24,42 @@
           "scale": [1, 1, 1]
         }
       }
+    },
+    {
+      "id": 3,
+      "name": "Quad",
+      "parent": 1,
+      "components": {
+        "transform": {
+          "position": [0, 1, 0],
+          "rotation": [0, 0, 0, 1],
+          "scale": [1, 1, 1]
+        },
+        "renderable": {
+          "mesh": 65589,
+          "material": 65589,
+          "bounds": {
+            "center": [0, 0, 0],
+            "extents": [1, 1, 0]
+          }
+        }
+      }
+    },
+    {
+      "id": 4,
+      "name": "Camera",
+      "components": {
+        "transform": {
+          "position": [0, 0, 6],
+          "rotation": [0, 0, 0, 1],
+          "scale": [1, 1, 1]
+        },
+        "camera": {
+          "fov": 1.0471976,
+          "near": 0.1,
+          "far": 100
+        }
+      }
     }
   ]
 }

@@ -480,6 +480,26 @@ pub const AssetTable = struct {
         return self.table.setMesh(slot, .{ .positions = positions, .uvs = uvs, .indices = indices });
     }
 
+    /// Store a decoded (owned) mesh, in the same slot layout `setMesh` uses.
+    ///
+    /// The source format decoders (`assets.mesh.decodeObj`) return an owned `Mesh`
+    /// rather than a `CXMH` view; this is the one conversion from that shape, so a
+    /// source asset and a derived artifact land in the table identically.
+    pub fn setDecodedMesh(self: *AssetTable, slot: usize, mesh: mesh_asset.Mesh) error{MeshTooLarge}!Handle {
+        const vertex_count = mesh.vertices.len;
+        const index_count = mesh.indices.len;
+        if (vertex_count > self.vertices_per_slot or index_count > self.indices_per_slot) return error.MeshTooLarge;
+        const positions = self.position_scratch[slot * self.vertices_per_slot ..][0..vertex_count];
+        const uvs = self.uv_scratch[slot * self.vertices_per_slot ..][0..vertex_count];
+        const indices = self.index_scratch[slot][0..index_count];
+        for (positions, uvs, mesh.vertices) |*p, *uv, v| {
+            p.* = .{ v.position[0], v.position[1], v.position[2] };
+            uv.* = .{ v.uv[0], v.uv[1] };
+        }
+        for (indices, mesh.indices) |*out, i| out.* = i;
+        return self.table.setMesh(slot, .{ .positions = positions, .uvs = uvs, .indices = indices });
+    }
+
     pub fn setColor(self: *AssetTable, slot: usize, linear: [4]f32) Handle {
         return self.table.setColor(slot, linear);
     }
