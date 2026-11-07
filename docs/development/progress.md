@@ -4,6 +4,82 @@ Permanent record of real progress, decisions, pending items and the next priorit
 task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
+## Cycle 2026-11-06 (c) — Mipmaps and LOD selection
+
+**Delivered (validated):**
+
+- `Texture.mips: []const MipLevel` — the levels below level 0, largest first —
+  plus `MipLevel`, `Texture.mipLevel(i)` / `mipLevelCount()`, and validation of the
+  chain inside `Texture.validate()` (exactly repeated halving, level length
+  `w*h*4`, nothing after 1x1) as `error.InvalidTexture`.
+- `corex.render.mipmap` (`src/render/mipmap.zig`): `Chain.generate(gpa, w, h,
+  pixels)` box-filters every level below level 0 with `(sum + count/2) / count`
+  per channel (integers, one round-half-up, no float) and owns one allocation;
+  odd axes share their last row/column instead of dropping it. Pure helpers
+  `levelCount` / `levelDims`. The module has no dependency on `raster.zig`.
+- `Options.mipmap` (`corex.render.Mipmap`) = `.trilinear` (default) / `.level0`.
+- LOD: `texelGradient` evaluates the exact derivative of `u = p / den`
+  (`(dp*den - p*dden) / den²`) with one reciprocal; `textureLod` is
+  `clamp(log2(max(|du|,|dv|)), 0, levels-1)`; `sampleTrilinear` filters
+  `floor`/`ceil` with the material filter and mixes them with one final round.
+  The six per-pixel gradient constants (`GradSteps`) come from the same per-pixel
+  edge steps the coverage loop already computes — six multiplies per triangle,
+  no extra sampling.
+- Fast path: a constant perspective denominator (every orthographic projection
+  and any affine UV map) makes the level constant, so `GradSteps.constantLod`
+  hoists the `log2` to once per triangle. Bit-identical to the general path.
+- Byte-identity guarantees kept: no `mips` → the exact old `sampleTexture`
+  expression; `mipmap = .level0` → level 0 of the chain through the same sampler.
+
+**Key decisions:**
+
+- The chain is the caller's data, built by a free function that owns one
+  allocation (`Chain`) and returns borrowed `levels()`. The rasterizer stays
+  allocation-free and keeps zero coupling to an asset layer — a decoded `CXTX`
+  texture plus `Chain.generate` is the whole integration.
+- Integer box filter rather than float: it is deterministic across platforms and
+  can be pinned exactly by the Python reference, like every other number in this
+  path. `+ count/2` is the single round-half-up.
+- Anisotropy is **not** attempted: the gradient takes the larger axis, which
+  over-blurs grazing angles. Documented as a limitation rather than approximated.
+- Performance: the first version recomputed the derivative and `log2` per pixel,
+  costing ~2x at 1024². The constant-denominator fast path brought the
+  orthographic case to ~1.2x (68.6 ms → 79.8 ms at 128 texels/pixel), which is the
+  common case for 2D/UI draws. The perspective case still pays ~2x and is
+  documented.
+- Three generator/reference bugs found and fixed while validating: `math` was
+  not imported in the new trilinear helper; `.level0` on a mipmapped texture must
+  sample the chain's own level 0 (not the 4x4 fixture); and the 4x4 base cases
+  were being fed the 16x16 level 0, which the new `big_base` flag in the vector
+  file now makes explicit.
+
+**Validation run (all green):**
+
+- `zig build test -Doptimize=Debug|ReleaseSafe|ReleaseFast` → 672/672 (12 new:
+  6 mipmap-module, 6 rasterizer).
+- `zig build`, `zig fmt --check src/ tools/ build.zig`, `zig build bench`.
+- 34 new reference frames (78 total, 1094 covered pixels) match bit for bit,
+  including a 24-case random mipmapped sweep over magnification, minification,
+  perspective and both `mipmap` modes.
+- AA-off/level-0 regression: the pre-existing 44 texture cases plus the 73 base,
+  40 light and 49 blend cases are byte-identical.
+- Launch-contract smoke: `--version`, `--mode validate`, `--headless`,
+  `--mode runtime --headless` (all exit 0).
+- Benchmark @1024²: level 0 68.62 ms, trilinear 79.84 ms (128 texels/pixel);
+  @512²: 17.76 → 20.69 ms; @256²: 4.96 → 5.92 ms.
+
+**Pending / next priority:**
+
+1. Renderer Low/Medium GPU backend contracts consuming the same draw list.
+2. Optional follow-ups, only if justified: anisotropic LOD (multiple samples or
+   a longer axis), per-material LOD bias, and `Texture` reuse for the AA path.
+3. GUI library + graphical editor; then the graphical splash on top of it.
+4. Lua VM / gameplay scripting (VM choice must be documented first).
+5. Export system / Export Templates (engine side) and the runtime player.
+6. Native Module API loader (C++), header under `include/corex/`.
+7. Audio: chorus/flanger/convolution/side-chain; OS device backends.
+8. Assets: progressive JPEG, compressed audio, glTF/FBX/DAE; hot-reload watcher.
+
 ## Cycle 2026-11-06 (b) — Edge antialiasing in the software rasterizer
 
 **Delivered (validated):**
@@ -36,8 +112,8 @@ continuation. Newest cycle first.
   stepping, not just self-consistency), quad-partition property, area conservation
   against the shoelace screen area, grid-aligned byte identity, no-depth-from-partial,
   translucent composite formula, `checkAllAllocationFailures` over the scratch sites,
-  single-triangle entry point. 661 tests total (was 658 before this cycle's new
-  cases).
+  single-triangle entry point. 660 tests total (658 before this cycle: the three
+  broken AA tests were replaced one for one and two are new).
 - Docs: `docs/render-raster.md` gained a full **Antialiasing** section (positions and
   rule, per-draw accumulation, resolve math, cost, verification), the API table, the
   pipeline step and an honest limitations bullet; `README.md`, `docs/architecture.md`
@@ -62,7 +138,7 @@ continuation. Newest cycle first.
 
 **Validation run (all green):**
 
-- `zig build test -Doptimize=Debug|ReleaseSafe|ReleaseFast` → 661/661.
+- `zig build test -Doptimize=Debug|ReleaseSafe|ReleaseFast` → 660/660.
 - `zig build`, `zig fmt --check src/ build.zig`, `zig build bench` (ReleaseFast).
 - Launch-contract smoke: `--version`, `--project … --mode validate`, `--headless`,
   `--mode runtime --headless` (all exit 0).

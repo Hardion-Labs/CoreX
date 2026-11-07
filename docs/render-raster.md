@@ -112,12 +112,15 @@ const stats = try R.rasterize(&target, frame.commands, cam.view_projection, reso
 | `Target.clear` | Reset color and depth. |
 | `Target.colorAt` / `depthAt` / `pixelCount` | Accessors. |
 | `Mesh` | `positions: []const [3]f32`, `indices: []const u32` (triangle list), optional `uvs: []const [2]f32` (one per position). |
-| `Texture` | `width`/`height`, borrowed `pixels` RGBA8 (row-major, top-down), `filter`. `validate()` rejects zero/oversized dims and length mismatches with `InvalidTexture`. |
+| `Texture` | `width`/`height`, borrowed `pixels` RGBA8 (row-major, top-down), `filter`, and optional `mips` (`[]const MipLevel`, largest first; empty by default). `validate()` rejects zero/oversized dims, length mismatches and a chain that is not repeated halving — all with `InvalidTexture`. |
+| `MipLevel` | `{ width, height, pixels }` for one reduced level, same layout as `Texture.pixels`. |
+| `mipmap.Chain` | `generate(gpa, width, height, pixels)` builds the levels below level 0 (integer box filter) and owns them; `levels()` feeds `Texture.mips`, `deinit(gpa)` frees. `levelCount`/`levelDims` are the pure helpers. |
+| `Mipmap` | `.trilinear` (default, pick and mix levels) or `.level0` (always full size). |
 | `Filter` | `nearest` or `bilinear`. |
 | `Light` | Directional light for the Lambert path: `direction` (toward the light, world space, normalized internally), `color`, `ambient`. `validate()` rejects malformed lights with `InvalidLight`. |
 | `Blend` | `.none` (default, verbatim write), `.alpha` (straight-alpha source-over), `.premultiplied`, `.additive`. |
 | `Antialias` | `.none` (default, one sample per pixel) or `.edge` (4x4 sub-samples, see [Antialiasing](#antialiasing)). |
-| `Options` | `cull` (`.none`/`.back`/`.front`), `front_face`, `depth_test`, `depth_write`, `light` (optional directional Lambert light; beats a `resources.directionalLight()` provider), `blend`, `antialias`. |
+| `Options` | `cull` (`.none`/`.back`/`.front`), `front_face`, `depth_test`, `depth_write`, `light` (optional directional Lambert light; beats a `resources.directionalLight()` provider), `blend`, `antialias`, `mipmap`. |
 | `Stats` | `skipped_draws`, `submitted`, `clipped`, `culled`, `rasterized`, `pixels`, `antialiased_pixels`. |
 | `rasterize` / `rasterizeAlloc` | Whole draw list, resolving handles through `resources`. `rasterize` takes no allocator and therefore forces `antialias = .none`; `rasterizeAlloc` is the entry point that can antialias. |
 | `drawMesh` / `drawMeshAlloc` | One mesh, one world matrix, one flat RGBA8 tint, optional texture and light. Same split: only the `Alloc` variant antialiases. |
@@ -455,10 +458,70 @@ dimensions above `max_dimension`, or a pixel-buffer length mismatch with
 `error.InvalidTexture`) aborts the command before touching the target; a mesh
 without usable `uvs` skips the command (`skipped_draws`), also before any draw.
 
-Not implemented: mipmaps/LOD selection, anisotropic filtering, sRGB transfer,
-or wrap modes other than repeat. Minified textures will
-alias — generate small enough mip images offline. The sampling math is pinned
-to the reference in `tools/gen_raster_texture_vectors.py`; changing any
+### Minification: mipmaps and LOD selection
+
+A texture that covers fewer pixels than it has texels aliases hard under both
+filters: nearest picks an arbitrary texel per pixel (moire), bilinear still
+averages only 2x2 of them. `Texture.mips` is the fix — a **mip chain** below level
+0, and `Options.mipmap` decides whether the sampler uses it.
+
+| Field / value | Meaning |
+| --- | --- |
+| `Texture.mips: []const MipLevel` | Levels 1..n, **largest first**, each exactly half of the one above (floored, never below 1). Empty (default) means level 0 only — every pre-mipmap behaviour is unchanged, byte for byte. |
+| `MipLevel` | `{ width, height, pixels }`, RGBA8 row-major top-down, same layout as `Texture.pixels`. |
+| `Options.mipmap = .trilinear` | Default. Pick the level per pixel from the screen-space UV gradient and mix the two neighbouring levels. |
+| `Options.mipmap = .level0` | Always sample level 0: crisp pixel art, aliasing under minification. |
+
+`corex.render.mipmap.Chain.generate(gpa, width, height, pixels)` builds the
+levels below level 0 with an **integer box filter** — `(sum + count/2) / count`
+per channel, one round-half-up, no float — and an odd axis shares its last row or
+column with the previous destination texel instead of dropping it, so the chain
+conserves energy. The chain owns one allocation; `levels()` is what
+`Texture.mips` wants. `Texture.validate()` rejects a chain that is not exactly
+repeated halving (or a level after 1x1), so a hand-built chain cannot silently
+desynchronize from the LOD selection.
+
+**Level selection.** With `u = p / den` (the perspective-correct mapping), the
+exact per-pixel derivative is `(dp * den - p * dden) / den²`. `dp`, `dq` and
+`dden` are the per-pixel changes of the perspective numerator and denominator;
+both are affine in screen space, so those six numbers are derived **once per
+triangle** from the same per-pixel edge steps the coverage loop already uses:
+`d(att) = da * (att0 - att2) + db * (att1 - att2)`, where `da`/`db` are the
+per-pixel barycentric steps. The gradient is then
+
+```
+rho = max(|du/dx|, |du/dy|, |dv/dx|, |dv/dy|) * size      // texels per pixel
+lod = clamp(log2(rho), 0, levels - 1)
+```
+
+so one texel per pixel is level 0, two is level 1, and magnifying (rho <= 1)
+clamps to 0 — the chain is never touched when magnifying. A zero, negative or
+non-finite gradient also selects level 0.
+
+**Trilinear.** `floor(lod)` and `ceil(lod)` are each filtered with the material's
+`filter` (nearest or bilinear) and the two results are mixed channel-wise in
+`f64` with **one final round**:
+`out = floor(fine * (1 - t) + coarse * t + 0.5)`. An integral `lod` does a single
+fetch, and `level0` through the trilinear path reproduces the plain sampler byte
+for byte.
+
+**Fast path.** When every vertex of a triangle carries the same `w_inv` (every
+orthographic projection, and any affine UV map) the denominator is constant, so
+`dden == 0`, the derivative reduces to `dp * den / den² = dp / den`, and the level
+is the **same for every pixel**. `GradSteps.constantLod` detects that and hoists
+the `log2` to once per triangle — the per-pixel cost becomes a compare and a
+select. Values are bit-identical to the general path; this is why the orthographic
+benchmark below only pays ~1.2x.
+
+Everything else about minification is unchanged: **no anisotropic filtering**
+(the gradient takes the larger axis, which over-blurs grazing angles), one
+gradient per pixel rather than per sample, no LOD bias or `textureQueryLod`, no
+gamma-correct downsampling.
+
+Not implemented: anisotropic filtering, sRGB transfer, or wrap modes other than
+repeat. Without a mip chain a minified texture still aliases — build one with
+`mipmap.Chain.generate`. The sampling math (filters, LOD and the trilinear mix) is
+pinned to the reference in `tools/gen_raster_texture_vectors.py`; changing any
 expression there requires regenerating
 [`src/render/raster_texture_vectors.zig`](../src/render/raster_texture_vectors.zig)
 and the tests will fail loudly until both sides agree bit for bit.
@@ -519,14 +582,17 @@ and the tests will fail loudly until both sides agree bit for bit.
   Agreement therefore validates the stepping, the bbox clamp and the fill-rule
   bias independently. Coverage masks and `f32` depth **bit patterns** must match
   exactly — 866 covered pixels across the corpus. CI never runs the generator.
-- **44 texture reference frames** in `src/render/raster_texture_vectors.zig`,
+- **78 texture reference frames** in `src/render/raster_texture_vectors.zig`,
   generated by [`tools/gen_raster_texture_vectors.py`](../tools/gen_raster_texture_vectors.py)
   (same brute-force coverage). UVs are carried as pre-divided `uw`/`vw`/`w_inv`
   tuples, and the Python reference recomputes the perspective-correct
   interpolation, both filters, repeat wrap (including negative UVs), tint
   multiply and rounding from scratch; the tests compare the **full RGBA8 frame**
-  plus coverage, so alpha writes and tint rounding are pinned as well — 576
-  covered pixels across the corpus, all bit-exact.
+  plus coverage, so alpha writes and tint rounding are pinned as well. 34 of the
+  cases are mipmapped (a 16x16 level 0 with 8 levels below it, and a 4x4 level 0
+  with 2; the generator rebuilds both chains with the same integer box filter and
+  recomputes the per-pixel LOD derivative and the trilinear mix); 1094 covered
+  pixels across the corpus, all bit-exact.
 - **40 lit reference frames** in `src/render/raster_light_vectors.zig`,
   generated by [`tools/gen_raster_light_vectors.py`](../tools/gen_raster_light_vectors.py)
   (same brute-force coverage). The raw world-space face normal is an input per
@@ -645,6 +711,23 @@ with the table above within run-to-run variance.
 | Nearest | 0.940 ms (69.7 Mpx/s) | 3.350 ms (78.2 Mpx/s) | 13.075 ms (80.2 Mpx/s) | ~3.3× |
 | Bilinear | 2.455 ms (26.7 Mpx/s) | 9.514 ms (27.6 Mpx/s) | 35.829 ms (29.3 Mpx/s) | ~9.1× |
 
+Minification through the mip chain, measured with the same harness: the shared
+tiles sample a 512x512 texture at 8 UV units per 32-pixel tile, i.e. 128 texels
+per pixel (level 7 — the case mipmaps exist for).
+
+| Target | Level 0 only | Trilinear (mip chain) | Relative |
+| --- | --- | --- | --- |
+| 256×256 | 4.96 ms | 5.92 ms | ~1.2× |
+| 512×512 | 17.76 ms | 20.69 ms | ~1.2× |
+| 1024×1024 | 68.62 ms | 79.84 ms | ~1.2× |
+
+The ~1.2x is the constant-level fast path: the UV map is affine here, so the level
+is hoisted out of the pixel loop and the per-pixel cost is a select plus one extra
+fetch. With a perspective divide in play (a varying denominator) the level has to
+be recomputed per pixel — one derivative and one `log2` — and the same draw costs
+about 2x. Both numbers are the price of not aliasing; `mipmap = .level0` keeps the
+old cost exactly.
+
 Bilinear is disproportionately expensive because of the per-pixel `f64`
 perspective correction: two divides by `Σλ·w_inv` per pixel. Replacing them with
 `x * (1/den)` would double-round and silently diverge from the pinned vectors,
@@ -690,8 +773,11 @@ See [asset-decoders.md](asset-decoders.md) for the codec.
   costs 1.5x to 5.5x depending on how much of the frame is edge (see
   [Cost](#cost)), needs per-draw scratch and therefore an allocator. It does not
   antialias *within* a pixel for textured minification — that is mipmapping's job.
-- **No mipmaps or LOD selection.** Minification aliases; the 4x4 grid only helps
-  geometric edges, not texture detail.
+- **Mip selection is isotropic.** The LOD takes the larger axis of the UV
+  gradient, so a surface seen at a grazing angle over-blurs where anisotropic
+  filtering would not. There is no LOD bias, no per-material level clamp and no
+  `textureQueryLod`; a texture without `mips` still minifies by point sampling
+  level 0 and aliases.
 - **No GPU backend.** This is a CPU reference path, not a Renderer Low tier.
 - **Single-threaded.** No tile parallelism or binning; a frame is rasterized in
   submission order on the calling thread.

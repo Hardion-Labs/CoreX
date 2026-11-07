@@ -11,6 +11,12 @@ bit for bit.
 The expected frames are emitted as full 8x8 RGBA buffers, which also covers
 alpha verbatim writes (no blending exists yet).
 
+Mipmapped cases (`mips == true`) additionally pin mip level selection: the
+generated chain below level 0 is recomputed here with the same integer box
+filter, the per-pixel LOD comes from the exact analytic derivative of the
+perspective UV mapping, and the trilinear mix is applied with the same single
+final round. Everything below level 0 is validated against this reference.
+
 Output: src/render/raster_texture_vectors.zig (committed; CI never runs this).
 
 Usage: python3 tools/gen_raster_texture_vectors.py
@@ -37,6 +43,143 @@ def texel(x, y):
 
 
 TEX_PIXELS = [c for y in range(TEX) for x in range(TEX) for c in texel(x, y)]
+
+# A 16x16 level 0 whose detail is deliberately finer than the 8x8 target: this is
+# what a minified texture looks like, and what mip level selection must fix. The
+# pattern mixes a 1-texel checker with a red ramp along x and a green ramp along
+# y, so aliasing shows up as both colour noise and a shifted ramp.
+MIP_TEX = 16
+
+
+def mip_texel(x, y):
+    checker = 0 if (x + y) % 2 == 0 else 255
+    r = (x * 16 + 8) % 256
+    g = (y * 16 + 4) % 256
+    b = checker
+    return (r, g, b, 255)
+
+
+def mip_tex_pixels():
+    return [c for y in range(MIP_TEX) for x in range(MIP_TEX) for c in mip_texel(x, y)]
+
+
+def mip_level_count(w, h):
+    n, d = 1, 0
+    while w > 1 or h > 1:
+        w, h = max(1, w // 2), max(1, h // 2)
+        n += 1
+    return n
+
+
+def mip_dims(w, h, level):
+    for _ in range(level):
+        w, h = max(1, w // 2), max(1, h // 2)
+    return w, h
+
+
+def downsample(src, sw, sh, dw, dh):
+    """Box filter with one integer round-half-up per channel (see mipmap.zig)."""
+    out = [0] * (dw * dh * 4)
+    for dy in range(dh):
+        y0 = dy * sh // dh
+        y1 = max(y0 + 1, (dy + 1) * sh // dh)
+        for dx in range(dw):
+            x0 = dx * sw // dw
+            x1 = max(x0 + 1, (dx + 1) * sw // dw)
+            count = (x1 - x0) * (y1 - y0)
+            acc = [0, 0, 0, 0]
+            for sy in range(y0, y1):
+                for sx in range(x0, x1):
+                    off = (sy * sw + sx) * 4
+                    for c in range(4):
+                        acc[c] += src[off + c]
+            off = (dy * dw + dx) * 4
+            for c in range(4):
+                out[off + c] = (acc[c] + count // 2) // count
+    return out
+
+
+def build_chain(pixels, w, h):
+    """Levels below level 0, largest first: [(w, h, pixels), ...]."""
+    levels = []
+    prev, pw, ph = pixels, w, h
+    for level in range(1, mip_level_count(w, h)):
+        dw, dh = mip_dims(w, h, level)
+        prev = downsample(prev, pw, ph, dw, dh)
+        levels.append((dw, dh, prev))
+        pw, ph = dw, dh
+    return levels
+
+
+def nearest_at(level, u, v):
+    lw, lh, pixels = level
+    x = min(lw - 1, int(repeat_frac(u) * lw))
+    y = min(lh - 1, int(repeat_frac(v) * lh))
+    off = (y * lw + x) * 4
+    return [pixels[off + c] for c in range(4)]
+
+
+def bilinear_at(level, u, v):
+    import math
+    lw, lh, pixels = level
+    uf, vf = repeat_frac(u), repeat_frac(v)
+    tx = uf * lw - 0.5
+    ty = vf * lh - 0.5
+    fx = tx - math.floor(tx)
+    fy = ty - math.floor(ty)
+    x0, x1 = wrap_index(tx, lw), (wrap_index(tx, lw) + 1) % lw
+    y0, y1 = wrap_index(ty, lh), (wrap_index(ty, lh) + 1) % lh
+    out = []
+    for c in range(4):
+        def at(x, y):
+            return float(pixels[(y * lw + x) * 4 + c])
+
+        top = (at(x0, y0) * (1.0 - fx) + at(x1, y0) * fx) * (1.0 - fy)
+        bottom = (at(x0, y1) * (1.0 - fx) + at(x1, y1) * fx) * fy
+        out.append(int(math.floor(top + bottom + 0.5)))
+    return out
+
+
+def sample_level(level, u, v, filt):
+    return nearest_at(level, u, v) if filt == "nearest" else bilinear_at(level, u, v)
+
+
+def texture_lod(du, dv, levels):
+    """log2 of the larger texel-space gradient, clamped to [0, levels - 1]."""
+    import math
+    rho = max(abs(du), abs(dv))
+    if not (rho > 1.0):
+        return 0.0
+    lod = math.log2(rho)
+    return min(lod, float(levels - 1)) if lod > 0.0 else 0.0
+
+
+def sample_trilinear(levels, u, v, lod, filt):
+    import math
+    base = int(lod) if lod >= 0 else 0
+    last = len(levels) - 1
+    if base >= last:
+        return sample_level(levels[last], u, v, filt)
+    t = lod - float(base)
+    if not (t > 0.0):
+        return sample_level(levels[base], u, v, filt)
+    fine = sample_level(levels[base], u, v, filt)
+    coarse = sample_level(levels[base + 1], u, v, filt)
+    return [int(math.floor(a * (1.0 - t) + b * t + 0.5)) for a, b in zip(fine, coarse)]
+
+
+def texel_gradient(p, q, den, dp, dq, dden, size):
+    """du/dv in texel units: the derivative of u = p / den, per screen axis."""
+    import math
+    den_sq = den * den
+    if not (den_sq > 0.0):
+        return 0.0, 0.0
+    inv_den_sq = 1.0 / den_sq  # one reciprocal, mirrored from texelGradient
+    du = max(abs((dp[0] * den - p * dden[0]) * inv_den_sq),
+             abs((dp[1] * den - p * dden[1]) * inv_den_sq)) * size[0]
+    dv = max(abs((dq[0] * den - q * dden[0]) * inv_den_sq),
+             abs((dq[1] * den - q * dden[1]) * inv_den_sq)) * size[1]
+    return du, dv
 
 
 def f64_bits(x):
@@ -93,21 +236,41 @@ def math_floor(t):
     return math.floor(t)
 
 
-def shade(vertex, w0, w1, w2, area_inv, tint, filt):
-    # vertex tuples: (x, y, z, uw, vw, w_inv) with uw/vw pre-divided by w.
+def shade(vertex, w0, w1, w2, area_inv, tint, filt, levels=None, grad=None, mipmap="trilinear"):
+    """Shade one pixel. `levels` is the full chain (level 0 first) when the case
+    is mipmapped; `grad` holds the per-pixel differences of the perspective
+    numerator and denominator, as (dp, dq, dden)."""
+    num_u = (((w0 * vertex[0][3] + w1 * vertex[1][3]) + w2 * vertex[2][3]) * area_inv)
+    num_v = (((w0 * vertex[0][4] + w1 * vertex[1][4]) + w2 * vertex[2][4]) * area_inv)
     den = ((w0 * vertex[0][5] + w1 * vertex[1][5]) + w2 * vertex[2][5]) * area_inv
     if not (den > 0.0) or den != den or den == float("inf"):
         u = v = 0.0
     else:
-        u = (((w0 * vertex[0][3] + w1 * vertex[1][3]) + w2 * vertex[2][3]) * area_inv) / den
-        v = (((w0 * vertex[0][4] + w1 * vertex[1][4]) + w2 * vertex[2][4]) * area_inv) / den
-    texel = sample_nearest(u, v) if filt == "nearest" else sample_bilinear(u, v)
+        u = num_u / den
+        v = num_v / den
+    use_mips = levels is not None and len(levels) > 1 and mipmap == "trilinear"
+    if not use_mips:
+        if levels is not None:
+            # `.level0` on a mipmapped texture samples the chain's own level 0.
+            texel = sample_level(levels[0], u, v, filt)
+        else:
+            texel = sample_nearest(u, v) if filt == "nearest" else sample_bilinear(u, v)
+        return tint_multiply(texel, tint)
+    lw, lh = levels[0][0], levels[0][1]
+    dp, dq, dden = grad
+    du, dv = texel_gradient(num_u, num_v, den, dp, dq, dden, (float(lw), float(lh)))
+    lod = texture_lod(du, dv, len(levels))
+    texel = sample_trilinear(levels, u, v, lod, filt)
     return tint_multiply(texel, tint)
 
 
 def rasterize(vertex, tint, filt, cull="none", front_face="ccw",
-              depth_test=True, depth_write=True):
-    """vertex: three (x, y, z, uw, vw, w_inv) tuples. Returns (drew, mask, frame)."""
+              depth_test=True, depth_write=True, levels=None, mipmap="trilinear"):
+    """vertex: three (x, y, z, uw, vw, w_inv) tuples. Returns (drew, mask, frame).
+
+    `levels` is the full mip chain (level 0 first) for a mipmapped case; the
+    gradient constants are then derived per triangle from the same per-pixel
+    edge steps the rasterizer uses, exactly like `GradSteps.init`."""
     v = list(vertex)
     area = edge(v[0][0], v[0][1], v[1][0], v[1][1], v[2][0], v[2][1])
     if area == 0:
@@ -124,6 +287,21 @@ def rasterize(vertex, tint, filt, cull="none", front_face="ccw",
         area = -area
 
     inv_area = 1.0 / float(area)
+    # Per-pixel barycentric steps, from the same edge-function deltas the Zig
+    # coverage loop steps by (one pixel right/down), divided by area: this is
+    # `GradSteps.init`. d(att) = da * (att0 - att2) + db * (att1 - att2).
+    da = ((float(v[1][1] - v[2][1]) * SUBPIXEL_SCALE) * inv_area,
+          (float(v[2][0] - v[1][0]) * SUBPIXEL_SCALE) * inv_area)
+    db = ((float(v[2][1] - v[0][1]) * SUBPIXEL_SCALE) * inv_area,
+          (float(v[0][0] - v[2][0]) * SUBPIXEL_SCALE) * inv_area)
+    grad = None
+    if levels is not None and len(levels) > 1 and mipmap == "trilinear":
+        duv = (v[0][3] - v[2][3], v[0][4] - v[2][4], v[0][5] - v[2][5])
+        duv1 = (v[1][3] - v[2][3], v[1][4] - v[2][4], v[1][5] - v[2][5])
+        axis = lambda k, c: da[k] * duv[c] + db[k] * duv1[c]
+        grad = (tuple(axis(k, 0) for k in (0, 1)),
+                tuple(axis(k, 1) for k in (0, 1)),
+                tuple(axis(k, 2) for k in (0, 1)))
     mask = [0] * (WIDTH * HEIGHT)
     frame = [0] * (WIDTH * HEIGHT * 4)
     depth = [1.0] * (WIDTH * HEIGHT)
@@ -150,7 +328,8 @@ def rasterize(vertex, tint, filt, cull="none", front_face="ccw",
             z = struct.unpack("<f", struct.pack("<f", z))[0]
             if not depth_test or z < depth[i]:
                 mask[i] = 1
-                frame[i * 4: i * 4 + 4] = shade(v, weights[0], weights[1], weights[2], inv_area, tint, filt)
+                frame[i * 4: i * 4 + 4] = shade(v, weights[0], weights[1], weights[2], inv_area, tint, filt,
+                                                 levels=levels, grad=grad, mipmap=mipmap)
                 if depth_write:
                     depth[i] = z
     return True, mask, frame
@@ -171,14 +350,37 @@ def pxw(x, y, z, u, v, w):
 def cases():
     out = []
 
-    def add(name, tri, filt="bilinear", tint=(255, 255, 255, 255), **kw):
-        drew, mask, frame = rasterize(tri, tint, filt, **kw)
-        out.append({"name": name, "tri": tri, "filt": filt, "tint": tint,
-                    "cull": kw.get("cull", "none"),
-                    "front_face": kw.get("front_face", "ccw"),
-                    "depth_test": kw.get("depth_test", True),
-                    "depth_write": kw.get("depth_write", True),
-                    "drew": drew, "mask": mask_bytes(mask), "frame": frame})
+    chain_cache = {}
+
+    def chain_for(name):
+        """Full chain (level 0 first) of the named level-0 texture."""
+        if name not in chain_cache:
+            base = (TEX, TEX, TEX_PIXELS) if name == "base" else (MIP_TEX, MIP_TEX, mip_tex_pixels())
+            levels = [base] + build_chain(base[2], base[0], base[1])
+            chain_cache[name] = levels
+        return chain_cache[name]
+
+    def add(name, tri, filt="bilinear", tint=(255, 255, 255, 255), mips=None, **kw):
+        levels = chain_for(mips) if mips is not None else None
+        if levels is not None:
+            # Every emitted chain must satisfy the sampler's validation, i.e. be
+            # exactly repeated halving of the level 0 it belongs to.
+            w, h = levels[0][0], levels[0][1]
+            for (lw, lh, _) in levels[1:]:
+                w, h = max(1, w // 2), max(1, h // 2)
+                assert (lw, lh) == (w, h), (name, lw, lh, w, h)
+        mipmap = kw.pop("mipmap", "trilinear")
+        drew, mask, frame = rasterize(tri, tint, filt, levels=levels, mipmap=mipmap, **kw)
+        entry = {"name": name, "tri": tri, "filt": filt, "tint": tint,
+                 "cull": kw.get("cull", "none"),
+                 "front_face": kw.get("front_face", "ccw"),
+                 "depth_test": kw.get("depth_test", True),
+                 "depth_write": kw.get("depth_write", True),
+                 "drew": drew, "mask": mask_bytes(mask), "frame": frame,
+                 "mips": mips is not None, "mipmap": mipmap, "big_base": mips == "mip"}
+        if mips is not None:
+            entry["levels"] = [(w, h, px) for (w, h, px) in chain_for(mips)[1:]]
+        out.append(entry)
 
     # Axis-aligned UV gradients, nearest and bilinear.
     add("uv_gradient_nearest", [px(0, 0, 0, 0, 0), px(8, 0, 0, 1, 0), px(0, 8, 0, 0, 1)], filt="nearest")
@@ -201,6 +403,36 @@ def cases():
     # Cull modes still gate coverage before any sampling happens.
     add("uv_culled_back", [px(1, 1, 0, 0, 0), px(7, 2, 0, 1, 0), px(3, 7, 0, 0, 1)], cull="back", front_face="ccw")
     add("uv_culled_front", [px(1, 1, 0, 0, 0), px(3, 7, 0, 0, 1), px(7, 2, 0, 1, 0)], cull="front", front_face="ccw")
+    # --- mipmapped cases -----------------------------------------------------
+    # The 16x16 level 0 covers the whole target 3 times over, so the UV gradient
+    # is ~6 texels/pixel: without mips that is heavy aliasing, with trilinear it
+    # lands between levels 2 and 3.
+    big_quad = [px(0, 0, 0, 0, 0), px(8, 0, 0, 3, 0), px(0, 8, 0, 0, 3)]
+    add("mip_minified_nearest", big_quad, filt="nearest", mips="mip")
+    add("mip_minified_bilinear", big_quad, filt="bilinear", mips="mip")
+    add("mip_minified_nearest_level0", big_quad, filt="nearest", mips="mip", mipmap="level0")
+    # One-to-one mapping: ~1 texel per pixel in x, 2 in y -> fractional LOD.
+    add("mip_anisotropic", [px(0, 0, 0, 0, 0), px(8, 0, 0, 2, 0), px(0, 8, 0, 0, 4)],
+        filt="bilinear", mips="mip")
+    # Magnification: the UV gradient is below one texel per pixel, so the chain
+    # must not be touched at all (LOD clamps to 0).
+    add("mip_magnified", [px(0, 0, 0, 0.2, 0.2), px(8, 0, 0, 0.6, 0.2), px(0, 8, 0, 0.2, 0.6)],
+        filt="bilinear", mips="mip")
+    # Perspective: the gradient varies per pixel, so the level varies too.
+    add("mip_perspective", [pxw(0, 0, 0, 0.0, 0.0, 2.4), pxw(8, 0, 0, 3.0, 0.0, 1.0), pxw(0, 8, 0, 0.0, 3.0, 1.0)],
+        filt="bilinear", mips="mip")
+    add("mip_perspective_nearest", [pxw(0, 0, 0, 1.5, 0.5, 3.0), pxw(8, 0, 0, 4.0, 0.5, 1.0), pxw(0, 8, 0, 1.5, 4.0, 1.0)],
+        filt="nearest", mips="mip")
+    # Repeat wrap and a tint on top of the mip chain.
+    add("mip_repeat_tint", [px(0, 0, 0, -1.5, 2.5), px(8, 0, 0, 2.5, 2.5), px(0, 8, 0, -1.5, 6.5)],
+        filt="bilinear", tint=(200, 220, 255, 255), mips="mip")
+    # The 4x4 base texture with a chain of its own (levels 4 -> 2 -> 1): pins the
+    # behaviour at the last level, where both taps collapse onto 1x1.
+    add("mip_base_minified", [px(0, 0, 0, 0, 0), px(8, 0, 0, 4, 0), px(0, 8, 0, 0, 4)],
+        filt="nearest", mips="base")
+    add("mip_base_bilinear", [px(0, 0, 0, 0, 0), px(8, 0, 0, 4, 0), px(0, 8, 0, 0, 4)],
+        filt="bilinear", mips="base")
+
     # Deterministic random cases: subpixel positions, random UVs and w, both filters.
     rng = random.Random(20261107)
     for n in range(28):
@@ -218,6 +450,26 @@ def cases():
             tint=rng.choice([(255, 255, 255, 255), (200, 220, 255, 255), (255, 200, 128, 255)]),
             cull=rng.choice(["none", "none", "back"]),
             front_face=rng.choice(["ccw", "cw"]))
+    # Random mipmapped cases: random screen triangles over the 16x16 level 0, so
+    # the LOD spans magnification through heavy minification including fractional
+    # levels, both filters and both mipmap modes.
+    for n in range(24):
+        tri = []
+        for _ in range(3):
+            x = rng.randint(-2 * SUBPIXEL_SCALE, 10 * SUBPIXEL_SCALE)
+            y = rng.randint(-2 * SUBPIXEL_SCALE, 10 * SUBPIXEL_SCALE)
+            z = struct.unpack("<f", struct.pack("<f", rng.uniform(-1, 1)))[0]
+            u = rng.uniform(-2.0, 3.0)
+            v = rng.uniform(-2.0, 3.0)
+            w = rng.uniform(0.5, 2.5)
+            tri.append((x, y, z, u / w, v / w, 1.0 / w))
+        add(f"mip_random_{n:02d}", tri,
+            filt=rng.choice(["nearest", "bilinear"]),
+            tint=rng.choice([(255, 255, 255, 255), (180, 200, 240, 255), (255, 220, 160, 255)]),
+            cull=rng.choice(["none", "none", "back"]),
+            front_face=rng.choice(["ccw", "cw"]),
+            mips="mip",
+            mipmap=rng.choice(["trilinear", "trilinear", "level0"]))
 
     return out
 
@@ -234,9 +486,13 @@ def emit(all_cases):
     lines.append("pub const width: u32 = 8;")
     lines.append("pub const height: u32 = 8;")
     lines.append("")
-    lines.append("/// The shared 4x4 RGBA8 texture every case samples (row-major, top-down).")
+    lines.append("/// The shared 4x4 RGBA8 texture the level-0 cases sample (row-major, top-down).")
     tex = ", ".join(str(b) for b in TEX_PIXELS)
     lines.append(f"pub const texture = [_]u8{{ {tex} }};")
+    lines.append("")
+    lines.append("/// The 16x16 level-0 texture the mipmapped cases sample.")
+    big = ", ".join(str(b) for b in mip_tex_pixels())
+    lines.append(f"pub const mip_texture = [_]u8{{ {big} }};")
     lines.append("")
     lines.append("pub const Vertex = struct { x: i32, y: i32, z: f32, uw: f64, vw: f64, w_inv: f64 };")
     lines.append("")
@@ -256,7 +512,15 @@ def emit(all_cases):
     lines.append("    mask: [8]u8,")
     lines.append("    /// Expected 8x8 RGBA8 frame, row-major (clear pixels stay zero).")
     lines.append("    frame: []const u8,")
+    lines.append("    /// Mip levels below level 0, largest first; empty for a level-0-only")
+    lines.append("    /// case (the whole pre-mipmap corpus).")
+    lines.append("    levels: []const Level,")
+    lines.append("    mipmap: enum { level0, trilinear },")
+    lines.append("    /// True when level 0 is `mip_texture` (16x16), false for `texture` (4x4).")
+    lines.append("    big_base: bool,")
     lines.append("};")
+    lines.append("")
+    lines.append("pub const Level = struct { width: u32, height: u32, pixels: []const u8 };")
     lines.append("")
     lines.append("pub const cases = [_]Case{")
     for c in all_cases:
@@ -280,6 +544,19 @@ def emit(all_cases):
         lines.append("        .drew = {0},".format(str(c["drew"]).lower()))
         lines.append("        .mask = .{{ {0} }},".format(mask))
         lines.append("        .frame = &.{{ {0} }},".format(frame))
+        if c["mips"]:
+            level_entries = []
+            for (lw, lh, lpix) in c["levels"]:
+                bytes_ = ", ".join("0x{0:02x}".format(b) for b in lpix)
+                level_entries.append(
+                    ".{{ .width = {0}, .height = {1}, .pixels = &.{{ {2} }} }}".format(lw, lh, bytes_))
+            lines.append("        .levels = &.{{ {0} }},".format(", ".join(level_entries)))
+            lines.append("        .mipmap = .{0},".format(c["mipmap"]))
+            lines.append("        .big_base = {0},".format(str(c["big_base"]).lower()))
+        else:
+            lines.append("        .levels = &.{},")
+            lines.append("        .mipmap = .trilinear,")
+            lines.append("        .big_base = false,")
         lines.append("    },")
     lines.append("};")
     lines.append("")

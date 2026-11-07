@@ -21,11 +21,14 @@
 //! `vw = v / w` and `w_inv = 1 / w` (clip space), which are linearly interpolated
 //! and divided through at the end of the pixel.
 //!
-//! Textures are borrowed, decoded RGBA8 buffers (`Texture`) with repeat wrap
-//! and nearest/bilinear magnification. A sampled texel is multiplied by the
-//! material's linear RGBA tint. The resulting fragment is written verbatim by
-//! default, or composited with the target using `Options.blend` (straight-alpha
-//! source-over, premultiplied or additive) — see `Blend`.
+//! Textures are borrowed, decoded RGBA8 buffers (`Texture`) with repeat wrap and
+//! nearest/bilinear filtering. A `Texture` may carry a mip chain (`mips`); with
+//! one, `Options.mipmap = .trilinear` picks the level per pixel from the exact
+//! screen-space UV gradient and mixes the two neighbouring levels, which is what
+//! removes minification aliasing. A sampled texel is multiplied by the material's
+//! linear RGBA tint. The resulting fragment is written verbatim by default, or
+//! composited with the target using `Options.blend` (straight-alpha source-over,
+//! premultiplied or additive) — see `Blend`.
 //!
 //! Coupling: geometry and materials arrive through a duck-typed `resources`
 //! value, so this module never imports the asset layer. A caller adapts
@@ -33,10 +36,11 @@
 //!
 //! Lighting is one optional directional Lambert term; blending is per-fragment
 //! in submission order (no order-independent transparency). Not implemented,
-//! and not claimed: MSAA, mipmaps, or any GPU path.
+//! and not claimed: MSAA, anisotropic filtering, or any GPU path.
 
 const std = @import("std");
 const draw = @import("draw.zig");
+const mip = @import("mipmap.zig");
 const transform = @import("../scene/transform.zig");
 
 const Allocator = std.mem.Allocator;
@@ -201,6 +205,22 @@ pub const Options = struct {
     /// pixels as translucent fragments. See `Antialias` for the guarantees each
     /// mode does and does not give.
     antialias: Antialias = .none,
+    /// How a textured draw picks the mip level to sample. Only matters for a
+    /// `Texture` that carries `mips`; without them every mode samples level 0,
+    /// which is the pre-mipmap behaviour byte for byte.
+    mipmap: Mipmap = .trilinear,
+};
+
+/// Mip level selection for textured draws.
+pub const Mipmap = enum {
+    /// Always sample level 0: `filter` magnifies *and* minifies. Aliases when
+    /// minifying; use it for pixel-art textures that must stay crisp.
+    level0,
+    /// Choose the level per pixel from the screen-space UV gradient and mix the
+    /// two neighbouring levels (trilinear), so a minified texture averages
+    /// instead of aliasing. Costs one extra filtered fetch when the level is
+    /// fractional. This is the default and a no-op for a texture without `mips`.
+    trilinear,
 };
 
 /// A triangle vertex in screen space: `x`/`y` are 28.4 fixed point pixels with
@@ -229,23 +249,60 @@ pub const Mesh = struct {
     uvs: ?[]const [2]f32 = null,
 };
 
+/// One mip level of a texture: RGBA8, row-major, top-down, exactly the layout
+/// of `Texture.pixels`. `width`/`height` are the level's own (reduced) size.
+/// The same type `mipmap.Chain` produces, so a generated chain feeds a
+/// `Texture` with no conversion.
+pub const MipLevel = mip.Level;
+
 /// A borrowed, decoded texture: RGBA8, row-major, top-down — exactly the
 /// layout of `assets.texture`'s `CXTX` pixel payload. `v = 0` samples the
 /// first (top) row. Coordinates wrap with repeat addressing (any value maps
-/// into the texture). No mipmap level or LOD selection exists; `filter`
-/// magnifies.
+/// into the texture).
+///
+/// Level 0 lives in `width`/`height`/`pixels`; the optional `mips` slice holds
+/// the smaller levels, largest first (see `MipChain`), which is what enables
+/// minification without aliasing. Without `mips` the texture is level 0 only
+/// and sampling stays bit-identical to the pre-mipmap behaviour.
 pub const Texture = struct {
     width: u32,
     height: u32,
     /// `width * height * 4` bytes, row-major, 4 bytes per pixel (RGBA).
     pixels: []const u8,
     filter: Filter = .bilinear,
+    /// Optional mip levels below level 0, largest first. Empty (the default)
+    /// means level 0 only: no LOD selection, `filter` magnifies/minifies.
+    mips: []const MipLevel = &.{},
+
+    /// Level 0 plus every entry of `mips`, so `mipLevelCount() == 1 + mips.len`.
+    /// Returns level 0 itself for an invalid index rather than panicking —
+    /// callers derive the index from `lodLevel`, which is bounded by it.
+    pub fn mipLevel(self: Texture, index: u32) MipLevel {
+        if (index == 0 or index > self.mips.len) return .{ .width = self.width, .height = self.height, .pixels = self.pixels };
+        return self.mips[index - 1];
+    }
+
+    /// Number of sampling levels: 1 without `mips`.
+    pub fn mipLevelCount(self: Texture) u32 {
+        return 1 + @as(u32, @intCast(self.mips.len));
+    }
 
     pub fn validate(self: Texture) Error!void {
         if (self.width == 0 or self.height == 0) return error.InvalidTexture;
         if (self.width > max_dimension or self.height > max_dimension) return error.InvalidTexture;
         const expected = @as(usize, self.width) * @as(usize, self.height) * 4;
         if (self.pixels.len != expected) return error.InvalidTexture;
+        for (self.mips, 0..) |level, i| {
+            // Level i + 1 must be exactly level i halved (floored, never below
+            // 1): the chain is the one `mipmap.Chain.generate` builds, so a
+            // caller cannot hand in levels that do not line up with the LOD
+            // selection.
+            const want = mip.levelDims(self.width, self.height, @intCast(i + 1));
+            if (level.width != want[0] or level.height != want[1]) return error.InvalidTexture;
+            if (level.pixels.len != @as(usize, level.width) * @as(usize, level.height) * 4) return error.InvalidTexture;
+            // Nothing can follow the 1x1 level.
+            if (want[0] == 1 and want[1] == 1 and i + 1 != self.mips.len) return error.InvalidTexture;
+        }
     }
 };
 
@@ -376,9 +433,23 @@ fn nearestTexel(tex: Texture, u: f64, v: f64) [4]u8 {
     return tex.pixels[off..][0..4].*;
 }
 
+fn nearestLevelTexel(level: MipLevel, u: f64, v: f64) [4]u8 {
+    const uf = repeatFrac(u);
+    const vf = repeatFrac(v);
+    const x: u32 = @min(level.width - 1, @as(u32, @intFromFloat(@floor(uf * @as(f64, @floatFromInt(level.width))))));
+    const y: u32 = @min(level.height - 1, @as(u32, @intFromFloat(@floor(vf * @as(f64, @floatFromInt(level.height))))));
+    const off = (@as(usize, y) * level.width + x) * 4;
+    return level.pixels[off..][0..4].*;
+}
+
 fn fetch(tex: Texture, ix: u32, iy: u32, channel: usize) f64 {
     const off = texelOffset(tex, ix, iy);
     return @floatFromInt(tex.pixels[off + channel]);
+}
+
+fn fetchLevel(level: MipLevel, ix: u32, iy: u32, channel: usize) f64 {
+    const off = (@as(usize, iy) * level.width + ix) * 4;
+    return @floatFromInt(level.pixels[off + channel]);
 }
 
 /// Bilinear magnification pinned to a single evaluation order: fractions as
@@ -409,10 +480,106 @@ fn bilinearTexel(tex: Texture, u: f64, v: f64) [4]u8 {
     return out;
 }
 
+/// `bilinearTexel` for an arbitrary level: same pinned operation order, wrapping
+/// and single final round, against that level's own dimensions.
+fn bilinearLevelTexel(level: MipLevel, u: f64, v: f64) [4]u8 {
+    const uf = repeatFrac(u);
+    const vf = repeatFrac(v);
+    const tx = uf * @as(f64, @floatFromInt(level.width)) - 0.5;
+    const ty = vf * @as(f64, @floatFromInt(level.height)) - 0.5;
+    const fx = tx - @floor(tx);
+    const fy = ty - @floor(ty);
+    const x0 = wrapIndex(tx, level.width);
+    const x1 = (x0 + 1) % level.width;
+    const y0 = wrapIndex(ty, level.height);
+    const y1 = (y0 + 1) % level.height;
+    var out: [4]u8 = undefined;
+    for (0..4) |channel| {
+        const c00 = fetchLevel(level, x0, y0, channel);
+        const c10 = fetchLevel(level, x1, y0, channel);
+        const c01 = fetchLevel(level, x0, y1, channel);
+        const c11 = fetchLevel(level, x1, y1, channel);
+        const top = (c00 * (1.0 - fx) + c10 * fx) * (1.0 - fy);
+        const bottom = (c01 * (1.0 - fx) + c11 * fx) * fy;
+        out[channel] = @intFromFloat(@floor(top + bottom + 0.5));
+    }
+    return out;
+}
+
 fn sampleTexture(tex: Texture, u: f64, v: f64) [4]u8 {
     return switch (tex.filter) {
         .nearest => nearestTexel(tex, u, v),
         .bilinear => bilinearTexel(tex, u, v),
+    };
+}
+
+fn sampleLevel(tex: Texture, index: u32, u: f64, v: f64) [4]u8 {
+    const level = tex.mipLevel(index);
+    return switch (tex.filter) {
+        .nearest => nearestLevelTexel(level, u, v),
+        .bilinear => bilinearLevelTexel(level, u, v),
+    };
+}
+
+/// Continuous level of detail: `log2` of the larger of the two texel-space UV
+/// gradients, clamped to `[0, levels - 1]`. `du`/`dv` are the per-pixel changes
+/// of `u`/`v` already scaled by the texture size, so 1 means one texel per pixel
+/// (level 0) and 2 means two (level 1). A zero, negative or non-finite gradient
+/// selects level 0, which is also exactly the pre-mipmap behaviour.
+fn textureLod(du: f64, dv: f64, levels: u32) f64 {
+    const max_level: f64 = @floatFromInt(levels - 1);
+    const rho = @max(@abs(du), @abs(dv));
+    if (!(rho > 1.0) or !std.math.isFinite(rho)) return 0.0;
+    const lod = @log2(rho);
+    if (!(lod > 0.0)) return 0.0;
+    return @min(lod, max_level);
+}
+
+/// Trilinear sample: floor/ceil of `lod`, each level filtered with `filter`, then
+/// the two results mixed channel-wise in `f64` and rounded **once**. A `lod` on a
+/// level boundary does a single fetch, and level 0 with `lod == 0` reproduces the
+/// plain `sampleTexture` result byte for byte.
+fn sampleTrilinear(tex: Texture, u: f64, v: f64, lod: f64) [4]u8 {
+    const base: u32 = @intFromFloat(@floor(lod));
+    const levels = tex.mipLevelCount();
+    if (base >= levels - 1) return sampleLevel(tex, levels - 1, u, v);
+    const t = lod - @as(f64, @floatFromInt(base));
+    if (!(t > 0.0)) return sampleLevel(tex, base, u, v);
+    const coarse = sampleLevel(tex, base + 1, u, v);
+    const fine = sampleLevel(tex, base, u, v);
+    var out: [4]u8 = undefined;
+    for (0..4) |channel| {
+        const a = @as(f64, @floatFromInt(fine[channel]));
+        const b = @as(f64, @floatFromInt(coarse[channel]));
+        out[channel] = @intFromFloat(@floor(a * (1.0 - t) + b * t + 0.5));
+    }
+    return out;
+}
+
+/// Per-pixel screen-space UV derivatives, in *texel* units: the change of
+/// `u * width` / `v * height` across one pixel step in x and in y, following the
+/// perspective-correct mapping. Written as `(p * den - q * dden) / den^2`, the
+/// exact derivative of `u = p / den` — no approximation, no extra sample.
+///
+/// `p`/`q` are the perspective numerator (`Σ w·uw / area`) and `den` the
+/// denominator at this pixel; `dp`/`dq`/`dden` are their per-x and per-y
+/// differences. A degenerate `den` cannot yield a derivative, so the caller's
+/// level stays 0.
+fn texelGradient(p: f64, q: f64, den: f64, dp: [2]f64, dq: [2]f64, dden: [2]f64, size: [2]f64) struct { du: f64, dv: f64 } {
+    const den_sq = den * den;
+    if (!(den_sq > 0.0) or !std.math.isFinite(den_sq)) return .{ .du = 0.0, .dv = 0.0 };
+    // One reciprocal instead of four divides: all four derivatives share
+    // `den * den`. The multiply form is pinned (and mirrored by the reference
+    // generator) — the value only feeds a log2 and a level clamp, so the
+    // rounding difference against a true divide is far below one level step.
+    const inv_den_sq = 1.0 / den_sq;
+    const dudx = (dp[0] * den - p * dden[0]) * inv_den_sq;
+    const dvdx = (dq[0] * den - q * dden[0]) * inv_den_sq;
+    const dudy = (dp[1] * den - p * dden[1]) * inv_den_sq;
+    const dvdy = (dq[1] * den - q * dden[1]) * inv_den_sq;
+    return .{
+        .du = @max(@abs(dudx), @abs(dudy)) * size[0],
+        .dv = @max(@abs(dvdx), @abs(dvdy)) * size[1],
     };
 }
 
@@ -878,11 +1045,55 @@ fn resolveAccumulated(target: *Target, accum: *AccumBuffers, options: Options, s
     accum.count = 0;
 }
 
+/// Per-pixel change of the perspective numerator (`dp`, `dq`) and denominator
+/// (`dden`), for the x and y screen axes. Both are affine in screen space, so
+/// these six numbers are constant over the triangle and computed once — the LOD
+/// therefore costs six multiplies per triangle plus one derivative per pixel.
+const GradSteps = struct {
+    dp: [2]f64,
+    dq: [2]f64,
+    dden: [2]f64,
+    /// Set when the perspective denominator is constant over the triangle (every
+    /// vertex carries the same `w_inv`) — an orthographic projection, or any
+    /// affine UV map. The texel gradient, and therefore the level, is then the
+    /// same for every pixel, so `log2` is paid once per triangle instead of once
+    /// per pixel. The value is bit-identical either way: the per-pixel derivative
+    /// with `dden == 0` reduces to exactly this expression.
+    constant_lod: ?f64 = null,
+
+    /// From the per-pixel barycentric steps (`da`, `db`) and the attribute
+    /// differences to the reference vertex 2:
+    /// `d(num)/d(axis) = da * (att0 - att2) + db * (att1 - att2)`.
+    fn init(v0: ScreenVertex, v1: ScreenVertex, v2: ScreenVertex, da: [2]f64, db: [2]f64) GradSteps {
+        const nu = v0.uw - v2.uw;
+        const nv = v0.vw - v2.vw;
+        const nw = v0.w_inv - v2.w_inv;
+        const mu = v1.uw - v2.uw;
+        const mv = v1.vw - v2.vw;
+        const mw = v1.w_inv - v2.w_inv;
+        return .{
+            .dp = .{ da[0] * nu + db[0] * mu, da[1] * nu + db[1] * mu },
+            .dq = .{ da[0] * nv + db[0] * mv, da[1] * nv + db[1] * mv },
+            .dden = .{ da[0] * nw + db[0] * mw, da[1] * nw + db[1] * mw },
+        };
+    }
+
+    /// The single level this triangle samples at, when `den` cannot vary. `size`
+    /// is the level-0 extent in texels and `levels` the chain length.
+    fn constantLod(self: GradSteps, den: f64, size: [2]f64, levels: u32) ?f64 {
+        if (self.dden[0] != 0.0 or self.dden[1] != 0.0) return null;
+        const grad_px = texelGradient(0.0, 0.0, den, self.dp, self.dq, self.dden, size);
+        return textureLod(grad_px.du, grad_px.dv, levels);
+    }
+};
+
 /// Shade one covered pixel: flat `rgba`, or `rgba` multiplied by the filtered
 /// texel with perspective-correct UVs (`w0`..`w2` are the already-biased
 /// coverage weights as f64, `inv_area` normalizes them). `lit`, when set, is
 /// the per-channel Lambert multiplier from `lightMultiplier` (albedo lighting,
-/// alpha untouched).
+/// alpha untouched). `grad` carries the per-pixel UV gradient constants when the
+/// texture has mip levels and `lod_mode == .trilinear`, and is ignored
+/// otherwise.
 fn shadePixel(
     texture: ?Texture,
     v0: ScreenVertex,
@@ -894,6 +1105,8 @@ fn shadePixel(
     inv_area: f64,
     rgba: [4]u8,
     lit: ?[3]f64,
+    lod_mode: Mipmap,
+    grad: ?GradSteps,
 ) [4]u8 {
     const tex = texture orelse {
         if (lit) |lm| {
@@ -906,6 +1119,10 @@ fn shadePixel(
         }
         return rgba;
     };
+    // Perspective numerator and denominator, both divided by `area` so the
+    // barycentric weights 0..area normalize correctly.
+    const num_u = ((w0 * v0.uw + w1 * v1.uw) + w2 * v2.uw) * inv_area;
+    const num_v = ((w0 * v0.vw + w1 * v1.vw) + w2 * v2.vw) * inv_area;
     const den = ((w0 * v0.w_inv + w1 * v1.w_inv) + w2 * v2.w_inv) * inv_area;
     var u: f64 = 0.0;
     var v: f64 = 0.0;
@@ -913,10 +1130,23 @@ fn shadePixel(
     // hand in degenerate weights. Fall back to the affine answer rather than
     // emit NaN.
     if (den > 0.0 and std.math.isFinite(den)) {
-        u = (((w0 * v0.uw + w1 * v1.uw) + w2 * v2.uw) * inv_area) / den;
-        v = (((w0 * v0.vw + w1 * v1.vw) + w2 * v2.vw) * inv_area) / den;
+        u = num_u / den;
+        v = num_v / den;
     }
-    const sampled = sampleTexture(tex, u, v);
+    // Level selection only exists when the texture actually carries mips; the
+    // no-mip path therefore stays the exact single-sample expression above.
+    const sampled = if (tex.mips.len == 0 or lod_mode == .level0) sampleTexture(tex, u, v) else blk: {
+        const g = grad.?;
+        break :blk sampleTrilinear(tex, u, v, g.constant_lod orelse level: {
+            // Perspective: the denominator varies per pixel, so the level does
+            // too. One derivative and one log2 per pixel.
+            const grad_px = texelGradient(num_u, num_v, den, g.dp, g.dq, g.dden, .{
+                @floatFromInt(tex.width),
+                @floatFromInt(tex.height),
+            });
+            break :level textureLod(grad_px.du, grad_px.dv, tex.mipLevelCount());
+        });
+    };
     if (lit) |lm| {
         var out: [4]u8 = undefined;
         for (0..4) |c| {
@@ -1048,6 +1278,26 @@ fn rasterTriangleCore(
     const step_y2 = (@as(i64, v1.x) - v0.x) * subpixel_scale;
 
     const inv_area = 1.0 / @as(f64, @floatFromInt(area));
+    // Mip level selection needs the per-pixel change of the perspective UV
+    // numerator and denominator. Both are affine in screen space, so the six
+    // constants are derived here once per triangle from the same per-pixel edge
+    // steps the coverage loop uses (already in whole pixels). A texture without
+    // mip levels, or `.level0`, never reads them.
+    const grad: ?GradSteps = if (texture) |tex| blk: {
+        if (tex.mips.len == 0 or options.mipmap == .level0) break :blk null;
+        var g = GradSteps.init(v0, v1, v2, .{
+            @as(f64, @floatFromInt(step_x0)) * inv_area,
+            @as(f64, @floatFromInt(step_y0)) * inv_area,
+        }, .{
+            @as(f64, @floatFromInt(step_x1)) * inv_area,
+            @as(f64, @floatFromInt(step_y1)) * inv_area,
+        });
+        g.constant_lod = g.constantLod(v0.w_inv, .{
+            @floatFromInt(tex.width),
+            @floatFromInt(tex.height),
+        }, tex.mipLevelCount());
+        break :blk g;
+    } else null;
     const z0: f64 = v0.z;
     const z1: f64 = v1.z;
     const z2: f64 = v2.z;
@@ -1138,7 +1388,7 @@ fn rasterTriangleCore(
                 const wgt2 = @as(f64, @floatFromInt(weight2));
                 const depth: f32 = @floatCast(((wgt0 * z0 + wgt1 * z1) + wgt2 * z2) * inv_area);
                 if (!options.depth_test or depth < target.depth[index]) {
-                    const shaded = shadePixel(texture, v0, v1, v2, wgt0, wgt1, wgt2, inv_area, rgba, lit);
+                    const shaded = shadePixel(texture, v0, v1, v2, wgt0, wgt1, wgt2, inv_area, rgba, lit, options.mipmap, grad);
                     if (aa) {
                         // Accumulate; `resolveAccumulated` composites once the
                         // whole mesh has been submitted. The mapping is
@@ -2209,9 +2459,165 @@ test "rasterizer matches the independent reference bit for bit" {
 
 const texture_vectors = @import("raster_texture_vectors.zig");
 
+test "textureLod: one texel per pixel is level 0, doubling adds one level" {
+    // Below or at one texel per pixel there is nothing to filter.
+    try testing.expectEqual(@as(f64, 0.0), textureLod(0.0, 0.0, 4));
+    try testing.expectEqual(@as(f64, 0.0), textureLod(1.0, 0.5, 4));
+    try testing.expectEqual(@as(f64, 0.0), textureLod(0.9, 0.2, 4));
+    // Exact powers of two land on level boundaries.
+    try testing.expectEqual(@as(f64, 1.0), textureLod(2.0, 2.0, 4));
+    try testing.expectEqual(@as(f64, 2.0), textureLod(4.0, 1.0, 4));
+    // The larger axis decides, and the result never exceeds the last level.
+    try testing.expectEqual(@as(f64, 2.0), textureLod(1.0, 4.0, 4));
+    try testing.expectEqual(@as(f64, 3.0), textureLod(64.0, 64.0, 4));
+    try testing.expectEqual(@as(f64, 0.0), textureLod(64.0, 64.0, 1));
+    // A degenerate gradient (non-finite, or a negative length) selects level 0.
+    try testing.expectEqual(@as(f64, 0.0), textureLod(std.math.nan(f64), 1.0, 4));
+    try testing.expectEqual(@as(f64, 0.0), textureLod(std.math.inf(f64), 1.0, 4));
+    // Between levels it is fractional, so the sampler mixes both.
+    const half = textureLod(3.0, 3.0, 4);
+    try testing.expect(half > 1.0 and half < 2.0);
+}
+
+test "texelGradient: matches the analytic derivative of the perspective mapping" {
+    // u = p / den, so du/dx = (dp/dx * den - p * dden/dx) / den^2. Every value
+    // here is an exact power of two, so the reciprocal multiply is exact too and
+    // the assertion is an identity rather than an approximation.
+    const g = texelGradient(0.5, 0.25, 2.0, .{ 0.5, 0.0 }, .{ 0.0, 0.125 }, .{ 0.25, 0.0 }, .{ 4.0, 4.0 });
+    // du/dx = (0.5 * 2 - 0.5 * 0.25) / 4 = 0.875 / 4 -> * 4 texels = 0.875
+    try testing.expectEqual(@as(f64, 0.875), g.du);
+    // dv/dy = (0.125 * 2 - 0.25 * 0) / 4 = 0.25 / 4 -> * 4 texels = 0.25
+    try testing.expectEqual(@as(f64, 0.25), g.dv);
+    // A zero denominator yields no gradient at all (level 0 downstream).
+    const degenerate = texelGradient(0.5, 0.25, 0.0, .{ 1, 1 }, .{ 1, 1 }, .{ 1, 1 }, .{ 4, 4 });
+    try testing.expectEqual(@as(f64, 0.0), degenerate.du);
+    try testing.expectEqual(@as(f64, 0.0), degenerate.dv);
+}
+
+test "sampleTrilinear: integral levels pick one level, fractional mixes both" {
+    // Two levels of a 2x2 texture: level 0 is black/white, level 1 is mid grey.
+    const level0 = [_]u8{
+        0,   0,   0,   255,
+        255, 255, 255, 255,
+        255, 255, 255, 255,
+        0,   0,   0,   255,
+    };
+    const level1 = [_]u8{ 128, 128, 128, 255 };
+    const mips = [_]MipLevel{.{ .width = 1, .height = 1, .pixels = &level1 }};
+    const tex = Texture{ .width = 2, .height = 2, .pixels = &level0, .mips = &mips, .filter = .nearest };
+    try tex.validate();
+    // (0.1, 0.1) is the black texel; (0.6, 0.1) the white one.
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 255 }, &sampleTrilinear(tex, 0.1, 0.1, 0.0));
+    try testing.expectEqualSlices(u8, &.{ 255, 255, 255, 255 }, &sampleTrilinear(tex, 0.6, 0.1, 0.0));
+    // Halfway to the last level: floor((0 + 128) / 2 + 0.5) = 64.
+    try testing.expectEqualSlices(u8, &.{ 64, 64, 64, 255 }, &sampleTrilinear(tex, 0.1, 0.1, 0.5));
+    // At or past the last level only that level is fetched.
+    try testing.expectEqualSlices(u8, &.{ 128, 128, 128, 255 }, &sampleTrilinear(tex, 0.1, 0.1, 1.0));
+    try testing.expectEqualSlices(u8, &.{ 128, 128, 128, 255 }, &sampleTrilinear(tex, 0.1, 0.1, 9.0));
+    // Level 0 through the trilinear path is byte-identical to the plain sampler.
+    for ([_][2]f64{ .{ 0.1, 0.1 }, .{ 0.6, 0.2 }, .{ 0.9, 0.9 } }) |uv| {
+        try testing.expectEqualSlices(u8, &sampleTexture(tex, uv[0], uv[1]), &sampleTrilinear(tex, uv[0], uv[1], 0.0));
+    }
+}
+
+test "Texture.validate: rejects a mip chain that is not repeated halving" {
+    const level0: [4 * 4 * 4]u8 = @splat(0);
+    const l2: [2 * 2 * 4]u8 = @splat(0);
+    const l1: [1 * 1 * 4]u8 = @splat(0);
+    const short: [15]u8 = @splat(0);
+
+    const ok_levels = [_]MipLevel{
+        .{ .width = 2, .height = 2, .pixels = &l2 },
+        .{ .width = 1, .height = 1, .pixels = &l1 },
+    };
+    const ok = Texture{ .width = 4, .height = 4, .pixels = &level0, .mips = &ok_levels };
+    try ok.validate();
+    try testing.expectEqual(@as(u32, 3), ok.mipLevelCount());
+    try testing.expectEqual(@as(u32, 4), ok.mipLevel(0).width);
+    try testing.expectEqual(@as(u32, 2), ok.mipLevel(1).width);
+    try testing.expectEqual(@as(u32, 1), ok.mipLevel(2).width);
+    // Out-of-range levels fall back to level 0 instead of reading out of bounds.
+    try testing.expectEqual(@as(u32, 4), ok.mipLevel(99).width);
+
+    // Wrong size for level 1.
+    const bad_size = [_]MipLevel{.{ .width = 3, .height = 2, .pixels = &l2 }};
+    try testing.expectError(error.InvalidTexture, (Texture{ .width = 4, .height = 4, .pixels = &level0, .mips = &bad_size }).validate());
+    // Level pixel slice does not match its dimensions.
+    const bad_len = [_]MipLevel{.{ .width = 2, .height = 2, .pixels = &short }};
+    try testing.expectError(error.InvalidTexture, (Texture{ .width = 4, .height = 4, .pixels = &level0, .mips = &bad_len }).validate());
+    // A level after 1x1 can never be reached.
+    const after_last = [_]MipLevel{
+        .{ .width = 2, .height = 2, .pixels = &l2 },
+        .{ .width = 1, .height = 1, .pixels = &l1 },
+        .{ .width = 1, .height = 1, .pixels = &l1 },
+    };
+    try testing.expectError(error.InvalidTexture, (Texture{ .width = 4, .height = 4, .pixels = &level0, .mips = &after_last }).validate());
+}
+
+test "drawMesh: mip selection removes minification aliasing" {
+    // A 24x24 checker over an 8x8 quad is minified 3:1. Sampling level 0 with
+    // nearest turns that into a beating pattern that jumps between 0 and 255 —
+    // the classic moire. Level 1 already averages every 2x2 block of a checker
+    // to mid grey, so trilinear sampling makes the whole quad uniform.
+    var checker: [24 * 24 * 4]u8 = undefined;
+    for (0..24) |y| for (0..24) |x| {
+        const v: u8 = if ((x + y) % 2 == 0) 0 else 255;
+        const o = (y * 24 + x) * 4;
+        checker[o] = v;
+        checker[o + 1] = v;
+        checker[o + 2] = v;
+        checker[o + 3] = 255;
+    };
+    var chain = try mip.Chain.generate(testing.allocator, 24, 24, &checker);
+    defer chain.deinit(testing.allocator);
+    const tex = Texture{ .width = 24, .height = 24, .pixels = &checker, .filter = .nearest, .mips = chain.levels() };
+    try tex.validate();
+
+    const Bounds = struct {
+        fn of(target: *Target) [2]u8 {
+            var lo: u8 = 255;
+            var hi: u8 = 0;
+            for (0..8) |y| for (0..8) |x| {
+                const p = target.colorAt(@intCast(x), @intCast(y));
+                lo = @min(lo, p[0]);
+                hi = @max(hi, p[0]);
+            };
+            return .{ lo, hi };
+        }
+    };
+
+    var aliased = try TestSurface.init(8, 8);
+    defer aliased.deinit();
+    _ = try drawMesh(&aliased.target, quadMeshUv(), transform.identity(), orthoSetup(), white, .{ .mipmap = .level0 }, tex);
+    const raw = Bounds.of(&aliased.target);
+    try testing.expectEqual(@as(u8, 0), raw[0]);
+    try testing.expectEqual(@as(u8, 255), raw[1]);
+
+    var smooth = try TestSurface.init(8, 8);
+    defer smooth.deinit();
+    _ = try drawMesh(&smooth.target, quadMeshUv(), transform.identity(), orthoSetup(), white, .{}, tex);
+    const filtered = Bounds.of(&smooth.target);
+    // Every pixel of the minified checker averages to the same mid value.
+    try testing.expect(filtered[1] - filtered[0] <= 2);
+    try testing.expect(filtered[0] > 100 and filtered[1] < 155);
+}
+
+test "drawMesh: a texture without mips is bit-identical under every mipmap mode" {
+    var plain = try TestSurface.init(8, 8);
+    defer plain.deinit();
+    var trilinear = try TestSurface.init(8, 8);
+    defer trilinear.deinit();
+    const tex = Texture{ .width = 2, .height = 2, .pixels = &texel_2x2, .filter = .bilinear };
+    _ = try drawMesh(&plain.target, quadMeshUv(), transform.identity(), orthoSetup(), white, .{ .mipmap = .level0 }, tex);
+    _ = try drawMesh(&trilinear.target, quadMeshUv(), transform.identity(), orthoSetup(), white, .{ .mipmap = .trilinear }, tex);
+    try testing.expectEqualSlices(u8, plain.target.color, trilinear.target.color);
+}
+
 test "textured rasterizer matches the independent reference bit for bit" {
     var s = try TestSurface.init(texture_vectors.width, texture_vectors.height);
     defer s.deinit();
+    // The generator emits one 4x4 level-0 texture and one 16x16 level-0 texture
+    // plus, per mipmapped case, the chain below level 0 it expects to be sampled.
     const checker = Texture{
         .width = 4,
         .height = 4,
@@ -2219,6 +2625,7 @@ test "textured rasterizer matches the independent reference bit for bit" {
         .filter = .nearest, // overridden per case below
     };
     var total_pixels: usize = 0;
+    var mip_pixels: usize = 0;
     for (texture_vectors.cases) |case| {
         s.target.clear(.{ 0, 0, 0, 0 }, 1.0);
         const options = Options{
@@ -2233,16 +2640,34 @@ test "textured rasterizer matches the independent reference bit for bit" {
             },
             .depth_test = case.depth_test,
             .depth_write = case.depth_write,
+            .mipmap = switch (case.mipmap) {
+                .level0 => .level0,
+                .trilinear => .trilinear,
+            },
         };
+        // Copy the case's levels into the sampler's own type (same layout).
+        var mip_levels: [8]MipLevel = undefined;
+        for (case.levels, 0..) |level, li| {
+            mip_levels[li] = .{ .width = level.width, .height = level.height, .pixels = level.pixels };
+        }
+        const base: MipLevel = if (case.big_base)
+            .{ .width = 16, .height = 16, .pixels = &texture_vectors.mip_texture }
+        else
+            .{ .width = checker.width, .height = checker.height, .pixels = checker.pixels };
         const tex = Texture{
-            .width = checker.width,
-            .height = checker.height,
-            .pixels = checker.pixels,
+            .width = base.width,
+            .height = base.height,
+            .pixels = base.pixels,
             .filter = switch (case.filter) {
                 .nearest => .nearest,
                 .bilinear => .bilinear,
             },
+            // The vector file's `Level` has the same layout as `mipmap.Level`;
+            // copy it across so the sampler sees its own type.
+            .mips = mip_levels[0..case.levels.len],
         };
+        // Every case must be a texture the rasterizer would accept.
+        try tex.validate();
         const tri = [3]ScreenVertex{
             .{ .x = case.tri[0].x, .y = case.tri[0].y, .z = case.tri[0].z, .uw = case.tri[0].uw, .vw = case.tri[0].vw, .w_inv = case.tri[0].w_inv },
             .{ .x = case.tri[1].x, .y = case.tri[1].y, .z = case.tri[1].z, .uw = case.tri[1].uw, .vw = case.tri[1].vw, .w_inv = case.tri[1].w_inv },
@@ -2280,10 +2705,12 @@ test "textured rasterizer matches the independent reference bit for bit" {
             }
         }
         total_pixels += pixels;
+        if (case.levels.len > 0) mip_pixels += pixels;
     }
     // Guard against the vector file silently becoming empty.
-    try testing.expect(texture_vectors.cases.len >= 40);
-    try testing.expect(total_pixels >= 500);
+    try testing.expect(texture_vectors.cases.len >= 70);
+    try testing.expect(total_pixels >= 1000);
+    try testing.expect(mip_pixels >= 500);
 }
 
 // --- texture-specific unit tests --------------------------------------------

@@ -1,5 +1,6 @@
 //! Benchmark for the software rasterizer: flat vs textured shading, the cost of
-//! alpha compositing against an opaque write, and the cost of antialiasing.
+//! alpha compositing against an opaque write, the cost of antialiasing, and the
+//! cost of mip selection when minifying.
 //! Method: ReleaseFast, best of five runs, 1024 quads (2048 triangles) tiled
 //! across the target (full coverage, integer tile counts). Invoked manually:
 //!
@@ -41,6 +42,54 @@ const AlphaResources = struct {
 // 64x64 RGBA8 gradient (per-texel variation so filtering has real work).
 var texture_pixels: [64 * 64 * 4]u8 = undefined;
 var tex64: R.RasterTexture = undefined;
+// 512x512 RGBA8 gradient with 1-texel detail. The minified mesh below maps 8 UV
+// units of it across each 32-pixel tile: 8 * 512 / 32 = 128 texels per pixel,
+// i.e. level 7 — the case mipmaps exist for.
+var big_pixels: [512 * 512 * 4]u8 = undefined;
+var tex_big: R.RasterTexture = undefined;
+var tex_big_mipped: R.RasterTexture = undefined;
+const minified_uvs = [_][2]f32{
+    .{ 0, 0 }, .{ 8, 0 }, .{ 8, 8 }, .{ 0, 8 },
+};
+const minified_mesh = R.RasterMesh{ .positions = &positions, .indices = &indices, .uvs = &minified_uvs };
+
+/// Serves the shared tiles with the 512x512 texture, with or without the mip
+/// chain, so the two runs differ in level selection only.
+const MinifiedResources = struct {
+    mipped: bool,
+    filt: R.TextureFilter,
+    pub fn mesh(self: MinifiedResources, handle: u32) ?R.RasterMesh {
+        _ = self;
+        _ = handle;
+        return minified_mesh;
+    }
+    pub fn color(self: MinifiedResources, handle: u32) ?[4]f32 {
+        _ = self;
+        return if (handle == 0) white else null;
+    }
+    pub fn texture(self: MinifiedResources, handle: u32) ?R.RasterTexture {
+        _ = handle;
+        var tex = if (self.mipped) tex_big_mipped else tex_big;
+        tex.filter = self.filt;
+        return tex;
+    }
+};
+
+fn runMinified(gpa: std.mem.Allocator, size: u32, cmds: []const R.DrawCommand, mipped: bool, filt: R.TextureFilter) !Run {
+    const n = @as(usize, size) * size;
+    const color = try gpa.alloc(u8, n * 4);
+    defer gpa.free(color);
+    const depth = try gpa.alloc(f32, n);
+    defer gpa.free(depth);
+    const vp = corex.render.orthographic(-1, 1, -1, 1, 0, 2);
+    var target = try R.Target.init(size, size, color, depth);
+    target.clear(.{ 0, 0, 0, 255 }, 1.0);
+    const resources = MinifiedResources{ .mipped = mipped, .filt = filt };
+    const t0 = monotonicNs();
+    const stats = try R.rasterize(&target, cmds, vp, resources, .{});
+    const ns = monotonicNs() - t0;
+    return .{ .ns = ns, .pixels = stats.pixels };
+}
 
 const FlatResources = struct {
     pub fn mesh(self: FlatResources, handle: u32) ?R.RasterMesh {
@@ -154,6 +203,20 @@ pub fn main() !void {
     };
     tex64 = .{ .width = 64, .height = 64, .pixels = &texture_pixels, .filter = .bilinear };
 
+    for (0..512) |y| for (0..512) |x| {
+        const o = (y * 512 + x) * 4;
+        big_pixels[o] = @intCast((x * 3 + y) % 256);
+        big_pixels[o + 1] = @intCast((y * 3 + x * 5) % 256);
+        big_pixels[o + 2] = @intCast((x ^ y) % 256);
+        big_pixels[o + 3] = 255;
+    };
+    // Build the chain once, outside the timed spans, and hand the levels
+    // straight to the texture. `Chain` owns the storage, so it is deliberately
+    // never freed: this is a one-shot process benchmark.
+    const chain = try R.mipmap.Chain.generate(gpa, 512, 512, &big_pixels);
+    tex_big = .{ .width = 512, .height = 512, .pixels = &big_pixels, .filter = .bilinear };
+    tex_big_mipped = .{ .width = 512, .height = 512, .pixels = &big_pixels, .filter = .bilinear, .mips = chain.levels() };
+
     const cmds = try commands(gpa);
     defer gpa.free(cmds);
 
@@ -173,18 +236,25 @@ pub fn main() !void {
         for (0..5) |_| best_alpha = @min(best_alpha, (try runOnce(gpa, false, size, .nearest, .alpha, cmds)).ns);
         var best_add: i128 = std.math.maxInt(i128);
         for (0..5) |_| best_add = @min(best_add, (try runOnce(gpa, false, size, .nearest, .additive, cmds)).ns);
+        // Mip selection, at 128 texels per pixel: the level-0 run is the classic
+        // aliasing case, the mipped run is the same draw with trilinear sampling.
+        var best_min_raw: i128 = std.math.maxInt(i128);
+        for (0..5) |_| best_min_raw = @min(best_min_raw, (try runMinified(gpa, size, cmds, false, .bilinear)).ns);
+        var best_min_mip: i128 = std.math.maxInt(i128);
+        for (0..5) |_| best_min_mip = @min(best_min_mip, (try runMinified(gpa, size, cmds, true, .bilinear)).ns);
         // Antialiased flat shade, with the tile edges shifted half a pixel off the
         // pixel grid so every tile has four partially covered edge rows/columns.
-        // Best of five for the same reason as above, but the whole frame is timed:
-        // scratch sizing, the accumulated pass and the resolve. One warm-up run
-        // first, so the scratch allocation does not dominate the first sample.
+        // The whole frame is timed: scratch sizing, the accumulated pass and the
+        // resolve. One warm-up run first, so the scratch allocation does not
+        // dominate the first sample.
         var best_aa: i128 = std.math.maxInt(i128);
         _ = try runAntialiased(gpa, size, cmds);
         for (0..5) |_| best_aa = @min(best_aa, (try runAntialiased(gpa, size, cmds)).ns);
-        std.debug.print("{d}x{d} covered={d} flat={d:.3}ms bilinear={d:.3}ms nearest={d:.3}ms alpha={d:.3}ms additive={d:.3}ms aa={d:.3}ms\n", .{
-            size,                                      size,                                    px,
-            @as(f64, @floatFromInt(best_flat)) / 1e6,  @as(f64, @floatFromInt(best_bi)) / 1e6,  @as(f64, @floatFromInt(best_near)) / 1e6,
-            @as(f64, @floatFromInt(best_alpha)) / 1e6, @as(f64, @floatFromInt(best_add)) / 1e6, @as(f64, @floatFromInt(best_aa)) / 1e6,
+        std.debug.print("{d}x{d} covered={d} flat={d:.3}ms bilinear={d:.3}ms nearest={d:.3}ms alpha={d:.3}ms additive={d:.3}ms aa={d:.3}ms minify={d:.3}ms minify_mip={d:.3}ms\n", .{
+            size,                                        size,                                        px,
+            @as(f64, @floatFromInt(best_flat)) / 1e6,    @as(f64, @floatFromInt(best_bi)) / 1e6,      @as(f64, @floatFromInt(best_near)) / 1e6,
+            @as(f64, @floatFromInt(best_alpha)) / 1e6,   @as(f64, @floatFromInt(best_add)) / 1e6,     @as(f64, @floatFromInt(best_aa)) / 1e6,
+            @as(f64, @floatFromInt(best_min_raw)) / 1e6, @as(f64, @floatFromInt(best_min_mip)) / 1e6,
         });
     }
 }
