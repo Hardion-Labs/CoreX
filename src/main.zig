@@ -119,6 +119,24 @@ fn runFrameLoop(gpa: std.mem.Allocator, io: Io, opts: cli.LaunchOptions, result:
     };
     defer render_assets.deinit();
 
+    // What was uploaded, in the table's own terms: the scratch it copied for meshes
+    // and the levels it borrows for textures. Reported next to the skip count so a
+    // project whose assets did not all arrive says so instead of looking complete.
+    {
+        var asset_buf: [256]u8 = undefined;
+        const asset_line = std.fmt.bufPrint(&asset_buf,
+            \\Assets uploaded: {d} meshes, {d} textures ({d} mipmapped), {d} skipped, {d} bytes
+            \\
+        , .{
+            render_assets.report.meshes,
+            render_assets.report.textures,
+            render_assets.report.mipmapped,
+            render_assets.report.skipped,
+            render_assets.uploadedBytes(),
+        }) catch return;
+        writeOut(io, asset_line);
+    }
+
     // The loop owns the surface and the renderer; every frame reuses both.
     //
     // `--fps` is the run's pacing request and wins over `settings.json`: the flag is a

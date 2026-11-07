@@ -257,9 +257,17 @@ Presentation — a window, a swapchain, a frame loop — is still the next layer
 - **The surface is the caller's.** Colour and depth are owned by whoever renders;
   `runtime.presentation.SurfaceTarget` owns one pair for a whole run and reallocates
   only when the size changes.
-- **Resource table is manual.** Slots are bound by the caller; there is no
-  automatic upload/eviction from the asset index, and no mip generation for `CXTX`
-  textures (the artifact carries no levels yet).
+- **Resource table: upload is automatic, eviction is explicit.** `scene.render_scene`
+  fills the table from the project's asset index, generates a mip chain for every
+  uploaded texture (`render.mipmap`, integer box filter) and frees the source bytes as
+  soon as the slot is filled, so what the renderer holds is exactly what it samples.
+  An upload reports its own footprint (`AssetTable.uploadedBytes`, the scratch it
+  copied plus every level it borrows) and the loader counts what it skipped and what it
+  mipmapped. **Eviction is not automatic**: there is no budget or LRU — `LoadedAssets.evict(path)`
+  is called by whoever knows the asset is no longer needed, and it releases the slot
+  (bumping the generations, so stored handles stop resolving) and frees the pixel
+  blocks. `CXTX` artifacts still carry no levels; the chain is generated at upload time,
+  which is why the artifact format did not change.
 
 ## Related
 

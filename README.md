@@ -112,8 +112,13 @@ report readiness, then run a **frame loop** over the project's own scene and pri
 accounting:
 
 ```text
+Assets uploaded: 1 meshes, 0 textures (0 mipmapped), 0 skipped, 144 bytes
 Frames: 120 of 120 (2 allocating) at 1280x720 medium — last frame: 1 commands, 1 draws, 0 skipped, 43264 pixels, 0 culled
 ```
+
+The assets line is what the renderer actually holds — the scratch it copied for meshes
+plus every mip level it generated for textures — not the size of the source files, which
+are released as soon as a slot is filled.
 
 `--frames` bounds the loop (default 1), and "2 allocating" is the whole warm-up: only the
 two draw-list buffers ever touch the general-purpose allocator, so every steady-state

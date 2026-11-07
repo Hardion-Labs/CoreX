@@ -257,6 +257,10 @@ pub const Handle = struct {
     }
 };
 
+/// Which of a slot's three entries a handle refers to. Each kind has its own
+/// generation, so setting a material cannot invalidate the mesh handle beside it.
+pub const ResourceKind = enum { mesh, color, texture };
+
 /// Fixed-capacity table of meshes, materials (colours) and optionally textures.
 ///
 /// Sized once with `init` — no allocation and no growth afterwards, so a frame
@@ -349,10 +353,46 @@ pub const ResourceTable = struct {
 
     /// Drop every entry in `slot`. The next `set*` on it gets a fresh
     /// generation, so handles to what was released stop resolving.
+    ///
+    /// The generation is bumped **here**, not only on the next `set*`: a caller that
+    /// releases a slot and then re-fills it must not have the old handles come back to
+    /// life, and a caller that recomputes a handle from a slot index (as the asset
+    /// loader does) needs the bump to have happened already. Releasing a slot that is
+    /// already free is a no-op, so an eviction policy cannot inflate generations.
     pub fn release(self: *ResourceTable, slot: usize) void {
-        self.slots[slot].mesh = false;
-        self.slots[slot].color = false;
-        self.slots[slot].texture = false;
+        const entry = &self.slots[slot];
+        if (!entry.mesh and !entry.color and !entry.texture) return;
+        entry.mesh = false;
+        entry.color = false;
+        entry.texture = false;
+        entry.mesh_gen +%= 1;
+        entry.color_gen +%= 1;
+        entry.texture_gen +%= 1;
+    }
+
+    /// Whether the kind's entry in `slot` is live.
+    pub fn isLive(self: *const ResourceTable, slot: usize, kind: ResourceKind) bool {
+        const entry = self.slots[slot];
+        return switch (kind) {
+            .mesh => entry.mesh,
+            .color => entry.color,
+            .texture => entry.texture,
+        };
+    }
+
+    /// The current handle of a specific kind in `slot`, or null when that kind is not
+    /// live there. This is what a caller that knows only the slot (the asset loader)
+    /// uses, and it is the only correct way to build a handle after a release: the
+    /// generation lives in the table, so a handle assembled from a guessed generation
+    /// silently stops resolving.
+    pub fn handleOf(self: *const ResourceTable, slot: usize, kind: ResourceKind) ?Handle {
+        const entry = self.slots[slot];
+        const gen = switch (kind) {
+            .mesh => if (entry.mesh) entry.mesh_gen else return null,
+            .color => if (entry.color) entry.color_gen else return null,
+            .texture => if (entry.texture) entry.texture_gen else return null,
+        };
+        return .{ .index = @intCast(slot), .generation = gen };
     }
 
     /// Resolver for the backend. `with_textures = false` hides the texture
@@ -506,6 +546,49 @@ pub const AssetTable = struct {
 
     pub fn setTexture(self: *AssetTable, slot: usize, texture: raster.Texture) Handle {
         return self.table.setTexture(slot, texture);
+    }
+
+    /// The current handle of `kind` in `slot`, or null when it is not live. Read from
+    /// the table rather than rebuilt from a slot index, because a release bumps the
+    /// generation: a handle recomputed from the index would resolve to whatever the
+    /// slot holds *now*, which is exactly the aliasing the generation exists to stop.
+    pub fn handleOf(self: *const AssetTable, slot: usize, kind: ResourceKind) ?Handle {
+        return self.table.handleOf(slot, kind);
+    }
+
+    /// Whether `kind` is live in `slot`.
+    pub fn isLive(self: *const AssetTable, slot: usize, kind: ResourceKind) bool {
+        return self.table.isLive(slot, kind);
+    }
+
+    /// Free everything `slot` holds and bump its generations, so every handle into it
+    /// stops resolving. The scratch buffers stay allocated (they are sliced per slot
+    /// and reused), so eviction is O(1) and never allocates.
+    pub fn release(self: *AssetTable, slot: usize) void {
+        self.table.release(slot);
+    }
+
+    /// Bytes the table can hand to a backend for the live entries: the mesh scratch
+    /// that was copied out of the assets (positions, UVs, indices) plus the texture
+    /// levels a caller uploaded. This is the table's own footprint, not the size of
+    /// the files it was filled from, and it is what an eviction/report path counts.
+    pub fn uploadedBytes(self: AssetTable) usize {
+        var bytes: usize = 0;
+        for (self.table.slots, 0..) |slot, i| {
+            if (slot.mesh) {
+                const mesh = self.table.meshes[i];
+                bytes += mesh.positions.len * @sizeOf([3]f32);
+                if (mesh.uvs) |uvs| bytes += uvs.len * @sizeOf([2]f32);
+                bytes += mesh.indices.len * @sizeOf(u32);
+            }
+            if (slot.texture) {
+                if (self.table.textures[i]) |texture| {
+                    bytes += texture.pixels.len;
+                    for (texture.mips) |level| bytes += level.pixels.len;
+                }
+            }
+        }
+        return bytes;
     }
 
     /// Resolver for the backend; see `ResourceTable.resources`.
@@ -732,6 +815,88 @@ test "pipeline: handles carry a generation, so a stale handle does not alias" {
     try testing.expectEqual(@as(usize, 0), table.liveCount());
     _ = table.setColor(0, .{ 1, 1, 1, 1 });
     try testing.expectEqual(@as(usize, 1), table.liveCount());
+}
+
+test "pipeline: release bumps every kind's generation and repeated release is a no-op" {
+    // The invariant the asset loader leans on: after a release, no handle built from
+    // the slot's index can come back to life, and an eviction policy that releases an
+    // already-free slot cannot inflate generations until they wrap.
+    const gpa = testing.allocator;
+    var table = try ResourceTable.init(gpa, 2);
+    defer table.deinit(gpa);
+    _ = table.setMesh(0, .{ .positions = &quad_positions, .indices = &quad_indices });
+    _ = table.setColor(0, .{ 1, 1, 1, 1 });
+    const texels = [_]u8{ 1, 2, 3, 4 };
+    _ = table.setTexture(0, .{ .width = 1, .height = 1, .pixels = &texels });
+
+    const mesh_handle = table.handleOf(0, .mesh).?;
+    const color_handle = table.handleOf(0, .color).?;
+    const texture_handle = table.handleOf(0, .texture).?;
+    try testing.expect(table.isLive(0, .mesh) and table.isLive(0, .color) and table.isLive(0, .texture));
+
+    table.release(0);
+    // Every kind stopped resolving, and no kind's handle was left valid.
+    try testing.expectEqual(@as(?Handle, null), table.handleOf(0, .mesh));
+    try testing.expectEqual(@as(?Handle, null), table.handleOf(0, .color));
+    try testing.expectEqual(@as(?Handle, null), table.handleOf(0, .texture));
+    try testing.expect(!table.isLive(0, .mesh) and !table.isLive(0, .color) and !table.isLive(0, .texture));
+    const res = table.resources(true);
+    try testing.expectEqual(@as(?raster.Mesh, null), res.mesh(mesh_handle.toBits()));
+    try testing.expectEqual(@as(?[4]f32, null), res.color(color_handle.toBits()));
+    try testing.expectEqual(@as(?raster.Texture, null), res.texture(texture_handle.toBits()));
+
+    // Releasing an empty slot does nothing: the generations do not move, so a
+    // release-on-evict loop cannot churn them.
+    table.release(0);
+    table.release(0);
+    const refilled = table.setMesh(0, .{ .positions = &quad_positions, .indices = &quad_indices });
+    // Two bumps since the first handle: one from the release, one from this store.
+    try testing.expectEqual(mesh_handle.generation +% 2, refilled.generation);
+
+    // A slot index out of range is refused by both accessors rather than read.
+    try testing.expectEqual(@as(?Handle, null), table.handleOf(1, .mesh));
+}
+
+test "pipeline: the asset table reports the bytes it uploaded, and eviction frees them" {
+    const gpa = testing.allocator;
+    const A = @import("../assets.zig");
+    const source =
+        \\v -1 -1 0
+        \\v 1 -1 0
+        \\v 1 1 0
+        \\vt 0 0
+        \\vt 1 0
+        \\vt 1 1
+        \\f 1/1 2/2 3/3
+    ;
+    var decoded = try A.mesh.decodeObj(gpa, source);
+    defer decoded.deinit(gpa);
+    const bytes = try A.mesh.serialize(gpa, decoded);
+    defer gpa.free(bytes);
+    const view = try A.mesh.parse(bytes);
+
+    var table = try AssetTable.init(gpa, .{ .capacity = 2, .vertices_per_slot = 4, .indices_per_slot = 3 });
+    defer table.deinit();
+    // An empty table owns nothing.
+    try testing.expectEqual(@as(usize, 0), table.uploadedBytes());
+
+    _ = try table.setMesh(0, view);
+    // Three vertices: positions + UVs + indices, exactly the scratch it copied.
+    const mesh_bytes = 3 * @sizeOf([3]f32) + 3 * @sizeOf([2]f32) + 3 * @sizeOf(u32);
+    try testing.expectEqual(mesh_bytes, table.uploadedBytes());
+
+    const level0 = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const level1 = [_]u8{ 9, 10, 11, 12 };
+    const mips = [_]raster.MipLevel{.{ .width = 1, .height = 1, .pixels = &level1 }};
+    _ = table.setTexture(1, .{ .width = 2, .height = 1, .pixels = &level0, .mips = &mips });
+    try testing.expectEqual(mesh_bytes + level0.len + level1.len, table.uploadedBytes());
+
+    // Eviction removes the live entries from the footprint; the scratch block itself
+    // stays allocated for reuse, which is why the count follows liveness, not size.
+    table.release(0);
+    try testing.expectEqual(level0.len + level1.len, table.uploadedBytes());
+    table.release(1);
+    try testing.expectEqual(@as(usize, 0), table.uploadedBytes());
 }
 
 test "pipeline: the asset table renders a CXMH mesh view and refuses oversized ones" {

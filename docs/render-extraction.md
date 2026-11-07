@@ -184,7 +184,15 @@ format) is the piece that connects a project to this layer:
 - `loadAssets(gpa, io, project_root, index, options)` — loads what the plan placed:
   `.mesh` artifacts and `.obj` sources become meshes, `.png`/`.bmp`/`.tga`/`.qoi`
   become textures; each mesh slot also gets a white base colour, so a mesh's own
-  handle is a valid material.
+  handle is a valid material. Source bytes are released as soon as a slot is filled —
+  a mesh is copied into the table's scratch, a texture keeps its level-0 pixels plus a
+  generated mip chain — so a session does not hold the files it decoded. `AssetReport`
+  counts `meshes`, `textures`, `mipmapped`, `skipped` and `evicted`.
+- `LoadedAssets.evict(path)` — release one asset's slot and pixel blocks. The slot
+  keeps its place in the path map (the layout is a property of the project, so a
+  reload lands in the same slot), but it stops resolving: `release` bumps the
+  generations, so every handle into it is dead. Eviction is explicit, not an automatic
+  budget; `uploadedBytes()` reports the footprint before and after.
 - `EngineRenderer.render(surface, scene, camera, view, resources, params)` — one
   frame through `RenderFrame.refill` + `pipeline.renderFrame`; the projection comes
   from the surface's aspect, so resizing reframes.
@@ -202,8 +210,10 @@ format) is the piece that connects a project to this layer:
   sorts to reduce state changes.
 - `Renderable` uses opaque mesh/material handles. The software rasterizer resolves
   them through a caller-supplied duck-typed provider, and `render_scene` fills that
-  table from the project's assets; uploading them to GPU resources, mip chains and
-  eviction are work for the future GPU backend.
+  table from the project's assets, with mip chains generated at upload. We have no GPU
+  yet, so "upload" means copying into CPU scratch; there is no VRAM residency, no
+  texture budget and no automatic (LRU/budgeted) eviction — `evict` is a call the
+  caller makes.
 - One `Renderable` per entity, one mesh per draw: no instancing, no multi-material
   meshes, and a texture is addressed as the material of the slot it was loaded into.
 - No per-object transparency beyond `back_to_front` sorting; transparent/opaque
