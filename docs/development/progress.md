@@ -4,6 +4,95 @@ Permanent record of real progress, decisions, pending items and the next priorit
 task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
+## Cycle 2026-11-07 (c) — Frame pacing (`target_fps`) and frame timing statistics
+
+**Diagnosis first (the logged next priority was not implementable here).** Cycle (b)
+recorded "next priority: a window + swapchain backend". That was checked before it was
+attempted, and it cannot be done or validated in this environment:
+
+| Requirement | Present? |
+|---|---|
+| X11 headers (`/usr/include/X11`) | **no** |
+| `libX11.so` linker symlink | **no** (`libX11.so.6` only) |
+| `pkg-config` | **no** |
+| `DISPLAY` / `WAYLAND_DISPLAY` | empty |
+| `Xvfb` | **no** |
+| ALSA headers (`/usr/include/alsa`) | **no** |
+
+Writing a window backend here would be speculative code that no test, no smoke run and
+no CI job could exercise — exactly what the working rules forbid. Per the standing
+"if blocked, stop and present the diagnosis" rule, the window was **not** attempted.
+Instead the second half of the logged pending item was taken, because it is fully
+verifiable end to end without a display: `target_fps` pacing plus frame timing
+statistics.
+
+**Delivered (validated):**
+
+- `src/runtime/pacing.zig` (new, `corex.runtime.pacing`, 6 tests): `Pacer` +
+  `FramePacing{work_ns, slept_ns, late}`.
+  - Budget is the integer reciprocal `1e9 / fps` — 60 fps is exactly `16_666_666 ns`,
+    the documented rate rather than an approximation (a test asserts the number).
+  - Deadline is anchored to `previous_deadline + budget`, so timer overshoot is repaid
+    by the next frame instead of accumulating into a loop that slowly runs below its
+    requested rate.
+  - A frame that overruns its budget never sleeps, is counted (`late_frames`) and
+    re-anchors on the instant it actually ended. Getting this wrong is subtle:
+    re-anchoring one budget *past* the overrun hands the next frame two budgets of
+    slack and halves the reported late frames. A dedicated test pins it.
+  - A wait beyond `max_wait_ns` (1 s) means the deadline is in the wrong epoch (clock
+    jump, corrupted budget): re-anchor and count a `resync` instead of hanging.
+  - `reschedule()` drops a stale schedule; `FrameLoop.run` calls it so a stall between
+    runs cannot produce a catch-up burst.
+  - `Pacer.disabled` never reads the clock — the headless default.
+  - **Honest scope:** this is a *sleep-based* pacer, not vsync. There is no presentable
+    surface, so there is no authoritative "display is ready" signal and the wait cannot
+    beat the timer resolution. The deadline it computes is the one a `FIFO` swapchain
+    would impose, so the accounting stays valid when one lands; only the mechanism
+    changes. Module docs, `docs/presentation.md` and the CHANGELOG all say this.
+- `presentation.FrameLoop`: `init(gpa, tier, w, h, target_fps: ?u32)`, `targetFps()`,
+  `frame(scene, resources, io: ?Io)`, `run(scene, resources, count, io: ?Io)`;
+  `RunReport` gained `slept_ns`, `elapsed_ns`, `late_frames`. `Error` gained
+  `InvalidTargetFps` and `Canceled`; a zero rate is refused rather than treated as
+  "unpaced". `io == null` renders without touching the clock, which is how the loop
+  tests measure work instead of wall-clock time.
+- `--fps <n>` in the launch contract (`src/core/cli.zig`, `docs/launch-contract.md`):
+  `--fps 0` is a usage error (`error.InvalidFps`, exit 2), not a synonym for unpaced.
+  The binary passes `io` and prints, only when paced,
+  `Pacing: <fps> fps — <n> late of <n> frames, <n> resyncs, <ms> slept, <ms> elapsed,
+  <ms>/frame`. 10 new tests (pacer 6, loop 3, cli 1): **729 total**.
+
+**Measured** (`ReleaseFast`, shipped example, 1280x720, one quad):
+
+```console
+$ corex-engine --project examples/hello-project/HelloProject.corex --frames 60 --fps 60
+Pacing: 60 fps — 0 late of 60 frames, 0 resyncs, 794.372 ms slept, 993.652 ms elapsed, 16.561 ms/frame
+$ corex-engine --project examples/hello-project/HelloProject.corex --frames 60 --fps 120
+Pacing: 120 fps — 0 late of 60 frames, 0 resyncs, 297.168 ms slept, 493.491 ms elapsed, 8.225 ms/frame
+```
+
+Both rates are held for the whole run. In **Debug** the same 60 fps run reports frames as
+late at 1280x720 (the CPU rasterizer is not fast enough in an unoptimized build); that is
+the honest behaviour — the frames are still drawn and counted, not slept away.
+
+**Decisions:**
+
+- Pacing is a separate module, not folded into `FrameLoop`: the arithmetic is testable on
+  its own, and the loop only sequences it (begin before the work, end after it).
+- The budget is computed in integers so `targetFps()` returns exactly the requested rate.
+- `settings.json`'s `target_fps` is deliberately **not** consulted by the headless loop:
+  with no window there is nothing to pace a displayed image for, so the default stays
+  unpaced and `--fps` is the explicit per-run override. Once a windowed loop exists, the
+  config value becomes its natural default; nothing else has to change.
+
+**Pending:** window/surface backend, swapchain, real vsync (and then `target_fps` from
+`settings.json` as the windowed default), input/event loop, a ring of frame timings for
+percentiles.
+
+**Next priority:** the same one cycle (b) recorded and this sandbox cannot validate —
+window + swapchain + vsync, to be attempted where a display and its dev headers exist.
+If it is still blocked, the next verifiable step is **asset upload/eviction** in the
+render table (and CXTX mips after it).
+
 ## Cycle 2026-11-07 (b) — Presentation: owned frame surface + bounded frame loop
 
 **Delivered (validated):**

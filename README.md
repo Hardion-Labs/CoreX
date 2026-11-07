@@ -104,6 +104,7 @@ Try the bundled example project:
 zig build run -- --project examples/hello-project/HelloProject.corex --mode validate
 zig build run -- --project examples/hello-project/HelloProject.corex --headless
 zig build run -- --project examples/hello-project/HelloProject.corex --headless --frames 120
+zig build run -- --project examples/hello-project/HelloProject.corex --headless --frames 60 --fps 60
 ```
 
 These commands are validated with Zig 0.17.0. Editor/runtime sessions open headless,
@@ -116,7 +117,15 @@ Frames: 120 of 120 (2 allocating) at 1280x720 medium — last frame: 1 commands,
 
 `--frames` bounds the loop (default 1), and "2 allocating" is the whole warm-up: only the
 two draw-list buffers ever touch the general-purpose allocator, so every steady-state
-frame is allocation-free. The example project ships a quad and a camera, so the frames
+frame is allocation-free. `--fps <n>` paces the loop to that rate and adds a second line
+of real measurements:
+
+```text
+Pacing: 60 fps — 0 late of 60 frames, 0 resyncs, 794.372 ms slept, 993.652 ms elapsed, 16.561 ms/frame
+```
+
+The pacer sleeps against the monotonic clock, anchored so overshoot does not accumulate;
+it is **not** vsync (there is no swapchain yet), and the docs say so. The example project ships a quad and a camera, so the frames
 draw real geometry. The graphical editor, GUI and GPU renderers are not implemented yet,
 and there is no window — the loop renders into a surface it owns
 ([docs/presentation.md](docs/presentation.md)).

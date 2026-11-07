@@ -56,6 +56,10 @@ pub const LaunchOptions = struct {
     /// default: one frame, then exit. There is no window to close yet, so a loop must
     /// be bounded by the caller.
     frames: ?usize = null,
+    /// Frame rate the loop paces itself to, overriding `settings.json`. `null` keeps
+    /// the run unpaced: with no window there is nothing to present to, so rendering
+    /// as fast as the machine allows is the honest default.
+    fps: ?u32 = null,
     /// null means "choose automatically" (logical cores minus one, min 1).
     jobs: ?usize = null,
     log_level: LogLevel = .info,
@@ -72,6 +76,7 @@ pub const ParseError = error{
     InvalidLogLevel,
     InvalidJobs,
     InvalidFrames,
+    InvalidFps,
 };
 
 /// Parse launch arguments (excluding argv[0]).
@@ -106,6 +111,12 @@ pub fn parse(args: []const []const u8) ParseError!LaunchOptions {
             const n = std.fmt.parseInt(usize, value, 10) catch return error.InvalidFrames;
             if (n == 0) return error.InvalidFrames;
             opts.frames = n;
+        } else if (eq(arg, "--fps")) {
+            if (opts.fps != null) return error.DuplicateArgument;
+            const value = try nextValue(args, &i);
+            const n = std.fmt.parseInt(u32, value, 10) catch return error.InvalidFps;
+            if (n == 0) return error.InvalidFps;
+            opts.fps = n;
         } else if (eq(arg, "--jobs")) {
             const value = try nextValue(args, &i);
             const n = std.fmt.parseInt(usize, value, 10) catch return error.InvalidJobs;
@@ -151,6 +162,7 @@ pub const help_text =
     \\      --scene <path>         Override the initial scene (project-relative).
     \\      --headless             Run without a graphical window.
     \\      --frames <n>           Render n frames before exiting (default: 1).
+    \\      --fps <n>              Pace the loop to n frames per second (default: unpaced).
     \\      --jobs <n>             Worker count for the job system (default: auto).
     \\      --log-level <level>    error | warn | info (default) | debug
     \\  -v, --version              Print the engine version and exit.
@@ -243,6 +255,18 @@ test "parse: --frames bounds the run and must be positive" {
     try std.testing.expectError(error.InvalidFrames, parse(&.{ "--project", "a.corex", "--frames", "many" }));
     try std.testing.expectError(error.MissingValue, parse(&.{ "--project", "a.corex", "--frames" }));
     try std.testing.expectError(error.DuplicateArgument, parse(&.{ "--project", "a.corex", "--frames", "1", "--frames", "2" }));
+}
+
+test "parse: --fps paces the loop and must be positive" {
+    const opts = try parse(&.{ "--project", "game.corex", "--fps", "30" });
+    try std.testing.expectEqual(@as(?u32, 30), opts.fps);
+    // Absent means unpaced, expressed as null rather than a sentinel rate.
+    try std.testing.expectEqual(@as(?u32, null), (try parse(&.{ "--project", "game.corex" })).fps);
+    try std.testing.expectError(error.InvalidFps, parse(&.{ "--project", "a.corex", "--fps", "0" }));
+    try std.testing.expectError(error.InvalidFps, parse(&.{ "--project", "a.corex", "--fps", "fast" }));
+    try std.testing.expectError(error.InvalidFps, parse(&.{ "--project", "a.corex", "--fps", "-60" }));
+    try std.testing.expectError(error.MissingValue, parse(&.{ "--project", "a.corex", "--fps" }));
+    try std.testing.expectError(error.DuplicateArgument, parse(&.{ "--project", "a.corex", "--fps", "30", "--fps", "60" }));
 }
 
 test "parse: invalid jobs" {

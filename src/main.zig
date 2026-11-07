@@ -120,13 +120,18 @@ fn runFrameLoop(gpa: std.mem.Allocator, io: Io, opts: cli.LaunchOptions, result:
     defer render_assets.deinit();
 
     // The loop owns the surface and the renderer; every frame reuses both.
-    var loop = corex.runtime.presentation.FrameLoop.init(gpa, tier, cfg.window_width, cfg.window_height) catch |err| {
+    //
+    // `--fps` is the run's pacing request and wins over `settings.json`: the flag is a
+    // per-run override for a tool that has no window to obey. When neither asks for a
+    // rate the loop is unpaced, which is the honest default for a bounded headless run.
+    const target_fps = opts.fps;
+    var loop = corex.runtime.presentation.FrameLoop.init(gpa, tier, cfg.window_width, cfg.window_height, target_fps) catch |err| {
         std.log.scoped(.startup).warn("cannot open the frame surface: {s}", .{@errorName(err)});
         return;
     };
     defer loop.deinit();
 
-    const report = loop.run(scene, render_assets.table.resources(true), frames) catch |err| {
+    const report = loop.run(scene, render_assets.table.resources(true), frames, io) catch |err| {
         std.log.scoped(.startup).warn("frame loop failed: {s}", .{@errorName(err)});
         return;
     };
@@ -146,6 +151,25 @@ fn runFrameLoop(gpa: std.mem.Allocator, io: Io, opts: cli.LaunchOptions, result:
         last.skipped,       last.pixels,    last.culled,
     }) catch return;
     writeOut(io, line);
+
+    // Pacing is reported only when it was asked for: a line of zeros for an unpaced run
+    // would look like a measurement of something that never happened.
+    if (loop.targetFps()) |fps| {
+        var pace_buf: [320]u8 = undefined;
+        const pace_line = std.fmt.bufPrint(&pace_buf,
+            \\Pacing: {d} fps — {d} late of {d} frames, {d} resyncs, {d:.3} ms slept, {d:.3} ms elapsed, {d:.3} ms/frame
+            \\
+        , .{
+            fps,
+            report.late_frames,
+            report.frames,
+            loop.pacer.resyncs,
+            @as(f64, @floatFromInt(report.slept_ns)) / std.time.ns_per_ms,
+            @as(f64, @floatFromInt(report.elapsed_ns)) / std.time.ns_per_ms,
+            if (report.frames == 0) @as(f64, 0) else @as(f64, @floatFromInt(report.elapsed_ns)) / std.time.ns_per_ms / @as(f64, @floatFromInt(report.frames)),
+        }) catch return;
+        writeOut(io, pace_line);
+    }
 }
 
 fn printSummary(io: Io, result: *const startup.StartupResult) void {
@@ -188,6 +212,7 @@ fn usageMessage(err: cli.ParseError) []const u8 {
         error.InvalidLogLevel => "error: invalid --log-level (expected error, warn, info or debug)\n",
         error.InvalidJobs => "error: invalid --jobs (expected a positive integer)\n",
         error.InvalidFrames => "error: invalid --frames (expected a positive integer)\n",
+        error.InvalidFps => "error: invalid --fps (expected a positive integer)\n",
     };
 }
 
