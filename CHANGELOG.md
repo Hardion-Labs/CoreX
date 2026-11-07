@@ -8,6 +8,21 @@ declared yet.
 
 ### Added
 
+- **Keyboard focus between docks** (`State.dock_focus`, `shell.DockFocus`).
+  - `Tab` / `Shift+Tab` move focus between the hierarchy and the inspector — the two docks
+    with keyboard behaviour; a stop that answers no key would be a stop the user has to
+    press Tab twice to get past.
+  - The focused dock is outlined in the accent colour: focus that is invisible is focus the
+    user cannot use.
+  - `Tab` is handled **before** the "a text field holds the keyboard" gate, so a focused
+    name field is not a place the user cannot leave; clicking a field moves the dock focus
+    with it, so the outline, the Tab order and the keys agree.
+  - Tree keys (`N`, `P`, `Enter`, arrows) act only on the hierarchy dock; `Delete`,
+    `Ctrl+Z` and `Ctrl+Y` stay dock-independent because they act on the selection and the
+    history rather than on a panel.
+- `shell.nameFieldId` as one constant for the inspector's name field, so the focus pass and
+  the field cannot disagree about which widget owns the keyboard.
+
 - **Keyboard navigation in the hierarchy** (`tree.step`, `tree.Step`, `tree.Move`).
   - `Down`/`Up` move by **visible line**, skipping the hidden children of a folded branch;
     `Right` unfolds a folded branch and then steps into it; `Left` folds an open branch and

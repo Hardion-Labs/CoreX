@@ -88,6 +88,10 @@ pub const State = struct {
     /// Last tree action that failed, so the status bar can say why instead of the click
     /// appearing to do nothing.
     edit_error: ?anyerror = null,
+    /// Which dock holds the keyboard. Only the hierarchy and the inspector are stops: they
+    /// are the two docks with keyboard behaviour, and a Tab stop that answers no key would
+    /// be a stop the user has to press Tab twice to get past.
+    dock_focus: DockFocus = .hierarchy,
     theme: Theme = .{},
     /// Set when the user clicked an entity this frame, so a caller can react
     /// (re-frame the camera, save the selection, ...) without diffing by hand.
@@ -114,6 +118,28 @@ pub const State = struct {
     /// the inspector, because the frame-level shortcuts must not fire for *any* focused
     /// field — `Delete` in a text field is a text key, never "destroy the entity".
     text_focused: bool = false,
+};
+
+/// The docks a user can move the keyboard focus between.
+pub const DockFocus = enum {
+    hierarchy,
+    inspector,
+
+    pub fn next(self: DockFocus) DockFocus {
+        return switch (self) {
+            .hierarchy => .inspector,
+            .inspector => .hierarchy,
+        };
+    }
+
+    pub fn previous(self: DockFocus) DockFocus {
+        // Two stops, so previous is next; written out rather than reused so adding a third
+        // stop later is a compile-time reminder to give it a reverse.
+        return switch (self) {
+            .hierarchy => .inspector,
+            .inspector => .hierarchy,
+        };
+    }
 };
 
 /// The dock geometry of one frame, as rectangles. Exposed (rather than kept private)
@@ -193,6 +219,15 @@ pub fn draw(
     if (!dock.inspector.isEmpty()) drawInspector(ctx, state, scene, history, dock.inspector);
     if (!dock.status.isEmpty()) drawStatus(ctx, state, history, frame, dock.status, dock.viewport);
 
+    // The focused dock is outlined in the accent colour. Which dock answers the keyboard is
+    // otherwise invisible, and a user needs to know where Tab put them.
+    const focused_rect = switch (state.dock_focus) {
+        .hierarchy => dock.hierarchy,
+        .inspector => dock.inspector,
+    };
+    if (!focused_rect.isEmpty()) ctx.canvas.strokeRect(focused_rect, state.theme.accent);
+
+    focusStep(ctx, state);
     if (!state.text_focused) applyShortcuts(ctx, state, scene, history);
     return state.selection_changed;
 }
@@ -396,6 +431,10 @@ fn runTreeAction(
         state.name_owner = 0;
     }
 }
+
+/// The inspector's name field id. One constant, so the focus pass and the field cannot
+/// disagree about which widget owns the keyboard.
+const name_field_id = widgets.Id.from(0x6e61_6d65, "inspector.name");
 
 /// The inspector: the selected entity's name as an editable field, its stable ID, local
 /// transform and the components the scene actually stores.
@@ -610,7 +649,7 @@ fn drawNameField(
     const value_rect = Rect.init(row.x + key_rect.w, row.y, @max(row.w - key_rect.w, 0), line_h);
     _ = text.draw(ctx.canvas, key_rect.x, key_rect.y, "name", .{ .color = theme.text_muted, .clip = key_rect });
 
-    const id = widgets.Id.from(0x6e61_6d65, "inspector.name");
+    const id = name_field_id;
     const focused = ctx.focus.eql(id);
 
     // The buffer mirrors the scene whenever the field is *not* being typed into, and
@@ -632,6 +671,9 @@ fn drawNameField(
     state.name_len = field.len;
     state.name_caret = field.caret;
     state.name_focused = r.focused;
+    // Taking the keyboard by clicking moves the dock focus too: the outline and the Tab
+    // order must agree with what is actually receiving keys.
+    if (r.focused) state.dock_focus = .inspector;
 
     if (!r.focused) return;
 
@@ -670,6 +712,21 @@ pub fn reloadName(state: *State, scene: anytype, entity: anytype) void {
     state.name_caret = n;
 }
 
+/// Move the keyboard focus between docks (Tab / Shift+Tab).
+///
+/// Called **before** the text-field gate: a focused field must not be a place the user
+/// cannot Tab out of, so this is the one shortcut that also works from inside one.
+fn focusStep(ctx: *widgets.Context, state: *State) void {
+    if (!ctx.keyPressed(.tab)) return;
+    state.dock_focus = if (ctx.input.modifiers.shift) state.dock_focus.previous() else state.dock_focus.next();
+    focusDock(ctx, state);
+    // The field republishes its focus at the start of the next frame; reflect the change
+    // now so this frame's state is not lying about who owns the keyboard.
+    state.name_focused = false;
+    state.text_focused = false;
+    if (state.dock_focus != .inspector) state.name_owner = 0;
+}
+
 /// Frame-level editing shortcuts. Only reached while the name field does not hold the
 /// keyboard, so a user typing a name never triggers a delete.
 ///
@@ -690,10 +747,13 @@ fn applyShortcuts(ctx: *widgets.Context, state: *State, scene: anytype, history:
         pruneSelection(state, scene);
         return;
     }
+    // Deleting is not tied to a dock: it acts on the selection, which is the tree's.
     if (ctx.keyPressed(.delete)) {
         _ = deleteSelected(state, history, scene);
         return;
     }
+    if (state.dock_focus != .hierarchy) return;
+
     // Tree actions on the selection: the same `tree.apply` a click uses, so a key and a
     // click cannot diverge in what they record.
     if (ctx.keyPressed(.n)) {
@@ -729,6 +789,18 @@ fn applyShortcuts(ctx: *widgets.Context, state: *State, scene: anytype, history:
         return;
     }
     if (ctx.keyPressed(.escape)) state.selected = 0;
+}
+
+/// Point the GUI's focus at the focused dock's widget.
+///
+/// The GUI resolves text input against `focus` (one widget owns the keyboard), so the dock
+/// focus has to be pushed down to a widget id: the inspector's name field, or nothing for
+/// the hierarchy, which reads keys from the context rather than from a widget.
+fn focusDock(ctx: *widgets.Context, state: *State) void {
+    switch (state.dock_focus) {
+        .hierarchy => ctx.setFocus(widgets.Id.zero),
+        .inspector => ctx.setFocus(name_field_id),
+    }
 }
 
 /// Resolve one arrow-key step and fold the result into the editor state.
@@ -1160,10 +1232,9 @@ test "editor: the shell allocates nothing per frame" {
 /// Find the inspector's name field on the last painted frame, so a test can click it
 /// without hard-coding panel arithmetic.
 fn nameFieldRect(h: *Harness) Rect {
-    const id = widgets.Id.from(0x6e61_6d65, "inspector.name");
     var i: usize = 0;
     while (i < h.ctx.entry_count) : (i += 1) {
-        if (h.ctx.entries[i].id.eql(id)) return h.ctx.entries[i].rect;
+        if (h.ctx.entries[i].id.eql(name_field_id)) return h.ctx.entries[i].rect;
     }
     return Rect.none;
 }
@@ -1762,4 +1833,84 @@ test "editor: navigation records nothing in the history" {
     h.frameInput(.{ .key = .right }, &h.state);
     try testing.expectEqual(@as(usize, 0), h.history.undoDepth());
     try testing.expect(!h.history.dirty);
+}
+
+test "editor: Tab moves the keyboard focus between the hierarchy and the inspector" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.state.selected = h.root_id;
+    h.runFrames(2);
+    try testing.expectEqual(DockFocus.hierarchy, h.state.dock_focus);
+
+    // Tab into the inspector: the GUI focus moves to the name field, so typing lands there.
+    h.frameInput(.{ .key = .tab }, &h.state);
+    try testing.expectEqual(DockFocus.inspector, h.state.dock_focus);
+    try testing.expect(h.ctx.focus.eql(name_field_id));
+
+    // Tab again wraps back to the hierarchy, which owns no GUI widget.
+    h.frameInput(.{ .key = .tab }, &h.state);
+    try testing.expectEqual(DockFocus.hierarchy, h.state.dock_focus);
+    try testing.expect(h.ctx.focus.eql(widgets.Id.zero));
+
+    // Shift+Tab goes the other way (two stops, so it lands on the inspector).
+    h.frameInput(.{ .key = .tab, .modifiers = .{ .shift = true } }, &h.state);
+    try testing.expectEqual(DockFocus.inspector, h.state.dock_focus);
+}
+
+test "editor: Tab out of a focused text field works, and tree keys stop acting" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.state.selected = h.root_id;
+    h.runFrames(2);
+
+    // Click into the name field, then Tab away: leaving a focused field must be possible.
+    const field = nameFieldRect(&h);
+    const cx = field.right() - 3;
+    h.hover(cx, field.y + 3);
+    h.click(cx, field.y + 3);
+    h.release(cx, field.y + 3);
+    try testing.expect(h.state.name_focused);
+    // Clicking a field moves the dock focus with it, so the outline and Tab agree.
+    try testing.expectEqual(DockFocus.inspector, h.state.dock_focus);
+
+    // Tab leaves the field and lands on the other dock (two stops, so it wraps).
+    h.frameInput(.{ .key = .tab }, &h.state);
+    try testing.expect(!h.state.name_focused);
+    try testing.expectEqual(DockFocus.hierarchy, h.state.dock_focus);
+
+    // With the inspector focused, tree keys do not move the selection...
+    h.frameInput(.{ .key = .tab }, &h.state);
+    try testing.expectEqual(DockFocus.inspector, h.state.dock_focus);
+    const before = h.state.selected;
+    h.frameInput(.{ .key = .down }, &h.state);
+    try testing.expectEqual(before, h.state.selected);
+    h.frameInput(.{ .key = .n }, &h.state);
+    try testing.expectEqual(@as(usize, 0), h.history.undoDepth());
+
+    // ...and back on the hierarchy they do again.
+    h.frameInput(.{ .key = .tab }, &h.state);
+    h.frameInput(.{ .key = .down }, &h.state);
+    try testing.expect(h.state.selected != before);
+}
+
+test "editor: the focused dock is outlined so Tab's effect is visible" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.runFrames(2);
+    const dock = Dock.compute(h.ctx.canvas.bounds());
+
+    // The hierarchy is focused by default: its top-left pixel is the accent border.
+    const accent = h.state.theme.accent;
+    const at_hierarchy = h.pixel(dock.hierarchy.x, dock.hierarchy.y);
+    try testing.expectEqual(accent, at_hierarchy);
+
+    h.frameInput(.{ .key = .tab }, &h.state);
+    h.runFrames(1);
+    // Focus moved: the inspector corner is now accent and the hierarchy corner is not.
+    try testing.expectEqual(accent, h.pixel(dock.inspector.x, dock.inspector.y));
+    const hierarchy_after = h.pixel(dock.hierarchy.x, dock.hierarchy.y);
+    try testing.expect(!std.mem.eql(u8, &accent, &hierarchy_after));
 }
