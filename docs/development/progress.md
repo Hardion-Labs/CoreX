@@ -4,6 +4,42 @@ Permanent record of real progress, decisions, pending items and the next priorit
 task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
+## Cycle 2026-11-07 (s) — Camera near/far clip-plane fields in the inspector
+
+**Diagnosis first.** Cycle (r) made `Transform.rotation` and `CameraComponent.fov` editable
+in the inspector, but `CameraComponent.near` and `CameraComponent.far` were still
+read-only. The recorded next priority was camera near/far fields. Window/swapchain
+remains blocked (unchanged; not attempted).
+
+**Delivered (validated):**
+
+- **`CameraScalarField` enum** (`.near` / `.far`) with `get`/`set` accessors on
+  `CameraComponent`, mirroring `TransformField`.
+- **`drawCameraScalarRow`** — one editable row per clip plane, in world-space units
+  (no degree/radian conversion). Committing writes the whole `CameraComponent` as one
+  undoable `set_component`; `CameraComponent.isValid` enforces `0 < near < far`, so a
+  commit that would break that (near ≤ 0, near ≥ far, far ≤ near) is rejected and the
+  field reverts to the scene value.
+- **Shell state** — `State.camera_near` and `State.camera_far` (`inspector.Row(1)` each),
+  plus both fields included in `text_focused` so frame-level shortcuts (`Delete`,
+  `Ctrl+Z`) do not fire while a clip-plane field holds the keyboard.
+
+**Suite:** **913/913** tests (clean cache), fmt clean, `zig build` OK, validate OK,
+`editor-frame` (640x360, HelloProject), `gui-frame`, `qoi-decode` build OK.
+
+**Decisions:** near/far are plain distances, not angles — no degree/radian conversion,
+matching their units in the component. Validation is delegated to `CameraComponent.isValid`
+(the single source of truth for `0 < near < far`) rather than duplicated in the UI.
+
+**Pending / not in this cycle:** viewport zoom (wheel / distance factor), click-to-select
+and drag-to-orbit in the viewport, gizmos, Home/End and PageUp/PageDown in the tree,
+multi-select, persisted fold state, sibling ordering if the scene gains a child order; and
+the window layer when the sandbox allows it.
+
+**Next priority:** viewport zoom (wheel or distance factor); then click-to-select /
+drag-to-orbit; sibling ordering if the scene gains a child order; and the window layer
+when the sandbox allows it.
+
 ## Cycle 2026-11-07 (r) — Rotation and camera fields in the inspector
 
 **Diagnosis first.** Cycle (q) delivered drag-and-drop reparenting, but the inspector

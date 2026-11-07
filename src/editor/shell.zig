@@ -123,8 +123,10 @@ pub const State = struct {
     transform_scale: inspector.Row(3) = .{},
     transform_rotation: inspector.Row(3) = .{},
 
-    /// Editable camera field (`fov` in degrees). Same rationale as the transform rows.
+    /// Editable camera fields (`fov`, `near`, `far`). Same rationale as the transform rows.
     camera_fov: inspector.Row(1) = .{},
+    camera_near: inspector.Row(1) = .{},
+    camera_far: inspector.Row(1) = .{},
 
     /// True while any inspector field holds the keyboard. One flag, set once per frame by
     /// the inspector, because the frame-level shortcuts must not fire for *any* focused
@@ -550,6 +552,10 @@ fn drawInspector(
         const row_h = line_h + 2;
         const fov_row = stack.measure(.{ .w = content.w, .h = row_h });
         drawCameraRow(ctx, state, scene, history, ent, &state.camera_fov, fov_row, c, "fov") catch |err| reportEditFailure(err, "fov");
+        const near_row = stack.measure(.{ .w = content.w, .h = row_h });
+        drawCameraScalarRow(ctx, state, scene, history, ent, &state.camera_near, near_row, .near, c, "near") catch |err| reportEditFailure(err, "near");
+        const far_row = stack.measure(.{ .w = content.w, .h = row_h });
+        drawCameraScalarRow(ctx, state, scene, history, ent, &state.camera_far, far_row, .far, c, "far") catch |err| reportEditFailure(err, "far");
     }
     if (scene.getComponent(render_scene.Transform, ent) == null and
         scene.getComponent(render_scene.Renderable, ent) == null and
@@ -567,7 +573,9 @@ fn drawInspector(
         state.transform_pos.isFocused() or
         state.transform_scale.isFocused() or
         state.transform_rotation.isFocused() or
-        state.camera_fov.isFocused();
+        state.camera_fov.isFocused() or
+        state.camera_near.isFocused() or
+        state.camera_far.isFocused();
 
     ctx.blockBelow(rect);
 }
@@ -764,6 +772,110 @@ fn drawCameraRow(
     row.owner = state.selected;
     var post = std.hash.Wyhash.init(0);
     post.update(std.mem.asBytes(&next.fov));
+    row.signature = post.final();
+}
+
+/// Which part of a `CameraComponent` a scalar row edits, and how to address it on commit.
+///
+/// `near` and `far` are plain world-space distances (not angles), so no degree/radian
+/// conversion is applied. `CameraComponent.isValid` enforces `0 < near < far`, so a
+/// commit that would break that is rejected and the field reverts.
+const CameraScalarField = enum {
+    near,
+    far,
+
+    fn get(self: CameraScalarField, c: render_scene.CameraComponent) f32 {
+        return switch (self) {
+            .near => c.near,
+            .far => c.far,
+        };
+    }
+
+    fn set(self: CameraScalarField, c: *render_scene.CameraComponent, value: f32) void {
+        switch (self) {
+            .near => c.near = value,
+            .far => c.far = value,
+        }
+    }
+};
+
+/// One editable camera scalar field (`near` or `far`).
+///
+/// A commit writes the whole `CameraComponent` back as one `set_component`, so a
+/// changed clip plane is one undo step, and an out-of-range value is rejected without
+/// touching the scene.
+fn drawCameraScalarRow(
+    ctx: *widgets.Context,
+    state: *State,
+    scene: anytype,
+    history: anytype,
+    entity: anytype,
+    row: anytype,
+    rect: Rect,
+    comptime field: CameraScalarField,
+    camera: *const render_scene.CameraComponent,
+    key: []const u8,
+) !void {
+    const values = .{field.get(camera.*)};
+    var sig = std.hash.Wyhash.init(0);
+    sig.update(std.mem.asBytes(&values[0]));
+    const signature = sig.final();
+    if (row.owner != state.selected or row.signature != signature) {
+        if (!row.isFocused()) {
+            row.load(values);
+            row.owner = state.selected;
+            row.signature = signature;
+        }
+    }
+    const seed = switch (field) {
+        .near => @as(u64, 0x6e_65_61),
+        .far => @as(u64, 0x66_61_72),
+    };
+    const outcome = inspector.drawRow(ctx, 1, row, rect, .{
+        .entity_id = state.selected,
+        .signature = signature,
+        .key = key,
+    }, @intCast(font.line_height + 2), seed);
+
+    switch (outcome) {
+        .idle => return,
+        .escape => {
+            row.load(values);
+            row.owner = state.selected;
+            row.signature = signature;
+            return;
+        },
+        .commit => {},
+    }
+
+    const typed = row.values() orelse {
+        row.load(values);
+        row.owner = state.selected;
+        row.signature = signature;
+        return;
+    };
+
+    var next = camera.*;
+    field.set(&next, typed[0]);
+    if (!next.isValid()) {
+        row.load(values);
+        row.owner = state.selected;
+        row.signature = signature;
+        return;
+    }
+    if (std.mem.eql(u8, std.mem.asBytes(&typed), std.mem.asBytes(&values))) {
+        row.signature = signature;
+        return;
+    }
+
+    const id = scene.idOf(entity) orelse return;
+    try history.apply(scene, .{ .set_component = .{
+        .id = id,
+        .value = edit.valueFor(@TypeOf(scene.*), render_scene.CameraComponent, next),
+    } });
+    row.owner = state.selected;
+    var post = std.hash.Wyhash.init(0);
+    post.update(std.mem.asBytes(&field.get(next)));
     row.signature = post.final();
 }
 
@@ -2085,6 +2197,142 @@ test "editor: an out-of-range camera fov is rejected" {
     try testing.expectEqual(before, h.history.undoDepth());
     // The buffer reverts to what the scene holds.
     try testing.expectEqualStrings("60", h.state.camera_fov.fields[0].text());
+}
+
+test "editor: camera near is editable and commits one undoable set_component" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.state.selected = h.camera_id;
+    h.runFrames(2);
+
+    // Default near is 0.1.
+    try testing.expectEqualStrings("0.1", h.state.camera_near.fields[0].text());
+
+    const field = numFieldRect(&h, 0x6e_65_61, "near", 0);
+    focusNumField(&h, field);
+    try testing.expect(h.state.camera_near.isFocused());
+
+    // "0.1" is three characters; clear all three, then type 1.0.
+    h.frameInput(.{ .key = .home }, &h.state);
+    h.frameInput(.{ .key = .delete }, &h.state);
+    h.frameInput(.{ .key = .delete }, &h.state);
+    h.frameInput(.{ .key = .delete }, &h.state);
+    h.frameInput(.{ .text = "1.0" }, &h.state);
+    const before = h.history.undoDepth();
+    h.frameInput(.{ .key = .enter }, &h.state);
+
+    const camera = h.scene.entityById(h.camera_id).?;
+    const c = h.scene.getComponent(render_scene.CameraComponent, camera).?;
+    try testing.expectEqual(@as(f32, 1.0), c.near);
+    try testing.expectEqual(before + 1, h.history.undoDepth());
+
+    try testing.expect(undo(&h.history, &h.scene));
+    const back = h.scene.getComponent(render_scene.CameraComponent, h.scene.entityById(h.camera_id).?).?;
+    try testing.expectEqual(@as(f32, 0.1), back.near);
+}
+
+test "editor: camera far is editable and commits one undoable set_component" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.state.selected = h.camera_id;
+    h.runFrames(2);
+
+    // Default far is 500.
+    try testing.expectEqualStrings("500", h.state.camera_far.fields[0].text());
+
+    const field = numFieldRect(&h, 0x66_61_72, "far", 0);
+    focusNumField(&h, field);
+    try testing.expect(h.state.camera_far.isFocused());
+
+    h.frameInput(.{ .key = .home }, &h.state);
+    h.frameInput(.{ .key = .delete }, &h.state);
+    h.frameInput(.{ .key = .delete }, &h.state);
+    h.frameInput(.{ .key = .delete }, &h.state);
+    h.frameInput(.{ .text = "1000" }, &h.state);
+    const before = h.history.undoDepth();
+    h.frameInput(.{ .key = .enter }, &h.state);
+
+    const camera = h.scene.entityById(h.camera_id).?;
+    const c = h.scene.getComponent(render_scene.CameraComponent, camera).?;
+    try testing.expectEqual(@as(f32, 1000.0), c.far);
+    try testing.expectEqual(before + 1, h.history.undoDepth());
+
+    try testing.expect(undo(&h.history, &h.scene));
+    const back = h.scene.getComponent(render_scene.CameraComponent, h.scene.entityById(h.camera_id).?).?;
+    try testing.expectEqual(@as(f32, 500.0), back.far);
+}
+
+test "editor: camera near equal to far is rejected" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.state.selected = h.camera_id;
+    h.runFrames(2);
+
+    const field = numFieldRect(&h, 0x6e_65_61, "near", 0);
+    focusNumField(&h, field);
+    h.frameInput(.{ .key = .home }, &h.state);
+    h.frameInput(.{ .key = .delete }, &h.state);
+    h.frameInput(.{ .key = .delete }, &h.state);
+    h.frameInput(.{ .key = .delete }, &h.state);
+    // far is 500 by default; setting near to 500 violates near < far.
+    h.frameInput(.{ .text = "500" }, &h.state);
+    const before = h.history.undoDepth();
+    h.frameInput(.{ .key = .enter }, &h.state);
+
+    const c = h.scene.getComponent(render_scene.CameraComponent, h.scene.entityById(h.camera_id).?).?;
+    try testing.expectEqual(@as(f32, 0.1), c.near);
+    try testing.expectEqual(before, h.history.undoDepth());
+    try testing.expectEqualStrings("0.1", h.state.camera_near.fields[0].text());
+}
+
+test "editor: camera near zero or negative is rejected" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.state.selected = h.camera_id;
+    h.runFrames(2);
+
+    const field = numFieldRect(&h, 0x6e_65_61, "near", 0);
+    focusNumField(&h, field);
+    h.frameInput(.{ .key = .home }, &h.state);
+    h.frameInput(.{ .key = .delete }, &h.state);
+    h.frameInput(.{ .key = .delete }, &h.state);
+    h.frameInput(.{ .key = .delete }, &h.state);
+    h.frameInput(.{ .text = "-1" }, &h.state);
+    const before = h.history.undoDepth();
+    h.frameInput(.{ .key = .enter }, &h.state);
+
+    const c = h.scene.getComponent(render_scene.CameraComponent, h.scene.entityById(h.camera_id).?).?;
+    try testing.expectEqual(@as(f32, 0.1), c.near);
+    try testing.expectEqual(before, h.history.undoDepth());
+    try testing.expectEqualStrings("0.1", h.state.camera_near.fields[0].text());
+}
+
+test "editor: camera far below near is rejected" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.state.selected = h.camera_id;
+    h.runFrames(2);
+
+    const field = numFieldRect(&h, 0x66_61_72, "far", 0);
+    focusNumField(&h, field);
+    h.frameInput(.{ .key = .home }, &h.state);
+    h.frameInput(.{ .key = .delete }, &h.state);
+    h.frameInput(.{ .key = .delete }, &h.state);
+    h.frameInput(.{ .key = .delete }, &h.state);
+    // near is 0.1 by default; setting far to 0.05 violates far > near.
+    h.frameInput(.{ .text = "0.05" }, &h.state);
+    const before = h.history.undoDepth();
+    h.frameInput(.{ .key = .enter }, &h.state);
+
+    const c = h.scene.getComponent(render_scene.CameraComponent, h.scene.entityById(h.camera_id).?).?;
+    try testing.expectEqual(@as(f32, 500.0), c.far);
+    try testing.expectEqual(before, h.history.undoDepth());
+    try testing.expectEqualStrings("500", h.state.camera_far.fields[0].text());
 }
 
 test "editor: the numeric fields follow the selection instead of the previous entity" {
