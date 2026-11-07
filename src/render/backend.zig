@@ -237,6 +237,19 @@ pub const Error = error{
 /// rasterizer takes (`@hasDecl` on `texture`/`directionalLight`). Function
 /// pointers rather than a vtable struct keep the shape equal to the comptime
 /// path, so `fromComptime` is a pure adapter.
+/// Compile-time contract of `DrawResources.fromComptime`: the argument is a
+/// pointer to the provider, never a provider by value.
+fn assertProviderPointer(comptime T: type) void {
+    switch (@typeInfo(T)) {
+        .pointer => |p| if (p.size != .one) @compileError(
+            "fromComptime takes a single-item pointer to the provider: pass &provider",
+        ),
+        else => @compileError(
+            "fromComptime takes a pointer to the provider: pass &provider, not the provider itself",
+        ),
+    }
+}
+
 pub const DrawResources = struct {
     ptr: *anyopaque,
     meshFn: *const fn (ptr: *anyopaque, handle: u32) ?raster.Mesh,
@@ -268,8 +281,17 @@ pub const DrawResources = struct {
     ///
     /// The adapter never inspects the provider beyond `@hasDecl`, so a provider
     /// that compiles for `raster.rasterize` also compiles here.
+    ///
+    /// The argument is a **pointer on purpose**. Taking the address of an `anytype`
+    /// parameter would hand out a dangling pointer to the callee's own copy: it
+    /// happens to read correctly at `-O Debug` only because the dead stack slot is
+    /// not overwritten, and it silently loses the provider's fields as soon as the
+    /// optimizer reuses the slot (observed as a `ReleaseSafe`-only conformance
+    /// failure). Passing `&provider` makes the borrow explicit and checked.
     pub fn fromComptime(provider: anytype) DrawResources {
-        const P = @TypeOf(provider);
+        const Ptr = @TypeOf(provider);
+        assertProviderPointer(Ptr);
+        const P = @typeInfo(Ptr).pointer.child;
         const Adapter = struct {
             fn mesh(ptr: *anyopaque, handle: u32) ?raster.Mesh {
                 const self: *const P = @ptrCast(@alignCast(ptr));
@@ -291,7 +313,7 @@ pub const DrawResources = struct {
         const has_texture = comptime @hasDecl(P, "texture");
         const has_light = comptime @hasDecl(P, "directionalLight");
         return .{
-            .ptr = @ptrCast(@constCast(&provider)),
+            .ptr = @ptrCast(@constCast(provider)),
             .meshFn = Adapter.mesh,
             .colorFn = Adapter.color,
             .textureFn = if (has_texture) Adapter.texture else null,
@@ -702,7 +724,7 @@ test "backend: the software backend is bit-identical to the rasterizer it drives
     const iface = backend.interface();
     defer iface.deinit(testing.allocator);
     try iface.beginFrame(Surface.of(&via), .{ .blend = .alpha });
-    const one = try iface.draw(testCommand(), ortho(), DrawResources.fromComptime(provider));
+    const one = try iface.draw(testCommand(), ortho(), DrawResources.fromComptime(&provider));
     const frame = try iface.endFrame();
 
     try testing.expectEqualSlices(u8, &direct_color, &via_color);
@@ -728,7 +750,7 @@ test "backend: culling, skipped draws and the frame stats add up" {
     // any pixel. `mvp` is the caller's job: `view_projection * world`.
     var flipped = testCommand();
     flipped.world[0] = -1;
-    _ = try iface.draw(flipped, transform.multiply(ortho(), flipped.world), DrawResources.fromComptime(provider));
+    _ = try iface.draw(flipped, transform.multiply(ortho(), flipped.world), DrawResources.fromComptime(&provider));
 
     // An unresolved mesh handle is a skipped draw, not an error.
     const unresolved = DrawResources{
@@ -765,7 +787,7 @@ test "backend: the tier gate rejects what a tier cannot do, before any pixel" {
     try testing.expectEqual(Tier.low, low_iface.tier());
     // Defaults are fine on Low: opaque, unlit, untextured geometry.
     try low_iface.beginFrame(Surface.of(&target), .{});
-    const plain = try low_iface.draw(testCommand(), ortho(), DrawResources.fromComptime(Provider{}));
+    const plain = try low_iface.draw(testCommand(), ortho(), DrawResources.fromComptime(&Provider{}));
     try testing.expectEqual(@as(usize, 64), plain.pixels);
     _ = try low_iface.endFrame();
 
@@ -780,7 +802,7 @@ test "backend: the tier gate rejects what a tier cannot do, before any pixel" {
     try low_iface.beginFrame(Surface.of(&target), .{});
     try testing.expectError(
         error.UnsupportedFeature,
-        low_iface.draw(testCommand(), ortho(), DrawResources.fromComptime(Provider{ .texture_handle = true })),
+        low_iface.draw(testCommand(), ortho(), DrawResources.fromComptime(&Provider{ .texture_handle = true })),
     );
     _ = try low_iface.endFrame();
 
@@ -792,7 +814,7 @@ test "backend: the tier gate rejects what a tier cannot do, before any pixel" {
     defer medium_iface.deinit(testing.allocator);
     try testing.expectEqual(Tier.medium, medium_iface.tier());
     try medium_iface.beginFrame(Surface.of(&target), .{ .blend = .alpha, .antialias = .edge });
-    const one = try medium_iface.draw(testCommand(), ortho(), DrawResources.fromComptime(Provider{ .texture_handle = true }));
+    const one = try medium_iface.draw(testCommand(), ortho(), DrawResources.fromComptime(&Provider{ .texture_handle = true }));
     const stats = try medium_iface.endFrame();
     // The quad fills the viewport exactly, so every pixel is fully covered: the
     // antialiased frame is accepted and renders, with no partial pixels to report.
@@ -807,12 +829,12 @@ test "backend: frame lifecycle is enforced" {
     const iface = backend.interface();
     defer iface.deinit(testing.allocator);
 
-    try testing.expectError(error.FrameNotBegun, iface.draw(testCommand(), ortho(), DrawResources.fromComptime(Provider{})));
+    try testing.expectError(error.FrameNotBegun, iface.draw(testCommand(), ortho(), DrawResources.fromComptime(&Provider{})));
     try testing.expectError(error.FrameNotBegun, iface.endFrame());
 
     try iface.beginFrame(Surface.of(&target), .{});
     try testing.expectError(error.FrameAlreadyBegun, iface.beginFrame(Surface.of(&target), .{}));
-    _ = try iface.draw(testCommand(), ortho(), DrawResources.fromComptime(Provider{}));
+    _ = try iface.draw(testCommand(), ortho(), DrawResources.fromComptime(&Provider{}));
     _ = try iface.endFrame();
     // A second frame is fine, and a malformed surface is refused.
     var short_depth: [8 * 8 - 1]f32 = @splat(1.0);
@@ -832,14 +854,14 @@ test "backend: a provider light is used unless the frame options set one" {
     // Provider light: red diffuse from +Z over a white quad.
     target.clear(.{ 0, 0, 0, 255 }, 1.0);
     try iface.beginFrame(Surface.of(&target), .{});
-    _ = try iface.draw(testCommand(), ortho(), DrawResources.fromComptime(LightProvider{}));
+    _ = try iface.draw(testCommand(), ortho(), DrawResources.fromComptime(&LightProvider{}));
     _ = try iface.endFrame();
     try testing.expectEqual([4]u8{ 128, 0, 0, 255 }, target.colorAt(4, 4));
 
     // An explicit frame light wins over the provider's.
     target.clear(.{ 0, 0, 0, 255 }, 1.0);
     try iface.beginFrame(Surface.of(&target), .{ .light = .{ .direction = .{ 0, 0, 1 }, .color = .{ 0.0, 0.5, 0.0 }, .ambient = .{ 0, 0, 0 } } });
-    _ = try iface.draw(testCommand(), ortho(), DrawResources.fromComptime(LightProvider{}));
+    _ = try iface.draw(testCommand(), ortho(), DrawResources.fromComptime(&LightProvider{}));
     _ = iface.endFrame() catch unreachable;
     try testing.expectEqual([4]u8{ 0, 128, 0, 255 }, target.colorAt(4, 4));
 
@@ -849,15 +871,19 @@ test "backend: a provider light is used unless the frame options set one" {
     defer low_iface.deinit(testing.allocator);
     target.clear(.{ 0, 0, 0, 255 }, 1.0);
     try low_iface.beginFrame(Surface.of(&target), .{});
-    _ = try low_iface.draw(testCommand(), ortho(), DrawResources.fromComptime(LightProvider{}));
+    _ = try low_iface.draw(testCommand(), ortho(), DrawResources.fromComptime(&LightProvider{}));
     _ = try low_iface.endFrame();
     try testing.expectEqual([4]u8{ 255, 255, 255, 255 }, target.colorAt(4, 4));
 }
 
 test "backend: DrawResources.fromComptime mirrors the optional declarations" {
+    // The provider lives in a named local: `fromComptime` borrows it, so the
+    // adapter must never be built from a temporary whose lifetime ends before the
+    // first `draw`.
+    var bare_provider = NoExtras{};
+    const bare = DrawResources.fromComptime(&bare_provider);
     // A provider without `texture`/`directionalLight` yields null function
     // pointers, exactly like `@hasDecl` missing in the comptime path.
-    const bare = DrawResources.fromComptime(NoExtras{});
     try testing.expect(bare.textureFn == null);
     try testing.expect(bare.lightFn == null);
     try testing.expect(bare.mesh(0) != null);
@@ -866,6 +892,51 @@ test "backend: DrawResources.fromComptime mirrors the optional declarations" {
 
     // A private `texture` decl is invisible to `@hasDecl` and must stay invisible
     // here too — the adapter inherits the same rule instead of redefining it.
-    const priv = DrawResources.fromComptime(PrivateExtras{});
+    var priv_provider = PrivateExtras{};
+    const priv = DrawResources.fromComptime(&priv_provider);
     try testing.expect(priv.textureFn == null);
+}
+
+test "backend: a provider whose fields matter survives the frame, not just a call" {
+    // Regression for a lifetime bug: `fromComptime` used to take the provider by
+    // value and store the address of its own parameter, so every field read came
+    // from a dead stack slot. It read correctly at -O Debug and produced the wrong
+    // colour at -O ReleaseSafe. The provider below reads three fields through the
+    // adapter on every handle, which no stale slot survives.
+    const FieldProvider = struct {
+        mesh_handle: u32 = 7,
+        material_handle: u32 = 3,
+        tint: [4]f32,
+
+        pub fn mesh(self: @This(), handle: u32) ?raster.Mesh {
+            if (handle != self.mesh_handle) return null;
+            return quad_mesh;
+        }
+        pub fn color(self: @This(), handle: u32) ?[4]f32 {
+            if (handle != self.material_handle) return null;
+            return self.tint;
+        }
+    };
+    var provider = FieldProvider{ .tint = .{ 0.5, 0.25, 1.0, 1.0 } };
+    const resources = DrawResources.fromComptime(&provider);
+
+    // Wrong handles must miss: that is the field being read, not a constant.
+    try testing.expectEqual(@as(?raster.Mesh, null), resources.mesh(0));
+    try testing.expect(resources.mesh(7) != null);
+    try testing.expectEqual([4]f32{ 0.5, 0.25, 1.0, 1.0 }, resources.color(3).?);
+
+    var cmd = testCommand();
+    cmd.mesh = 7;
+    cmd.material = 3;
+    var surface = TestSurface{};
+    var target = try surface.init();
+    target.clear(.{ 0, 0, 0, 255 }, 1.0);
+    var gpu = SoftwareBackend.init(testing.allocator, .medium);
+    const iface = gpu.interface();
+    defer iface.deinit(testing.allocator);
+    try iface.beginFrame(Surface.of(&target), .{});
+    _ = try iface.draw(cmd, ortho(), resources);
+    _ = try iface.endFrame();
+    // The tint reached the framebuffer, channel by channel.
+    try testing.expectEqual([4]u8{ 128, 64, 255, 255 }, target.colorAt(4, 4));
 }

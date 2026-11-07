@@ -7,7 +7,8 @@
 //!   4. Load configuration in workers.
 //!   5. Index assets (concurrently with configuration).
 //!   6. Prepare the initial scene (skipped in `validate` mode).
-//!   7. Open the editor / prepare the runtime (skipped in `validate` mode).
+//!   7. Open the editor / prepare the runtime (skipped in `validate` mode),
+//!      including selecting the renderer backend for the configured tier.
 //!
 //! The engine never depends on the CoreXHub. `--hub-launch` only affects an
 //! informational log line.
@@ -23,6 +24,7 @@ const assets = @import("assets.zig");
 const splash_mod = @import("splash.zig");
 const diagnostics = @import("diagnostics.zig");
 const scene_mod = @import("../scene.zig");
+const render_mod = @import("../render.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -69,6 +71,9 @@ pub const StartupResult = struct {
     /// When no initial scene is requested, this is an empty scene.
     scene_data: ?scene_mod.EngineScene,
     mode: cli.Mode,
+    /// The renderer tier the project asked for, mapped onto the render contract.
+    /// `null` in `validate` mode, which prepares no session.
+    render_tier: ?render_mod.Tier,
 
     pub fn deinit(self: *StartupResult) void {
         if (self.scene_data) |*s| s.deinit();
@@ -195,7 +200,24 @@ pub fn run(
     }
 
     // Step 7: open the editor / prepare the runtime.
+    var render_tier: ?render_mod.Tier = null;
     if (opts.mode != .validate) {
+        splash.setProgress("selecting renderer", 0.9);
+        // The tier comes from `settings.json`; a project may name a tier no
+        // backend implements yet (Advanced), which is a configuration error
+        // reported here rather than a session that silently renders at a lower
+        // quality.
+        const tier = render_mod.tierFromConfig(cfg.renderer);
+        render_tier = tier;
+        if (render_mod.backendFor(tier, gpa) == null) {
+            // Warn, not err: this is an expected, handled rejection of a project
+            // configuration (like an incompatible version), reported to the
+            // caller as `error.PreparationFailed` and exit code 6.
+            log.warn("renderer tier \"{s}\" has no backend in this build", .{@tagName(cfg.renderer)});
+            return error.PreparationFailed;
+        }
+        log.info("renderer tier: {s}", .{@tagName(cfg.renderer)});
+
         splash.setProgress("opening editor", 0.95);
         // The graphical editor and GUI library are planned subsystems; until
         // they exist the session is opened headless and readiness is reported.
@@ -211,6 +233,7 @@ pub fn run(
         .scene = scene_req,
         .scene_data = scene_data,
         .mode = opts.mode,
+        .render_tier = render_tier,
     };
 }
 
@@ -478,6 +501,63 @@ test "startup: editor loads scene entities and components" {
     const child = s.entityById(2).?;
     try std.testing.expect(s.parent(child).?.eql(root));
     try std.testing.expectEqual(@as(f32, 1), s.getComponent(scene_mod.Transform, root).?.position[0]);
+}
+
+test "startup: the session selects the renderer tier from settings.json" {
+    var proj = try TestProject.init();
+    defer proj.deinit();
+    try proj.write("Game.corex", minimal_manifest);
+    try proj.write("settings.json",
+        \\{ "renderer": "low", "window_width": 800, "window_height": 600 }
+    );
+
+    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const mpath = try proj.manifestPath(&path_buf);
+    const opts = cli.LaunchOptions{ .mode = .editor, .project_path = mpath, .headless = true };
+    var splash = splash_mod.HeadlessSplash{};
+    var result = try run(std.testing.allocator, std.testing.io, opts, splash.interface());
+    defer result.deinit();
+
+    try std.testing.expectEqual(config.RendererTier.low, result.config.renderer);
+    // The contract tier, not the config enum: low is implemented by the CPU
+    // driver, through the capability gate.
+    try std.testing.expectEqual(render_mod.Tier.low, result.render_tier.?);
+}
+
+test "startup: a tier with no backend fails instead of rendering lower" {
+    const prev_log_level = suppressEngineLogs();
+    defer std.testing.log_level = prev_log_level;
+
+    var proj = try TestProject.init();
+    defer proj.deinit();
+    try proj.write("Game.corex", minimal_manifest);
+    try proj.write("settings.json",
+        \\{ "renderer": "advanced" }
+    );
+
+    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const mpath = try proj.manifestPath(&path_buf);
+    const opts = cli.LaunchOptions{ .mode = .runtime, .project_path = mpath, .headless = true };
+    var splash = splash_mod.HeadlessSplash{};
+    try std.testing.expectError(error.PreparationFailed, run(std.testing.allocator, std.testing.io, opts, splash.interface()));
+    // The splash is closed on the failure path, like every other stage.
+    try std.testing.expect(!splash.is_open);
+}
+
+test "startup: validate mode selects no renderer tier" {
+    var proj = try TestProject.init();
+    defer proj.deinit();
+    try proj.write("Game.corex", minimal_manifest);
+
+    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const mpath = try proj.manifestPath(&path_buf);
+    const opts = cli.LaunchOptions{ .mode = .validate, .project_path = mpath };
+    var splash = splash_mod.HeadlessSplash{};
+    var result = try run(std.testing.allocator, std.testing.io, opts, splash.interface());
+    defer result.deinit();
+    // Validation prepares no session, so no backend is selected — and an
+    // `advanced` project still validates, because nothing is rendered.
+    try std.testing.expect(result.render_tier == null);
 }
 
 test "exitCode mapping is stable" {

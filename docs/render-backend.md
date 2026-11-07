@@ -72,7 +72,7 @@ Two derived rules keep the gate honest:
 | `Capabilities` | One boolean per feature, returned by `capabilities(tier)`. |
 | `FrameOptions` | What the caller asks of a frame: `blend`, `antialias`, `mipmap`, `light`, `depth_test`, `depth_write`, `cull`, `front_face`. `rasterOptions()` converts to the rasterizer's `Options` so a field can never be forgotten on one side. |
 | `Surface` | The framebuffer: `width`, `height`, borrowed RGBA8 `color` (`w*h*4`), borrowed `f32` `depth` (`w*h`). `validate()`, `clear(rgba, depth)`, `pixelCount()`. `Surface.of(&target)` adapts the rasterizer's `Target` — a cast, not a copy. |
-| `DrawResources` | The asset resolver as a **runtime** value: a pointer plus `meshFn`/`colorFn` and optional `textureFn`/`lightFn`. `fromComptime(provider)` adapts any provider the rasterizer already accepts. |
+| `DrawResources` | The asset resolver as a **runtime** value: a pointer plus `meshFn`/`colorFn` and optional `textureFn`/`lightFn`. `fromComptime(&provider)` adapts any provider the rasterizer already accepts — by pointer, so the borrow and its lifetime are explicit. |
 | `DrawStats` | Per draw: `submitted`, `skipped`, `pixels`, `antialiased`, `culled`. |
 | `FrameStats` | Accumulated: `draws`, `submitted`, `skipped`, `pixels`, `antialiased_pixels`, `culled`; `add(DrawStats)` is the only way to fold one in. |
 | `Backend` | The vtable: `tier`, `beginFrame(surface, options)`, `draw(command, mvp, resources)`, `endFrame()`, `deinit(gpa)`. |
@@ -151,6 +151,70 @@ driver serves `.low` (through the capability gate) and `.medium`.
 - **Adapter fidelity.** `fromComptime` yields null function pointers for absent
   optional declarations and keeps a **private** `texture` decl invisible, exactly
   like `@hasDecl` in the comptime path.
+- **Adapter lifetime.** The argument is a pointer to the provider, checked at
+  comptime. An earlier by-value signature stored the address of its own parameter
+  and silently read a dead stack slot at `-O ReleaseSafe`; a regression test now
+  drives a provider whose handles and tint are read through the adapter and asserts
+  the resulting pixels.
+
+## The frame pipeline (`src/render/pipeline.zig`)
+
+The contract above stops at one `draw` call; `pipeline` is the layer that turns a
+**scene** into a **finished frame** with one call, so callers never redo the same
+four steps:
+
+```
+renderScene(gpa, tier, surface, scene, camera, sort_mode, resources, params)
+  ├─ extractDrawList        culling + sorting (docs/render-extraction.md)
+  ├─ resolve(tier, params)  coerce what the tier cannot do
+  └─ renderFrame            beginFrame → N × draw(mvp = vp * world) → endFrame
+```
+
+- **Tier selection.** `tierFromConfig(config.RendererTier)` maps the project
+  setting onto `Tier` and is **checked at compile time**: a config tier with no
+  render tier fails the build. The dependency still runs one way — `render` does
+  not import `core/config.zig`; the mapping is duck-typed on the tag name and both
+  enums are asserted to have the same tags.
+- `backendFor(tier, gpa)` is the **single** place a backend is registered. Today
+  Low and Medium map to `SoftwareBackend`; **Advanced has no backend**, so `run`
+  refuses it (`error.PreparationFailed`, exit code 6) instead of silently rendering
+  a tier lower.
+- `resolve(tier, params, blend_hint)` turns a `FrameParams` into `FrameOptions`
+  the tier can actually honour: antialiasing, mip selection, lighting and blending
+  are switched off on a tier that lacks them. The pipeline never trips the gate it
+  documents, and a caller still gets the whole feature set for free on Medium.
+  The default blend comes from the extraction sort — `back_to_front` means
+  transparency (`.alpha`), the other modes are opaque.
+- `mvp = view_projection * world` is folded here, once per draw, per the
+  contract's rule.
+- `FrameReport` returns the tier, command count, extraction culling, backend
+  `FrameStats` and the **options that were accepted**, so "requested X, got Y" is
+  observable without guessing.
+
+### Asset handles
+
+`DrawCommand.mesh`/`.material` are opaque `u32`s, so the pipeline needs a resolver:
+`ResourceTable` is a **fixed-capacity** handle table (allocated once, no growth, no
+allocation per frame) for meshes, material colours and optional textures.
+`Handle` packs a slot index and a **per-kind generation**, so a released handle
+cannot alias a slot that was reused, and setting a material on a slot does not
+invalidate that slot's mesh handle.
+
+`AssetTable` builds on it for real project assets: it copies a zero-copy `CXMH`
+view (`assets.mesh`) into tightly-packed scratch and borrows nothing else, and
+`textureFromAsset` adapts a decoded `CXTX` texture to the rasterizer's borrowed
+`Texture` with no copy. The engine therefore renders real assets while `render`
+keeps **no dependency** on the asset layer beyond these two thin adapters. Limits
+are explicit: a mesh larger than the slot sizing is `error.MeshTooLarge`, never a
+truncated mesh.
+
+### Where it is wired in
+
+`startup.run` step 7 selects the tier from `settings.json` after the configuration
+is loaded, logs it and fails the session when the tier has no backend; the launch
+summary prints the **selected** tier (`validate` mode prepares no session and
+reports the configured one). Presentation — a window, a swapchain, a frame loop —
+is still the next layer; nothing renders per frame in the engine binary yet.
 
 ## Limitations and next steps
 
@@ -167,9 +231,16 @@ driver serves `.low` (through the capability gate) and `.medium`.
 - **`FrameStats.culled` counts triangles**, because that is what the rasterizer
   reports per draw; a GPU backend may report draw-level culling instead, so the
   number is documented as backend-reported diagnostics, not a contract value.
-- Not wired into startup yet: the startup pipeline still opens a headless session,
-  and nothing selects or instantiates a backend from `settings.json`. That wiring
-  belongs with the runtime/window layer, not with the contract.
+- **No presentation.** The tier is selected at startup and the pipeline can render
+  a frame, but no window, swapchain or frame loop exists, so the engine binary
+  still opens a headless session and never calls `renderScene`.
+- **One frame in, one frame out.** No sub-frame pipelining, no double buffering,
+  no per-pass API; `renderScene` extracts and draws in one call and allocates the
+  draw list per call (a per-frame allocator hand-off is the obvious next step once
+  a loop owns the memory).
+- **Resource table is manual.** Slots are bound by the caller; there is no
+  automatic upload/eviction from the asset index, and no mip generation for `CXTX`
+  textures (the artifact carries no levels yet).
 
 ## Related
 
