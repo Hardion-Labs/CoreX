@@ -123,6 +123,7 @@ src/
     ├── shell.zig         # Docks, hierarchy, viewport, inspector, status [implemented]
     ├── edit.zig          # Commands, undo/redo, dirty tracking, atomic save [implemented]
     ├── inspector.zig     # Editable numeric rows (fields, parsing, commit)  [implemented]
+    ├── frame_camera.zig  # Scene bounds, camera fit and orbit (no GUI)      [implemented]
     └── tree.zig          # Flat rows, folding, tree actions, keyboard nav     [implemented]
 ```
 
@@ -193,7 +194,9 @@ docked hierarchy, scene viewport, inspector and status bar over a prepared sessi
 borrowing the scene, renderer and surface instead of owning them. The *editing model*
 (`corex.editor.edit`) adds reversible commands, an undo/redo stack, dirty tracking and an
 atomic save, and the inspector edits the name, position and scale through it
-(`corex.editor.inspector` owns the numeric fields and their parsing). `zig build
+(`corex.editor.inspector` owns the numeric fields and their parsing, and
+`corex.editor.frame_camera` owns the viewport's framing math — scene bounds, the fit
+distance for a lens, and orbit — with no GUI and no renderer in it). `zig build
 editor-frame` renders one real editor frame of a project headlessly. Still planned: a
 window and real input, rotation/camera fields, drag-and-drop reparenting, asset browser,
 gizmos and the editor loop.

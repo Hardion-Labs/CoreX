@@ -8,10 +8,24 @@ declared yet.
 
 ### Added
 
+- **Viewport keyboard framing and orbit** (`editor.frame_camera`, `State.camera_view`).
+  - `F` frames the whole scene, `Shift+F` frames the selection; the arrows orbit the view.
+  - `bounds`/`boundsOf` frame the geometry the scene actually has (both a `Transform` and a
+    `Renderable`, eight corners of the local unit box); an entity with no geometry still
+    frames as the point it occupies, so a group is frameable.
+  - `fit` keeps the authored direction and only moves the target and the eye, so repeated
+    `F` presses are stable; `orbit` clamps the sine of the elevation, so key repeat cannot
+    tip the view over a pole.
+  - The camera is written as **one** `set_component` through the history: `Ctrl+Z` restores
+    it and the project becomes dirty like any other edit. `NoCamera` / `NothingToFrame` are
+    reported instead of moving the camera somewhere arbitrary.
+- **The viewport is now the third Tab stop** (`DockFocus.viewport`): hierarchy → viewport →
+  inspector, with the focus ring on whichever dock answers the keyboard.
+
 - **Keyboard focus between docks** (`State.dock_focus`, `shell.DockFocus`).
-  - `Tab` / `Shift+Tab` move focus between the hierarchy and the inspector — the two docks
-    with keyboard behaviour; a stop that answers no key would be a stop the user has to
-    press Tab twice to get past.
+  - `Tab` / `Shift+Tab` move focus between the docks with keyboard behaviour (which now
+    includes the viewport); a stop that answers no key would be a stop the user has to press
+    Tab twice to get past.
   - The focused dock is outlined in the accent colour: focus that is invisible is focus the
     user cannot use.
   - `Tab` is handled **before** the "a text field holds the keyboard" gate, so a focused

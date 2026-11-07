@@ -4,6 +4,74 @@ Permanent record of real progress, decisions, pending items and the next priorit
 task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
+## Cycle 2026-11-07 (p) — Viewport keyboard framing and orbit
+
+**Diagnosis first.** Cycle (o) made the keyboard able to *reach* every dock, but the
+viewport was deliberately not a stop because it answered no key. The recorded next priority
+was to give it a vocabulary — frame the scene, frame the selection, orbit — which is also
+what makes it a legitimate Tab stop. Window/swapchain remains blocked (unchanged; not
+attempted).
+
+**Delivered (validated):**
+
+- **`src/editor/frame_camera.zig`** (`corex.editor.frame_camera`), the camera math with no
+  GUI and no renderer in it:
+  - `Bounds` / `bounds(scene, gpa)` / `boundsOf(scene, id, gpa)` — the world box of the
+    geometry the scene actually has (eight corners of the local unit box, so a scaled mesh
+    is framed by its real extent). Only entities with **both** `Transform` and `Renderable`
+    contribute to `bounds`; `boundsOf` handles one entity and falls back to the point it
+    occupies when it has no geometry, so framing an empty group is still useful.
+  - `View{target, direction, distance}` with `fit` (keeps the authored direction, moves the
+    target and the eye), `orbit` (pitch about the camera's right axis, then yaw about world
+    +Y), `fitDistance` (`radius/sin(fov/2) * 1.15`, floored at `min_distance`),
+    `toTransform` (eye = target − direction·distance, basis → quaternion by Shepperd) and
+    `viewOf` (the inverse, so a command starts from what is on screen).
+- **`DockFocus.viewport`** — the third Tab stop, with `next`/`previous` written out so a new
+  stop is a compile error rather than a silent asymmetry.
+- **`cameraCommand`** — `F` frames everything, `Shift+F` frames the selection, arrows orbit.
+  Each command re-reads the camera from the scene (`viewOf`), then writes the result as
+  **one** `set_component` through the history, so `Ctrl+Z` restores the camera the user had
+  and the project is marked dirty like any other change.
+- **Honest failures** — `NoCamera` when the scene authors none, `NothingToFrame` when there
+  is no geometry, `InvalidTransform` before anything reaches the history; all shown in the
+  status bar for the frame.
+
+**Bugs found and fixed while validating:**
+
+- `boundsOf` was referenced but never written; written now, with a test for a child's world
+  extent (the parent's offset must count), an empty entity and a missing id.
+- `applyShortcuts` had no allocator, so the camera commands could not compute world
+  transforms; the frame's `gpa` is now threaded through `draw` instead of the shell
+  allocating a hidden buffer.
+- `findCameraEntity` walked the ECS view with a pointless `entityById(0)` guard; it now
+  picks the first **valid** camera, which is what the renderer's `findCamera` does.
+- **Orbit jumped after anything else moved the camera**: the view was remembered from the
+  last command, not read from the scene. Each command now starts from `viewOf(camera)`, so
+  an orbit after an undo or an inspector edit turns from what is on screen.
+- Framing a scene with no geometry used to leave the camera untouched *silently*; it now
+  reports `NothingToFrame`.
+- `Escape` only worked on the hierarchy, because it sat at the end of the hierarchy branch;
+  it now clears the selection from any dock, like `Delete`, since both act on the selection
+  rather than on a panel.
+- `std.math.pi / 3` at runtime is an ambiguous coercion (hit twice more here); `@as(f32,
+  …)` is the fix.
+
+**Suite:** **890/890** tests (clean cache), fmt clean, `zig build` OK, validate, runtime,
+`gui-frame`, `editor-frame` (640x360), `qoi-decode`, `bench-extract -Doptimize=ReleaseFast`.
+
+**Decisions:** framing changes *where* the camera is, not *where it looks* (repeated `F` is
+stable); the camera lives in the scene and the history, never in editor state; orbit clamps
+the **sine** of the elevation, because a rotation-based clamp overshoots under key repeat;
+the viewport is a Tab stop now that it answers keys.
+
+**Pending / not in this cycle:** zoom (a wheel or a distance factor), click-to-select and
+drag-to-orbit in the viewport, gizmos, Home/End and PageUp/PageDown in the tree,
+multi-select, drag-and-drop reparenting, rotation/camera fields, persisted fold state.
+
+**Next priority:** drag-and-drop reparenting in the hierarchy (a pointer gesture over rows,
+landing on the existing `tree.apply` `reparent` command), then rotation/camera fields; and
+the window layer when the sandbox allows it.
+
 ## Cycle 2026-11-07 (o) — Keyboard focus between docks
 
 **Diagnosis first.** Cycle (n) made the tree navigable by keyboard, but the keyboard could

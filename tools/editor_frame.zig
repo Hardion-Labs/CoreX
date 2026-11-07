@@ -156,7 +156,7 @@ fn run(init: std.process.Init) !void {
     var pass: usize = 0;
     while (pass < 2) : (pass += 1) {
         ctx.beginFrame(frame_input);
-        _ = shell.draw(&ctx, &dockest, shown, &history, frame);
+        _ = shell.draw(&ctx, &dockest, shown, &history, frame, gpa);
         ctx.endFrame();
     }
 

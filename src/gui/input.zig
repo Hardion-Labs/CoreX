@@ -41,6 +41,8 @@ pub const Key = enum {
     /// `n` = "new", `p` = "reparent to root": the two tree actions that need a key.
     n,
     p,
+    /// `f` = "frame": the viewport's focus command.
+    f,
 };
 
 pub const PointerButton = enum { left, right, middle };

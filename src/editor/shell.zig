@@ -34,9 +34,11 @@ const theme_mod = @import("../gui/theme.zig");
 const widgets = @import("../gui/widgets.zig");
 const edit = @import("edit.zig");
 const inspector = @import("inspector.zig");
+const frame_camera = @import("frame_camera.zig");
 const tree = @import("tree.zig");
 const scene_mod = @import("../scene/scene.zig");
 const render_scene = @import("../scene/render_scene.zig");
+const transform_mod = @import("../scene/transform.zig");
 
 pub const Color = canvas.Color;
 pub const Rect = canvas.Rect;
@@ -88,10 +90,12 @@ pub const State = struct {
     /// Last tree action that failed, so the status bar can say why instead of the click
     /// appearing to do nothing.
     edit_error: ?anyerror = null,
-    /// Which dock holds the keyboard. Only the hierarchy and the inspector are stops: they
-    /// are the two docks with keyboard behaviour, and a Tab stop that answers no key would
-    /// be a stop the user has to press Tab twice to get past.
+    /// Which dock holds the keyboard. All three are stops: each answers at least one key,
+    /// which is the rule for being a stop at all.
     dock_focus: DockFocus = .hierarchy,
+    /// The camera view the editor last framed, kept so `orbit` turns from what is on screen
+    /// rather than from the authored transform (which may be anywhere).
+    camera_view: frame_camera.View = .{},
     theme: Theme = .{},
     /// Set when the user clicked an entity this frame, so a caller can react
     /// (re-frame the camera, save the selection, ...) without diffing by hand.
@@ -123,21 +127,24 @@ pub const State = struct {
 /// The docks a user can move the keyboard focus between.
 pub const DockFocus = enum {
     hierarchy,
+    viewport,
     inspector,
 
     pub fn next(self: DockFocus) DockFocus {
         return switch (self) {
-            .hierarchy => .inspector,
+            .hierarchy => .viewport,
+            .viewport => .inspector,
             .inspector => .hierarchy,
         };
     }
 
     pub fn previous(self: DockFocus) DockFocus {
-        // Two stops, so previous is next; written out rather than reused so adding a third
-        // stop later is a compile-time reminder to give it a reverse.
+        // Written out rather than reusing `next` three times, so a new stop is a compile
+        // error here instead of a silent asymmetry in the Tab order.
         return switch (self) {
             .hierarchy => .inspector,
-            .inspector => .hierarchy,
+            .viewport => .hierarchy,
+            .inspector => .viewport,
         };
     }
 };
@@ -195,6 +202,7 @@ pub fn draw(
     scene: anytype,
     history: anytype,
     frame: Frame,
+    gpa: std.mem.Allocator,
 ) bool {
     const total = ctx.canvas.bounds();
     if (total.isEmpty()) return false;
@@ -223,12 +231,13 @@ pub fn draw(
     // otherwise invisible, and a user needs to know where Tab put them.
     const focused_rect = switch (state.dock_focus) {
         .hierarchy => dock.hierarchy,
+        .viewport => dock.viewport,
         .inspector => dock.inspector,
     };
     if (!focused_rect.isEmpty()) ctx.canvas.strokeRect(focused_rect, state.theme.accent);
 
     focusStep(ctx, state);
-    if (!state.text_focused) applyShortcuts(ctx, state, scene, history);
+    if (!state.text_focused) applyShortcuts(ctx, state, scene, history, gpa);
     return state.selection_changed;
 }
 
@@ -732,7 +741,7 @@ fn focusStep(ctx: *widgets.Context, state: *State) void {
 ///
 /// Shortcuts are a *convenience* over the same three functions a menu or a test would
 /// call — they add no behaviour of their own.
-fn applyShortcuts(ctx: *widgets.Context, state: *State, scene: anytype, history: anytype) void {
+fn applyShortcuts(ctx: *widgets.Context, state: *State, scene: anytype, history: anytype, gpa: std.mem.Allocator) void {
     if (ctx.input.modifiers.ctrl) {
         const key = ctx.input.key orelse return;
         switch (key) {
@@ -747,11 +756,40 @@ fn applyShortcuts(ctx: *widgets.Context, state: *State, scene: anytype, history:
         pruneSelection(state, scene);
         return;
     }
-    // Deleting is not tied to a dock: it acts on the selection, which is the tree's.
+    // Deleting and clearing are not tied to a dock: they act on the selection, which is the
+    // tree's, and every dock that is not a text field should be able to act on it.
     if (ctx.keyPressed(.delete)) {
         _ = deleteSelected(state, history, scene);
         return;
     }
+    if (ctx.keyPressed(.escape)) {
+        state.selected = 0;
+        return;
+    }
+    // The viewport frames and orbits. Its keys are checked before the hierarchy's so a
+    // dock's vocabulary is decided by the focus, not by which branch happens to run first.
+    if (state.dock_focus == .viewport) {
+        if (ctx.keyPressed(.f)) {
+            const what: FrameTarget = if (ctx.input.modifiers.shift) .fit_selection else .fit_all;
+            cameraCommand(state, scene, history, gpa, what);
+            return;
+        }
+        if (ctx.input.key) |key| {
+            const turn: ?Orbit = switch (key) {
+                .left => .{ .yaw = -0.2, .pitch = 0 },
+                .right => .{ .yaw = 0.2, .pitch = 0 },
+                .up => .{ .yaw = 0, .pitch = 0.2 },
+                .down => .{ .yaw = 0, .pitch = -0.2 },
+                else => null,
+            };
+            if (turn) |t| {
+                cameraCommand(state, scene, history, gpa, .{ .orbit = t });
+                return;
+            }
+        }
+        return;
+    }
+
     if (state.dock_focus != .hierarchy) return;
 
     // Tree actions on the selection: the same `tree.apply` a click uses, so a key and a
@@ -786,9 +824,7 @@ fn applyShortcuts(ctx: *widgets.Context, state: *State, scene: anytype, history:
         if (selected != null and hasChildren(scene, state.selected)) {
             runTreeAction(state, scene, history, .toggle_collapse, state.selected);
         }
-        return;
     }
-    if (ctx.keyPressed(.escape)) state.selected = 0;
 }
 
 /// Point the GUI's focus at the focused dock's widget.
@@ -798,7 +834,9 @@ fn applyShortcuts(ctx: *widgets.Context, state: *State, scene: anytype, history:
 /// the hierarchy, which reads keys from the context rather than from a widget.
 fn focusDock(ctx: *widgets.Context, state: *State) void {
     switch (state.dock_focus) {
-        .hierarchy => ctx.setFocus(widgets.Id.zero),
+        // Neither the hierarchy nor the viewport owns a text widget: they read keys from
+        // the context, and clearing focus is what stops a stale field from eating them.
+        .hierarchy, .viewport => ctx.setFocus(widgets.Id.zero),
         .inspector => ctx.setFocus(name_field_id),
     }
 }
@@ -832,6 +870,123 @@ fn navigateTree(state: *State, scene: anytype, history: anytype, kind: tree.Step
         // selected entity, but make sure the window is not left showing a stale slice.
         revealSelection(state, scene, list.visible, &state.collapsed);
     }
+}
+
+/// What a viewport command asks the camera to do.
+const FrameTarget = union(enum) {
+    /// Frame every rendered entity in the scene.
+    fit_all,
+    /// Frame the selection (or the point it occupies when it has no geometry).
+    fit_selection,
+    /// Turn the view around its target by these radians.
+    orbit: Orbit,
+};
+
+/// A turn around the camera target, in radians.
+const Orbit = struct { yaw: f32, pitch: f32 };
+
+/// The viewport's keyboard commands: frame the whole scene, frame the selection, orbit.
+///
+/// Framing reads the scene's geometry (`frame_camera.bounds`) and writes the camera entity's
+/// transform through the history as one `set_component`, so "focus all" is an ordinary
+/// undoable edit rather than a hidden camera state the file does not know about.
+fn cameraCommand(
+    state: *State,
+    scene: anytype,
+    history: anytype,
+    gpa: std.mem.Allocator,
+    what: FrameTarget,
+) void {
+    state.edit_error = null;
+    // Start from what the scene's camera actually does, not from the last thing this editor
+    // asked for: an inspector edit, an undo or a reload may have moved it since.
+    syncCameraView(state, scene);
+    switch (what) {
+        .orbit => |turn| {
+            // Orbit needs no geometry: it turns the view the editor already framed.
+            state.camera_view = frame_camera.orbit(state.camera_view, turn.yaw, turn.pitch);
+            applyCamera(state, scene, history, state.camera_view);
+        },
+        .fit_all, .fit_selection => {
+            const box: ?frame_camera.Bounds = if (what == .fit_all)
+                frame_camera.bounds(scene, gpa) catch |err| {
+                    state.edit_error = err;
+                    return;
+                }
+            else
+                // The selection's own extent, or a point at its world position when it has
+                // no rendered geometry: framing an empty group is still a useful request.
+                frame_camera.boundsOf(scene, state.selected, gpa) catch |err| {
+                    state.edit_error = err;
+                    return;
+                };
+            // Nothing to frame is a real answer for a scene of cameras and empties alone:
+            // say so in the status bar instead of nudging the camera to the origin.
+            const found = box orelse {
+                state.edit_error = error.NothingToFrame;
+                return;
+            };
+            const fov = cameraFov(scene) catch @as(f32, std.math.pi) / 3;
+            state.camera_view = frame_camera.fit(state.camera_view, found, fov);
+            applyCamera(state, scene, history, state.camera_view);
+        },
+    }
+}
+
+/// Re-read the camera's placement from the scene, keeping the remembered distance.
+///
+/// A rotation says nothing about how far the target is, so the distance is the one the
+/// editor last worked with (5 units until a fit replaces it). Everything else — the eye and
+/// the viewing direction — comes from the scene, which is what keeps an orbit from jumping
+/// when the camera was moved by something other than the viewport.
+fn syncCameraView(state: *State, scene: anytype) void {
+    const camera = findCameraEntity(scene) orelse return;
+    const t = scene.getComponent(render_scene.Transform, camera) orelse return;
+    state.camera_view = frame_camera.viewOf(t.*, state.camera_view.distance);
+}
+
+/// Fov of the scene's own camera, so framing uses the lens that will render the frame.
+fn cameraFov(scene: anytype) !f32 {
+    var view = scene.ecsWorld().view(.{render_scene.CameraComponent});
+    while (view.next()) |entry| {
+        const component = entry[1];
+        if (component.isValid()) return component.fov;
+    }
+    return error.NoCamera;
+}
+
+/// Write `view` onto the scene's camera entity as one undoable command.
+fn applyCamera(state: *State, scene: anytype, history: anytype, view: frame_camera.View) void {
+    const camera = findCameraEntity(scene) orelse {
+        // Nothing to move: the scene authors no camera, and inventing one here would be a
+        // scene edit the user did not ask for.
+        state.edit_error = error.NoCamera;
+        return;
+    };
+    const t = frame_camera.toTransform(view);
+    if (!t.isValid()) {
+        state.edit_error = error.InvalidTransform;
+        return;
+    }
+    const id = scene.idOf(camera) orelse return;
+    history.apply(scene, .{ .set_component = .{
+        .id = id,
+        .value = edit.valueFor(@TypeOf(scene.*), render_scene.Transform, t),
+    } }) catch |err| {
+        state.edit_error = err;
+    };
+}
+
+/// The first usable camera entity, matching the renderer's own `findCamera` order: the ECS
+/// view visits entities in stable-ID order, so the camera the editor moves is the camera
+/// `renderSceneFrame` would render through.
+fn findCameraEntity(scene: anytype) ?@TypeOf(scene.entityById(0).?) {
+    var view = scene.ecsWorld().view(.{render_scene.CameraComponent});
+    while (view.next()) |entry| {
+        if (!entry[1].isValid()) continue;
+        return entry[0];
+    }
+    return null;
 }
 
 /// Whether an entity has any children, which is what decides if Enter has anything to fold.
@@ -979,6 +1134,7 @@ const Harness = struct {
     state: State = .{},
     history: edit.History(render_scene.EngineRenderScene) = undefined,
     root_id: u64 = 0,
+    camera_id: u64 = 0,
     child_id: u64 = 0,
     loose_id: u64 = 0,
 
@@ -994,6 +1150,16 @@ const Harness = struct {
         try self.scene.addComponent(child, render_scene.Transform{});
         const loose = try self.scene.createEntity("loose", null);
         self.loose_id = self.scene.idOf(loose).?;
+
+        // A camera looking at the scene from +Z, so the viewport's framing commands have a
+        // lens and an entity to move — the same shape a real project has.
+        const camera = try self.scene.createEntity("camera", null);
+        self.camera_id = self.scene.idOf(camera).?;
+        try self.scene.addComponent(camera, render_scene.Transform{
+            .position = .{ 0, 0, 6 },
+            .rotation = transform_mod.identity_quat,
+        });
+        try self.scene.addComponent(camera, render_scene.CameraComponent{});
 
         // A visible checkerboard so "the viewport shows the scene" is observable.
         var y: usize = 0;
@@ -1028,7 +1194,7 @@ const Harness = struct {
             .scene_name = "level1",
         };
         self.ctx.beginFrame(frame_input);
-        _ = draw(&self.ctx, &self.state, &self.scene, &self.history, frame);
+        _ = draw(&self.ctx, &self.state, &self.scene, &self.history, frame, testing.allocator);
         self.ctx.endFrame();
     }
 
@@ -1102,10 +1268,10 @@ test "editor: a frame paints the docks, the viewport and a status line" {
     // The status bar is painted even before any click.
     try testing.expectEqual(h.state.theme.button, h.pixel(dock.status.x + 6, dock.status.y + 4));
 
-    // One hit area per entity row (three), the disclosure control of the one row that has
+    // One hit area per entity row (four), the disclosure control of the one row that has
     // children, and the panel's "+" control: the frame's widget table holds exactly what
     // was painted.
-    try testing.expectEqual(@as(usize, 5), h.ctx.entry_count);
+    try testing.expectEqual(@as(usize, 6), h.ctx.entry_count);
 }
 
 test "editor: clicking a hierarchy row selects that entity, and only that one" {
@@ -1835,7 +2001,7 @@ test "editor: navigation records nothing in the history" {
     try testing.expect(!h.history.dirty);
 }
 
-test "editor: Tab moves the keyboard focus between the hierarchy and the inspector" {
+test "editor: Tab walks the hierarchy, the viewport and the inspector" {
     var h = Harness{};
     try h.init();
     defer h.deinit();
@@ -1843,17 +2009,23 @@ test "editor: Tab moves the keyboard focus between the hierarchy and the inspect
     h.runFrames(2);
     try testing.expectEqual(DockFocus.hierarchy, h.state.dock_focus);
 
-    // Tab into the inspector: the GUI focus moves to the name field, so typing lands there.
+    // One Tab moves to the viewport, which owns no GUI widget of its own.
+    h.frameInput(.{ .key = .tab }, &h.state);
+    try testing.expectEqual(DockFocus.viewport, h.state.dock_focus);
+    try testing.expect(h.ctx.focus.eql(widgets.Id.zero));
+
+    // The next Tab reaches the inspector and hands the GUI focus to the name field, so
+    // typing lands there.
     h.frameInput(.{ .key = .tab }, &h.state);
     try testing.expectEqual(DockFocus.inspector, h.state.dock_focus);
     try testing.expect(h.ctx.focus.eql(name_field_id));
 
-    // Tab again wraps back to the hierarchy, which owns no GUI widget.
+    // And the third wraps back to the hierarchy.
     h.frameInput(.{ .key = .tab }, &h.state);
     try testing.expectEqual(DockFocus.hierarchy, h.state.dock_focus);
     try testing.expect(h.ctx.focus.eql(widgets.Id.zero));
 
-    // Shift+Tab goes the other way (two stops, so it lands on the inspector).
+    // Shift+Tab walks the other way: three stops, so it lands on the inspector.
     h.frameInput(.{ .key = .tab, .modifiers = .{ .shift = true } }, &h.state);
     try testing.expectEqual(DockFocus.inspector, h.state.dock_focus);
 }
@@ -1875,24 +2047,156 @@ test "editor: Tab out of a focused text field works, and tree keys stop acting" 
     // Clicking a field moves the dock focus with it, so the outline and Tab agree.
     try testing.expectEqual(DockFocus.inspector, h.state.dock_focus);
 
-    // Tab leaves the field and lands on the other dock (two stops, so it wraps).
+    // Tab leaves the field and lands on the hierarchy, which is next after the inspector.
     h.frameInput(.{ .key = .tab }, &h.state);
     try testing.expect(!h.state.name_focused);
     try testing.expectEqual(DockFocus.hierarchy, h.state.dock_focus);
 
-    // With the inspector focused, tree keys do not move the selection...
+    // With the viewport focused, tree keys do not move the selection and do not create...
     h.frameInput(.{ .key = .tab }, &h.state);
-    try testing.expectEqual(DockFocus.inspector, h.state.dock_focus);
+    try testing.expectEqual(DockFocus.viewport, h.state.dock_focus);
     const before = h.state.selected;
-    h.frameInput(.{ .key = .down }, &h.state);
-    try testing.expectEqual(before, h.state.selected);
     h.frameInput(.{ .key = .n }, &h.state);
     try testing.expectEqual(@as(usize, 0), h.history.undoDepth());
+    try testing.expectEqual(before, h.state.selected);
+
+    // ...but the arrows turn the camera instead, as one undoable edit that leaves the
+    // selection alone: the viewport's keys are the camera's, not the tree's.
+    h.frameInput(.{ .key = .down }, &h.state);
+    try testing.expectEqual(@as(usize, 1), h.history.undoDepth());
+    try testing.expectEqual(before, h.state.selected);
 
     // ...and back on the hierarchy they do again.
     h.frameInput(.{ .key = .tab }, &h.state);
+    h.frameInput(.{ .key = .tab }, &h.state);
+    try testing.expectEqual(DockFocus.hierarchy, h.state.dock_focus);
     h.frameInput(.{ .key = .down }, &h.state);
     try testing.expect(h.state.selected != before);
+}
+
+test "editor: F frames the scene, Shift+F the selection, and both are undoable" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.runFrames(2);
+    h.state.dock_focus = .viewport;
+
+    const camera = h.scene.entityById(h.camera_id).?;
+    const authored = h.scene.getComponent(render_scene.Transform, camera).?.*;
+    const authored_z = authored.position[2];
+
+    // Nothing in the fixture renders, so "frame all" has no geometry to frame and says so
+    // instead of inventing a camera placement.
+    h.frameInput(.{ .key = .f }, &h.state);
+    try testing.expectEqual(@as(usize, 0), h.history.undoDepth());
+    try testing.expectEqual(error.NothingToFrame, h.state.edit_error.?);
+    h.runFrames(1); // the status bar reports it once
+    try testing.expectEqual(authored_z, h.scene.getComponent(render_scene.Transform, camera).?.position[2]);
+
+    // Two visible meshes far apart: F frames both, Shift+F frames the selected one.
+    const root = h.scene.entityById(h.root_id).?;
+    try h.scene.addComponent(root, render_scene.Renderable{ .mesh = 1, .material = 0 });
+    const loose = h.scene.entityById(h.loose_id).?;
+    try h.scene.addComponent(loose, render_scene.Transform{ .position = .{ 5, 5, 5 } });
+    try h.scene.addComponent(loose, render_scene.Renderable{ .mesh = 1, .material = 0 });
+    h.state.selected = h.loose_id;
+    h.runFrames(1);
+
+    h.frameInput(.{ .key = .f }, &h.state);
+    try testing.expectEqual(@as(usize, 1), h.history.undoDepth());
+    try testing.expect(h.state.edit_error == null);
+    // The whole scene's centre is the midpoint of both meshes' extents: the root's box
+    // spans x 0.5..1.5 / y 1.5..3.5, the loose one 4.5..5.5.
+    try testing.expectApproxEqAbs(@as(f32, 3), h.state.camera_view.target[0], 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 3.5), h.state.camera_view.target[1], 1e-3);
+    const framed = h.scene.getComponent(render_scene.Transform, camera).?.*;
+    try testing.expect(framed.position[2] != authored_z);
+
+    // Frame-all is stable: focusing again lands on the same transform instead of drifting.
+    h.frameInput(.{ .key = .f }, &h.state);
+    const again = h.scene.getComponent(render_scene.Transform, camera).?.*;
+    try testing.expectApproxEqAbs(framed.position[2], again.position[2], 1e-4);
+
+    // Shift+F frames the selected entity's own extent, so the target moves onto it.
+    h.frameInput(.{ .key = .f, .modifiers = .{ .shift = true } }, &h.state);
+    try testing.expectEqual(@as(usize, 3), h.history.undoDepth());
+    try testing.expectApproxEqAbs(@as(f32, 5), h.state.camera_view.target[0], 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 5), h.state.camera_view.target[1], 1e-3);
+    // A single mesh is closer to the camera than the spread of both, and the move went
+    // through the history, so one undo restores the framed-everything placement.
+    try h.history.undo(&h.scene);
+    const undone = h.scene.getComponent(render_scene.Transform, camera).?.*;
+    try testing.expectApproxEqAbs(framed.position[2], undone.position[2], 1e-4);
+}
+
+test "editor: arrows orbit the camera around the target it was framed on" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    const root = h.scene.entityById(h.root_id).?;
+    try h.scene.addComponent(root, render_scene.Renderable{ .mesh = 1, .material = 0 });
+    h.runFrames(1);
+    h.state.dock_focus = .viewport;
+    h.frameInput(.{ .key = .f }, &h.state);
+    try testing.expectEqual(@as(usize, 1), h.history.undoDepth());
+
+    const camera = h.scene.entityById(h.camera_id).?;
+    const target = h.state.camera_view.target;
+    const distance = h.state.camera_view.distance;
+    const framed = h.scene.getComponent(render_scene.Transform, camera).?.*;
+
+    // A yaw about world +Y swings the eye off the +Z axis, keeping its distance from the
+    // target it is turning around.
+    h.frameInput(.{ .key = .left }, &h.state);
+    try testing.expect(h.state.edit_error == null);
+    try testing.expectEqual(@as(usize, 2), h.history.undoDepth());
+    const turned = h.scene.getComponent(render_scene.Transform, camera).?.*;
+    try testing.expect(@abs(turned.position[0] - target[0]) > 0.1);
+    const dx = turned.position[0] - target[0];
+    const dz = turned.position[2] - target[2];
+    try testing.expectApproxEqAbs(distance, @sqrt(dx * dx + dz * dz), 1e-2);
+
+    // The view still looks at the same point: orbiting turns around the target.
+    const cam = (try render_scene.EngineRenderer.cameraOf(&h.scene, camera, testing.allocator)).?;
+    const p = transform_mod.transformPoint(cam.view_projection, target);
+    try testing.expectApproxEqAbs(@as(f32, 0), p[0], 1e-2);
+    try testing.expectApproxEqAbs(@as(f32, 0), p[1], 1e-2);
+
+    // Undo puts the camera back where the fit left it, so an orbit is an ordinary edit.
+    try h.history.undo(&h.scene);
+    const restored = h.scene.getComponent(render_scene.Transform, camera).?.*;
+    try testing.expectApproxEqAbs(framed.position[0], restored.position[0], 1e-4);
+    try testing.expectApproxEqAbs(framed.position[2], restored.position[2], 1e-4);
+}
+
+test "editor: the viewport's keys stay out of the text fields, and Escape still clears" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    const root = h.scene.entityById(h.root_id).?;
+    try h.scene.addComponent(root, render_scene.Renderable{ .mesh = 1, .material = 0 });
+    h.state.selected = h.root_id;
+    h.runFrames(2);
+
+    // Click into the name field: it holds the keyboard, so F is a letter, not a command.
+    const field = nameFieldRect(&h);
+    h.hover(field.right() - 3, field.y + 3);
+    h.click(field.right() - 3, field.y + 3);
+    h.release(field.right() - 3, field.y + 3);
+    try testing.expect(h.state.name_focused);
+    h.frameInput(.{ .key = .f }, &h.state);
+    try testing.expectEqual(@as(usize, 0), h.history.undoDepth());
+
+    // Tab out of the field and on to the viewport: the same key now frames, because the
+    // dock, not the letter, decides what a key means.
+    h.frameInput(.{ .key = .tab }, &h.state); // -> hierarchy
+    h.frameInput(.{ .key = .tab }, &h.state); // -> viewport
+    try testing.expectEqual(DockFocus.viewport, h.state.dock_focus);
+    h.frameInput(.{ .key = .f }, &h.state);
+    try testing.expectEqual(@as(usize, 1), h.history.undoDepth());
+    // Escape still clears the selection from here: it acts on the selection, not on a dock.
+    h.frameInput(.{ .key = .escape }, &h.state);
+    try testing.expectEqual(@as(u64, 0), h.state.selected);
 }
 
 test "editor: the focused dock is outlined so Tab's effect is visible" {
@@ -1907,10 +2211,17 @@ test "editor: the focused dock is outlined so Tab's effect is visible" {
     const at_hierarchy = h.pixel(dock.hierarchy.x, dock.hierarchy.y);
     try testing.expectEqual(accent, at_hierarchy);
 
+    // Focus moved to the viewport: its corner is now accent and the hierarchy's is not.
     h.frameInput(.{ .key = .tab }, &h.state);
     h.runFrames(1);
-    // Focus moved: the inspector corner is now accent and the hierarchy corner is not.
-    try testing.expectEqual(accent, h.pixel(dock.inspector.x, dock.inspector.y));
+    try testing.expectEqual(accent, h.pixel(dock.viewport.x, dock.viewport.y));
     const hierarchy_after = h.pixel(dock.hierarchy.x, dock.hierarchy.y);
     try testing.expect(!std.mem.eql(u8, &accent, &hierarchy_after));
+
+    // And on to the inspector, which takes the outline with it.
+    h.frameInput(.{ .key = .tab }, &h.state);
+    h.runFrames(1);
+    try testing.expectEqual(accent, h.pixel(dock.inspector.x, dock.inspector.y));
+    const viewport_after = h.pixel(dock.viewport.x, dock.viewport.y);
+    try testing.expect(!std.mem.eql(u8, &accent, &viewport_after));
 }
