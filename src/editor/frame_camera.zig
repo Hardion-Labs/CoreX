@@ -384,6 +384,18 @@ pub fn rayIntersectsBounds(ray: Ray, box: Bounds) ?f32 {
     return @max(t_min, 0.0);
 }
 
+/// Intersects a ray with a plane defined by a point and a unit normal.
+///
+/// Returns the distance from the ray origin to the intersection point, or `null`
+/// when the ray is parallel to the plane or points away from it (behind the eye).
+pub fn rayIntersectsPlane(ray: Ray, plane_point: Vec3, plane_normal: Vec3) ?f32 {
+    const denom = transform.dot(ray.direction, plane_normal);
+    if (@abs(denom) < 1e-6) return null;
+    const t = transform.dot(transform.sub(plane_point, ray.origin), plane_normal) / denom;
+    if (t < 0) return null;
+    return t;
+}
+
 // --- tests ------------------------------------------------------------------
 
 const testing = std.testing;

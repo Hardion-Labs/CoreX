@@ -4,6 +4,80 @@ Permanent record of real progress, decisions, pending items and the next priorit
 task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
+## Cycle 2026-11-07 (w) — Viewport translate gizmo (drag-to-move)
+
+**Diagnosis first.** Cycle (v) delivered viewport selection highlight via
+`projectToViewport`: the selected entity is marked with an accent crosshair at
+its projected screen position. But there was still no way to *move* an entity
+from the viewport — only from code or the inspector. The recorded next priority
+was exactly this: gizmos (3D manipulator handles drawn in the viewport, driven
+by pointer drag). Window/swapchain remains blocked (unchanged; not attempted).
+
+**Delivered (validated):**
+
+- **`src/gui/canvas.zig`** — `line(x0, y0, x1, y1, color)`: a freeform,
+  one-pixel-wide line using Bresenham's algorithm (integer only, no float, no
+  division in the inner loop), clipped to the canvas via `blendPixel`. Used by
+  the viewport gizmos to draw their axis handles.
+- **`src/editor/frame_camera.zig`** — `rayIntersectsPlane(ray, plane_point,
+  plane_normal)`: distance from ray origin to a plane defined by a point and a
+  unit normal, or `null` when parallel/behind. Used to project a screen drag
+  onto the entity's drag plane.
+- **`src/editor/shell.zig`**:
+  - **`GizmoMode`** (`.translate`) and **`GizmoAxis`** (`.x` / `.y` / `.z`)
+    enums — which tool and which axis are active.
+  - **`Gizmo`** struct (`mode`, `axis`, `drag_start`, `drag_start_world`,
+    `active`) with `begin`/`cancel` — the gizmo drag gesture as a value,
+    testable without a pointer, like `ViewportDrag` and `tree.Drag`.
+  - **`State.viewport_gizmo: Gizmo`** — shell-owned state for the in-flight
+    gizmo gesture.
+  - **`drawViewportGizmo(ctx, state, scene, gpa, viewport)`** — projects the
+    selected entity's world position and one unit along each axis through the
+    camera's view-projection matrix, painting three coloured axis handles
+    (X red, Y green, Z blue) from the projected position; the active axis is
+    drawn brighter. Wired into `draw` right after `drawViewportSelected`.
+  - **`pickGizmoAxis(state, scene, gpa, pointer, viewport)`** — measures the
+    pointer's screen-space distance to each projected handle line and returns
+    the nearest axis within 8 px, or `null`.
+  - **`distPointToSegment`** — squared distance from a point to a line segment
+    in screen space, for axis-handle picking.
+  - **`applyGizmoDrag(state, scene, gpa, pointer, viewport)`** — projects the
+    pointer through the camera onto the drag plane (perpendicular to the
+    camera's look direction, passing through the entity), measures displacement
+    along the selected axis, and writes the new position directly to the
+    entity's `Transform` for immediate feedback.
+  - **`applyShortcuts` wiring** — press on an axis handle starts the gizmo drag
+    (instead of orbit); release applies the move as one undoable
+    `set_component` through the history; press on nothing starts drag-to-orbit
+    as before. `text_focused` guard preserved.
+- **Tests:** 4 new tests in `shell.zig` — gizmo pick returns the axis under the
+  pointer; gizmo pick returns `null` when nothing is selected; gizmo pick
+  returns `null` far from any handle; gizmo drag moves the entity along X and
+  is undoable (one history entry, undo restores). All 935 tests pass
+  (931 pre-existing + 4 new), fmt clean, `zig build` OK, `editor-frame` OK.
+
+**Decisions:**
+
+- Translate only in this cycle; rotate and scale follow once the translate path
+  is proven. The `GizmoMode` enum keeps the door open without speculative
+  rotate/scale code.
+- The drag plane is perpendicular to the camera's look direction, so screen
+  drag maps naturally to movement "into/out of" the screen along the chosen
+  axis — the standard viewport-gizmo behaviour.
+- The move is written directly to the scene during the drag (immediate
+  feedback) and committed as one undoable `set_component` on release — the
+  history is not flooded with one entry per pointer frame.
+- Axis-handle length is fixed in world units (0.5), so it shrinks with
+  distance like the scene itself; the tip gets a small filled square for
+  easier hitting.
+
+**Pending / not in this cycle:** gizmo rotate and scale, Home/End and
+PageUp/PageDown in the tree, multi-select, persisted fold state, sibling
+ordering; and the window layer when the sandbox allows it.
+
+**Next priority:** gizmo rotate and scale; then sibling ordering if the scene
+gains a child order; and the window layer when the sandbox allows it.
+
 ## Cycle 2026-11-07 (v) — Viewport selection highlight (projectToViewport)
 
 **Diagnosis first.** Cycle (u) delivered click-to-select (click an entity in the
