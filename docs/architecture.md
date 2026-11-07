@@ -94,6 +94,7 @@ src/
 │   ├── culling.zig       # Frustum + AABB/sphere classification        [implemented]
 │   ├── draw.zig          # Renderable + draw-list extraction + sorting [implemented]
 │   ├── backend.zig       # Renderer tier contract + CPU backend driver   [implemented]
+│   ├── pipeline.zig      # Scene -> frame pipeline + handle tables       [implemented]
 │   ├── mipmap.zig        # Mip-chain construction (integer box filter)   [implemented]
 │   └── raster.zig        # Software rasterizer: coverage + depth buffer  [implemented]
 ├── audio.zig             # Audio public module; device-independent mixing
@@ -161,7 +162,7 @@ Three quality tiers:
 - **Advanced:** high-end features; only the *contract* is defined for now.
 
 The project selects a tier via `settings.json` (`config.RendererTier`). **No GPU
-backend is chosen yet**, but the tier **contract** now exists
+backend is chosen yet**, but the tier **contract** and its **frame pipeline** now exist
 (`src/render/backend.zig`, `docs/render-backend.md`): `Tier` (`low`/`medium`/
 `advanced`), a single `capabilities(tier)` table, `FrameOptions`, a borrowed
 `Surface` (RGBA8 + `f32` depth), a runtime `DrawResources` resolver adapted from

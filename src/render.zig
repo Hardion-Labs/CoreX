@@ -74,6 +74,19 @@ pub const SoftwareBackend = backend.SoftwareBackend;
 pub const capabilities = backend.capabilities;
 pub const unsupported = backend.unsupported;
 
+/// Frame pipeline over the tier contract: tier selection, option resolution,
+/// `mvp` folding and the per-frame loop; see `docs/render-backend.md`.
+pub const pipeline = @import("render/pipeline.zig");
+pub const renderScene = pipeline.renderScene;
+pub const renderFrame = pipeline.renderFrame;
+pub const tierFromConfig = pipeline.tierFromConfig;
+pub const backendFor = pipeline.backendFor;
+pub const FrameParams = pipeline.FrameParams;
+pub const FrameReport = pipeline.FrameReport;
+pub const ResourceTable = pipeline.ResourceTable;
+pub const AssetTable = pipeline.AssetTable;
+pub const RenderHandle = pipeline.Handle;
+
 pub const Target = raster.Target;
 pub const ScreenVertex = raster.ScreenVertex;
 pub const RasterMesh = raster.Mesh;

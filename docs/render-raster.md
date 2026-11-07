@@ -296,6 +296,14 @@ const stats = try R.rasterizeAlloc(gpa, &target, frame.commands, cam.view_projec
 not per fragment, and resolution is deferred until the whole draw command is in —
 that is the design decision that makes shared edges work (see below).
 
+The pixel box each triangle is rasterized over is clamped to the target **after**
+the fixed-point→pixel shift, and both paths share the same four clamps: a vertex
+projecting far outside the target yields a large negative pixel index, and clamping
+only the fixed-point coordinate left a small negative box origin that the
+antialiasing halo widened by one more — which overflowed the `i32` subtraction that
+computes the box shift. A regression test rasterizes a triangle much larger than
+the target on both paths.
+
 ### Sub-sample positions and the top-left rule
 
 Sub-sample `k` of a pixel along one axis sits at `(k + 0.5) / 4` of the pixel, so
