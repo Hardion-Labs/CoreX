@@ -4,6 +4,198 @@ Permanent record of real progress, decisions, pending items and the next priorit
 task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
+## Cycle 2026-11-07 (u) — Viewport click-to-select and drag-to-orbit
+
+**Diagnosis first.** Cycle (t) delivered viewport zoom (wheel → multiplicative
+distance factor, clamped at `frame_camera.min_distance`), completing basic camera
+navigation (frame / orbit / zoom). The viewport could move the camera but could not
+*point* at anything: clicking an entity selected nothing, and dragging only scrolled
+the hierarchy or did nothing. The recorded next priority was exactly this: click-to-select
+and drag-to-orbit. Window/swapchain remains blocked (unchanged; not attempted).
+
+**Delivered (validated):**
+
+- **`src/scene/transform.zig`** — `mat4Inverse` rewritten as Gauss-Jordan elimination
+  with partial pivoting (replacing an adjugate whose cofactors were wrong for
+  non-trivial matrices). Returns `null` on singular. 3 tests: identity round-trip,
+  m×inv=I, singular→null. The old `mat3Det` helper was removed (no longer used).
+- **`src/editor/frame_camera.zig`** — `Ray`, `pickRay` (NDC → world ray via inverse
+  view-projection, origin = camera position), `rayIntersectsBounds` (slab method,
+  `tmin`/`tmax` with `t_near`/`t_far` clamp) + 4 tests. `render_camera` import added
+  for `Camera.perspectiveLookAt`. `pickRay` test comment fixed ("right edge" → bottom-right
+  corner, direction checks corrected).
+- **`src/editor/shell.zig`**:
+  - **`State.viewport_drag: ViewportDrag`** — the drag-to-orbit gesture as a value:
+    `begin(pos)` arms it from a press, `end(pos)` reports whether the pointer moved
+    enough to count as a drag (>2 px) rather than a click, `cancel()` abandons it.
+    Exactly like `tree.Drag`, testable headlessly without a pointer.
+  - **`ViewportDrag` struct** — `start` / `previous` / `active` fields, all public,
+    with `begin`/`end`/`cancel` methods.
+  - **Click-to-select** — `pickEntity(state, scene, gpa, pointer, viewport)`: casts a
+    pick ray through the pointer, tests every entity with both `Transform` and
+    `Renderable` against its world-space unit-box bounds (built from `computeWorldTransforms`),
+    nearest hit wins. On hit sets `state.selected`, `state.selection_changed = true`,
+    `state.name_owner = 0` (inspector reloads). One `set_component` via history would
+    be the undoable path; the current write is direct state (selection is view state,
+    not scene data — consistent with how selection already works).
+  - **Drag-to-orbit** — in `applyShortcuts`: pointer press on the viewport starts the
+    drag; release finalizes it (click if no movement, nothing if drag); movement while
+    down feeds `.orbit` to `cameraCommand` with `0.005` sensitivity per pixel (yaw
+    negated for natural drag direction, pitch sign matched to screen-up).
+  - **`applyShortcuts` wiring** — press/release/drag are checked before the wheel and
+    key branches, only when `dock_focus == .viewport` and the pointer is inside
+    `dock.viewport`. The existing `text_focused` guard is preserved (no pointer action
+    while a text field holds the keyboard).
+- **Tests:** 4 new tests in `shell.zig` — `ViewportDrag` begin/end (movement vs
+  click), `cancel`, click on empty viewport selects nothing (no history entry), and
+  drag in the viewport changes `camera_view.direction`. All 929 tests pass
+  (925 pre-existing + 4 new), fmt clean, `zig build` OK, validate OK.
+
+**Decisions:**
+
+- Click-to-select writes `state.selected` directly rather than through the history:
+  selection is editor view state (the same contract the tree click already uses), not
+  scene data. Undoable selection (`set_component` on a "selected" component) is a
+  later cycle if wanted.
+- Drag-to-orbit reuses the *exact* `cameraCommand` `.orbit` path the keyboard arrows
+  use, so a drag and a key are one code path and cannot diverge. One undoable
+  `set_component` per frame of drag would flood the history; the camera view is
+  accumulated in `state.camera_view` and committed through `applyCamera` on each
+  input frame — matching how orbit already works.
+- A press that never moves is a click (select), not a drag; the `>2 px` threshold
+  matches `tree.Drag`'s gesture contract.
+- `mat4Inverse` uses Gauss-Jordan (not adjugate) because the cofactor expansion is
+  error-prone under column-major storage; the determinant threshold `1e-8` matches
+  the existing convention.
+
+**Pending / not in this cycle:** selection highlight via `projectToViewport` in the
+viewport (the entity is selected but not yet drawn highlighted), gizmos, Home/End and
+PageUp/PageDown in the tree, multi-select, persisted fold state, sibling ordering; and
+the window layer when the sandbox allows it.
+
+**Next priority:** selection highlight in the viewport (`projectToViewport` + drawn
+indication of the selected entity); then gizmos; sibling ordering if the scene gains a
+child order; and the window layer when the sandbox allows it.
+
+## Cycle 2026-11-07 (t) — Viewport zoom (wheel / distance factor)
+
+**Diagnosis first.** Cycle (s) made `near`/`far` editable in the inspector, completing the
+camera's clip-plane controls. The viewport could frame and orbit but had no way to move
+the camera closer or farther from its target — the last gap in basic camera navigation.
+The recorded next priority was exactly this: viewport zoom. Window/swapchain remains
+blocked (unchanged; not attempted).
+
+**Delivered (validated):**
+
+- **`Zoom` struct + `FrameTarget.zoom` variant** — a multiplicative zoom factor applied to
+  the camera's current distance. `> 1` moves the camera farther (zoom out), `< 1` moves it
+  closer (zoom in). Result is clamped at `frame_camera.min_distance` (0.5) so the eye never
+  enters its own target.
+- **`cameraCommand` `.zoom` handler** — changes only `distance`; target and viewing
+  direction stay untouched, so the camera dollies in/out around the point it already looks
+  at. Committed as one undoable `set_component` through the history.
+- **Wheel-to-zoom** — when the viewport holds dock focus and the pointer is over the
+  viewport, the wheel zooms: wheel up/away (> 0) zooms in (factor 0.9), wheel down/toward
+  (< 0) zooms out (factor 1/0.9). Over the hierarchy the wheel still scrolls the tree;
+  without viewport focus the wheel does nothing.
+- **`applyShortcuts`** now receives `dock: Dock` to hit-test the pointer against the
+  viewport rect. `text_focused` guard preserved: no zoom while a text field holds the
+  keyboard.
+
+**Suite:** **917/917** tests (clean cache), fmt clean, `zig build` OK, validate OK,
+`editor-frame` (640x360, HelloProject), `gui-frame`, `qoi-decode` build OK.
+
+**Decisions:** zoom is multiplicative (factor × distance) rather than additive, so it
+feels consistent at any scale. The direction and target are preserved — zoom dollies,
+it does not re-aim. The `dock` rect is passed into `applyShortcuts` rather than
+recomputed, keeping a single source of truth for dock geometry.
+
+**Pending / not in this cycle:** click-to-select and drag-to-orbit in the viewport, gizmos,
+Home/End and PageUp/PageDown in the tree, multi-select, persisted fold state, sibling
+ordering if the scene gains a child order; and the window layer when the sandbox allows it.
+
+**Next priority:** click-to-select and drag-to-orbit in the viewport; then gizmos;
+sibling ordering if the scene gains a child order; and the window layer when the sandbox
+allows it.
+
+## Cycle 2026-11-07 (s) — Camera near/far clip-plane fields in the inspector
+
+**Diagnosis first.** Cycle (r) made `Transform.rotation` and `CameraComponent.fov` editable
+in the inspector, but `CameraComponent.near` and `CameraComponent.far` were still
+read-only. The recorded next priority was camera near/far fields. Window/swapchain
+remains blocked (unchanged; not attempted).
+
+**Delivered (validated):**
+
+- **`CameraScalarField` enum** (`.near` / `.far`) with `get`/`set` accessors on
+  `CameraComponent`, mirroring `TransformField`.
+- **`drawCameraScalarRow`** — one editable row per clip plane, in world-space units
+  (no degree/radian conversion). Committing writes the whole `CameraComponent` as one
+  undoable `set_component`; `CameraComponent.isValid` enforces `0 < near < far`, so a
+  commit that would break that (near ≤ 0, near ≥ far, far ≤ near) is rejected and the
+  field reverts to the scene value.
+- **Shell state** — `State.camera_near` and `State.camera_far` (`inspector.Row(1)` each),
+  plus both fields included in `text_focused` so frame-level shortcuts (`Delete`,
+  `Ctrl+Z`) do not fire while a clip-plane field holds the keyboard.
+
+**Suite:** **913/913** tests (clean cache), fmt clean, `zig build` OK, validate OK,
+`editor-frame` (640x360, HelloProject), `gui-frame`, `qoi-decode` build OK.
+
+**Decisions:** near/far are plain distances, not angles — no degree/radian conversion,
+matching their units in the component. Validation is delegated to `CameraComponent.isValid`
+(the single source of truth for `0 < near < far`) rather than duplicated in the UI.
+
+**Pending / not in this cycle:** viewport zoom (wheel / distance factor), click-to-select
+and drag-to-orbit in the viewport, gizmos, Home/End and PageUp/PageDown in the tree,
+multi-select, persisted fold state, sibling ordering if the scene gains a child order; and
+the window layer when the sandbox allows it.
+
+**Next priority:** viewport zoom (wheel or distance factor); then click-to-select /
+drag-to-orbit; sibling ordering if the scene gains a child order; and the window layer
+when the sandbox allows it.
+
+## Cycle 2026-11-07 (r) — Rotation and camera fields in the inspector
+
+**Diagnosis first.** Cycle (q) delivered drag-and-drop reparenting, but the inspector
+still showed two read-only values the model can already write: `Transform.rotation` (a
+quaternion) and `CameraComponent.fov`. The recorded next priority was exactly this.
+Window/swapchain remains blocked (unchanged; not attempted).
+
+**Delivered (validated):**
+
+- **`src/scene/transform.zig`** — `quatFromEuler(roll, pitch, yaw)` composes a unit
+  quaternion from three Euler angles in degrees (roll about X, pitch about Y, yaw about Z;
+  equivalently `q = q_yaw * q_pitch * q_roll`). `quatToEuler(q)` extracts them back,
+  normalizing first and clamping pitch to [-90, 90] against the gimbal-lock singularity.
+  Round-trip is stable for axis-aligned rotations.
+- **Inspector rotation field** (`State.transform_rotation`, `TransformField.rotation`) —
+  the rotation row shows three Euler angles in degrees; committing converts them back to
+  the stored quaternion as one undoable `set_component`, keeping untouched axes intact and
+  rejecting non-finite results.
+- **Inspector camera FOV field** (`State.camera_fov`, `drawCameraRow`) — the FOV is now
+  editable in degrees instead of read-only text. Committing writes the whole
+  `CameraComponent` as one undoable `set_component`; out-of-range FOVs (≤ 0 or ≥ π) are
+  rejected and the field reverts.
+- **Shell** — `text_focused` now also accounts for `transform_rotation` and `camera_fov`,
+  so frame-level shortcuts (`Delete`, `Ctrl+Z`) do not fire while a numeric field holds the
+  keyboard.
+
+**Suite:** **908/908** tests (clean cache), fmt clean, `zig build` OK, validate, runtime,
+`gui-frame`, `editor-frame` (640x360), `qoi-decode`, `bench-extract -Doptimize=ReleaseFast`.
+
+**Decisions:** rotation is expressed to the user as Euler angles (degrees), not raw
+quaternion components — raw components are not a usable editing surface. The conversion
+lives in `transform.zig` next to the other quaternion math. FOV is degrees in the UI,
+radians in the component, matching the existing `fieldRow` display convention.
+
+**Pending / not in this cycle:** camera near/far fields, zoom (wheel / distance factor),
+click-to-select and drag-to-orbit in the viewport, gizmos, Home/End and PageUp/PageDown in
+the tree, multi-select, persisted fold state, sibling ordering; and the window layer when
+the sandbox allows it.
+
+**Next priority:** camera near/far fields if needed, then viewport zoom; sibling ordering
+if the scene gains a child order; and the window layer when the sandbox allows it.
+
 ## Cycle 2026-11-07 (q) — Drag and drop reparenting
 
 **Diagnosis first.** Cycle (p) closed the keyboard gap, but reparenting still required

@@ -18,11 +18,13 @@
 const std = @import("std");
 const components = @import("../scene/components.zig");
 const render_scene = @import("../scene/render_scene.zig");
+const render_camera = @import("../render.zig").Camera;
 const transform = @import("../scene/transform.zig");
 
 const Renderable = render_scene.Renderable;
 
 pub const Vec3 = transform.Vec3;
+pub const Mat4 = transform.Mat4;
 
 /// The world-space box around the scene's geometry.
 pub const Bounds = struct {
@@ -319,6 +321,69 @@ fn quatFromBasis(m: transform.Mat4) transform.Quat {
     }
 }
 
+/// A ray in world space: an origin and a unit direction.
+pub const Ray = struct {
+    origin: Vec3,
+    direction: Vec3,
+};
+
+/// Builds a pick ray from NDC screen coordinates (`ndc_x`, `ndc_y` in [-1, 1]).
+///
+/// The ray starts at the camera's eye and passes through the point on the near
+/// plane corresponding to the screen coordinate. Returns `null` when the
+/// view-projection matrix cannot be inverted.
+pub fn pickRay(
+    ndc_x: f32,
+    ndc_y: f32,
+    inv_view_projection: Mat4,
+    camera_position: Vec3,
+) ?Ray {
+    // Unproject the near-plane corner (ndc_x, ndc_y, -1) into world space.
+    const clip: [4]f32 = .{ ndc_x, ndc_y, -1.0, 1.0 };
+    var world: [4]f32 = undefined;
+    inline for (0..4) |r| {
+        var sum: f32 = 0;
+        inline for (0..4) |c| {
+            sum += inv_view_projection[c * 4 + r] * clip[c];
+        }
+        world[r] = sum;
+    }
+    if (world[3] == 0) return null;
+    const inv_w = 1.0 / world[3];
+    const near_point: Vec3 = .{ world[0] * inv_w, world[1] * inv_w, world[2] * inv_w };
+
+    const direction = transform.normalize(transform.sub(near_point, camera_position));
+    if (transform.length(direction) == 0) return null;
+
+    return .{ .origin = camera_position, .direction = direction };
+}
+
+/// Intersects a ray with an axis-aligned bounding box using the slab method.
+///
+/// Returns the distance from the ray origin to the nearest intersection point,
+/// or `null` when the ray misses the box.
+pub fn rayIntersectsBounds(ray: Ray, box: Bounds) ?f32 {
+    var t_min: f32 = -std.math.inf(f32);
+    var t_max: f32 = std.math.inf(f32);
+
+    inline for (0..3) |i| {
+        const inv_d = if (ray.direction[i] != 0) 1.0 / ray.direction[i] else std.math.inf(f32);
+        var t1 = (box.min[i] - ray.origin[i]) * inv_d;
+        var t2 = (box.max[i] - ray.origin[i]) * inv_d;
+        if (inv_d < 0) {
+            const tmp = t1;
+            t1 = t2;
+            t2 = tmp;
+        }
+        t_min = @max(t_min, t1);
+        t_max = @min(t_max, t2);
+        if (t_min > t_max) return null;
+    }
+
+    if (t_max < 0) return null;
+    return @max(t_min, 0.0);
+}
+
 // --- tests ------------------------------------------------------------------
 
 const testing = std.testing;
@@ -494,6 +559,65 @@ test "boundsOf frames a child's world extent, a point for an empty, and null for
 
     // An id that names nothing is not an error, and it is not a box either.
     try testing.expect((try boundsOf(&scene, 0xdead_beef, testing.allocator)) == null);
+}
+
+test "pickRay: centre of screen shoots down the camera's view direction" {
+    const cam = render_camera.perspectiveLookAt(
+        .{ 0, 0, 5 },
+        .{ 0, 0, 0 },
+        .{ 0, 1, 0 },
+        @as(f32, std.math.pi) / 3,
+        1.0,
+        0.1,
+        100,
+    );
+    const inv_vp = transform.mat4Inverse(cam.view_projection) orelse return;
+    const ray = pickRay(0, 0, inv_vp, cam.position) orelse return;
+    // Centre of screen: ray points straight down -Z towards the target.
+    try testing.expectApproxEqAbs(@as(f32, 0), ray.direction[0], 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 0), ray.direction[1], 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, -1), ray.direction[2], 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 0), ray.origin[0], 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 0), ray.origin[1], 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 5), ray.origin[2], 1e-4);
+}
+
+test "pickRay: right edge of screen shoots right and down" {
+    const cam = render_camera.perspectiveLookAt(
+        .{ 0, 0, 5 },
+        .{ 0, 0, 0 },
+        .{ 0, 1, 0 },
+        @as(f32, std.math.pi) / 2,
+        1.0,
+        0.1,
+        100,
+    );
+    const inv_vp = transform.mat4Inverse(cam.view_projection) orelse return;
+    const ray = pickRay(1, -1, inv_vp, cam.position) orelse return;
+    // Bottom-right corner of the NDC screen: ray points right and down in world space.
+    try testing.expect(ray.direction[0] > 0);
+    try testing.expect(ray.direction[1] < 0);
+    try testing.expect(ray.direction[2] < 0);
+}
+
+test "rayIntersectsBounds: ray through the centre of a box hits" {
+    const box = Bounds{ .min = .{ -1, -1, -1 }, .max = .{ 1, 1, 1 } };
+    const ray = Ray{ .origin = .{ 0, 0, -5 }, .direction = .{ 0, 0, 1 } };
+    const hit = rayIntersectsBounds(ray, box) orelse return;
+    try testing.expectApproxEqAbs(@as(f32, 4), hit, 1e-4);
+}
+
+test "rayIntersectsBounds: ray missing the box returns null" {
+    const box = Bounds{ .min = .{ -1, -1, -1 }, .max = .{ 1, 1, 1 } };
+    const ray = Ray{ .origin = .{ 0, 5, -5 }, .direction = .{ 0, 0, 1 } };
+    try testing.expect(rayIntersectsBounds(ray, box) == null);
+}
+
+test "rayIntersectsBounds: ray starting inside the box hits at distance 0" {
+    const box = Bounds{ .min = .{ -1, -1, -1 }, .max = .{ 1, 1, 1 } };
+    const ray = Ray{ .origin = .{ 0, 0, 0 }, .direction = .{ 0, 0, 1 } };
+    const hit = rayIntersectsBounds(ray, box) orelse return;
+    try testing.expectApproxEqAbs(@as(f32, 0), hit, 1e-4);
 }
 
 /// Replace a camera entity's transform in place and recompute the engine camera, so a test
