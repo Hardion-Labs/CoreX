@@ -34,6 +34,49 @@ declared yet.
   handles, light precedence (provider vs explicit vs absent) and the whole
   capability gate — 9 new tests (681 total).
 
+- Frame pipeline over the tier contract (`src/render/pipeline.zig`,
+  `corex.render.pipeline`, `docs/render-backend.md`): `renderScene` takes a scene
+  and a tier and produces a frame — extraction, `mvp` folding, the
+  `beginFrame`/`draw`/`endFrame` loop and a `FrameReport` (tier, commands,
+  extraction culling, backend stats and the options that were **accepted**).
+  `renderFrame` is the same path for an already extracted draw list.
+  `tierFromConfig` maps `settings.json`'s `RendererTier` onto the contract's `Tier`
+  with a **comptime** check that no config tier lacks a render tier;
+  `backendFor` is the single place a backend is registered, and since Advanced has
+  none, a project that names it is refused at startup (exit code 6) instead of
+  silently rendering at Medium. `resolve` coerces a `FrameParams` to what the tier
+  can honour (antialiasing, mip selection, lighting, blending), so the pipeline
+  never trips its own gate and the default blend follows the extraction sort
+  (`back_to_front` → `.alpha`). `ResourceTable` is a fixed-capacity,
+  allocation-free-after-init handle table with **per-kind generations**, so a
+  released or reused slot cannot be aliased by a stale handle and a material does
+  not invalidate its slot's mesh; `AssetTable` fills it from zero-copy `CXMH`
+  views plus `textureFromAsset` for decoded `CXTX` textures, keeping `render`
+  free of an asset-layer dependency. Startup step 7 now selects and logs the tier
+  and fails the session when the tier has no backend; the launch summary prints
+  the selected tier.
+
+### Fixed
+
+- **`DrawResources.fromComptime` returned a dangling pointer.** It took the
+  provider by value and stored the address of its own parameter, so every field
+  read afterwards came from a dead stack slot: correct at `-O Debug` (nothing
+  overwrites it) and wrong at `-O ReleaseSafe`, where the optimizer reuses the
+  slot — observed as a conformance failure that made the software backend render a
+  different colour than the rasterizer it drives. It now requires a pointer
+  (`fromComptime(&provider)`, enforced at comptime with an explicit message), which
+  makes the borrow explicit and the lifetime the caller's. Regression test: a
+  provider whose mesh/material handles and tint are read through the adapter ends
+  up in the framebuffer channel by channel, and the whole suite now runs green in
+  Debug, ReleaseSafe and ReleaseFast.
+
+- Software rasterizer: a triangle whose vertices project outside the target could
+  panic with an integer overflow in the pixel-box math. The box was clamped before
+  the fixed-point→pixel shift, which can leave a negative index; the antialiasing
+  halo then widened it by one more and `clip_min - min` overflowed. Both paths now
+  clamp to the target after the shift and share the same four clamps, with a
+  regression test that fails without the fix.
+
 ### Changed
 
 - `Texture` in the render contract is validated before shading
