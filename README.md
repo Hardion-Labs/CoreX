@@ -401,7 +401,10 @@ aliased path); a texture without `mips` samples level 0 exactly as before.
 
 The extraction design and math conventions are documented in
 [`docs/render-extraction.md`](docs/render-extraction.md); the rasterizer, its
-verification and its limits in [`docs/render-raster.md`](docs/render-raster.md).
+verification and its limits in [`docs/render-raster.md`](docs/render-raster.md);
+the renderer **tier contract** (Low/Medium/Advanced capabilities, the backend
+vtable, the frame lifecycle and the CPU driver that implements Medium today) in
+[`docs/render-backend.md`](docs/render-backend.md).
 
 ## Audio
 
@@ -603,7 +606,8 @@ Indicative; subject to change as technical decisions are validated.
 - [x] Backend-independent render extraction (camera, frustum culling, sorted draw lists).
 - [x] CPU software rasterizer (fixed-point watertight coverage, depth buffer, textured shading).
 - [x] Rasterizer lighting: single directional Lambert (face normals, CPU reference path).
-- [ ] Renderer Low / Medium GPU backends; Advanced contract.
+- [x] Renderer tier contract (Low/Medium/Advanced capabilities + backend vtable, CPU driver).
+- [ ] Renderer Low / Medium GPU backends implementing that contract.
 - [x] Rasterizer blending: `.none`, straight-alpha source-over, premultiplied, additive.
 - [x] Rasterizer antialiasing: 4x4 sub-sample coverage, per-draw accumulation, `Antialias.edge`.
 - [x] Rasterizer mipmaps: integer box-filter chain, per-pixel LOD, trilinear sampling.
