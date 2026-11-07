@@ -247,7 +247,7 @@ pub fn draw(
     if (!focused_rect.isEmpty()) ctx.canvas.strokeRect(focused_rect, state.theme.accent);
 
     focusStep(ctx, state);
-    if (!state.text_focused) applyShortcuts(ctx, state, scene, history, gpa);
+    if (!state.text_focused) applyShortcuts(ctx, state, scene, history, gpa, dock);
     return state.selection_changed;
 }
 
@@ -986,7 +986,7 @@ fn focusStep(ctx: *widgets.Context, state: *State) void {
 ///
 /// Shortcuts are a *convenience* over the same three functions a menu or a test would
 /// call — they add no behaviour of their own.
-fn applyShortcuts(ctx: *widgets.Context, state: *State, scene: anytype, history: anytype, gpa: std.mem.Allocator) void {
+fn applyShortcuts(ctx: *widgets.Context, state: *State, scene: anytype, history: anytype, gpa: std.mem.Allocator, dock: Dock) void {
     if (ctx.input.modifiers.ctrl) {
         const key = ctx.input.key orelse return;
         switch (key) {
@@ -1011,9 +1011,17 @@ fn applyShortcuts(ctx: *widgets.Context, state: *State, scene: anytype, history:
         state.selected = 0;
         return;
     }
-    // The viewport frames and orbits. Its keys are checked before the hierarchy's so a
-    // dock's vocabulary is decided by the focus, not by which branch happens to run first.
+    // The viewport frames, orbits and zooms. Its keys are checked before the hierarchy's
+    // so a dock's vocabulary is decided by the focus, not by which branch happens to run
+    // first. The wheel zooms only when the pointer is over the viewport: over the
+    // hierarchy it still scrolls the tree (handled in drawHierarchy).
     if (state.dock_focus == .viewport) {
+        if (ctx.input.wheel != 0 and ctx.input.pointer_in_window and dock.viewport.containsPoint(ctx.input.pointer)) {
+            // Wheel up/away (> 0) zooms in (closer), wheel down/toward (< 0) zooms out.
+            const factor: f32 = if (ctx.input.wheel > 0) 0.9 else 1.0 / 0.9;
+            cameraCommand(state, scene, history, gpa, .{ .zoom = .{ .factor = factor } });
+            return;
+        }
         if (ctx.keyPressed(.f)) {
             const what: FrameTarget = if (ctx.input.modifiers.shift) .fit_selection else .fit_all;
             cameraCommand(state, scene, history, gpa, what);
@@ -1125,10 +1133,18 @@ const FrameTarget = union(enum) {
     fit_selection,
     /// Turn the view around its target by these radians.
     orbit: Orbit,
+    /// Move the camera toward or away from its target, keeping the target and the
+    /// viewing direction unchanged.
+    zoom: Zoom,
 };
 
 /// A turn around the camera target, in radians.
 const Orbit = struct { yaw: f32, pitch: f32 };
+
+/// A multiplicative zoom of the camera distance: `> 1` moves the camera farther
+/// (zoom out), `< 1` moves it closer (zoom in). The result is clamped at
+/// `frame_camera.min_distance` so the eye never enters its own target.
+const Zoom = struct { factor: f32 };
 
 /// The viewport's keyboard commands: frame the whole scene, frame the selection, orbit.
 ///
@@ -1150,6 +1166,19 @@ fn cameraCommand(
         .orbit => |turn| {
             // Orbit needs no geometry: it turns the view the editor already framed.
             state.camera_view = frame_camera.orbit(state.camera_view, turn.yaw, turn.pitch);
+            applyCamera(state, scene, history, state.camera_view);
+        },
+        .zoom => |z| {
+            // Zoom changes only the distance: target and direction stay put, so the
+            // camera dollies in or out around the point it already looks at. Clamp at
+            // min_distance so the eye never enters its own target.
+            const next = @max(state.camera_view.distance * z.factor, frame_camera.min_distance);
+            if (next == state.camera_view.distance) return;
+            state.camera_view = .{
+                .target = state.camera_view.target,
+                .direction = state.camera_view.direction,
+                .distance = next,
+            };
             applyCamera(state, scene, history, state.camera_view);
         },
         .fit_all, .fit_selection => {
@@ -2798,6 +2827,106 @@ test "editor: arrows orbit the camera around the target it was framed on" {
     const restored = h.scene.getComponent(render_scene.Transform, camera).?.*;
     try testing.expectApproxEqAbs(framed.position[0], restored.position[0], 1e-4);
     try testing.expectApproxEqAbs(framed.position[2], restored.position[2], 1e-4);
+}
+
+test "editor: wheel over the viewport zooms the camera in and out" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    const root = h.scene.entityById(h.root_id).?;
+    try h.scene.addComponent(root, render_scene.Renderable{ .mesh = 1, .material = 0 });
+    h.runFrames(1);
+    h.state.dock_focus = .viewport;
+    h.frameInput(.{ .key = .f }, &h.state);
+    try testing.expectEqual(@as(usize, 1), h.history.undoDepth());
+
+    const before = h.state.camera_view.distance;
+    const dock = Dock.compute(h.ctx.canvas.bounds());
+    const vx = dock.viewport.x + 10;
+    const vy = dock.viewport.y + 10;
+
+    // Wheel up/away (positive) zooms in: distance shrinks.
+    h.frameInput(.{ .pointer = .{ .x = vx, .y = vy }, .pointer_in_window = true, .wheel = 3 }, &h.state);
+    try testing.expect(h.state.edit_error == null);
+    try testing.expect(h.state.camera_view.distance < before);
+    try testing.expectEqual(@as(usize, 2), h.history.undoDepth());
+
+    // Wheel down/toward (negative) zooms out: distance grows.
+    h.frameInput(.{ .pointer = .{ .x = vx, .y = vy }, .pointer_in_window = true, .wheel = -3 }, &h.state);
+    try testing.expect(h.state.camera_view.distance > before * 0.9);
+    try testing.expectEqual(@as(usize, 3), h.history.undoDepth());
+
+    // Undo restores the pre-zoom distance.
+    try h.history.undo(&h.scene);
+    const undone = h.state.camera_view.distance;
+    try testing.expectApproxEqAbs(before, undone, 1e-4);
+}
+
+test "editor: wheel over the hierarchy scrolls the tree instead of zooming" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    const root = h.scene.entityById(h.root_id).?;
+    try h.scene.addComponent(root, render_scene.Renderable{ .mesh = 1, .material = 0 });
+    h.runFrames(1);
+    h.state.dock_focus = .viewport;
+
+    const dock = Dock.compute(h.ctx.canvas.bounds());
+    const hx = dock.hierarchy.x + 10;
+    const hy = dock.hierarchy.y + 40;
+
+    const before = h.state.camera_view.distance;
+    h.frameInput(.{ .pointer = .{ .x = hx, .y = hy }, .pointer_in_window = true, .wheel = -3 }, &h.state);
+    // The hierarchy consumed the wheel: the camera distance is unchanged.
+    try testing.expectEqual(before, h.state.camera_view.distance);
+    try testing.expectEqual(@as(usize, 0), h.history.undoDepth());
+}
+
+test "editor: wheel over the viewport requires viewport focus to zoom" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    const root = h.scene.entityById(h.root_id).?;
+    try h.scene.addComponent(root, render_scene.Renderable{ .mesh = 1, .material = 0 });
+    h.runFrames(1);
+    // dock_focus is .hierarchy by default, not .viewport.
+
+    const dock = Dock.compute(h.ctx.canvas.bounds());
+    const vx = dock.viewport.x + 10;
+    const vy = dock.viewport.y + 10;
+
+    const before = h.state.camera_view.distance;
+    h.frameInput(.{ .pointer = .{ .x = vx, .y = vy }, .pointer_in_window = true, .wheel = -3 }, &h.state);
+    // Not focused on the viewport: no zoom.
+    try testing.expectEqual(before, h.state.camera_view.distance);
+    try testing.expectEqual(@as(usize, 0), h.history.undoDepth());
+}
+
+test "editor: zoom clamps at the minimum distance" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    const root = h.scene.entityById(h.root_id).?;
+    try h.scene.addComponent(root, render_scene.Renderable{ .mesh = 1, .material = 0 });
+    h.runFrames(1);
+    h.state.dock_focus = .viewport;
+    h.frameInput(.{ .key = .f }, &h.state);
+
+    const dock = Dock.compute(h.ctx.canvas.bounds());
+    const vx = dock.viewport.x + 10;
+    const vy = dock.viewport.y + 10;
+
+    // Zoom in aggressively until the clamp bites.
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        h.frameInput(.{ .pointer = .{ .x = vx, .y = vy }, .pointer_in_window = true, .wheel = 10 }, &h.state);
+    }
+    const clamped = h.state.camera_view.distance;
+    try testing.expect(clamped >= frame_camera.min_distance);
+    try testing.expect(clamped <= frame_camera.min_distance + 0.01);
+    // The camera still looks at the same target after clamping: zoom only moves the eye.
+    try testing.expectApproxEqAbs(h.state.camera_view.target[0], 1, 1e-4);
+    try testing.expectApproxEqAbs(h.state.camera_view.target[1], 2, 1e-4);
 }
 
 test "editor: the viewport's keys stay out of the text fields, and Escape still clears" {

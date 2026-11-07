@@ -4,6 +4,47 @@ Permanent record of real progress, decisions, pending items and the next priorit
 task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
+## Cycle 2026-11-07 (t) — Viewport zoom (wheel / distance factor)
+
+**Diagnosis first.** Cycle (s) made `near`/`far` editable in the inspector, completing the
+camera's clip-plane controls. The viewport could frame and orbit but had no way to move
+the camera closer or farther from its target — the last gap in basic camera navigation.
+The recorded next priority was exactly this: viewport zoom. Window/swapchain remains
+blocked (unchanged; not attempted).
+
+**Delivered (validated):**
+
+- **`Zoom` struct + `FrameTarget.zoom` variant** — a multiplicative zoom factor applied to
+  the camera's current distance. `> 1` moves the camera farther (zoom out), `< 1` moves it
+  closer (zoom in). Result is clamped at `frame_camera.min_distance` (0.5) so the eye never
+  enters its own target.
+- **`cameraCommand` `.zoom` handler** — changes only `distance`; target and viewing
+  direction stay untouched, so the camera dollies in/out around the point it already looks
+  at. Committed as one undoable `set_component` through the history.
+- **Wheel-to-zoom** — when the viewport holds dock focus and the pointer is over the
+  viewport, the wheel zooms: wheel up/away (> 0) zooms in (factor 0.9), wheel down/toward
+  (< 0) zooms out (factor 1/0.9). Over the hierarchy the wheel still scrolls the tree;
+  without viewport focus the wheel does nothing.
+- **`applyShortcuts`** now receives `dock: Dock` to hit-test the pointer against the
+  viewport rect. `text_focused` guard preserved: no zoom while a text field holds the
+  keyboard.
+
+**Suite:** **917/917** tests (clean cache), fmt clean, `zig build` OK, validate OK,
+`editor-frame` (640x360, HelloProject), `gui-frame`, `qoi-decode` build OK.
+
+**Decisions:** zoom is multiplicative (factor × distance) rather than additive, so it
+feels consistent at any scale. The direction and target are preserved — zoom dollies,
+it does not re-aim. The `dock` rect is passed into `applyShortcuts` rather than
+recomputed, keeping a single source of truth for dock geometry.
+
+**Pending / not in this cycle:** click-to-select and drag-to-orbit in the viewport, gizmos,
+Home/End and PageUp/PageDown in the tree, multi-select, persisted fold state, sibling
+ordering if the scene gains a child order; and the window layer when the sandbox allows it.
+
+**Next priority:** click-to-select and drag-to-orbit in the viewport; then gizmos;
+sibling ordering if the scene gains a child order; and the window layer when the sandbox
+allows it.
+
 ## Cycle 2026-11-07 (s) — Camera near/far clip-plane fields in the inspector
 
 **Diagnosis first.** Cycle (r) made `Transform.rotation` and `CameraComponent.fov` editable
