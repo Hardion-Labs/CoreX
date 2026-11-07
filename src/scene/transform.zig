@@ -50,6 +50,87 @@ pub fn multiply(a: Mat4, b: Mat4) Mat4 {
     return out;
 }
 
+/// Inverts a 4x4 matrix using Gauss-Jordan elimination.
+///
+/// Returns `null` when the matrix is singular (no pivot large enough).
+/// Column-major layout: element (row r, col c) is `m[c * 4 + r]`.
+pub fn mat4Inverse(m: Mat4) ?Mat4 {
+    // Work row-major for clarity: a[r * 4 + c] = element at row r, col c.
+    var a: [16]f32 = undefined;
+    var r: usize = 0;
+    while (r < 4) : (r += 1) {
+        var c: usize = 0;
+        while (c < 4) : (c += 1) {
+            a[r * 4 + c] = m[c * 4 + r];
+        }
+    }
+    // Augment with identity.
+    var inv: [16]f32 = undefined;
+    r = 0;
+    while (r < 4) : (r += 1) {
+        var c: usize = 0;
+        while (c < 4) : (c += 1) {
+            inv[r * 4 + c] = if (r == c) 1.0 else 0.0;
+        }
+    }
+    // Gauss-Jordan elimination with partial pivoting.
+    var col: usize = 0;
+    while (col < 4) : (col += 1) {
+        // Find pivot: largest absolute value in this column at or below the diagonal.
+        var pivot_row: usize = col;
+        var max_val = @abs(a[col * 4 + col]);
+        var rr: usize = col + 1;
+        while (rr < 4) : (rr += 1) {
+            const v = @abs(a[rr * 4 + col]);
+            if (v > max_val) {
+                max_val = v;
+                pivot_row = rr;
+            }
+        }
+        if (max_val < 1e-8) return null;
+        // Swap rows if needed.
+        if (pivot_row != col) {
+            var cc: usize = 0;
+            while (cc < 4) : (cc += 1) {
+                const tmp = a[col * 4 + cc];
+                a[col * 4 + cc] = a[pivot_row * 4 + cc];
+                a[pivot_row * 4 + cc] = tmp;
+                const tmp2 = inv[col * 4 + cc];
+                inv[col * 4 + cc] = inv[pivot_row * 4 + cc];
+                inv[pivot_row * 4 + cc] = tmp2;
+            }
+        }
+        // Normalize pivot row.
+        const inv_pivot = 1.0 / a[col * 4 + col];
+        var cc: usize = 0;
+        while (cc < 4) : (cc += 1) {
+            a[col * 4 + cc] *= inv_pivot;
+            inv[col * 4 + cc] *= inv_pivot;
+        }
+        // Eliminate this column from all other rows.
+        rr = 0;
+        while (rr < 4) : (rr += 1) {
+            if (rr == col) continue;
+            const factor = a[rr * 4 + col];
+            cc = 0;
+            while (cc < 4) : (cc += 1) {
+                a[rr * 4 + cc] -= factor * a[col * 4 + cc];
+                inv[rr * 4 + cc] -= factor * inv[col * 4 + cc];
+            }
+        }
+    }
+    // Convert back to column-major: result[c * 4 + r] = inv[r * 4 + c].
+    var result: Mat4 = undefined;
+    r = 0;
+    while (r < 4) : (r += 1) {
+        var c: usize = 0;
+        while (c < 4) : (c += 1) {
+            result[c * 4 + r] = inv[r * 4 + c];
+        }
+    }
+    return result;
+}
+
 /// Build a local TRS matrix `T * R * S` from a `Transform`. The rotation
 /// quaternion is normalized first; a zero-length quaternion becomes identity.
 pub fn fromTransform(t: Transform) Mat4 {
@@ -440,4 +521,25 @@ test "euler: quatFromEuler with zero axis-like angles yields identity-like quate
     try testing.expectApproxEqAbs(@as(f32, 0), q[1], eps);
     try testing.expectApproxEqAbs(@as(f32, 0), q[2], eps);
     try testing.expectApproxEqAbs(@as(f32, 1), q[3], eps);
+}
+
+test "mat4Inverse: identity inverts to identity" {
+    const inv = mat4Inverse(identity()) orelse return;
+    try testing.expect(approxEqual(inv, identity(), eps));
+}
+
+test "mat4Inverse: matrix times its inverse is identity" {
+    const m = fromTransform(.{
+        .position = .{ 1, 2, 3 },
+        .rotation = quatFromAxisAngle(.{ 0, 1, 0 }, 0.7),
+        .scale = .{ 2, 1, 3 },
+    });
+    const inv = mat4Inverse(m) orelse return;
+    const product = multiply(m, inv);
+    try testing.expect(approxEqual(product, identity(), eps));
+}
+
+test "mat4Inverse: singular matrix returns null" {
+    const zero: Mat4 = @splat(0);
+    try testing.expect(mat4Inverse(zero) == null);
 }

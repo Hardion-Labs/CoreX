@@ -100,6 +100,9 @@ pub const State = struct {
     /// row it is released over. Only the row it started from is remembered, because a press
     /// already resolved against the previous frame's widget table.
     tree_drag: tree.Drag = .{},
+    /// The drag-to-orbit gesture in the viewport, if any: the press position and the
+    /// previous frame's pointer position, used to turn pointer motion into camera orbit.
+    viewport_drag: ViewportDrag = .{},
     theme: Theme = .{},
     /// Set when the user clicked an entity this frame, so a caller can react
     /// (re-frame the camera, save the selection, ...) without diffing by hand.
@@ -987,6 +990,33 @@ fn focusStep(ctx: *widgets.Context, state: *State) void {
 /// Shortcuts are a *convenience* over the same three functions a menu or a test would
 /// call — they add no behaviour of their own.
 fn applyShortcuts(ctx: *widgets.Context, state: *State, scene: anytype, history: anytype, gpa: std.mem.Allocator, dock: Dock) void {
+    // Viewport drag-to-orbit: a press on the viewport starts the gesture.
+    if (ctx.input.pointer_pressed and state.dock_focus == .viewport and dock.viewport.containsPoint(ctx.input.pointer)) {
+        state.viewport_drag.begin(ctx.input.pointer);
+        return;
+    }
+    // A release finalizes the gesture: a click (no movement) selects; a drag already orbited.
+    if (ctx.input.pointer_released and state.viewport_drag.active) {
+        const was_drag = state.viewport_drag.end(ctx.input.pointer);
+        state.viewport_drag.cancel();
+        if (!was_drag) {
+            // No movement: click-to-select the entity under the pointer.
+            pickEntity(state, scene, gpa, ctx.input.pointer, dock.viewport);
+        }
+        return;
+    }
+    // While dragging, orbit from the pointer's movement.
+    if (state.viewport_drag.active and ctx.input.pointer_down and dock.viewport.containsPoint(ctx.input.pointer)) {
+        const delta_x = @as(f32, @floatFromInt(ctx.input.pointer.x)) - @as(f32, @floatFromInt(state.viewport_drag.previous.x));
+        const delta_y = @as(f32, @floatFromInt(ctx.input.pointer.y)) - @as(f32, @floatFromInt(state.viewport_drag.previous.y));
+        state.viewport_drag.previous = ctx.input.pointer;
+        const sensitivity: f32 = 0.005;
+        cameraCommand(state, scene, history, gpa, .{ .orbit = .{
+            .yaw = -delta_x * sensitivity,
+            .pitch = delta_y * sensitivity,
+        } });
+        return;
+    }
     if (ctx.input.modifiers.ctrl) {
         const key = ctx.input.key orelse return;
         switch (key) {
@@ -1146,6 +1176,40 @@ const Orbit = struct { yaw: f32, pitch: f32 };
 /// `frame_camera.min_distance` so the eye never enters its own target.
 const Zoom = struct { factor: f32 };
 
+/// The viewport's drag-to-orbit gesture: one press on the viewport, then movement.
+///
+/// Kept as a value with `begin`/`cancel` so the rules (a drag needs movement to
+/// count as a drag; a press that never moves is a click) are testable without a
+/// pointer, exactly like `tree.Drag`. The shell owns the state; this owns the meaning.
+pub const ViewportDrag = struct {
+    /// Position where the press landed, in canvas coordinates.
+    start: canvas.Point = .{},
+    /// Position of the pointer in the previous frame, in canvas coordinates.
+    previous: canvas.Point = .{},
+    /// Whether a drag is currently in progress.
+    active: bool = false,
+
+    /// Start a drag from `pos`, in canvas coordinates.
+    pub fn begin(self: *ViewportDrag, pos: canvas.Point) void {
+        self.start = pos;
+        self.previous = pos;
+        self.active = true;
+    }
+
+    /// End the gesture. Returns `true` when the pointer moved enough to count as a
+    /// drag (rather than a click), so the caller knows whether to do a pick.
+    pub fn end(self: *ViewportDrag, pos: canvas.Point) bool {
+        const moved = @abs(@as(f32, @floatFromInt(pos.x - self.start.x))) > 2.0 or @abs(@as(f32, @floatFromInt(pos.y - self.start.y))) > 2.0;
+        self.active = false;
+        return moved;
+    }
+
+    /// Cancel the gesture without applying anything.
+    pub fn cancel(self: *ViewportDrag) void {
+        self.active = false;
+    }
+};
+
 /// The viewport's keyboard commands: frame the whole scene, frame the selection, orbit.
 ///
 /// Framing reads the scene's geometry (`frame_camera.bounds`) and writes the camera entity's
@@ -1261,6 +1325,66 @@ fn findCameraEntity(scene: anytype) ?@TypeOf(scene.entityById(0).?) {
         return entry[0];
     }
     return null;
+}
+
+/// Selects the rendered entity under the pointer in the viewport, if any.
+///
+/// Casts a pick ray from the camera through the screen coordinate and tests it
+/// against every entity's world-space bounding box. The nearest hit wins.
+fn pickEntity(
+    state: *State,
+    scene: anytype,
+    gpa: std.mem.Allocator,
+    pointer: canvas.Point,
+    viewport: Rect,
+) void {
+    const camera = findCameraEntity(scene) orelse return;
+    const cam = render_scene.EngineRenderer.cameraOf(scene, camera, gpa) catch return orelse return;
+    const inv_vp = transform_mod.mat4Inverse(cam.view_projection) orelse return;
+
+    // Convert pointer coordinates to NDC relative to the viewport.
+    const ndc_x = @as(f32, @floatFromInt(2 * (pointer.x - viewport.x))) / @as(f32, @floatFromInt(viewport.w)) - 1.0;
+    const ndc_y = 1.0 - @as(f32, @floatFromInt(2 * (pointer.y - viewport.y))) / @as(f32, @floatFromInt(viewport.h));
+
+    const ray = frame_camera.pickRay(ndc_x, ndc_y, inv_vp, cam.position) orelse return;
+
+    var world = scene.computeWorldTransforms(gpa) catch return;
+    defer world.deinit();
+
+    var view = scene.ecsWorld().view(.{ render_scene.Transform, render_scene.Renderable });
+    var best_id: u64 = 0;
+    var best_t: f32 = std.math.inf(f32);
+    while (view.next()) |entry| {
+        const entity = entry[0];
+        const m = world.get(entity) orelse continue;
+        // Build the entity's world-space bounds from the local unit box.
+        var min: [3]f32 = .{ std.math.inf(f32), std.math.inf(f32), std.math.inf(f32) };
+        var max: [3]f32 = .{ -std.math.inf(f32), -std.math.inf(f32), -std.math.inf(f32) };
+        var corner: usize = 0;
+        while (corner < 8) : (corner += 1) {
+            const local: [3]f32 = .{
+                if (corner & 1 == 0) -0.5 else 0.5,
+                if (corner & 2 == 0) -0.5 else 0.5,
+                if (corner & 4 == 0) -0.5 else 0.5,
+            };
+            const p = transform_mod.transformPoint(m, local);
+            for (0..3) |i| {
+                min[i] = @min(min[i], p[i]);
+                max[i] = @max(max[i], p[i]);
+            }
+        }
+        const bounds = frame_camera.Bounds{ .min = min, .max = max };
+        const t = frame_camera.rayIntersectsBounds(ray, bounds) orelse continue;
+        if (t < best_t) {
+            best_t = t;
+            best_id = scene.idOf(entity) orelse continue;
+        }
+    }
+    if (best_id != 0) {
+        state.selected = best_id;
+        state.selection_changed = true;
+        state.name_owner = 0; // the inspector must reload for the new entity
+    }
 }
 
 /// Whether an entity has any children, which is what decides if Enter has anything to fold.
@@ -2984,4 +3108,83 @@ test "editor: the focused dock is outlined so Tab's effect is visible" {
     try testing.expectEqual(accent, h.pixel(dock.inspector.x, dock.inspector.y));
     const viewport_after = h.pixel(dock.viewport.x, dock.viewport.y);
     try testing.expect(!std.mem.eql(u8, &accent, &viewport_after));
+}
+
+test "editor: viewport drag start/end detects movement vs click" {
+    var drag: ViewportDrag = .{};
+    const start = canvas.Point{ .x = 100, .y = 100 };
+
+    drag.begin(start);
+    try testing.expect(drag.active);
+    try testing.expectEqual(start, drag.start);
+    try testing.expectEqual(start, drag.previous);
+
+    // No movement: end reports false (it was a click).
+    const no_move = drag.end(start);
+    try testing.expect(!no_move);
+    try testing.expect(!drag.active);
+
+    // Movement: end reports true (it was a drag).
+    drag.begin(start);
+    const moved = canvas.Point{ .x = 105, .y = 100 };
+    const was_drag = drag.end(moved);
+    try testing.expect(was_drag);
+    try testing.expect(!drag.active);
+}
+
+test "editor: viewport drag cancel clears the gesture" {
+    var drag: ViewportDrag = .{};
+    drag.begin(canvas.Point{ .x = 10, .y = 10 });
+    try testing.expect(drag.active);
+    drag.cancel();
+    try testing.expect(!drag.active);
+}
+
+test "editor: a click on the viewport with no movement selects nothing under an empty pointer" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.runFrames(1);
+    h.state.dock_focus = .viewport;
+
+    const dock = Dock.compute(h.ctx.canvas.bounds());
+    const vx = dock.viewport.x + 10;
+    const vy = dock.viewport.y + 10;
+
+    // Press and release at the same point: a click, but nothing rendered there.
+    h.click(vx, vy);
+    h.release(vx, vy);
+    try testing.expectEqual(@as(u64, 0), h.state.selected);
+    try testing.expectEqual(@as(usize, 0), h.history.undoDepth());
+}
+
+test "editor: dragging in the viewport orbits the camera" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.runFrames(1);
+    h.state.dock_focus = .viewport;
+
+    const dock = Dock.compute(h.ctx.canvas.bounds());
+    const start_x = dock.viewport.x + 10;
+    const start_y = dock.viewport.y + 10;
+
+    // Press starts the drag.
+    h.click(start_x, start_y);
+    try testing.expect(h.state.viewport_drag.active);
+
+    // Move the pointer with the button down: drag-to-orbit updates the camera view.
+    const move_x = start_x + 40;
+    const move_y = start_y + 20;
+    const before = h.state.camera_view;
+    h.frameInput(.{
+        .pointer = .{ .x = move_x, .y = move_y },
+        .pointer_in_window = true,
+        .pointer_down = true,
+    }, &h.state);
+    // Release finalizes the drag (movement happened, so no pick).
+    h.release(move_x, move_y);
+    try testing.expect(!h.state.viewport_drag.active);
+    // The camera direction should have changed from the drag (orbit swings the direction).
+    try testing.expect(before.direction[0] != h.state.camera_view.direction[0] or before.direction[1] != h.state.camera_view.direction[1] or before.direction[2] != h.state.camera_view.direction[2]);
 }

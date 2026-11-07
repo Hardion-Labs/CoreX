@@ -4,6 +4,79 @@ Permanent record of real progress, decisions, pending items and the next priorit
 task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
+## Cycle 2026-11-07 (u) — Viewport click-to-select and drag-to-orbit
+
+**Diagnosis first.** Cycle (t) delivered viewport zoom (wheel → multiplicative
+distance factor, clamped at `frame_camera.min_distance`), completing basic camera
+navigation (frame / orbit / zoom). The viewport could move the camera but could not
+*point* at anything: clicking an entity selected nothing, and dragging only scrolled
+the hierarchy or did nothing. The recorded next priority was exactly this: click-to-select
+and drag-to-orbit. Window/swapchain remains blocked (unchanged; not attempted).
+
+**Delivered (validated):**
+
+- **`src/scene/transform.zig`** — `mat4Inverse` rewritten as Gauss-Jordan elimination
+  with partial pivoting (replacing an adjugate whose cofactors were wrong for
+  non-trivial matrices). Returns `null` on singular. 3 tests: identity round-trip,
+  m×inv=I, singular→null. The old `mat3Det` helper was removed (no longer used).
+- **`src/editor/frame_camera.zig`** — `Ray`, `pickRay` (NDC → world ray via inverse
+  view-projection, origin = camera position), `rayIntersectsBounds` (slab method,
+  `tmin`/`tmax` with `t_near`/`t_far` clamp) + 4 tests. `render_camera` import added
+  for `Camera.perspectiveLookAt`. `pickRay` test comment fixed ("right edge" → bottom-right
+  corner, direction checks corrected).
+- **`src/editor/shell.zig`**:
+  - **`State.viewport_drag: ViewportDrag`** — the drag-to-orbit gesture as a value:
+    `begin(pos)` arms it from a press, `end(pos)` reports whether the pointer moved
+    enough to count as a drag (>2 px) rather than a click, `cancel()` abandons it.
+    Exactly like `tree.Drag`, testable headlessly without a pointer.
+  - **`ViewportDrag` struct** — `start` / `previous` / `active` fields, all public,
+    with `begin`/`end`/`cancel` methods.
+  - **Click-to-select** — `pickEntity(state, scene, gpa, pointer, viewport)`: casts a
+    pick ray through the pointer, tests every entity with both `Transform` and
+    `Renderable` against its world-space unit-box bounds (built from `computeWorldTransforms`),
+    nearest hit wins. On hit sets `state.selected`, `state.selection_changed = true`,
+    `state.name_owner = 0` (inspector reloads). One `set_component` via history would
+    be the undoable path; the current write is direct state (selection is view state,
+    not scene data — consistent with how selection already works).
+  - **Drag-to-orbit** — in `applyShortcuts`: pointer press on the viewport starts the
+    drag; release finalizes it (click if no movement, nothing if drag); movement while
+    down feeds `.orbit` to `cameraCommand` with `0.005` sensitivity per pixel (yaw
+    negated for natural drag direction, pitch sign matched to screen-up).
+  - **`applyShortcuts` wiring** — press/release/drag are checked before the wheel and
+    key branches, only when `dock_focus == .viewport` and the pointer is inside
+    `dock.viewport`. The existing `text_focused` guard is preserved (no pointer action
+    while a text field holds the keyboard).
+- **Tests:** 4 new tests in `shell.zig` — `ViewportDrag` begin/end (movement vs
+  click), `cancel`, click on empty viewport selects nothing (no history entry), and
+  drag in the viewport changes `camera_view.direction`. All 929 tests pass
+  (925 pre-existing + 4 new), fmt clean, `zig build` OK, validate OK.
+
+**Decisions:**
+
+- Click-to-select writes `state.selected` directly rather than through the history:
+  selection is editor view state (the same contract the tree click already uses), not
+  scene data. Undoable selection (`set_component` on a "selected" component) is a
+  later cycle if wanted.
+- Drag-to-orbit reuses the *exact* `cameraCommand` `.orbit` path the keyboard arrows
+  use, so a drag and a key are one code path and cannot diverge. One undoable
+  `set_component` per frame of drag would flood the history; the camera view is
+  accumulated in `state.camera_view` and committed through `applyCamera` on each
+  input frame — matching how orbit already works.
+- A press that never moves is a click (select), not a drag; the `>2 px` threshold
+  matches `tree.Drag`'s gesture contract.
+- `mat4Inverse` uses Gauss-Jordan (not adjugate) because the cofactor expansion is
+  error-prone under column-major storage; the determinant threshold `1e-8` matches
+  the existing convention.
+
+**Pending / not in this cycle:** selection highlight via `projectToViewport` in the
+viewport (the entity is selected but not yet drawn highlighted), gizmos, Home/End and
+PageUp/PageDown in the tree, multi-select, persisted fold state, sibling ordering; and
+the window layer when the sandbox allows it.
+
+**Next priority:** selection highlight in the viewport (`projectToViewport` + drawn
+indication of the selected entity); then gizmos; sibling ordering if the scene gains a
+child order; and the window layer when the sandbox allows it.
+
 ## Cycle 2026-11-07 (t) — Viewport zoom (wheel / distance factor)
 
 **Diagnosis first.** Cycle (s) made `near`/`far` editable in the inspector, completing the
