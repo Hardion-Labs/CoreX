@@ -42,6 +42,76 @@ pub const Row = struct {
     collapsed: bool = false,
 };
 
+/// The reparent gesture: one press on a row, one release on another.
+///
+/// Kept as a value with a `begin`/`end` pair so the rules (a drag needs two different
+/// rows, a drop on the dragged row or on its current parent is not an edit, a drop that
+/// would create a cycle is refused *before* a command exists) are testable without a
+/// pointer, exactly like `step` and `apply`. The shell owns the state; this owns the
+/// meaning.
+pub const Drag = struct {
+    /// The row the press landed on, or 0 when no drag is in progress.
+    source: u64 = 0,
+
+    /// Start a drag from `id`, unless the row cannot be dragged.
+    ///
+    /// Returns whether a drag started: dragging row 0 (nothing) is not a drag, and
+    /// starting a second drag from the same press would replace the first mid-gesture.
+    pub fn begin(self: *Drag, id: u64) bool {
+        if (id == 0) return false;
+        if (self.source != 0) return false;
+        self.source = id;
+        return true;
+    }
+
+    /// Drop the dragged row onto `target` (`null` = the panel's empty area, i.e. root).
+    ///
+    /// Always ends the gesture, so a failed drop does not leave the tree holding a drag
+    /// the user has already released. Returns the action to apply — `.none` when the
+    /// drop changes nothing — so the caller has one path for every outcome.
+    pub fn end(self: *Drag, target: ?u64, scene: anytype) Action {
+        const source = self.source;
+        self.source = 0;
+        if (source == 0) return .none;
+        // Dropping a node on itself is not a move...
+        if (target) |t| if (t == source) return .none;
+        // ...nor is dropping a folded row onto its own hidden descendant, which would move
+        // a subtree inside a branch the user cannot see. The check is against the *chain*,
+        // not just the direct parent: the scene would refuse the cycle afterwards, but a
+        // gesture that can never do anything should not record a command that fails.
+        if (target) |t| if (isAncestor(scene, source, t)) return .none;
+        // A reparent already in that place is not an edit; `apply` repeats the check so a
+        // direct call has the same meaning.
+        return .{ .reparent = target };
+    }
+
+    /// Cancel the gesture (Escape, or a host that lost the pointer).
+    pub fn cancel(self: *Drag) void {
+        self.source = 0;
+    }
+
+    pub fn active(self: Drag) bool {
+        return self.source != 0;
+    }
+};
+
+/// Whether `id` is `descendant` itself or above it in the parent chain.
+///
+/// The bounded walk is the same one `Scene.setParent` uses to refuse a cycle; doing it here
+/// as well is what lets a drop that cannot work be reported as a refusal *before* a command
+/// is created, instead of as a history failure after one.
+pub fn isAncestor(scene: anytype, id: u64, descendant: u64) bool {
+    var current: ?u64 = descendant;
+    var steps: usize = 0;
+    while (current) |cid| {
+        if (cid == id) return true;
+        if (steps == max_depth) return false;
+        steps += 1;
+        current = scene.parentIdOf(cid);
+    }
+    return false;
+}
+
 /// The set of collapsed entities, kept inline.
 ///
 /// A tree with 64 folded branches is already unmanageable in a 150 px panel, and a fixed
@@ -416,6 +486,11 @@ pub fn apply(
             if (row == 0) return .{};
             // Dropping a node on itself or on its current parent is not an edit.
             if (parent != null and parent.? == row) return .{};
+            if (parent) |p| {
+                // A drop that would move a subtree inside itself is refused here, before a
+                // command exists, so the history never records an edit that cannot apply.
+                if (isAncestor(scene, row, p)) return .{ .failure = error.ParentCycle };
+            }
             const current = scene.parentIdOf(row);
             const same_parent = if (current) |c| (parent != null and parent.? == c) else parent == null;
             if (same_parent) return .{};
@@ -914,4 +989,142 @@ test "tree navigation: down past the caller's window still finds the next row" {
     build(&scene, &list);
     try testing.expectEqual(ids[2], list.rows[0].id);
     try testing.expectEqual(ids[1], step(&scene, list.rows[0..list.len], ids[2], .previous, &collapsed, 100).id);
+}
+
+test "drag: a press and a release on different rows is one reparent command" {
+    const testing = std.testing;
+    const scene_mod = @import("../scene/scene.zig");
+    const components = @import("../scene/components.zig");
+    const edit = @import("edit.zig");
+    const Scene = scene_mod.Scene(.{scene_mod.Component(components.Transform, "transform")});
+    const History = edit.History(Scene);
+
+    var scene = try Scene.init(testing.allocator, "level");
+    defer scene.deinit();
+    var history = History.init(testing.allocator);
+    defer history.deinit();
+    var collapsed = Collapsed{};
+
+    const a = try scene.createEntity("a", null);
+    const a_id = scene.idOf(a).?;
+    const b = try scene.createEntity("b", null);
+    const b_id = scene.idOf(b).?;
+
+    var drag = Drag{};
+    try testing.expect(drag.begin(a_id));
+    // A second press during the same gesture does not retarget it.
+    try testing.expect(!drag.begin(b_id));
+    try testing.expect(drag.active());
+
+    const action = drag.end(b_id, &scene);
+    try testing.expect(!drag.active());
+    const effect = apply(action, a_id, &collapsed, &scene, &history);
+    try testing.expect(effect.changed);
+    try testing.expectEqual(b_id, scene.parentIdOf(a_id).?);
+    try testing.expectEqual(@as(usize, 1), history.undoDepth());
+
+    // One undo puts the row back as a root: the drop was an ordinary edit.
+    try history.undo(&scene);
+    try testing.expectEqual(@as(?u64, null), scene.parentIdOf(a_id));
+}
+
+test "drag: dropping on the empty area makes a root, and a useless drop records nothing" {
+    const testing = std.testing;
+    const scene_mod = @import("../scene/scene.zig");
+    const components = @import("../scene/components.zig");
+    const edit = @import("edit.zig");
+    const Scene = scene_mod.Scene(.{scene_mod.Component(components.Transform, "transform")});
+    const History = edit.History(Scene);
+
+    var scene = try Scene.init(testing.allocator, "level");
+    defer scene.deinit();
+    var history = History.init(testing.allocator);
+    defer history.deinit();
+    var collapsed = Collapsed{};
+
+    const parent = try scene.createEntity("parent", null);
+    const parent_id = scene.idOf(parent).?;
+    const child = try scene.createEntity("child", parent_id);
+    const child_id = scene.idOf(child).?;
+
+    // Dropping a child on its own parent changes nothing: no command, no dirty flag.
+    var drag = Drag{};
+    _ = drag.begin(child_id);
+    const on_parent = drag.end(parent_id, &scene);
+    const effect = apply(on_parent, child_id, &collapsed, &scene, &history);
+    try testing.expect(!effect.changed);
+    try testing.expectEqual(@as(usize, 0), history.undoDepth());
+    try testing.expectEqual(parent_id, scene.parentIdOf(child_id).?);
+
+    // Dropping a row on itself is not a drag that goes anywhere either.
+    _ = drag.begin(child_id);
+    const on_self = drag.end(child_id, &scene);
+    try testing.expect(!apply(on_self, child_id, &collapsed, &scene, &history).changed);
+    try testing.expectEqual(@as(usize, 0), history.undoDepth());
+
+    // Dropping on the blank panel area means "make it a root".
+    _ = drag.begin(child_id);
+    const to_root = drag.end(null, &scene);
+    try testing.expect(apply(to_root, child_id, &collapsed, &scene, &history).changed);
+    try testing.expectEqual(@as(?u64, null), scene.parentIdOf(child_id));
+    try testing.expectEqual(@as(usize, 1), history.undoDepth());
+}
+
+test "drag: a drop that would build a cycle is refused before a command exists" {
+    const testing = std.testing;
+    const scene_mod = @import("../scene/scene.zig");
+    const components = @import("../scene/components.zig");
+    const edit = @import("edit.zig");
+    const Scene = scene_mod.Scene(.{scene_mod.Component(components.Transform, "transform")});
+    const History = edit.History(Scene);
+
+    var scene = try Scene.init(testing.allocator, "level");
+    defer scene.deinit();
+    var history = History.init(testing.allocator);
+    defer history.deinit();
+    var collapsed = Collapsed{};
+
+    const root = try scene.createEntity("root", null);
+    const root_id = scene.idOf(root).?;
+    const mid = try scene.createEntity("mid", root_id);
+    const mid_id = scene.idOf(mid).?;
+    const leaf = try scene.createEntity("leaf", mid_id);
+    const leaf_id = scene.idOf(leaf).?;
+
+    try testing.expect(isAncestor(&scene, root_id, leaf_id));
+    try testing.expect(!isAncestor(&scene, leaf_id, root_id));
+
+    // Dragging the root onto its own grandchild would move a subtree inside itself.
+    var drag = Drag{};
+    _ = drag.begin(root_id);
+    const action = drag.end(leaf_id, &scene);
+    try testing.expectEqual(Action.none, action);
+    const effect = apply(action, root_id, &collapsed, &scene, &history);
+    try testing.expect(!effect.changed);
+    try testing.expectEqual(@as(usize, 0), history.undoDepth());
+    try testing.expectEqual(@as(?u64, null), scene.parentIdOf(root_id));
+
+    // A direct `apply` reports the refusal instead of silently doing nothing.
+    const direct = apply(.{ .reparent = leaf_id }, root_id, &collapsed, &scene, &history);
+    try testing.expectEqual(error.ParentCycle, direct.failure.?);
+    try testing.expectEqual(@as(usize, 0), history.undoDepth());
+}
+
+test "drag: cancel ends the gesture without an action" {
+    const testing = std.testing;
+    const scene_mod = @import("../scene/scene.zig");
+    const components = @import("../scene/components.zig");
+    const Scene = scene_mod.Scene(.{scene_mod.Component(components.Transform, "transform")});
+
+    var scene = try Scene.init(testing.allocator, "level");
+    defer scene.deinit();
+    const e = try scene.createEntity("e", null);
+    const id = scene.idOf(e).?;
+
+    var drag = Drag{};
+    _ = drag.begin(id);
+    drag.cancel();
+    try testing.expect(!drag.active());
+    // A release after a cancel is not a drop: there is nothing being dragged.
+    try testing.expectEqual(Action.none, drag.end(null, &scene));
 }

@@ -805,14 +805,15 @@ In the shell: click the name, a position or a scale field, type, press `Enter` t
 one undoable step (`Escape` discards it); `Ctrl+Z` undo, `Ctrl+Y` / `Ctrl+Shift+Z` redo,
 `Delete` delete the selection, `Escape` clear it. In the hierarchy, `+` (or `N`) adds a
 child, `P` makes the selection a root, `Enter` folds/unfolds a branch, arrow keys walk the
-visible rows (`Right`/`Left` unfold and enter, fold and leave), and the disclosure arrow
-and the wheel work with the pointer. `Tab` / `Shift+Tab` walk the keyboard focus across the
+visible rows (`Right`/`Left` unfold and enter, fold and leave), dragging a row onto another
+one reparents it (onto the blank area, makes it a root), and the disclosure arrow and the
+wheel work with the pointer. `Tab` / `Shift+Tab` walk the keyboard focus across the
 docks (the focused dock is outlined). In the viewport, `F` frames the whole scene, `Shift+F`
 frames the selection and the arrows orbit — the camera move is an ordinary undoable edit.
 
 Limits: no window or real input, rotation and camera fields are read-only (the model
 already carries `set_component`), the history is in-memory and not persisted, no field
-scrubbing, no viewport zoom or pointer camera control, no drag-and-drop reparenting, no persisted fold
+scrubbing, no viewport zoom or pointer camera control, no sibling reordering by drag, no persisted fold
 state, no multi-select, no gizmos or camera controls, fixed dock widths. See
 [`docs/editor-shell.md`](docs/editor-shell.md).
 
