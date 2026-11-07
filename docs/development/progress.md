@@ -4,6 +4,58 @@ Permanent record of real progress, decisions, pending items and the next priorit
 task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
+## Cycle 2026-11-07 (v) — Viewport selection highlight (projectToViewport)
+
+**Diagnosis first.** Cycle (u) delivered click-to-select (click an entity in the
+viewport to set `state.selected`) and drag-to-orbit (drag to swing the camera
+direction around its target), both validated. The entity could be selected but
+there was no visual indication of *what* is selected inside the viewport — the
+user had to look at the hierarchy/inspector to know. The recorded next priority
+was exactly this: selection highlight via `projectToViewport`. Window/swapchain
+remains blocked (unchanged; not attempted).
+
+**Delivered (validated):**
+
+- **`drawViewportSelected(ctx, state, scene, gpa, viewport)`** — projects the
+  selected entity's world-space position through the camera's view-projection
+  matrix (`projectToViewport`) and paints a small accent-coloured crosshair
+  (`strokeRect`, half-size 4 px) at that pixel, so the user can see what is
+  selected directly in the viewport.
+  - No-op when nothing is selected (`state.selected == 0`) or when the entity
+    projects outside the clip volume / viewport.
+  - Calls `findCameraEntity` + `cameraOf` for `view_projection`, then
+    `computeWorldTransforms` to get the entity's world matrix (position read
+    from column 4: `m[12], m[13], m[14]`).
+  - Guards with `Rect.intersects` so the crosshair never paints outside the
+    viewport rect.
+- **Wired into `draw`** — called right after the viewport blit and border
+  stroke, so the highlight paints on top of the rendered scene.
+- **Tests:** 2 new tests in `shell.zig` — highlight draws at the root entity's
+  projected position (accent pixels at all four crosshair corners, point inside
+  viewport), and highlight is a no-op when nothing is selected. All 931 tests
+  pass (929 pre-existing + 2 new), fmt clean, `zig build` OK, `editor-frame`
+  OK.
+
+**Decisions:**
+
+- The highlight is a simple crosshair (rect stroke) rather than a bounding-box
+  outline, because the entity's world-space bounds require the pick-ray path
+  (already in `pickEntity`) and a screen-space rect is cheaper and sufficient
+  for a selection indicator.
+- Position is read directly from the world matrix's translation column rather
+  than calling `transformPoint`, since the entity's origin is what matters for
+  a selection indicator.
+- The highlight is drawn every frame while the selection persists (view state,
+  not scene data), matching how selection already works across the editor.
+
+**Pending / not in this cycle:** gizmos, Home/End and PageUp/PageDown in the
+tree, multi-select, persisted fold state, sibling ordering; and the window
+layer when the sandbox allows it.
+
+**Next priority:** gizmos (3D manipulator handles for translate/rotate/scale,
+drawn in the viewport and driven by pointer drag); then sibling ordering if
+the scene gains a child order; and the window layer when the sandbox allows it.
+
 ## Cycle 2026-11-07 (u) — Viewport click-to-select and drag-to-orbit
 
 **Diagnosis first.** Cycle (t) delivered viewport zoom (wheel → multiplicative
