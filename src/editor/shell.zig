@@ -704,6 +704,22 @@ fn applyShortcuts(ctx: *widgets.Context, state: *State, scene: anytype, history:
         runTreeAction(state, scene, history, .{ .reparent = null }, state.selected);
         return;
     }
+    // Arrow keys navigate the visible tree. They are resolved against the same row list
+    // the panel paints, so a step can never land on a row the user cannot see.
+    if (ctx.input.key) |key| {
+        const step_opt: ?tree.Step = switch (key) {
+            .down => .next,
+            .up => .previous,
+            .right => .into,
+            .left => .out,
+            else => null,
+        };
+        if (step_opt) |step_kind| {
+            navigateTree(state, scene, history, step_kind);
+            return;
+        }
+    }
+
     // Enter on a selection folds or unfolds its branch, if it has one.
     if (ctx.keyPressed(.enter)) {
         const selected = if (state.selected != 0) scene.entityById(state.selected) else null;
@@ -713,6 +729,37 @@ fn applyShortcuts(ctx: *widgets.Context, state: *State, scene: anytype, history:
         return;
     }
     if (ctx.keyPressed(.escape)) state.selected = 0;
+}
+
+/// Resolve one arrow-key step and fold the result into the editor state.
+///
+/// The row list is rebuilt here (bounded, allocation-free) because the shortcut pass runs
+/// after the panels: passing the painted list would mean keeping a 512-entry array alive
+/// across the frame for one keystroke. `revealSelection` then scrolls the window to
+/// whatever the step selected, so the selection is always on screen.
+fn navigateTree(state: *State, scene: anytype, history: anytype, kind: tree.Step) void {
+    _ = history;
+    var rows: [tree.max_rows]tree.Row = undefined;
+    // A window wide enough for the step's own line plus its neighbours; the model falls
+    // back to `indexOf` beyond it, so this is a cost bound, not a correctness one.
+    var list = tree.List{
+        .rows = &rows,
+        .visible = @min(state.rows_per_frame, tree.max_rows),
+        .collapsed = &state.collapsed,
+    };
+    tree.build(scene, &list);
+    const move = tree.step(scene, list.rows[0..list.len], state.selected, kind, &state.collapsed, tree.max_rows);
+    if (!move.moved) return;
+    if (move.id != 0 and move.id != state.selected) {
+        state.selected = move.id;
+        state.name_owner = 0;
+        state.selection_changed = true;
+    }
+    if (move.folded) {
+        // A fold can hide the current selection's row without deselecting it; keep the
+        // selected entity, but make sure the window is not left showing a stale slice.
+        revealSelection(state, scene, list.visible, &state.collapsed);
+    }
 }
 
 /// Whether an entity has any children, which is what decides if Enter has anything to fold.
@@ -1628,4 +1675,91 @@ test "editor: a failed tree action is reported instead of looking like a no-op" 
     // The tree did not change and nothing was recorded.
     try testing.expect(h.scene.parentIdOf(h.root_id) == null);
     try testing.expectEqual(@as(usize, 0), h.history.undoDepth());
+}
+
+test "editor: arrow keys walk the tree, and arrows in a text field do not" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.state.selected = h.root_id;
+    h.runFrames(1);
+
+    // Down goes to the child row (depth-first), Down again to the next root.
+    h.frameInput(.{ .key = .down }, &h.state);
+    try testing.expectEqual(h.child_id, h.state.selected);
+    h.frameInput(.{ .key = .down }, &h.state);
+    try testing.expectEqual(h.loose_id, h.state.selected);
+    h.frameInput(.{ .key = .up }, &h.state);
+    try testing.expectEqual(h.child_id, h.state.selected);
+
+    // Right on an open, childless row does nothing; Up to the root, then Left folds it.
+    h.state.selected = h.root_id;
+    h.runFrames(1);
+    h.frameInput(.{ .key = .left }, &h.state);
+    try testing.expect(h.state.collapsed.contains(h.root_id));
+    try testing.expectEqual(h.root_id, h.state.selected);
+    // Down from the folded root skips the hidden child.
+    h.frameInput(.{ .key = .down }, &h.state);
+    try testing.expectEqual(h.loose_id, h.state.selected);
+    // Right on the folded root would unfold it, but the selection is elsewhere now.
+    h.state.selected = h.root_id;
+    h.runFrames(1);
+    h.frameInput(.{ .key = .right }, &h.state);
+    try testing.expect(!h.state.collapsed.contains(h.root_id));
+
+    // While a text field has the keyboard, arrows edit text (the field's caret), not the
+    // tree: the selection must not move.
+    h.state.selected = h.root_id;
+    h.runFrames(2);
+    const field = nameFieldRect(&h);
+    const cx = field.right() - 3;
+    h.hover(cx, field.y + 3);
+    h.click(cx, field.y + 3);
+    h.release(cx, field.y + 3);
+    try testing.expect(h.state.name_focused);
+    h.frameInput(.{ .key = .down }, &h.state);
+    try testing.expectEqual(h.root_id, h.state.selected);
+}
+
+test "editor: a keyboard step scrolls its row into view" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    var ids: [30]u64 = @splat(0);
+    var i: usize = 0;
+    while (i < 30) : (i += 1) {
+        const e = try h.scene.createEntity("row", null);
+        ids[i] = h.scene.idOf(e).?;
+    }
+    h.runFrames(2);
+    h.state.selected = 0;
+    try testing.expectEqual(@as(usize, 0), h.state.tree_offset);
+
+    // Walk down past the window; the offset must follow so the selection stays visible.
+    var steps: usize = 0;
+    while (steps < 25) : (steps += 1) h.frameInput(.{ .key = .down }, &h.state);
+    try testing.expect(h.state.tree_offset > 0);
+
+    var rows: [tree.max_rows]tree.Row = undefined;
+    var list = tree.List{ .rows = &rows, .visible = 5, .offset = h.state.tree_offset };
+    tree.build(&h.scene, &list);
+    var found = false;
+    for (list.rows[0..list.len]) |row| {
+        if (row.id == h.state.selected) found = true;
+    }
+    try testing.expect(found);
+}
+
+test "editor: navigation records nothing in the history" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.state.selected = h.root_id;
+    h.runFrames(1);
+    h.frameInput(.{ .key = .down }, &h.state);
+    h.frameInput(.{ .key = .up }, &h.state);
+    h.frameInput(.{ .key = .left }, &h.state);
+    h.frameInput(.{ .key = .right }, &h.state);
+    try testing.expectEqual(@as(usize, 0), h.history.undoDepth());
+    try testing.expect(!h.history.dirty);
 }

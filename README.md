@@ -804,13 +804,14 @@ try edit.saveScene(&history, scene, io, dir, "scenes/main.scene", gpa); // stage
 In the shell: click the name, a position or a scale field, type, press `Enter` to commit
 one undoable step (`Escape` discards it); `Ctrl+Z` undo, `Ctrl+Y` / `Ctrl+Shift+Z` redo,
 `Delete` delete the selection, `Escape` clear it. In the hierarchy, `+` (or `N`) adds a
-child, `P` makes the selection a root, `Enter` folds/unfolds a branch, the disclosure
-arrow and the wheel work with the pointer.
+child, `P` makes the selection a root, `Enter` folds/unfolds a branch, arrow keys walk the
+visible rows (`Right`/`Left` unfold and enter, fold and leave), and the disclosure arrow
+and the wheel work with the pointer.
 
 Limits: no window or real input, rotation and camera fields are read-only (the model
 already carries `set_component`), the history is in-memory and not persisted, no field
-scrubbing, no keyboard tree navigation or drag-and-drop reparenting, no persisted fold
-state, no gizmos or camera controls, fixed dock widths. See
+scrubbing, no Tab focus traversal, no drag-and-drop reparenting, no persisted fold
+state, no multi-select, no gizmos or camera controls, fixed dock widths. See
 [`docs/editor-shell.md`](docs/editor-shell.md).
 
 ## Development
