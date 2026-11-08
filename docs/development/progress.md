@@ -1,29 +1,59 @@
-**Current state:** `main` = `b4f14f0` (merge of PR #79) carrying the
-full-engine audit (PR #75), the AA-scratch bound (PR #76), and the
-`cameraOf` chain-walk (PR #79). Retested **on merged main** in this sandbox:
-**975/975** with a **cold `--cache-dir`** — a warm cache prints
-`3/3 steps succeeded` without re-executing a single test, so a cached step is
-not a retest — plus `zig fmt --check src/ build.zig tools/` clean and the CI
-launch-contract smoke (validate, editor headless, runtime, editor-frame,
-qoi-decode) OK. CI green on all PRs. **Regression status on main: the JPEG
-IDCT vector test fails in ReleaseSafe and ReleaseFast on `ab64c39` itself
-(pre-existing, masked by Debug-only CI); the fix (truncating vector cast)
-makes all three modes green since PR #75.**
+**Current state:** `main` = `90bd281` (merge of PR #80) carrying the full-engine
+audit (PR #75), the AA-scratch bound (PR #76), and the `cameraOf` chain-walk
+(PR #79). Retested **on merged main** in this sandbox: **975/975** with a
+**cold `--cache-dir`**; `zig fmt --check src/ build.zig tools/` clean; CI launch-contract
+smoke OK. CI green on all PRs. **Regression status on main: the JPEG IDCT vector
+test fails in ReleaseSafe and ReleaseFast on `ab64c39` itself (pre-existing,
+masked by Debug-only CI); the fix (truncating vector cast) makes all three
+modes green since PR #75.**
 **Fold-state persistence is decided: do NOT persist.** 2026-11-08, owner's call
-— the editor keeps the status quo (the tree's `revealSelection` already
-unfolds the chain to the selection, which is what makes the status quo
-survivable). View-state persistence is out of the `.scene` contract and out of
-the Hub-owned manifest; revisit only when the editor has a real loop/window,
-as per-user session state outside project files. The evolution proposals at
-the end of cycle (e) remain proposals; none is to be implemented silently.
+— revisit only when the editor has a real loop/window, as per-user session
+state outside project files.
 
-Toolchain note for the next continuation: Zig 0.17.0 lives in a venv under `/tmp`
-(`/tmp/zigvenv`, wrapper `/home/user/zig.sh`), and `/tmp` **is wiped between sessions**,
-so reinstall it before anything else (done again at the start of this cycle; the command
-below still works):
-`python3 -m venv /tmp/zigvenv && /tmp/zigvenv/bin/pip install ziglang==0.17.0` (pip
-warns the wheel is yanked for a partial PyPI upload; the binary is still 0.17.0 and
-works). Window / swapchain remains blocked in this sandbox.
+**Next steps are blocked pending external input:**
+1. **Upstream Zig report (`@intCast` i32vec→u8vec lowers to signed-saturating
+   `vpackssdw`/`vpacksswb` on AVX2, clamping 149→127).** ziglang/zig restricts
+   issue creation to collaborators; this account cannot file it. Full evidence
+   (repro below, disassembly from the CoreX test binary, workaround shipped in
+   PR #75) is kept in `/tmp/zig-avx2-repro/` and summarized here so it can be
+   filed by someone with collaborator access. Do not re-implement a workaround
+   beyond PR #75's truncating bit cast.
+   Repro:
+   ```zig
+   const std = @import("std");
+   fn clampByte(v: @Vector(8, f32)) [8]u8 {
+       const ints: @Vector(8, i32) = @intFromFloat(v);
+       return @as(@Vector(8, u8), @intCast(ints));
+   }
+   pub fn main() !void {
+       var src: [8]f32 = undefined;
+       src[0] = 0.5; src[1] = 3.5; src[2] = 13.5; src[3] = 26.5;
+       src[4] = 49.5; src[5] = 75.5; src[6] = 108.5; src[7] = 149.5;
+       const v = @Vector(8, f32){ src[0], src[1], src[2], src[3], src[4], src[5], src[6], src[7] };
+       const out = clampByte(v); // expect [..., 149]; observed on CI: [..., 127]
+       if (out[7] != 149) std.debug.print("BUG: 149 became {d}\n", .{out[7]});
+   }
+   ```
+   CI disassembly at `assets.jpeg.idct`: `vpackssdw ...; vpacksswb ...` (signed
+   saturating packs) implement the `@intCast`; value 149 saturated to 127
+   (i8 signed max), gray_8x8 libjpeg vector max diff 104 (tolerance 4). Shipped
+   workaround in PR #75: `@bitCast` to `@Vector(8, u32)`, then `@truncate` to
+   `@Vector(8, u8)`.
+2. **Observer kernel unification** (`schedule`/`graph`/`frame`): end-of-cycle (e)
+   proposal; not to be implemented without an owner's call.
+
+**Toolchain note:** Zig 0.17.0 in `/tmp/zigvenv`; `/tmp` is wiped between sessions
+— reinstall before continuing. Window / swapchain remains blocked in this
+sandbox.
+
+## Cycle 2026-11-08 (h) — Ledger: next steps blocked pending external input
+
+**No CoreX code change this cycle.** The candidate audit-backlog work (JPEG
+`@intCast` upstream report; observer-kernel unification) cannot proceed:
+ziglang/zig restricts issue creation to collaborators (this account is not one),
+and the observer kernel needs an owner's call. The ledger above records the
+complete evidence for both so either can be picked up immediately once
+unblocked.
 
 ## Cycle 2026-11-08 (g) — cameraOf stops paying for a snapshot it never needed
 
