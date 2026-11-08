@@ -524,8 +524,10 @@ pub fn apply(
 }
 
 /// Move `row` one position among its siblings: `delta` of -1 moves up, +1 down.
-/// Returns whether the order actually changed. Implemented as one `set_order`
-/// command per swapped pair, so undo/redo is exact.
+/// Returns whether the order actually changed. A swap is two `set_order` commands —
+/// each sibling's own key, so undo restores both exactly instead of guessing what the
+/// previous order was — recorded as **one** gesture, because that is one thing the user
+/// pressed a key to do.
 fn reorderSibling(scene: anytype, row: u64, delta: i32, history: anytype) anyerror!bool {
     if (row == 0) return false;
     const parent = scene.parentIdOf(row);
@@ -558,11 +560,13 @@ fn reorderSibling(scene: anytype, row: u64, delta: i32, history: anytype) anyerr
     const other_order = scene.orderOf(other);
     if (row_order == other_order) return false;
 
-    // Swap orders: row takes other's order, other takes row's order.
-    history.apply(scene, .{ .set_order = .{ .id = row, .order = other_order } }) catch |err| {
-        return err;
-    };
-    try history.apply(scene, .{ .set_order = .{ .id = other, .order = row_order } });
+    // Swap orders: row takes other's order, other takes row's order. One gesture, so a
+    // failure on the second command cannot leave the first moved and the pair half-swapped
+    // — which is exactly what two separate `apply` calls could do.
+    try history.applyBatch(scene, &.{
+        .{ .set_order = .{ .id = row, .order = other_order } },
+        .{ .set_order = .{ .id = other, .order = row_order } },
+    });
     return true;
 }
 
@@ -732,8 +736,8 @@ test "tree actions: move_up and move_down reorder siblings, undoable" {
     const noop = apply(.move_up, b_id, &collapsed, &scene, &history);
     try testing.expect(!noop.changed);
 
-    // Undo the move_up: back to a, b, c (2 set_order commands undone).
-    try history.undo(&scene);
+    // Undo the move_up: one press, because one gesture moved both keys.
+    try testing.expectEqual(@as(usize, 1), history.undoDepth());
     try history.undo(&scene);
     const n5 = scene.childIdsInto(root_id, &ids);
     try testing.expectEqual(@as(usize, 3), n5);
@@ -741,8 +745,7 @@ test "tree actions: move_up and move_down reorder siblings, undoable" {
     try testing.expectEqual(b_id, ids[1]);
     try testing.expectEqual(c_id, ids[2]);
 
-    // Redo: back to b, a, c (2 commands redone).
-    try history.redo(&scene);
+    // Redo: back to b, a, c (the same one gesture, re-applied).
     try history.redo(&scene);
     const n6 = scene.childIdsInto(root_id, &ids);
     try testing.expectEqual(@as(usize, 3), n6);
@@ -755,7 +758,7 @@ test "tree actions: move_up and move_down reorder siblings, undoable" {
     try testing.expect(!root_noop.changed);
 }
 
-test "tree actions: a half-undone reorder is a tie, which is why a swap records two commands" {
+test "tree actions: a reorder is one undo step, restoring both keys together" {
     const testing = std.testing;
     const scene_mod = @import("../scene/scene.zig");
     const components = @import("../scene/components.zig");
@@ -780,22 +783,31 @@ test "tree actions: a half-undone reorder is a tie, which is why a swap records 
 
     try testing.expect(apply(.move_up, b_id, &collapsed, &scene, &history).changed);
 
-    // Undo the second command only: `a` gets its own ID back as its key while `b` keeps the key
-    // it took, so the two are tied and the tie breaks by ID -- the paint order reads as if the
-    // swap never happened, and `b` is left carrying an authored key a save would write.
+    // One gesture, so one press covers both keys: `b` gives the key it took back and `a`
+    // gets its own, which is also what leaves nothing authored for a save to write. The
+    // pair used to be recorded as two entries, and a single press then restored only half
+    // of it — the state it stopped in had one key moved, the other not, and the two tied,
+    // which is a state the user never had and could have saved.
+    try testing.expectEqual(@as(usize, 1), history.undoDepth());
     try history.undo(&scene);
     var ids: [3]u64 = @splat(0);
     try testing.expectEqual(@as(usize, 3), scene.childIdsInto(root_id, &ids));
     try testing.expectEqual(a_id, ids[0]);
     try testing.expectEqual(b_id, ids[1]);
     try testing.expectEqual(c_id, ids[2]);
-    try testing.expectEqual(a_id, scene.orderOf(b_id));
-    try testing.expectEqual(a_id, scene.orderOf(a_id));
-
-    // The second press is what makes the pair natural again, so nothing is left to serialize.
-    try history.undo(&scene);
     try testing.expectEqual(b_id, scene.orderOf(b_id));
     try testing.expectEqual(a_id, scene.orderOf(a_id));
+    try testing.expectEqual(@as(usize, 0), history.undoDepth());
+    try testing.expectEqual(@as(usize, 1), history.redoDepth());
+
+    // Redo puts the whole swap back in one press, in the order the commands were given.
+    try history.redo(&scene);
+    try testing.expectEqual(@as(usize, 3), scene.childIdsInto(root_id, &ids));
+    try testing.expectEqual(b_id, ids[0]);
+    try testing.expectEqual(a_id, ids[1]);
+    try testing.expectEqual(c_id, ids[2]);
+    try testing.expectEqual(a_id, scene.orderOf(b_id));
+    try testing.expectEqual(b_id, scene.orderOf(a_id));
 }
 
 test "tree actions: delete is one command and does not touch the fold state of others" {

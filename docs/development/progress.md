@@ -17,7 +17,94 @@ so reinstall before anything else with
 warns the wheel is yanked for a partial PyPI upload; the binary is still 0.17.0 and
 works). Window / swapchain remains blocked in this sandbox.
 
-## Cycle 2026-11-08 — Reachable gizmo tools, and allocation-failure tests that mean it
+## Cycle 2026-11-08 (b) — A gesture is the undo step (`History.applyBatch`)
+
+**Why this was next.** The previous cycle declared it, and it was worth doing rather than
+leaving documented: `reorderSibling` recorded a swap as two `apply` calls, so (a) one
+`Ctrl+Z` stopped in a state the user never had — both siblings tied on one key, ties break
+by ID, so the press could read as though nothing happened *and* leave an authored key for a
+save to write — and (b) if the second command failed, the first stayed moved **and
+recorded**. (b) is the defect; (a) was its visible symptom. Not hypothetical: the first
+`set_order` creates `Scene.sibling_order` lazily and the second `put` can fail growing it,
+so the pair can genuinely be split by an allocation failure.
+
+**Delivered (validated):**
+
+- **`History.applyBatch(scene, commands)`** — applies N commands, records **one** step.
+  Each command still captures its own `before` snapshot before it runs, and a command that
+  fails rolls the ones already applied back newest-first and records nothing. **`apply` is
+  now the one-command case of it** (`applyBatch(&.{command})`), deliberately: two code paths
+  promising atomicity is how they drift.
+- **`History.Entry.group_len: u32 = 1`** — the group is a count on its own entries, not a
+  second list of boundaries. `Entry` stays plain data, so `truncateRedo` cannot leak half a
+  gesture and `undo` still allocates nothing.
+- **`undo` / `redo` walk whole groups**; `cursor` remains an entry index and only ever moves
+  to a group boundary, which is what lets `undo` read the extent from the entry below it and
+  `redo` from the entry at it. **`undoDepth` / `redoDepth` now count steps**, because the
+  number of presses left is the honest meaning of "depth" (`cursor` alone would report 2 for
+  one gesture).
+- **`max_batch`** (`maxInt(u32)`), refused with `error.Rejected` past it — reusing the tag
+  `capture` already returns for a history-side refusal (an over-long name) instead of adding
+  a fourth error to the module's contract. Untestable by construction; it exists so the cast
+  into the field is total.
+- **`tree.reorderSibling`** records the two `set_order` commands as one `applyBatch`, and its
+  doc now says why the pair is not two gestures.
+- **Tests: 951 → 955**, 4 new in `edit.zig`: one step per gesture (depths *and* entry
+  counts, redo re-applies in the given order); a failing command rolls the whole group back,
+  records nothing and does not even set `dirty`; an empty batch is not an edit; a new edit
+  after an undo drops a whole redo gesture, and group undo stays allocation-free under a
+  counting allocator.
+- **Docs**: `docs/editor-shell.md`'s editing model gained the "the gesture is the unit"
+  paragraph, `group_len` in the entry diagram, and the atomicity clause in the guarantees
+  list; `edit.zig`'s header gained the same. Two stale counts fixed on the way: the header and
+  the doc both said **six** commands and the arm list never named `set_order` — there are
+  seven, since the sibling-ordering cycle.
+
+**Inverted on purpose.** Last cycle's test "a half-undone reorder is a tie, which is why a
+swap records two commands" pinned exactly what this cycle removes, so it now asserts the
+opposite ("a reorder is one undo step, restoring both keys together": one press, both keys
+natural, `redoDepth` 1). That is not a reversed decision — the decision *was* "a batch in
+`History` is what it needs"; the test recorded the cost of not yet having it.
+
+**Decisions:**
+
+- No `group_index` beside `group_len`: nothing reads it, and a field nothing reads is a field
+  that can disagree with the entries around it.
+- Nothing else was converted. Checked before assuming: the reorder was the **only** path in
+  `src/` where one user action applied more than one command. Each shell edit records exactly
+  one (transform row, camera row and camera scalar row, name commit, delete, gizmo drag), and
+  `tree.apply`'s three `history.apply` calls are mutually exclusive arms of its action `switch`
+  — one per action, not three. A general API with one caller is therefore the honest size of
+  this change, not an unfinished migration.
+- Left alone deliberately: `forward`'s `.set_order` arm maps a scene `OutOfMemory` to
+  `error.Rejected` — the `.create` arm does the same to `createEntityWithExactId` (`.delete`
+  needs no mapping, `destroyEntity` cannot fail) — so the rollback stays correct and only the
+  tag is imprecise; giving `set_order` a finer error set would be a contract edit for a status
+  bar message. And `applied_total` now counts gestures while being read by nothing, tests
+  included — the same is true before this cycle, and deleting a public field is not this
+  cycle's business either.
+
+**Validation (run here, Zig 0.17.0):** `zig fmt --check src/ tools/ build.zig` clean;
+`zig build test` **955/955** in Debug, ReleaseSafe and ReleaseFast; 40 runs of the Debug
+binary at 40 distinct seeds, 0 failures; `zig build` and `zig build -Doptimize=ReleaseSafe`
+OK; launch contract 4/4 (`--version`, `--mode validate`, `--headless`,
+`--mode runtime --headless`); `zig build editor-frame -- … 2 dirty` + `zig build qoi-decode`
+(640x360, 11968 bytes, decodes). Note: the `--listen=-` `failed command` artifact recorded
+last cycle did **not** appear once when the suite runs were sequential instead of overlapping
+a compile — which is what that diagnosis predicted.
+
+**Known limitations:** unchanged from the cycle above except that the "reorder costs two
+presses / can be half-undone" item is closed. Still open: the 64-sibling window in
+`reorderSibling` and its refusal of a tied pair; no end-to-end `scene.stream` assertion for
+the order carry (the shared `scenes/town.scene` fixture is what it would have to change);
+fold state not persisted, which needs a `format_version` decision; the OS window layer
+unvalidatable here.
+
+**Next priority:** pointer-scrub on the inspector's numeric fields — the GUI already reports
+the drag state it needs and `docs/editor-shell.md` lists it as a Limitation, so it is the
+smallest coherent step that adds user-visible capability.
+
+
 
 **Two corrections to the record above first.** Both were wrong as written, and both
 mattered — the cycle started by chasing them:

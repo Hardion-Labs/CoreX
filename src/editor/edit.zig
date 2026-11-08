@@ -12,9 +12,15 @@
 //!   entry; undo and redo allocate nothing at all, which is what makes an undo bound to
 //!   a key press safe to call from inside a frame.
 //!
+//! * **The gesture is the undo unit, not the command.** `applyBatch` records several
+//!   commands as one step, so what the user did in one motion is what one `Ctrl+Z` backs
+//!   out of — and `undoDepth` counts those steps, because that is the number of presses
+//!   left. A command stays the unit of *meaning*: each one still carries its own
+//!   snapshot, which is why a group needs no inverse formula of its own.
+//!
 //! Undo is exact, not reconstructed. Before every edit the history captures the
 //! entity's **full prior state** (name, parent, every schema component), and undo puts
-//! that state back. That is one rule for all six commands instead of six subtly
+//! that state back. That is one rule for all seven commands instead of seven subtly
 //! different inverse formulas — and it is what makes the hard cases right: undoing a
 //! delete restores the entity's **original stable ID** (so the editor's selection
 //! survives), its parent and all its components; undoing a create removes exactly what
@@ -156,7 +162,17 @@ pub fn History(comptime Scene: type) type {
         pub const Entry = struct {
             command: Command(Scene),
             before: Snapshot = .{},
+            /// How many entries this gesture spans: `1` for a single command. A group is
+            /// stored as a count on its own entries rather than as a second list of
+            /// boundaries, because a second list is one more thing that can disagree with
+            /// `entries` — and because it keeps `Entry` plain data, so `truncateRedo`
+            /// cannot leak and `undo` cannot allocate.
+            group_len: u32 = 1,
         };
+
+        /// How many commands one gesture may span. The bound exists only so `group_len`
+        /// fits the field above; no gesture the editor can produce comes near it.
+        pub const max_batch = std.math.maxInt(u32);
 
         gpa: Allocator,
         /// Entries oldest-first; `entries.len` can exceed `cursor` (the redo tail).
@@ -185,12 +201,28 @@ pub fn History(comptime Scene: type) type {
             return self.cursor < self.entries.items.len;
         }
 
+        /// How many `undo` presses are available — **gestures**, which is what a press steps
+        /// back over, not the commands a gesture happened to need. Walking the group
+        /// boundaries is exact without a second counter to keep in sync, and the walk is
+        /// bounded by the history the user can accumulate. The shell asks `canUndo` /
+        /// `canRedo` when a shortcut fires; nothing calls these depths per frame.
         pub fn undoDepth(self: Self) usize {
-            return self.cursor;
+            var i = self.cursor;
+            var steps: usize = 0;
+            while (i > 0) : (steps += 1) {
+                i -= self.entries.items[i - 1].group_len;
+            }
+            return steps;
         }
 
+        /// How many `redo` presses are available, in gestures. See `undoDepth`.
         pub fn redoDepth(self: Self) usize {
-            return self.entries.items.len - self.cursor;
+            var i = self.cursor;
+            var steps: usize = 0;
+            while (i < self.entries.items.len) : (steps += 1) {
+                i += self.entries.items[i].group_len;
+            }
+            return steps;
         }
 
         /// Drop the redo tail: after an undo, a new edit makes the undone future
@@ -201,33 +233,75 @@ pub fn History(comptime Scene: type) type {
             }
         }
 
-        /// Apply `command` to `scene` and record it.
-        ///
-        /// Failure leaves the scene and the history as they were: the snapshot is
-        /// captured before any mutation, every arm validates first, and a scene-level
-        /// failure (which can only be an allocation or a rejected value) is rolled back
-        /// by restoring the snapshot.
+        /// Apply `command` to `scene` and record it. The one-command case of `applyBatch`,
+        /// so a single edit and a multi-command gesture cannot drift apart in what they
+        /// guarantee.
         pub fn apply(self: *Self, scene: anytype, command: Command(Scene)) Error!void {
-            self.truncateRedo();
-            try self.entries.ensureUnusedCapacity(self.gpa, 1);
+            try self.applyBatch(scene, &.{command});
+        }
 
-            const id = commandEntityId(command);
-            var before: Snapshot = .{};
-            if (scene.entityById(id)) |entity| {
-                before = try capture(scene, entity);
+        /// Apply `commands` to `scene` as **one** undo step.
+        ///
+        /// A gesture that needs more than one command — swapping two siblings' order keys
+        /// is the case the hierarchy has — is one thing the user did, so it has to be one
+        /// thing they undo. Recording such a pair as two entries leaves a `Ctrl+Z` press
+        /// stopping in the middle of it, and the state it stops in is one the user never
+        /// had.
+        ///
+        /// Failure leaves the scene and the history as they were, for the group as a whole
+        /// as well as for each command in it: a snapshot is captured before each mutation,
+        /// every arm validates first, and a command that fails — an allocation, or a value
+        /// the scene rejects — rolls the commands already applied back over their snapshots
+        /// and records nothing.
+        pub fn applyBatch(self: *Self, scene: anytype, commands: []const Command(Scene)) Error!void {
+            if (commands.len == 0) return;
+            if (commands.len > max_batch) return error.Rejected;
+            self.truncateRedo();
+            try self.entries.ensureUnusedCapacity(self.gpa, commands.len);
+
+            const first = self.entries.items.len;
+            for (commands, 0..) |command, i| {
+                const id = commandEntityId(command);
+                var before: Snapshot = .{};
+                if (scene.entityById(id)) |entity| {
+                    before = capture(scene, entity) catch |err| {
+                        self.rollbackGroup(scene, first, i);
+                        return err;
+                    };
+                }
+
+                self.forward(scene, command) catch |err| {
+                    // This command was not appended, so `i` is exactly how many applied
+                    // edits stand between the scene and the state it had on entry.
+                    self.rollbackGroup(scene, first, i);
+                    return err;
+                };
+
+                self.entries.appendAssumeCapacity(.{
+                    .command = command,
+                    .before = before,
+                    .group_len = @intCast(commands.len),
+                });
             }
 
-            self.forward(scene, command) catch |err| {
-                // A partially applied edit is undone from the snapshot just taken, so a
-                // failed command cannot leave the scene half-changed.
-                restore(scene, id, before) catch {};
-                return err;
-            };
-
-            self.entries.appendAssumeCapacity(.{ .command = command, .before = before });
-            self.cursor += 1;
+            // `cursor` lands on a group boundary and only ever moves by whole groups, which
+            // is what lets `undo`/`redo` find a gesture's extent from the entry beside them.
+            self.cursor = self.entries.items.len;
             self.applied_total += 1;
             self.dirty = true;
+        }
+
+        /// Undo `applied` entries appended from `first`, newest first — the reverse of the
+        /// order they ran in, so a rolled-back gesture lands each entity in the state it
+        /// had before the gesture rather than between two of its commands.
+        fn rollbackGroup(self: *Self, scene: anytype, first: usize, applied: usize) void {
+            var i = first + applied;
+            while (i > first) {
+                i -= 1;
+                const entry = self.entries.items[i];
+                restore(scene, commandEntityId(entry.command), entry.before) catch {};
+            }
+            self.entries.shrinkRetainingCapacity(first);
         }
 
         fn forward(self: *Self, scene: anytype, command: Command(Scene)) Error!void {
@@ -272,24 +346,34 @@ pub fn History(comptime Scene: type) type {
             }
         }
 
-        /// Undo the most recent applied edit by restoring the state captured before it.
-        /// Allocates nothing.
+        /// Undo the most recent applied **gesture** by restoring the state captured before
+        /// each of its commands, in the reverse of the order they ran. Allocates nothing.
         pub fn undo(self: *Self, scene: anytype) Error!void {
             if (!self.canUndo()) return;
-            const entry = self.entries.items[self.cursor - 1];
-            try restore(scene, commandEntityId(entry.command), entry.before);
-            self.cursor -= 1;
+            const end = self.cursor;
+            const begin = end - self.entries.items[end - 1].group_len;
+            var i = end;
+            while (i > begin) {
+                i -= 1;
+                const entry = self.entries.items[i];
+                try restore(scene, commandEntityId(entry.command), entry.before);
+            }
+            self.cursor = begin;
             self.dirty = true;
         }
 
-        /// Re-apply the most recent undone edit. The snapshot is **kept** from the first
-        /// application: the state before a redone delete is the same state as before the
-        /// original, so undo after redo restores it again.
+        /// Re-apply the most recent undone gesture. The snapshots are **kept** from the
+        /// first application: the state before a redone delete is the same state as before
+        /// the original, so undo after redo restores it again.
         pub fn redo(self: *Self, scene: anytype) Error!void {
             if (!self.canRedo()) return;
-            const entry = &self.entries.items[self.cursor];
-            try self.forward(scene, entry.command);
-            self.cursor += 1;
+            const begin = self.cursor;
+            const end = begin + self.entries.items[begin].group_len;
+            var i = begin;
+            while (i < end) : (i += 1) {
+                try self.forward(scene, self.entries.items[i].command);
+            }
+            self.cursor = end;
             self.dirty = true;
         }
 
@@ -703,6 +787,116 @@ test "edit: a new edit after undo discards the redo tail" {
     try h.history.undo(&h.scene);
     try h.history.undo(&h.scene);
     try testing.expectEqual(@as(i32, 1), h.scene.getComponent(Extra, entityOfOrPanic(&h, id)).?.amount);
+}
+
+test "edit: applyBatch is one undo step, and one step covers the whole gesture" {
+    var h = testHarness();
+    defer h.scene.deinit();
+    defer h.history.deinit();
+    const a = try h.scene.createEntity("a", null);
+    const b = try h.scene.createEntity("b", null);
+    const a_id = h.scene.idOf(a).?;
+    const b_id = h.scene.idOf(b).?;
+
+    try h.history.applyBatch(&h.scene, &.{
+        .{ .rename = .{ .id = a_id, .name = Name.init("first").? } },
+        .{ .rename = .{ .id = b_id, .name = Name.init("second").? } },
+    });
+    try testing.expectEqualStrings("first", h.scene.nameOf(h.scene.entityById(a_id).?).?);
+    try testing.expectEqualStrings("second", h.scene.nameOf(h.scene.entityById(b_id).?).?);
+    // Two commands, one gesture: this is the number of `Ctrl+Z` presses left, and it is one.
+    try testing.expectEqual(@as(usize, 1), h.history.undoDepth());
+    try testing.expectEqual(@as(usize, 2), h.history.entries.items.len);
+
+    try h.history.undo(&h.scene);
+    try testing.expectEqualStrings("a", h.scene.nameOf(h.scene.entityById(a_id).?).?);
+    try testing.expectEqualStrings("b", h.scene.nameOf(h.scene.entityById(b_id).?).?);
+    try testing.expectEqual(@as(usize, 0), h.history.undoDepth());
+    try testing.expectEqual(@as(usize, 1), h.history.redoDepth());
+
+    // Redo re-applies both, in the order they were given.
+    try h.history.redo(&h.scene);
+    try testing.expectEqualStrings("first", h.scene.nameOf(h.scene.entityById(a_id).?).?);
+    try testing.expectEqualStrings("second", h.scene.nameOf(h.scene.entityById(b_id).?).?);
+    try testing.expectEqual(@as(usize, 1), h.history.undoDepth());
+    try testing.expectEqual(@as(usize, 0), h.history.redoDepth());
+}
+
+test "edit: a failing command rolls the whole gesture back and records nothing" {
+    var h = testHarness();
+    defer h.scene.deinit();
+    defer h.history.deinit();
+    const a = try h.scene.createEntity("a", null);
+    const a_id = h.scene.idOf(a).?;
+
+    // The second command names an entity the scene does not have. Applied as two `apply`
+    // calls this would have left the first rename standing; as a gesture it must not.
+    try testing.expectError(
+        error.EntityNotFound,
+        h.history.applyBatch(&h.scene, &.{
+            .{ .rename = .{ .id = a_id, .name = Name.init("renamed").? } },
+            .{ .rename = .{ .id = 9999, .name = Name.init("nobody").? } },
+        }),
+    );
+    try testing.expectEqualStrings("a", h.scene.nameOf(h.scene.entityById(a_id).?).?);
+    try testing.expect(!h.history.canUndo());
+    try testing.expectEqual(@as(usize, 0), h.history.entries.items.len);
+    // Nothing was recorded, so nothing is owed to the user as an unsaved change either.
+    try testing.expect(!h.history.dirty);
+}
+
+test "edit: an empty gesture is not an edit" {
+    var h = testHarness();
+    defer h.scene.deinit();
+    defer h.history.deinit();
+    try h.history.applyBatch(&h.scene, &.{});
+    try testing.expect(!h.history.canUndo());
+    try testing.expect(!h.history.dirty);
+    try testing.expectEqual(@as(usize, 0), h.history.entries.items.len);
+}
+
+test "edit: a gesture stays whole across a truncation and costs nothing to undo" {
+    var h = testHarness();
+    defer h.scene.deinit();
+    defer h.history.deinit();
+    const a = try h.scene.createEntity("a", null);
+    const b = try h.scene.createEntity("b", null);
+    const a_id = h.scene.idOf(a).?;
+    const b_id = h.scene.idOf(b).?;
+
+    try h.history.apply(&h.scene, .{ .rename = .{ .id = a_id, .name = Name.init("one").? } });
+    try h.history.applyBatch(&h.scene, &.{
+        .{ .rename = .{ .id = b_id, .name = Name.init("two").? } },
+        .{ .set_order = .{ .id = b_id, .order = 1 } },
+    });
+    // One command and one gesture: two presses, three entries.
+    try testing.expectEqual(@as(usize, 2), h.history.undoDepth());
+    try h.history.undo(&h.scene);
+    try testing.expectEqualStrings("b", h.scene.nameOf(h.scene.entityById(b_id).?).?);
+    try testing.expectEqual(b_id, h.scene.orderOf(b_id));
+
+    // A new edit after the undo must drop the *whole* redo tail, including both entries of
+    // the discarded gesture, or the tail would reappear as a half gesture.
+    var counting = CountingAllocator{ .child = testing.allocator };
+    h.history.gpa = counting.allocator();
+    try h.history.applyBatch(&h.scene, &.{
+        .{ .rename = .{ .id = b_id, .name = Name.init("three").? } },
+        .{ .rename = .{ .id = a_id, .name = Name.init("four").? } },
+    });
+    h.history.gpa = testing.allocator;
+    try testing.expectEqual(@as(usize, 0), h.history.redoDepth());
+    try testing.expectEqual(@as(usize, 2), h.history.undoDepth());
+
+    // Undoing a group allocates nothing, exactly as undoing a single command does: the
+    // entries it walks over were paid for when they were recorded.
+    counting.calls = 0;
+    h.history.gpa = counting.allocator();
+    try h.history.undo(&h.scene);
+    try h.history.undo(&h.scene);
+    h.history.gpa = testing.allocator;
+    try testing.expectEqual(@as(usize, 0), counting.calls);
+    try testing.expectEqualStrings("a", h.scene.nameOf(h.scene.entityById(a_id).?).?);
+    try testing.expectEqualStrings("b", h.scene.nameOf(h.scene.entityById(b_id).?).?);
 }
 
 test "edit: undo and redo are allocation-free once the entry exists" {

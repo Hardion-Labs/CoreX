@@ -8,6 +8,22 @@ declared yet.
 
 ### Added
 
+- **A gesture is the undo step** (`History.applyBatch`, `History.Entry.group_len`).
+  - `applyBatch(commands)` applies several commands and records them as **one** step, so what
+    the user did in one motion is what one `Ctrl+Z` backs out of. `undoDepth` and `redoDepth`
+    now count steps rather than commands — the number of presses left is what a status bar or a
+    test should read — and `apply` is the one-command case of `applyBatch`, so a single edit and
+    a multi-command gesture cannot drift apart in what they promise.
+  - Failure is atomic over the group. Each command captures its own prior state before it runs,
+    and a command that fails rolls the ones before it back newest-first and records nothing —
+    which is what makes a half-applied edit unrepresentable, including the case the tree had: a
+    swap whose second `set_order` fails under allocation pressure used to leave the first key
+    moved, undoable only as its own step.
+  - The group is a count stored on its own entries, not a second list of boundaries, so `Entry`
+    stays plain data: `truncateRedo` cannot leak half a gesture and `undo`/`redo` still allocate
+    nothing (asserted with a counting allocator).
+  - 4 new tests (955 total).
+
 - **Gizmo tool keys** (`W` / `E` / `R`, `State.setGizmoMode`, `shell.GizmoMode`).
   - The rotate and scale gizmos already measured, picked and painted — and could not be reached:
     `viewport_gizmo.mode` had no writer anywhere, so every drag was a translate. `W` moves,
@@ -24,9 +40,9 @@ declared yet.
   - Paint order is authored data, not the order the allocator happened to produce: `rootIds`
     and `childIdsInto` sort by `(order, id)` within a parent, where a key defaults to the
     entity's own stable ID and ties break by ID.
-  - `move_up` / `move_down` swap a row with its neighbour as two `set_order` commands — two
-    `Ctrl+Z` presses to undo, which is what lets undo restore both keys exactly instead of
-    guessing what the previous order was.
+  - `move_up` / `move_down` swap a row with its neighbour as two `set_order` commands recorded
+    as one gesture, which is what lets undo restore both keys exactly instead of guessing what
+    the previous order was.
   - `order` is written **only when it differs from that default**, so a scene nobody reordered
     serializes as it did before the field existed. `cloneSubtree`, prefab capture and a streamed
     sector all carry it; a cloned root keeps no key, because it was attached rather than moved.
