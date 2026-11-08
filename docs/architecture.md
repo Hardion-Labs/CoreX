@@ -197,9 +197,12 @@ atomic save, and the inspector edits the name, position and scale through it
 (`corex.editor.inspector` owns the numeric fields and their parsing, and
 `corex.editor.frame_camera` owns the viewport's framing math — scene bounds, the fit
 distance for a lens, and orbit — with no GUI and no renderer in it). `zig build
-editor-frame` renders one real editor frame of a project headlessly. Still planned: a
-window and real input, rotation/camera fields, drag-and-drop reparenting, asset browser,
-gizmos and the editor loop.
+editor-frame` renders one real editor frame of a project headlessly. Still planned: the
+window with real input, the editor loop that runs on it, and an asset browser. Rotation and
+camera fields, drag-and-drop reparenting, the viewport gizmos, the atomic save and the scrub
+on numeric fields are all in. (`corex.gui` still has no automatic focus traversal — the
+editor cycles docks itself with `Key.tab`, which is why the two statements are not in
+conflict.)
 
 ### First-party GUI library — implemented; text shaping planned
 The engine's own GUI toolkit (`corex.gui`, [gui-foundation.md](gui-foundation.md)):

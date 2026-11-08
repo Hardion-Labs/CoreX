@@ -84,6 +84,12 @@ sectors are built) carries its authored order across, so an instance paints its 
 way its source does; the cloned root keeps none, because it is being attached to a new parent
 rather than moved among its old siblings.
 
+Carrying it means **re-ranking, not copying**: a group that was reordered is rewritten as
+`0..n-1` in the source's paint order, because a key authored against the source's IDs would
+otherwise be compared against the *clone's* IDs — a different number space, where an explicit
+`7` can lose to an implicit `9` that used to be a `6`. A group nobody reordered is left
+unwritten, so cloning never grows the document.
+
 ## The `transform` component
 
 The entity's local component relative to its parent (or to the scene root). All

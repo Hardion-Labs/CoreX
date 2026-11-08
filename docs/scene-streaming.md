@@ -101,9 +101,12 @@ is beyond `unload_radius`. That band is the hysteresis: a listener sitting on th
 boundary cannot cause a load/unload every frame. Pinned sectors are loaded
 regardless of distance and are never unloaded by `update`.
 
-Sectors are visited in canonical name order, and each sector's roots are cloned in
-ascending source-ID order, so the same manifest and the same positions always
-produce the same result.
+Sectors are visited in canonical name order. Within a sector the roots are cloned in
+the source's **paint order** — `(order, id)`, the order the hierarchy shows them in —
+and the IDs one clone allocates ascend with the source's, so the same manifest and the
+same positions always produce the same result. Both halves matter: the ascending IDs are
+what make a load reproducible, and the paint order is what makes an order the user
+authored *among roots* survive being streamed in.
 
 ### Budgets
 

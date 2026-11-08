@@ -21,6 +21,98 @@ below still works):
 warns the wheel is yanked for a partial PyPI upload; the binary is still 0.17.0 and
 works). Window / swapchain remains blocked in this sandbox.
 
+## Cycle 2026-11-08 (d) — Authored order through the file, and a docs claim that was wrong
+
+**Why this was next, and why the other candidate is blocked.** The previous cycle named two
+items: fold-state persistence and an end-to-end `scene.stream` order test. The first one is
+**blocked on a decision, not on work**, and the reason is a contract: `docs/project-format.md`
+says the engine *"does **not create** `.corex` files"* — only reads and validates — and its
+validation rejects unknown fields, so editor view state cannot go into the manifest without
+the engine becoming an author of a Hub-owned file. The other place it could go is the
+`.scene` document, which the editor already writes (`edit.saveScene`), but that document is
+loaded by the runtime too, and `format_version = 1` with strict rejection means *any* new
+field is a version bump. So a fold-state feature is really a choice about who owns view state
+— sidecar file, scene-format bump, or "not persisted" (the tree's `revealSelection` already
+unfolds the chain to the selection, which is what makes the status quo survivable) — and that
+is an owner's call, not something to guess at in a cycle. Recorded here rather than invented.
+
+**Delivered (validated):** the second candidate, plus what the diagnosis turned up.
+
+- **`scene.zig`'s document tests already covered `order`** (1177 serialize/parse, 1226
+  `cloneSubtree`, 1280 parse rejection), and `prefab.zig:245` already covers the prefab path —
+  checked before writing anything, so this cycle does not re-test those. What nothing covered was
+  order on the two paths that go through **real files**: the editor's atomic save, and a sector
+  load where the clone's IDs are not the document's IDs.
+- **`save: an authored sibling order reaches the file, and only where it is not natural`**
+  (`src/editor/edit.zig`) — reorder through `history.apply(.set_order)`, `saveScene`, read the
+  bytes back off disk, `TestScene.load` them: the paint order is restored, exactly one entity
+  carries a key (the omission rule survives the write), and the reorder is still undoable
+  afterwards.
+- **`stream: an authored sibling order survives a sector load, re-ranked and not copied`**
+  (`src/scene/stream.zig`) — a new `garden` sector file and its own `ordered.corexstream`
+  manifest in the shared `Fixture` (the `town`/`cave` documents are untouched, because other
+  tests count their entities). `town` is loaded first **on purpose**, so every cloned ID is
+  shifted away from the source's numbers, which is the only condition under which "re-rank the
+  group" and "copy the keys" differ: the fixture holds a child with an explicit `7` between two
+  siblings whose implicit keys are their IDs — verbatim, it jumps ahead of both.
+- **Every assertion was proven to have teeth by mutating production code** and confirming which
+  tests fail: verbatim keys → *only* the new stream test fails; never skipping a natural group →
+  the new test plus `scene: cloneSubtree carries the authored sibling order`; roots walked by ID
+  instead of paint order → *only* the new stream test fails. Three behaviours, two of which
+  nothing else in the suite could see. The mutations were reverted and `git diff` confirmed
+  `src/scene/scene.zig` byte-identical afterwards — **this cycle changes no production code**.
+- **A documentation claim that was false.** `docs/scene-streaming.md` said "each sector's roots
+  are cloned in ascending source-ID order". They are not: `rootIds` → `childIdsInto(null, …)`
+  sorts by `(order, id)`, so roots are cloned in the source's **paint order**, and it is the IDs
+  *within* one `cloneSubtree` that ascend with the source's. The conflation hid the reason the
+  code is shaped this way — the paint order is what makes an order authored among *roots* survive
+  streaming, and that guarantee is now pinned by the new test's fourth assertion.
+  `docs/scene-format.md` gained the why of re-ranking next to the existing "carries its authored
+  order across" sentence.
+- **`docs/architecture.md`'s editor list was stale** the same way last cycle's Inspector list
+  was: it still called rotation/camera fields, drag-and-drop reparenting, gizmos and the editor
+  loop "planned". Verified item by item — all but the window, the loop and the asset browser
+  exist — and the sentence now says so.
+
+**Validation (all run here, this cycle):** `zig build test` at **965/965 in Debug, ReleaseSafe
+and ReleaseFast** (`3/3 steps succeeded`); `zig fmt src/` then `fmt --check src/ tools/ build.zig`
+clean; `zig build` clean; `editor-frame` → 640x360 / 6 widgets, `qoi-decode` → 921600 bytes;
+`corex-engine --project examples/hello-project/HelloProject.corex --mode validate` →
+"Project is valid and compatible", and `--headless --frames 3` → 3 of 3. The sandbox came up with
+`/tmp` wiped as the ledger warned: `/tmp/zigvenv` + `/home/user/zig.sh` were recreated with the
+recorded command before anything else.
+
+**Decisions:**
+
+- **Extend the fixture with new files instead of editing `town.scene`.** Adding a second child to
+  `TownRoot` to make an order observable would have changed the entity counts that four other
+  stream tests assert. New content in a shared temp directory costs nothing and disturbs nothing;
+  the alternative was touching tests that are not about order.
+- **Names, not ID arithmetic, in the assertions.** The clone's IDs depend on load order, so the
+  test finds entities through `idNamed`/`nameOf` and asserts the *sequence of names* a paint-order
+  walk returns; only the re-ranking assertion reads raw keys, where the number is the point.
+- **`orderOf(implicit) == id` is asserted, not "the map is empty"** — the observable claim is that
+  an untouched group carries nothing, and `orderOf` is the function every sort in the codebase
+  uses to decide that.
+
+**Known limitations:**
+
+- The stream test pins **one** sector load of an authored group. It does not cover an authored
+  order that survives *both* a save and a stream in the same run, nor the `Options.max_loads`
+  budget interacting with order (there is nothing order-specific in the budget path to cover).
+- Fold-state persistence stays undone, pending the ownership decision above. It is the only
+  declared item this cycle could not take without inventing a contract.
+- The two helpers `idNamed`/`nameOf` live in `stream.zig`'s test region; `scene.zig` has no
+  equivalent. If a third test file needs them, that is the moment to move them, not before.
+
+**Next priority:** the fold-state decision (three options above) needs an answer from the
+project owner; anything else in the editor's persistence area is smaller than that. With it
+answered, the natural follow-on is whichever of the two survives: a sidecar
+`<project>.editor` document, or a `format_version = 2` scene format that carries a view section
+and teaches `validate` to accept it. `docs/architecture.md` still has the window, the editor loop
+and the asset browser as genuinely planned, and `docs/gui-foundation.md`'s "no keyboard focus
+traversal yet" is **correct** — checked this cycle, do not "fix" it.
+
 ## Cycle 2026-11-08 (c) — Dragging an inspector number scrubs it
 
 **Why this was next.** The previous cycle declared it: *"a drag-to-scrub affordance needs

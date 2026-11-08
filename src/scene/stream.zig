@@ -555,6 +555,34 @@ const Fixture = struct {
             \\] }
         });
         try self.tmp.dir.writeFile(io, .{ .sub_path = "world.corexstream", .data = two_sectors });
+        // A second world for the sibling-order tests, with its own sector file. The shared
+        // `town`/`cave` documents keep their shape because other tests count their entities;
+        // everything order-specific lives here, where an `order` field can be authored
+        // without disturbing them.
+        //
+        // The IDs below are not contiguous, and that is load-bearing: a key equal to the
+        // entity's own ID is the *natural* order and would be dropped by `setOrder`, so Rose
+        // may not be ID 7 while carrying `order: 7`. Renumbering this document to close the
+        // gap would quietly make the order it authors mean nothing.
+        try self.tmp.dir.writeFile(io, .{ .sub_path = "scenes/garden.scene", .data =
+            \\{ "format_version": 1, "name": "garden", "entities": [
+            \\  { "id": 3, "name": "Alpha" },
+            \\  { "id": 4, "name": "Beta", "order": 1 },
+            \\  { "id": 5, "name": "Soil" },
+            \\  { "id": 6, "name": "Fern", "parent": 5 },
+            \\  { "id": 8, "name": "Rose", "parent": 5, "order": 7 },
+            \\  { "id": 9, "name": "Thorn", "parent": 5 },
+            \\  { "id": 10, "name": "Wall" },
+            \\  { "id": 11, "name": "Brick", "parent": 10 },
+            \\  { "id": 12, "name": "Mortar", "parent": 10 }
+            \\] }
+        });
+        try self.tmp.dir.writeFile(io, .{ .sub_path = "ordered.corexstream", .data =
+            \\{ "format_version": 1, "name": "ordered", "sectors": [
+            \\  { "name": "town", "scene": "scenes/town.scene", "center": [0, 0, 0], "radius": 10 },
+            \\  { "name": "garden", "scene": "scenes/garden.scene", "center": [0, 10, 0], "radius": 10 }
+            \\] }
+        });
         return self;
     }
 
@@ -564,6 +592,11 @@ const Fixture = struct {
 
     fn manifest(self: *Fixture, gpa: Allocator) !Manifest {
         return Manifest.load(gpa, testing.io, self.tmp.dir, "world.corexstream");
+    }
+
+    /// The two-sector manifest the order tests use.
+    fn orderedManifest(self: *Fixture, gpa: Allocator) !Manifest {
+        return Manifest.load(gpa, testing.io, self.tmp.dir, "ordered.corexstream");
     }
 };
 
@@ -699,6 +732,97 @@ test "stream: manifest load/save file roundtrip and unsafe path rejection" {
     try testing.expectEqualSlices(u8, a, b);
     try testing.expectError(error.UnsafePath, Manifest.load(gpa, testing.io, fx.tmp.dir, "../x"));
     try testing.expectError(error.ProjectIo, Manifest.load(gpa, testing.io, fx.tmp.dir, "missing"));
+}
+
+// A clone allocates new IDs that ascend with the source's, so an authored key copied
+// verbatim would be compared against IDs it was never compared against in the source
+// document. `cloneSubtree` answers that by re-ranking a reordered group 0..n-1; nothing
+// but a load through a real sector file can show the difference, because both scenes in the
+// unit tests share an ID space.
+fn idNamed(self: *TestScene, name: []const u8) ?u64 {
+    var it = self.records.iterator();
+    while (it.next()) |entry| {
+        const have = entry.value_ptr.name orelse continue;
+        if (std.mem.eql(u8, have, name)) return entry.key_ptr.*;
+    }
+    return null;
+}
+
+/// A nameless entity reads as the empty string; every entity this test looks for is named
+/// in the fixture, so the `orelse` only keeps the helper total.
+fn nameOf(self: *TestScene, id: u64) []const u8 {
+    return self.records.get(id).?.name orelse "";
+}
+
+test "stream: an authored sibling order survives a sector load, re-ranked and not copied" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init();
+    defer fx.cleanup();
+    var target = try TestScene.init(gpa, "live");
+    defer target.deinit();
+    var s = TestStream.init(gpa, &target, try fx.orderedManifest(gpa));
+    defer s.deinit();
+
+    // `town` first, on purpose: it pushes every cloned ID away from the source document's
+    // numbers, which is what makes the re-ranking observable below.
+    try s.loadSector(testing.io, fx.tmp.dir, "town");
+    try s.loadSector(testing.io, fx.tmp.dir, "garden");
+    try testing.expectEqual(@as(usize, 13), target.count());
+
+    // In the document, Rose (key 7) sits between Fern (6) and Thorn (9). Cloned verbatim it
+    // would jump ahead of both, because their keys are their new IDs and those are larger.
+    const soil = idNamed(&target, "Soil").?;
+    var kids: [3]u64 = .{ 0, 0, 0 };
+    try testing.expectEqual(@as(usize, 3), target.childIdsInto(soil, &kids));
+    try testing.expectEqualStrings("Fern", nameOf(&target, kids[0]));
+    try testing.expectEqualStrings("Rose", nameOf(&target, kids[1]));
+    try testing.expectEqualStrings("Thorn", nameOf(&target, kids[2]));
+    // The keys are the ranks the clone handed the group, not the file's numbers.
+    try testing.expectEqual(@as(u64, 0), target.orderOf(kids[0]));
+    try testing.expectEqual(@as(u64, 1), target.orderOf(kids[1]));
+    try testing.expectEqual(@as(u64, 2), target.orderOf(kids[2]));
+
+    // A group nobody reordered stays unwritten, so streaming a sector never grows the scene
+    // with keys that mean nothing.
+    const wall = idNamed(&target, "Wall").?;
+    var plain: [2]u64 = .{ 0, 0 };
+    try testing.expectEqual(@as(usize, 2), target.childIdsInto(wall, &plain));
+    try testing.expectEqualStrings("Brick", nameOf(&target, plain[0]));
+    try testing.expectEqual(@as(u64, plain[0]), target.orderOf(plain[0]));
+    try testing.expectEqual(@as(u64, plain[1]), target.orderOf(plain[1]));
+
+    // Beta is a root whose authored key puts it before Alpha, whose ID is smaller. The
+    // cloned root keeps no key of its own, so this order can only come from the roots being
+    // walked in the source's paint order.
+    const garden = s.sectorEntities("garden").?;
+    var roots: [9]u64 = @splat(0);
+    const written = target.childIdsInto(null, &roots);
+    var garden_roots: [4]u64 = .{ 0, 0, 0, 0 };
+    var n: usize = 0;
+    for (roots[0..written]) |id| {
+        for (garden) |gid| {
+            if (gid == id and n < garden_roots.len) {
+                garden_roots[n] = id;
+                n += 1;
+            }
+        }
+    }
+    try testing.expectEqual(@as(usize, 4), n);
+    try testing.expectEqualStrings("Beta", nameOf(&target, garden_roots[0]));
+    try testing.expectEqualStrings("Alpha", nameOf(&target, garden_roots[1]));
+    try testing.expectEqualStrings("Soil", nameOf(&target, garden_roots[2]));
+    try testing.expectEqualStrings("Wall", nameOf(&target, garden_roots[3]));
+
+    // Unload and reload: the order is data in the file, so it comes back identical rather
+    // than as whatever the second pass happened to produce.
+    try testing.expectEqual(@as(usize, 9), try s.unloadSector("garden"));
+    try s.loadSector(testing.io, fx.tmp.dir, "garden");
+    const soil2 = idNamed(&target, "Soil").?;
+    var again: [3]u64 = .{ 0, 0, 0 };
+    try testing.expectEqual(@as(usize, 3), target.childIdsInto(soil2, &again));
+    try testing.expectEqualStrings("Fern", nameOf(&target, again[0]));
+    try testing.expectEqualStrings("Rose", nameOf(&target, again[1]));
+    try testing.expectEqualStrings("Thorn", nameOf(&target, again[2]));
 }
 
 test "stream: explicit load captures the whole sector and unload removes exactly it" {

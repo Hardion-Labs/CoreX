@@ -574,6 +574,22 @@ declared yet.
 
 ### Fixed
 
+- **The streaming documentation described the clone order wrongly** (`docs/scene-streaming.md`).
+  - "each sector's roots are cloned in ascending source-ID order" is not what the code does, and
+    not what a user needs it to be: a sector's roots are cloned in the source's **paint order**
+    — `(order, id)`, the order the hierarchy shows — which is the only reason an order authored
+    *among roots* survives being streamed in. The ascending source IDs are what one clone hands
+    out **within** a subtree; that is the determinism half, and the two were conflated.
+  - `docs/scene-format.md` now says why `cloneSubtree` re-ranks a reordered group instead of
+    copying its keys: a key authored against the source's IDs would be compared against the
+    clone's, where an explicit `7` can lose to an implicit `9` that used to be a `6`.
+  - Pinned by 2 new tests (965 total) on the real file paths — `saveScene` carrying an authored
+    order through the atomic write (the "omit the natural key" rule survives it), and
+    `Stream.loadSector` over a sector whose sibling order **flips** if keys were copied
+    verbatim. Each assertion was checked against mutated production code: the stream test is the
+    only one in the suite that notices a verbatim copy, or roots walked by ID, which is why it
+    is worth having.
+
 - **Allocation-failure tests could pass on one heap layout and fail on the next.** The standard
   harness picks which allocation fails by counting `alloc` calls, but a container that grows
   **in place** (`resize` / `remap`) is not counted — so a pass that inherited room from the pass
