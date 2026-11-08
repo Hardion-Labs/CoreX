@@ -5,14 +5,17 @@ task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
 
-**Current state:** `main` = `e267a2e` (merge of PR #66, from branch
-`arena/e07674d5-corex`). Retested **on the merged tree** in this sandbox: 951/951 in
-Debug and ReleaseSafe, `zig fmt --check src/ tools/ build.zig` clean, `zig build` and
-the launch contract OK, CI green on the PR. The suite is no longer red on `main` here —
-the allocation-failure probe that made it fail reproducibly is fixed by this cycle.
+**Current state:** `main` = `5a67cd0` (merge of PR #68, from branch
+`arena/5afdb426-corex`). Retested **on the merged tree** in this sandbox: **955/955**
+in Debug and ReleaseSafe, `zig fmt --check src/ tools/ build.zig` clean, `zig build` OK,
+the headless launch contract OK, CI green on the PR. `History` now treats a gesture as
+one undo step; the suite has been green on `main` since PR #66 fixed the
+allocation-failure probe.
+
 Toolchain note for the next continuation: Zig 0.17.0 lives in a venv under `/tmp`
 (`/tmp/zigvenv`, wrapper `/home/user/zig.sh`), and `/tmp` **is wiped between sessions**,
-so reinstall before anything else with
+so reinstall it before anything else (done again at the start of this cycle; the command
+below still works):
 `python3 -m venv /tmp/zigvenv && /tmp/zigvenv/bin/pip install ziglang==0.17.0` (pip
 warns the wheel is yanked for a partial PyPI upload; the binary is still 0.17.0 and
 works). Window / swapchain remains blocked in this sandbox.
