@@ -5,13 +5,16 @@ task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
 
-**Current state:** `main` = `21f2b57` (merge of PR #70, from branch
-`arena/924a4516-corex`). Retested **on the merged tree** in this sandbox: **963/963** in
-Debug (cold cache, so the count is a real run and not a cached step) and in ReleaseSafe,
-`zig fmt --check src/ tools/ build.zig` clean, `zig build` OK, `editor-frame` + `qoi-decode`
-+ the headless launch contract OK, CI green on the PR. `History` has treated a gesture as one
-undo step since PR #68; a gesture can now also *be* a drag — the inspector's six numeric rows
-scrub, and typing and dragging share one commit path, one guard and one undo step.
+**Current state:** `main` = `9417344` (merge of PR #73, from branch
+`arena/8f42f3c7-corex`). Retested **on the merged tree** in this sandbox: **965/965** in each
+of Debug, ReleaseSafe and ReleaseFast, every one with a **cold `--cache-dir`** — a warm cache
+prints `3/3 steps succeeded` without re-executing a single test, so a cached step is not a
+retest — plus `zig fmt --check src/ tools/ build.zig` clean, `zig build` OK, `editor-frame` +
+`qoi-decode` + the headless launch contract OK, CI green. Authored sibling order is now pinned
+on the paths that go through real files (`saveScene`, `Stream.loadSector`), and
+`docs/scene-streaming.md` no longer claims roots are cloned by ID when they are cloned by paint
+order. **One item is blocked on a decision, not on work:** fold-state persistence needs to know
+who owns editor view state (see the 2026-11-08 (d) entry) — do not re-derive that from scratch.
 
 Toolchain note for the next continuation: Zig 0.17.0 lives in a venv under `/tmp`
 (`/tmp/zigvenv`, wrapper `/home/user/zig.sh`), and `/tmp` **is wiped between sessions**,
