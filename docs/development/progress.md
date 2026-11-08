@@ -1,11 +1,14 @@
-**Current state:** `main` = `90bd281` (merge of PR #80) carrying the full-engine
-audit (PR #75), the AA-scratch bound (PR #76), and the `cameraOf` chain-walk
-(PR #79). Retested **on merged main** in this sandbox: **975/975** with a
-**cold `--cache-dir`**; `zig fmt --check src/ build.zig tools/` clean; CI launch-contract
-smoke OK. CI green on all PRs. **Regression status on main: the JPEG IDCT vector
-test fails in ReleaseSafe and ReleaseFast on `ab64c39` itself (pre-existing,
-masked by Debug-only CI); the fix (truncating vector cast) makes all three
-modes green since PR #75.**
+**Current state:** `main` = `232a810` (merge of PR #82) carrying the full-engine
+audit (PR #75), the AA-scratch bound (PR #76), the `cameraOf` chain-walk
+(PR #79), and the hardening round 2 (PR #82). Retested **on merged main** in
+this sandbox: **975/975** with a **cold `--cache-dir`** — a warm cache prints
+`3/3 steps succeeded` without re-executing a single test, so a cached step is
+not a retest — plus `zig fmt --check src/ build.zig tools/` clean and the CI
+launch-contract smoke (validate, editor headless, runtime, editor-frame,
+qoi-decode) OK. CI green on all PRs. **Regression status on main: the JPEG
+IDCT vector test fails in ReleaseSafe and ReleaseFast on `ab64c39` itself
+(pre-existing, masked by Debug-only CI); the fix (truncating vector cast)
+makes all three modes green since PR #75.**
 **Fold-state persistence is decided: do NOT persist.** 2026-11-08, owner's call
 — revisit only when the editor has a real loop/window, as per-user session
 state outside project files.
@@ -46,6 +49,8 @@ state outside project files.
 — reinstall before continuing. Window / swapchain remains blocked in this
 sandbox.
 
+## Cycle 2026-11-08 (i) — Hardening round 2 (startup, render, editor)
+
 ## Cycle 2026-11-08 (h) — Ledger: next steps blocked pending external input
 
 **No CoreX code change this cycle.** The candidate audit-backlog work (JPEG
@@ -54,6 +59,84 @@ ziglang/zig restricts issue creation to collaborators (this account is not one),
 and the observer kernel needs an owner's call. The ledger above records the
 complete evidence for both so either can be picked up immediately once
 unblocked.
+
+## Cycle 2026-11-08 (i) — Hardening round 2 (startup, render, editor)
+
+**Delivered (PR #82 → `main` at `232a810`):** a second deep-dive audit pass
+across startup, render pipeline, and editor undo/redo, all validated on
+975/975 cold-cache in Debug, ReleaseSafe and ReleaseFast, CI green, main
+retested after merge.
+
+**Core/startup (High):**
+- `config_future` no longer leaked when `assets_future.await` fails: the
+  surviving future is cancelled before the early return (the comment claimed
+  both jobs were always awaited, but the error path abandoned `config_future`).
+- `dirname()` null maps to `error.Internal` (not `InvalidManifest`): an internal
+  failure is not a manifest problem.
+- `resolveAbsolute()` errors mapped precisely: `OutOfMemory` stays `OutOfMemory`,
+  everything else becomes `InvalidManifest` (not a silent OOM collapse).
+- `project_path` null returns `ProjectNotFound` (exit 5), not `Internal` (exit 1).
+
+**Core/assets (High/Medium):**
+- `statFile()` failure logs a warning instead of silently dropping the file from
+  the index.
+- `totalBytes()` is O(1): `total_bytes` cached during indexing.
+
+**Core/manifest (Security-High):**
+- `max_manifest_bytes` (1 MiB) enforced inside `parse()`, so a direct caller
+  cannot bypass the size cap and trigger unbounded JSON allocation.
+- New `ParseError.FileTooBig` for oversized documents.
+
+**Core/paths (Medium):**
+- Empty path components (e.g. trailing `assets/`) rejected as `UnsafePath`.
+
+**Core/splash (Medium):**
+- `setProgress()` clamps fraction to [0, 1] so inf/nan/negative can't produce
+  garbled progress logs.
+
+**Core/cli (Low):**
+- Duplicate detection for boolean flags (`--help`/`--version`/`--hub-launch`/
+  `--headless`), matching value-taking arguments.
+
+**Editor (High):**
+- `History.redo()` rolls back already-applied commands on `forward()` failure,
+  so the scene is never left half-applied relative to the history.
+- Gizmo drag release records one undoable `set_component` command: the initial
+  transform is restored so `history.apply` captures it as "before" and the final
+  transform as "after".
+
+**Render/camera (High):**
+- `perspective()` and `orthographic()` validate parameters and return
+  `error.InvalidFrustum` instead of dividing by zero or producing NaN matrices
+  that defeat frustum culling.
+
+**Render/draw (High/Medium):**
+- `RenderFrame.spare` buffer can no longer dangle after a failed grow: the spare
+  is stolen before extraction and restored on success; on error the list storage
+  is freed and `spare` stays empty.
+- Translucent (`back_to_front`) draw lists never claim occlusion tiles, so a
+  blended surface cannot erase geometry behind it.
+- Non-finite world bounds are rejected up front and counted as culled, so a NaN
+  matrix can no longer defeat frustum culling.
+- Occlusion tile grid capped at 2048x2048 (16 MiB max) to prevent hostile configs
+  from allocating gigabytes.
+
+**Render/occlusion (High):**
+- `Buffer.init` rejects grids above 2048x2048 tiles.
+
+**Render/pipeline (High/Medium):**
+- `AssetTable.init` caps `vertices_per_slot` (1M) and `indices_per_slot` (6M)
+  so a malicious config can't allocate tens of GiB up front.
+- `ResourceTable.setColor()` validates color channels are finite and in [0,1],
+  preventing `@intFromFloat(NaN)` UB in the backend.
+- All `ResourceTable` slot accessors bounds-check the slot index.
+- `AssetTable.setMesh/setColor/setTexture` return `pipeline.Error!Handle`.
+- `pipeline.Error` gains `InvalidValue`, `InvalidFrustum`, `MeshTooLarge`,
+  `InvalidAsset`.
+
+**Next steps unchanged:** the two blocked items from cycle (h) remain blocked.
+The closest candidate once unblocked is the JPEG AVX2 upstream report; the
+observer-kernel unification needs an owner's call.
 
 ## Cycle 2026-11-08 (g) — cameraOf stops paying for a snapshot it never needed
 
