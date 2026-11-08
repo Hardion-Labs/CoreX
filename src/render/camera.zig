@@ -15,10 +15,21 @@ const transform = @import("../scene/transform.zig");
 const Mat4 = transform.Mat4;
 const Vec3 = transform.Vec3;
 
+pub const Error = error{
+    /// The projection parameters are degenerate or non-finite (e.g. `near == far`,
+    /// `right == left`, negative aspect). Projection would divide by zero or
+    /// produce NaN, so the matrix is rejected instead of silently breaking
+    /// culling and rasterization downstream.
+    InvalidFrustum,
+};
+
 /// Right-handed perspective projection (OpenGL clip space, NDC z in [-1, 1]).
 /// `fov_y` is the vertical field of view in radians; `aspect` is width/height;
 /// `near`/`far` are positive plane distances with `near < far`.
-pub fn perspective(fov_y: f32, aspect: f32, near: f32, far: f32) Mat4 {
+pub fn perspective(fov_y: f32, aspect: f32, near: f32, far: f32) Error!Mat4 {
+    if (!std.math.isFinite(fov_y) or fov_y <= 0 or fov_y >= std.math.pi) return error.InvalidFrustum;
+    if (!std.math.isFinite(aspect) or aspect <= 0) return error.InvalidFrustum;
+    if (!std.math.isFinite(near) or !std.math.isFinite(far) or near <= 0 or near >= far) return error.InvalidFrustum;
     const f = 1.0 / @tan(fov_y * 0.5);
     var m = std.mem.zeroes(Mat4);
     m[0] = f / aspect;
@@ -30,7 +41,10 @@ pub fn perspective(fov_y: f32, aspect: f32, near: f32, far: f32) Mat4 {
 }
 
 /// Right-handed orthographic projection (OpenGL clip space, NDC z in [-1, 1]).
-pub fn orthographic(left: f32, right: f32, bottom: f32, top: f32, near: f32, far: f32) Mat4 {
+pub fn orthographic(left: f32, right: f32, bottom: f32, top: f32, near: f32, far: f32) Error!Mat4 {
+    if (!std.math.isFinite(left) or !std.math.isFinite(right) or right == left) return error.InvalidFrustum;
+    if (!std.math.isFinite(bottom) or !std.math.isFinite(top) or top == bottom) return error.InvalidFrustum;
+    if (!std.math.isFinite(near) or !std.math.isFinite(far) or far == near) return error.InvalidFrustum;
     var m = transform.identity();
     m[0] = 2 / (right - left);
     m[5] = 2 / (top - bottom);
@@ -100,7 +114,7 @@ pub const Camera = struct {
 
     /// Convenience: a perspective camera looking from `eye` at `target`.
     pub fn perspectiveLookAt(eye: Vec3, target: Vec3, up: Vec3, fov_y: f32, aspect: f32, near: f32, far: f32) Camera {
-        return init(lookAt(eye, target, up), perspective(fov_y, aspect, near, far), eye);
+        return init(lookAt(eye, target, up), perspective(fov_y, aspect, near, far) catch unreachable, eye);
     }
 };
 
@@ -116,7 +130,7 @@ fn expectVec3(expected: Vec3, actual: Vec3) !void {
 test "perspective maps near/far planes to NDC z = -1/+1" {
     const near: f32 = 1;
     const far: f32 = 100;
-    const p = perspective(std.math.pi / 2.0, 1.0, near, far);
+    const p = perspective(std.math.pi / 2.0, 1.0, near, far) catch unreachable;
     // A point on the near plane (view space z = -near) -> clip.z/clip.w = -1.
     const zn = p[10] * (-near) + p[14];
     const wn = p[11] * (-near);
@@ -128,14 +142,14 @@ test "perspective maps near/far planes to NDC z = -1/+1" {
 }
 
 test "perspective field of view scales x/y symmetrically" {
-    const p = perspective(std.math.pi / 2.0, 2.0, 1, 10);
+    const p = perspective(std.math.pi / 2.0, 2.0, 1, 10) catch unreachable;
     // fov 90deg => f = 1; aspect 2 => m[0] = 0.5, m[5] = 1.
     try testing.expectApproxEqAbs(@as(f32, 0.5), p[0], eps);
     try testing.expectApproxEqAbs(@as(f32, 1.0), p[5], eps);
 }
 
 test "orthographic maps the box corners to NDC +/-1" {
-    const o = orthographic(-2, 2, -1, 1, 1, 10);
+    const o = orthographic(-2, 2, -1, 1, 1, 10) catch unreachable;
     // x = right -> NDC x = +1; y = top -> NDC y = +1; z = -near -> NDC z = -1.
     try testing.expectApproxEqAbs(@as(f32, 1), o[0] * 2 + o[12], eps);
     try testing.expectApproxEqAbs(@as(f32, 1), o[5] * 1 + o[13], eps);

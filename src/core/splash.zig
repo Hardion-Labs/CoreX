@@ -69,8 +69,10 @@ pub const HeadlessSplash = struct {
     fn setProgress(ptr: *anyopaque, message: []const u8, fraction: f32) void {
         const self: *HeadlessSplash = @ptrCast(@alignCast(ptr));
         self.last_message = message;
-        self.progress = fraction;
-        log.info("[{d:.0}%] {s}", .{ fraction * 100.0, message });
+        // Clamp to [0, 1] so a caller passing inf/nan/negative can't produce
+        // garbled progress logs. Graphical implementations should do the same.
+        self.progress = std.math.clamp(fraction, 0.0, 1.0);
+        log.info("[{d:.0}%] {s}", .{ self.progress * 100.0, message });
     }
 
     fn hide(ptr: *anyopaque) void {

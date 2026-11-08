@@ -90,16 +90,28 @@ pub fn parse(args: []const []const u8) ParseError!LaunchOptions {
     var mode_seen = false;
     var jobs_seen = false;
     var log_seen = false;
+    var help_seen = false;
+    var version_seen = false;
+    var hub_launch_seen = false;
+    var headless_seen = false;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (eq(arg, "--help") or eq(arg, "-h")) {
+            if (help_seen) return error.DuplicateArgument;
+            help_seen = true;
             opts.show_help = true;
         } else if (eq(arg, "--version") or eq(arg, "-v")) {
+            if (version_seen) return error.DuplicateArgument;
+            version_seen = true;
             opts.show_version = true;
         } else if (eq(arg, "--hub-launch")) {
+            if (hub_launch_seen) return error.DuplicateArgument;
+            hub_launch_seen = true;
             opts.hub_launch = true;
         } else if (eq(arg, "--headless")) {
+            if (headless_seen) return error.DuplicateArgument;
+            headless_seen = true;
             opts.headless = true;
         } else if (eq(arg, "--project") or eq(arg, "-p")) {
             if (opts.project_path != null) return error.DuplicateArgument;

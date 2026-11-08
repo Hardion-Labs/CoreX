@@ -27,6 +27,7 @@ pub fn validateRelative(p: []const u8) PathError!void {
     }
     var it = std.mem.tokenizeAny(u8, p, "/\\");
     while (it.next()) |comp| {
+        if (comp.len == 0) return error.UnsafePath;
         if (std.mem.eql(u8, comp, "..") or std.mem.eql(u8, comp, ".")) return error.UnsafePath;
     }
 }

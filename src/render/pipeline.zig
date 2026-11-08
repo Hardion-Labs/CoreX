@@ -56,6 +56,14 @@ const Surface = backend.Surface;
 pub const Error = backend.Error || error{
     /// Extraction failed (malformed scene data surfaced during extraction).
     Internal,
+    /// A color or other per-slot value is out of range or non-finite.
+    InvalidValue,
+    /// The camera's projection parameters are degenerate (e.g. near == far).
+    InvalidFrustum,
+    /// A mesh or its index data exceeds the slot sizing configured at init.
+    MeshTooLarge,
+    /// A scene asset is malformed and cannot be loaded.
+    InvalidAsset,
 };
 
 /// The tier the project configuration names, as a render tier.
@@ -350,7 +358,8 @@ pub const ResourceTable = struct {
 
     /// Store geometry in slot `slot` (replacing whatever it held). The slices are
     /// borrowed: the caller keeps them alive while the table is in use.
-    pub fn setMesh(self: *ResourceTable, slot: usize, mesh: raster.Mesh) Handle {
+    pub fn setMesh(self: *ResourceTable, slot: usize, mesh: raster.Mesh) Error!Handle {
+        if (slot >= self.slots.len) return error.InvalidValue;
         const entry = &self.slots[slot];
         self.meshes[slot] = mesh;
         entry.mesh = true;
@@ -358,7 +367,12 @@ pub const ResourceTable = struct {
         return .{ .index = @intCast(slot), .generation = entry.mesh_gen };
     }
 
-    pub fn setColor(self: *ResourceTable, slot: usize, linear: [4]f32) Handle {
+    pub fn setColor(self: *ResourceTable, slot: usize, linear: [4]f32) Error!Handle {
+        // Reject non-finite or out-of-range colors up front: @intFromFloat(NaN)
+        // downstream is UB, and a NaN color would poison every draw that uses it.
+        for (linear) |c| {
+            if (!std.math.isFinite(c) or c < 0.0 or c > 1.0) return error.InvalidValue;
+        }
         const entry = &self.slots[slot];
         self.colors[slot] = linear;
         entry.color = true;
@@ -366,7 +380,8 @@ pub const ResourceTable = struct {
         return .{ .index = @intCast(slot), .generation = entry.color_gen };
     }
 
-    pub fn setTexture(self: *ResourceTable, slot: usize, texture: raster.Texture) Handle {
+    pub fn setTexture(self: *ResourceTable, slot: usize, texture: raster.Texture) Error!Handle {
+        if (slot >= self.slots.len) return error.InvalidValue;
         const entry = &self.slots[slot];
         self.textures[slot] = texture;
         entry.texture = true;
@@ -383,6 +398,7 @@ pub const ResourceTable = struct {
     /// loader does) needs the bump to have happened already. Releasing a slot that is
     /// already free is a no-op, so an eviction policy cannot inflate generations.
     pub fn release(self: *ResourceTable, slot: usize) void {
+        if (slot >= self.slots.len) return;
         const entry = &self.slots[slot];
         if (!entry.mesh and !entry.color and !entry.texture) return;
         entry.mesh = false;
@@ -395,6 +411,7 @@ pub const ResourceTable = struct {
 
     /// Whether the kind's entry in `slot` is live.
     pub fn isLive(self: *const ResourceTable, slot: usize, kind: ResourceKind) bool {
+        if (slot >= self.slots.len) return false;
         const entry = self.slots[slot];
         return switch (kind) {
             .mesh => entry.mesh,
@@ -409,6 +426,7 @@ pub const ResourceTable = struct {
     /// generation lives in the table, so a handle assembled from a guessed generation
     /// silently stops resolving.
     pub fn handleOf(self: *const ResourceTable, slot: usize, kind: ResourceKind) ?Handle {
+        if (slot >= self.slots.len) return null;
         const entry = self.slots[slot];
         const gen = switch (kind) {
             .mesh => if (entry.mesh) entry.mesh_gen else return null,
@@ -488,10 +506,20 @@ pub const AssetTable = struct {
 
     pub const InitError = error{ OutOfMemory, InvalidOptions };
 
+    /// Hard cap on per-slot scratch to keep `init`'s up-front allocation bounded
+    /// even when a caller (or a hand-edited `settings.json`) supplies absurd
+    /// `vertices_per_slot` / `indices_per_slot`. The scratch is allocated once
+    /// at `init`, before any mesh is validated, so an unbounded value would be
+    /// a DoS vector.
+    pub const max_vertices_per_slot: usize = 1_000_000;
+    pub const max_indices_per_slot: usize = 6_000_000;
+
     pub fn init(gpa: Allocator, options: Options) InitError!AssetTable {
         if (options.capacity == 0 or options.capacity > ResourceTable.max_capacity) return error.InvalidOptions;
         if (options.vertices_per_slot == 0 or options.indices_per_slot == 0) return error.InvalidOptions;
         if (options.indices_per_slot % 3 != 0) return error.InvalidOptions;
+        if (options.vertices_per_slot > max_vertices_per_slot) return error.InvalidOptions;
+        if (options.indices_per_slot > max_indices_per_slot) return error.InvalidOptions;
         var table = ResourceTable.init(gpa, options.capacity) catch return error.OutOfMemory;
         errdefer table.deinit(gpa);
         const positions = gpa.alloc([3]f32, options.capacity * options.vertices_per_slot) catch return error.OutOfMemory;
@@ -527,7 +555,7 @@ pub const AssetTable = struct {
     /// Store `view` in `slot` and return the handle a `Renderable.mesh` uses.
     /// Fails with `error.MeshTooLarge` when the view exceeds the slot sizing —
     /// an explicit limit rather than a truncated mesh.
-    pub fn setMesh(self: *AssetTable, slot: usize, view: mesh_asset.MeshView) error{MeshTooLarge}!Handle {
+    pub fn setMesh(self: *AssetTable, slot: usize, view: mesh_asset.MeshView) Error!Handle {
         const vertex_count = view.vertex_count;
         const index_count = view.index_count;
         if (vertex_count > self.vertices_per_slot or index_count > self.indices_per_slot) return error.MeshTooLarge;
@@ -548,7 +576,7 @@ pub const AssetTable = struct {
     /// The source format decoders (`assets.mesh.decodeObj`) return an owned `Mesh`
     /// rather than a `CXMH` view; this is the one conversion from that shape, so a
     /// source asset and a derived artifact land in the table identically.
-    pub fn setDecodedMesh(self: *AssetTable, slot: usize, mesh: mesh_asset.Mesh) error{MeshTooLarge}!Handle {
+    pub fn setDecodedMesh(self: *AssetTable, slot: usize, mesh: mesh_asset.Mesh) Error!Handle {
         const vertex_count = mesh.vertices.len;
         const index_count = mesh.indices.len;
         if (vertex_count > self.vertices_per_slot or index_count > self.indices_per_slot) return error.MeshTooLarge;
@@ -563,11 +591,11 @@ pub const AssetTable = struct {
         return self.table.setMesh(slot, .{ .positions = positions, .uvs = uvs, .indices = indices });
     }
 
-    pub fn setColor(self: *AssetTable, slot: usize, linear: [4]f32) Handle {
+    pub fn setColor(self: *AssetTable, slot: usize, linear: [4]f32) Error!Handle {
         return self.table.setColor(slot, linear);
     }
 
-    pub fn setTexture(self: *AssetTable, slot: usize, texture: raster.Texture) Handle {
+    pub fn setTexture(self: *AssetTable, slot: usize, texture: raster.Texture) Error!Handle {
         return self.table.setTexture(slot, texture);
     }
 
@@ -724,8 +752,8 @@ test "pipeline: a scene renders through the pipeline on Low and Medium" {
     defer table.deinit(gpa);
     // One slot carries both kinds; each keeps its own generation, so defining the
     // material after the mesh must not invalidate the mesh handle.
-    const mesh_handle = table.setMesh(0, .{ .positions = &quad_positions, .indices = &quad_indices, .uvs = &quad_uvs });
-    const color_handle = table.setColor(0, .{ 1, 0, 0, 1 });
+    const mesh_handle = try table.setMesh(0, .{ .positions = &quad_positions, .indices = &quad_indices, .uvs = &quad_uvs });
+    const color_handle = try table.setColor(0, .{ 1, 0, 0, 1 });
 
     // `Renderable` stores the packed handles, exactly as a scene file would.
     const e = try scene.createEntity("quad", null);
@@ -765,13 +793,15 @@ test "pipeline: the pipeline result equals driving the backend by hand" {
     const gpa = testing.allocator;
     var table = try ResourceTable.init(gpa, 2);
     defer table.deinit(gpa);
-    _ = table.setMesh(0, .{ .positions = &quad_positions, .indices = &quad_indices });
-    _ = table.setColor(0, .{ 0.25, 0.5, 0.75, 1 });
+    _ = table.setMesh(0, .{ .positions = &quad_positions, .indices = &quad_indices }) catch unreachable;
+    _ = table.setColor(0, .{ 0.25, 0.5, 0.75, 1 }) catch unreachable;
 
+    const cmd_mesh = try table.setMesh(0, .{ .positions = &quad_positions, .indices = &quad_indices });
+    const cmd_color = try table.setColor(0, .{ 0.25, 0.5, 0.75, 1 });
     const cmd = DrawCommand{
         .entity = .{ .index = 1, .generation = 0 },
-        .mesh = table.setMesh(0, .{ .positions = &quad_positions, .indices = &quad_indices }).toBits(),
-        .material = table.setColor(0, .{ 0.25, 0.5, 0.75, 1 }).toBits(),
+        .mesh = cmd_mesh.toBits(),
+        .material = cmd_color.toBits(),
         .world = transform.fromTransform(.{ .position = .{ 0.25, 0, 0 } }),
         .bounds = .{ .center = .{ 0, 0, 0 }, .extents = .{ 1, 1, 0.1 } },
         .depth = 0,
@@ -808,9 +838,9 @@ test "pipeline: occlusion changes which commands are drawn, never the pixels" {
     defer scene.deinit();
     var table = try ResourceTable.init(gpa, 4);
     defer table.deinit(gpa);
-    const mesh_handle = table.setMesh(0, .{ .positions = &quad_positions, .indices = &quad_indices, .uvs = &quad_uvs });
-    const red = table.setColor(0, .{ 1, 0, 0, 1 });
-    const blue = table.setColor(1, .{ 0, 0, 1, 1 });
+    const mesh_handle = try table.setMesh(0, .{ .positions = &quad_positions, .indices = &quad_indices, .uvs = &quad_uvs });
+    const red = try table.setColor(0, .{ 1, 0, 0, 1 });
+    const blue = try table.setColor(1, .{ 0, 0, 1, 1 });
 
     // Near, large, covering the view.
     const near = try scene.createEntity("near", null);
@@ -905,7 +935,7 @@ test "pipeline: handles carry a generation, so a stale handle does not alias" {
     const gpa = testing.allocator;
     var table = try ResourceTable.init(gpa, 2);
     defer table.deinit(gpa);
-    const first = table.setMesh(0, .{ .positions = &quad_positions, .indices = &quad_indices });
+    const first = try table.setMesh(0, .{ .positions = &quad_positions, .indices = &quad_indices });
     const res = table.resources(false);
     try testing.expect(res.mesh(first.toBits()) != null);
 
@@ -914,7 +944,7 @@ test "pipeline: handles carry a generation, so a stale handle does not alias" {
 
     // Reusing the slot bumps the generation: the old handle stays dead while the
     // new one resolves, so a stale draw cannot pick up someone else's geometry.
-    const second = table.setMesh(0, .{ .positions = &quad_positions, .indices = &quad_indices });
+    const second = try table.setMesh(0, .{ .positions = &quad_positions, .indices = &quad_indices });
     try testing.expect(second.generation != first.generation);
     try testing.expectEqual(@as(?raster.Mesh, null), res.mesh(first.toBits()));
     try testing.expect(res.mesh(second.toBits()) != null);
@@ -927,7 +957,7 @@ test "pipeline: handles carry a generation, so a stale handle does not alias" {
     try testing.expectEqual(@as(?raster.Texture, null), res.texture(second.toBits()));
     // A live mesh without a material is not a renderable pair.
     try testing.expectEqual(@as(usize, 0), table.liveCount());
-    _ = table.setColor(0, .{ 1, 1, 1, 1 });
+    _ = table.setColor(0, .{ 1, 1, 1, 1 }) catch unreachable;
     try testing.expectEqual(@as(usize, 1), table.liveCount());
 }
 
@@ -938,10 +968,10 @@ test "pipeline: release bumps every kind's generation and repeated release is a 
     const gpa = testing.allocator;
     var table = try ResourceTable.init(gpa, 2);
     defer table.deinit(gpa);
-    _ = table.setMesh(0, .{ .positions = &quad_positions, .indices = &quad_indices });
-    _ = table.setColor(0, .{ 1, 1, 1, 1 });
+    _ = table.setMesh(0, .{ .positions = &quad_positions, .indices = &quad_indices }) catch unreachable;
+    _ = table.setColor(0, .{ 1, 1, 1, 1 }) catch unreachable;
     const texels = [_]u8{ 1, 2, 3, 4 };
-    _ = table.setTexture(0, .{ .width = 1, .height = 1, .pixels = &texels });
+    _ = table.setTexture(0, .{ .width = 1, .height = 1, .pixels = &texels }) catch unreachable;
 
     const mesh_handle = table.handleOf(0, .mesh).?;
     const color_handle = table.handleOf(0, .color).?;
@@ -963,7 +993,7 @@ test "pipeline: release bumps every kind's generation and repeated release is a 
     // release-on-evict loop cannot churn them.
     table.release(0);
     table.release(0);
-    const refilled = table.setMesh(0, .{ .positions = &quad_positions, .indices = &quad_indices });
+    const refilled = try table.setMesh(0, .{ .positions = &quad_positions, .indices = &quad_indices });
     // Two bumps since the first handle: one from the release, one from this store.
     try testing.expectEqual(mesh_handle.generation +% 2, refilled.generation);
 
@@ -1002,7 +1032,7 @@ test "pipeline: the asset table reports the bytes it uploaded, and eviction free
     const level0 = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
     const level1 = [_]u8{ 9, 10, 11, 12 };
     const mips = [_]raster.MipLevel{.{ .width = 1, .height = 1, .pixels = &level1 }};
-    _ = table.setTexture(1, .{ .width = 2, .height = 1, .pixels = &level0, .mips = &mips });
+    _ = table.setTexture(1, .{ .width = 2, .height = 1, .pixels = &level0, .mips = &mips }) catch unreachable;
     try testing.expectEqual(mesh_bytes + level0.len + level1.len, table.uploadedBytes());
 
     // Eviction removes the live entries from the footprint; the scratch block itself
@@ -1038,7 +1068,7 @@ test "pipeline: the asset table renders a CXMH mesh view and refuses oversized o
     var assets = try AssetTable.init(gpa, .{ .capacity = 1, .vertices_per_slot = 6, .indices_per_slot = 6 });
     defer assets.deinit();
     const handle = try assets.setMesh(0, view);
-    _ = assets.setColor(0, .{ 0, 1, 0, 1 });
+    _ = assets.setColor(0, .{ 0, 1, 0, 1 }) catch unreachable;
 
     const res = assets.resources(false);
     const stored = res.mesh(handle.toBits()).?;
@@ -1114,8 +1144,8 @@ test "pipeline: real assets (CXMH + CXTX) render end to end through the table" {
     var assets = try AssetTable.init(gpa, .{ .capacity = 1, .vertices_per_slot = 6, .indices_per_slot = 6 });
     defer assets.deinit();
     const mesh_handle = try assets.setMesh(0, view);
-    const color_handle = assets.setColor(0, .{ 1, 1, 1, 1 });
-    const tex_handle = assets.setTexture(0, textureFromAsset(tex_asset));
+    const color_handle = try assets.setColor(0, .{ 1, 1, 1, 1 });
+    const tex_handle = try assets.setTexture(0, textureFromAsset(tex_asset));
     try testing.expectEqual(mesh_handle.index, tex_handle.index);
 
     var scene = try TestScene.init(gpa, "main");

@@ -415,8 +415,8 @@ fn buildScene(scene: *testing_scene.EngineRenderScene, table: *pipeline.Resource
 
     const positions = [_][3]f32{ .{ -1, -1, 0 }, .{ 1, -1, 0 }, .{ 1, 1, 0 }, .{ -1, 1, 0 } };
     const indices = [_]u32{ 0, 1, 2, 0, 2, 3 };
-    const mesh_handle = table.setMesh(0, .{ .positions = &positions, .indices = &indices });
-    const color_handle = table.setColor(0, .{ 0, 1, 0, 1 });
+    const mesh_handle = try table.setMesh(0, .{ .positions = &positions, .indices = &indices });
+    const color_handle = try table.setColor(0, .{ 0, 1, 0, 1 });
     scene.getComponent(testing_scene.Renderable, quad).?.mesh = mesh_handle.toBits();
     scene.getComponent(testing_scene.Renderable, quad).?.material = color_handle.toBits();
 }

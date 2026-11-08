@@ -655,7 +655,7 @@ const TestSurface = struct {
 };
 
 fn ortho() Mat4 {
-    return @import("camera.zig").orthographic(-2, 2, -2, 2, 0, 4);
+    return @import("camera.zig").orthographic(-2, 2, -2, 2, 0, 4) catch unreachable;
 }
 
 const quad_positions = [_][3]f32{ .{ -2, -2, -2 }, .{ 2, -2, -2 }, .{ 2, 2, -2 }, .{ -2, 2, -2 } };

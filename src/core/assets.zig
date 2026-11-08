@@ -14,6 +14,7 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
+const log = std.log;
 
 pub const AssetKind = enum {
     texture,
@@ -61,6 +62,9 @@ pub const AssetIndex = struct {
     gpa: Allocator,
     entries: std.ArrayList(AssetEntry),
     _arena: *std.heap.ArenaAllocator,
+    /// Cached sum of `entries[].size`, updated during indexing so `totalBytes`
+    /// is O(1) instead of O(n) on every call.
+    total_bytes: u64 = 0,
 
     pub fn deinit(self: *AssetIndex) void {
         self.entries.deinit(self.gpa);
@@ -82,10 +86,9 @@ pub const AssetIndex = struct {
         return n;
     }
 
+    /// Total byte size of all indexed entries. O(1): cached during indexing.
     pub fn totalBytes(self: AssetIndex) u64 {
-        var total: u64 = 0;
-        for (self.entries.items) |e| total += e.size;
-        return total;
+        return self.total_bytes;
     }
 };
 
@@ -132,13 +135,17 @@ pub fn indexDirectories(
 
             while (walker.next(io) catch return error.ProjectIo) |entry| {
                 if (entry.kind != .file) continue;
-                const stat = entry.dir.statFile(io, entry.basename, .{}) catch continue;
+                const stat = entry.dir.statFile(io, entry.basename, .{}) catch |err| {
+                    log.warn("failed to stat asset \"{s}/{s}\": {s}", .{ sub, entry.basename, @errorName(err) });
+                    continue;
+                };
                 const rel = std.fmt.allocPrint(a, "{s}/{s}", .{ sub, entry.path }) catch return error.OutOfMemory;
                 index.entries.append(gpa, .{
                     .path = rel,
                     .size = stat.size,
                     .kind = AssetKind.fromExtension(std.fs.path.extension(entry.basename)),
                 }) catch return error.OutOfMemory;
+                index.total_bytes += stat.size;
             }
         }
     }

@@ -109,9 +109,12 @@ pub fn run(
     log.debug("services initialized ({d} workers)", .{js.worker_count});
 
     const project_path = opts.project_path orelse return error.Internal;
-    const abs_path = paths.resolveAbsolute(gpa, io, project_path) catch return error.OutOfMemory;
+    const abs_path = paths.resolveAbsolute(gpa, io, project_path) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidManifest,
+    };
     defer gpa.free(abs_path);
-    const project_root = std.fs.path.dirname(abs_path) orelse return error.InvalidManifest;
+    const project_root = std.fs.path.dirname(abs_path) orelse return error.Internal;
     const project_root_owned = gpa.dupe(u8, project_root) catch return error.OutOfMemory;
     errdefer gpa.free(project_root_owned);
 
@@ -177,12 +180,17 @@ pub fn run(
     // Await both jobs so neither is left running. `config.load` returns a value
     // type (no heap ownership), so discarding it on the assets-error path is
     // leak-free; the asset index owns memory and is cleaned via errdefer.
-    const assets_result = assets_future.await(js.io());
-    const config_result = config_future.await(js.io());
+    const assets_result = assets_future.await(js.io()) catch |err| {
+        _ = config_future.cancel(js.io()) catch {};
+        return mapAssetsError(err);
+    };
+    const config_result = config_future.await(js.io()) catch |err| {
+        return mapConfigError(err);
+    };
 
-    var index = assets_result catch |err| return mapAssetsError(err);
+    var index = assets_result;
     errdefer index.deinit();
-    const cfg = config_result catch |err| return mapConfigError(err);
+    const cfg = config_result;
     profiler.record("config+assets", stage_timer.elapsedNanoseconds());
     stage_timer.restart();
     splash.setProgress("configuration loaded and assets indexed", 0.7);
