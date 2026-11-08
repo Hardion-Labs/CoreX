@@ -80,7 +80,7 @@ history command (one `Ctrl+Z` undoes exactly what one click did):
 | delete | `Delete` | `delete` |
 | reparent | drag a row onto another row (or onto the blank area, for a root) | `reparent` |
 | reparent to a root | `P` | `reparent` with a null parent |
-| reorder among siblings | `move_up` / `move_down` | two `set_order` commands, so two `Ctrl+Z` |
+| reorder among siblings | `move_up` / `move_down` | two `set_order` commands, one `Ctrl+Z` |
 | fold / unfold | the disclosure, `Enter` on a row with children | none (view only) |
 
 Sibling order is **scene data**, not a view preference: `Scene` keeps an explicit `order`
@@ -88,10 +88,12 @@ key per entity (defaulting to the entity's own stable ID) and writes it into the
 only when it differs, so a reorder survives a save, a prefab capture and a streamed sector,
 and a scene nobody reordered serializes exactly as it did before the field existed. That is
 also why a swap is two commands rather than one custom inverse: undo restores both keys
-exactly instead of guessing what the previous order was. The cost shows up one press early:
-a single `Ctrl+Z` leaves the swapped pair holding the **same** key, which tie-breaks by ID
-rather than restoring the previous order — so the first press can look like nothing happened,
-while one explicit key stays in the document until the second press clears it.
+exactly instead of guessing what the previous order was. The two are recorded as **one
+gesture** (`History.applyBatch`), which is what makes that safe: one `Ctrl+Z` moves both
+keys back together, so the press never stops in a state the user never had — a pair tied on
+one key, which tie-breaks by ID and so can read as though nothing happened while leaving an
+authored key for a save to write. It is also what makes a half-swap unrepresentable: if the
+second command fails, the first is rolled back and nothing is recorded.
 
 ### Drag and drop
 
@@ -345,19 +347,26 @@ into an editor. It imports no GUI and no renderer: the shell drives it, and so d
 tests.
 
 ```
-Command (a value)  ──apply──►  Scene          + an Entry {command, before} on the stack
+Command (a value)  ──apply──►  Scene          + an Entry {command, before, group_len}
                    ◄─undo───   restore(before)
 ```
 
-**A command is a description, not a closure.** Six arms, all plain data:
-`set_component`, `remove_component`, `rename`, `reparent`, `create`, `delete`. Each
-names an entity by **stable ID** — not by the generational ECS handle, which gets
-recycled — so a command recorded a frame ago still names the right entity.
+**A command is a description, not a closure.** Seven arms, all plain data:
+`set_component`, `remove_component`, `rename`, `reparent`, `create`, `delete`,
+`set_order`. Each names an entity by **stable ID** — not by the generational ECS
+handle, which gets recycled — so a command recorded a frame ago still names the right
+entity.
+
+**The gesture, not the command, is what undo steps over.** `apply` records one command;
+`applyBatch` records several as one step, and `undoDepth`/`redoDepth` count steps — the
+number of `Ctrl+Z` presses left, which is what the user is owed. A command stays the
+unit of meaning inside it: every command in a gesture carries its own snapshot, so a
+group needs no inverse formula of its own and the entries stay plain data.
 
 **Undo is exact, by snapshot.** Before every edit the history captures the entity's full
 prior state (name, parent, every schema component). Undo puts that state back. One rule
-for all six commands instead of six inverse formulas, and it is what makes the hard case
-right: undoing a **delete** restores the entity with its **original stable ID**, its
+for all seven commands instead of seven inverse formulas, and it is what makes the hard
+case right: undoing a **delete** restores the entity with its **original stable ID**, its
 parent and all its components, so a selection (or an older command) still resolves
 afterwards. A schema is the single source of truth — `History(Scene).ComponentValue` is
 a comptime union with one *typed* arm per schema component, so a value travels with its
@@ -367,7 +376,9 @@ What the model guarantees, each point covered by a test:
 
 - **Failure changes nothing.** An invalid command records no entry and leaves the scene
   alone; a scene-level failure mid-apply is rolled back from the snapshot taken just
-  before, so the scene is never half-edited.
+  before, so the scene is never half-edited. In a gesture the rule covers the group: a
+  command that fails rolls back the commands before it, newest first, and records none of
+  them — which is why a swap of two siblings' order keys cannot leave one key moved.
 - **`undo` and `redo` allocate nothing** (measured with a counting allocator), which is
   what makes it safe to bind them to a key press inside a frame.
 - **A new edit discards the redo tail** — the undone future is unreachable and its
