@@ -275,6 +275,10 @@ pub fn Stream(comptime schemas: anytype) type {
             /// True when a candidate was left unprocessed because a budget ran
             /// out, so the caller knows to call `update` again.
             pending: bool = false,
+            /// In-range sectors that can never fit the resident-entity ceiling
+            /// (the sector alone exceeds it). Unlike `pending`, retrying cannot
+            /// help: the caller should surface this instead of looping forever.
+            oversized: usize = 0,
         };
 
         const Residency = struct {
@@ -293,8 +297,12 @@ pub fn Stream(comptime schemas: anytype) type {
         const LoadOutcome = union(enum) {
             loaded: usize,
             already_resident,
-            /// The sector would exceed the resident-entity ceiling.
+            /// The sector alone can never fit the resident-entity ceiling,
+            /// no matter what else is unloaded. Permanent for this project.
             too_large,
+            /// The sector would fit the ceiling, but not alongside the current
+            /// residents. Transient: unloading may make room later.
+            no_room,
         };
 
         gpa: Allocator,
@@ -407,7 +415,8 @@ pub fn Stream(comptime schemas: anytype) type {
             // Check the ceiling before touching the target, so a rejected sector
             // costs a parse but never a partial mutation.
             const incoming = source.count();
-            if (incoming > cap or self.entity_total > cap - incoming) return .too_large;
+            if (incoming > cap) return .too_large;
+            if (self.entity_total > cap - incoming) return .no_room;
 
             const source_roots = try source.rootIds(self.gpa);
             defer self.gpa.free(source_roots);
@@ -501,7 +510,8 @@ pub fn Stream(comptime schemas: anytype) type {
                 switch (try self.loadInner(io, dir, index, options.max_resident_entities)) {
                     .loaded => report.loaded += 1,
                     .already_resident => {},
-                    .too_large => report.pending = true,
+                    .too_large => report.oversized += 1,
+                    .no_room => report.pending = true,
                 }
             }
 
@@ -998,10 +1008,12 @@ test "stream: the resident-entity ceiling rejects a sector without mutating the 
     const before = try target.serialize(gpa);
     defer gpa.free(before);
 
-    // cave (1 entity) fits; town (4) would exceed the ceiling of 3.
+    // cave (1 entity) fits; town (4) alone exceeds the ceiling of 3, so it is
+    // reported as oversized — retrying cannot help, and pending stays false.
     const r = try s.update(testing.io, fx.tmp.dir, .{ 0, 0, 0 }, .{ .max_resident_entities = 3 });
     try testing.expectEqual(@as(usize, 1), r.loaded);
-    try testing.expect(r.pending);
+    try testing.expectEqual(@as(usize, 1), r.oversized);
+    try testing.expect(!r.pending);
     try testing.expect(s.isResident("cave"));
     try testing.expect(!s.isResident("town"));
     try testing.expectEqual(@as(usize, 1), s.residentEntityCount());
@@ -1010,7 +1022,8 @@ test "stream: the resident-entity ceiling rejects a sector without mutating the 
     _ = try s.unloadSector("cave");
     const r2 = try s.update(testing.io, fx.tmp.dir, .{ 0, 0, 0 }, .{ .max_resident_entities = 0 });
     try testing.expectEqual(@as(usize, 0), r2.loaded);
-    try testing.expect(r2.pending);
+    try testing.expectEqual(@as(usize, 2), r2.oversized);
+    try testing.expect(!r2.pending);
     const after = try target.serialize(gpa);
     defer gpa.free(after);
     try testing.expectEqualSlices(u8, before, after);

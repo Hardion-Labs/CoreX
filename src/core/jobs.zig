@@ -71,8 +71,11 @@ pub const Batch = struct {
         self.group.async(self.io, function, args);
     }
 
-    pub fn wait(self: *Batch) void {
-        self.group.await(self.io) catch {};
+    /// Wait for every task in the batch. Errors are not swallowed: the first
+    /// failure (usually `error.Canceled`) is propagated so a caller cannot
+    /// mistake a failed batch for a finished one.
+    pub fn wait(self: *Batch) Io.Cancelable!void {
+        try self.group.await(self.io);
     }
 
     pub fn cancel(self: *Batch) void {
@@ -130,7 +133,7 @@ test "job system: batch runs all tasks" {
     for (&slots, 0..) |*slot, i| {
         b.add(fillSlot, .{ slot, @intCast(i * 10) });
     }
-    b.wait();
+    b.wait() catch return error.TestUnexpectedResult;
 
     try std.testing.expectEqual(@as(i32, 0), slots[0]);
     try std.testing.expectEqual(@as(i32, 10), slots[1]);

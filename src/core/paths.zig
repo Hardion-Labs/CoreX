@@ -23,7 +23,7 @@ pub fn validateRelative(p: []const u8) PathError!void {
     if (std.fs.path.isAbsolute(p)) return error.UnsafePath;
     if (p[0] == '/' or p[0] == '\\') return error.UnsafePath;
     for (p) |c| {
-        if (c < 0x20) return error.UnsafePath;
+        if (c < 0x20 or c == 0x7f) return error.UnsafePath;
     }
     var it = std.mem.tokenizeAny(u8, p, "/\\");
     while (it.next()) |comp| {

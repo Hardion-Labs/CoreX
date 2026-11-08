@@ -29,7 +29,7 @@ corex-engine [options]
 | `--headless` | — | Forces execution without a graphical window (splash/editor in headless mode, log only). The graphical mode is planned; until the GUI library exists, execution is headless by default. |
 | `--frames` | integer > 0 | Frames to render before exiting. Default `1`. A headless run has no window to close, so the count bounds it; `validate` renders nothing regardless. |
 | `--fps` | integer > 0 | Paces the frame loop to this rate. Default: unpaced (render as fast as the machine allows), which is the honest default while nothing is displayed. `--fps 0` is a usage error rather than a synonym for unpaced. |
-| `--jobs` | integer > 0 | Number of job-system workers. Default: logical cores minus one (minimum 1). |
+| `--jobs` | integer, `1`–`1024` | Number of job-system workers. Default: logical cores minus one (minimum 1). |
 | `--log-level` | `error` \| `warn` \| `info` \| `debug` | Log level. Default: `info`. |
 | `--version`, `-v` | — | Prints the engine version and exits with code 0. |
 | `--help`, `-h` | — | Prints the help text and exits with code 0. |

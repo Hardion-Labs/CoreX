@@ -83,14 +83,14 @@ pub fn parse(gpa: Allocator, bytes: []const u8) LoadError!ProjectConfig {
 /// Load `settings.json` from the project root. Returns defaults when the file
 /// is absent. Suitable for running on a worker (`JobSystem.spawn`).
 pub fn load(gpa: Allocator, io: Io, project_root: []const u8) LoadError!ProjectConfig {
-    var dir = Io.Dir.openDirAbsolute(io, project_root, .{}) catch |err| switch (err) {
-        error.FileNotFound => return ProjectConfig{},
-        else => return error.ProjectIo,
-    };
+    var dir = Io.Dir.openDirAbsolute(io, project_root, .{}) catch return error.ProjectIo;
     defer dir.close(io);
 
     const bytes = dir.readFileAlloc(io, "settings.json", gpa, .limited(max_config_bytes)) catch |err| switch (err) {
         error.FileNotFound => return ProjectConfig{},
+        // Oversized document: reject it as an invalid config, not an IO error.
+        error.StreamTooLong, error.FileTooBig => return error.InvalidConfig,
+        error.OutOfMemory => return error.OutOfMemory,
         else => return error.ProjectIo,
     };
     defer gpa.free(bytes);

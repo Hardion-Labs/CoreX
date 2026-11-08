@@ -329,11 +329,19 @@ pub fn slider(ctx: *Context, id: Id, rect: Rect, label_text: []const u8, min: i3
     );
     ctx.canvas.fillRect(track_rect, t.track);
 
-    const steps = hi - lo;
+    // Normalise a caller's out-of-range value once, up front: the knob and the
+    // stored value can never disagree afterwards.
+    value.* = clampInt(value.*, lo, hi);
+
+    // All range arithmetic in i64: a full-range [min, max] pair overflows i32.
+    const steps: i64 = @as(i64, hi) - @as(i64, lo);
     const knob_w: i32 = 6;
     const travel = @max(track_rect.w - knob_w, 0);
-    const range = @max(steps, 1);
-    const offset = if (hi == lo) 0 else @divTrunc((value.* - lo) * travel, range);
+    const range: i64 = @max(steps, 1);
+    const offset = if (hi == lo) 0 else blk: {
+        const raw = @divTrunc((@as(i64, value.*) - lo) * @as(i64, travel), range);
+        break :blk @as(i32, @intCast(std.math.clamp(raw, @as(i64, 0), @as(i64, travel))));
+    };
     const knob = Rect.init(track_rect.x + clampInt(offset, 0, travel), rect.y, knob_w, rect.h);
     ctx.canvas.fillRect(knob, if (r.pressed) t.button_active else if (r.isHovered()) t.button_hover else t.button);
     ctx.canvas.strokeRect(knob, t.border);
@@ -346,8 +354,8 @@ pub fn slider(ctx: *Context, id: Id, rect: Rect, label_text: []const u8, min: i3
 
     if (r.pressed and travel > 0 and hi > lo) {
         const rel = clampInt(ctx.input.pointer.x - track_rect.x - @divTrunc(knob_w, 2), 0, travel);
-        const next = lo + @divTrunc(rel * range + @divTrunc(travel, 2), travel);
-        const clamped = clampInt(next, lo, hi);
+        const next64 = @as(i64, lo) + @divTrunc(@as(i64, rel) * range + @as(i64, @divTrunc(travel, 2)), @as(i64, travel));
+        const clamped = @as(i32, @intCast(std.math.clamp(next64, @as(i64, lo), @as(i64, hi))));
         if (clamped != value.*) {
             value.* = clamped;
             r.changed = true;

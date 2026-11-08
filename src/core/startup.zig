@@ -109,7 +109,7 @@ pub fn run(
     log.debug("services initialized ({d} workers)", .{js.worker_count});
 
     const project_path = opts.project_path orelse return error.Internal;
-    const abs_path = paths.resolveAbsolute(gpa, io, project_path) catch return error.ProjectNotFound;
+    const abs_path = paths.resolveAbsolute(gpa, io, project_path) catch return error.OutOfMemory;
     defer gpa.free(abs_path);
     const project_root = std.fs.path.dirname(abs_path) orelse return error.InvalidManifest;
     const project_root_owned = gpa.dupe(u8, project_root) catch return error.OutOfMemory;
@@ -138,8 +138,14 @@ pub fn run(
 
     // Step 3: validate manifest and compatibility.
     splash.setProgress("validating manifest", 0.2);
-    const bytes = Io.Dir.cwd().readFileAlloc(io, abs_path, gpa, .limited(max_manifest_bytes)) catch
-        return error.ProjectNotFound;
+    // Map read failures precisely: a missing/unreadable project file is
+    // ProjectNotFound, an oversized document is InvalidManifest, OOM is OOM.
+    const bytes = Io.Dir.cwd().readFileAlloc(io, abs_path, gpa, .limited(max_manifest_bytes)) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir, error.IsDir, error.AccessDenied, error.PermissionDenied => return error.ProjectNotFound,
+        error.StreamTooLong, error.FileTooBig => return error.InvalidManifest,
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.Internal,
+    };
     defer gpa.free(bytes);
 
     var man = manifest.parse(gpa, bytes) catch |err| return mapManifestError(err);

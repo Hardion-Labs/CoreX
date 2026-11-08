@@ -55,6 +55,8 @@ pub const Error = error{
     InvalidDimension,
     /// A mesh index points past its position array.
     InvalidIndex,
+    /// A position or UV coordinate is NaN or infinite.
+    InvalidVertex,
     /// The UV array is missing or does not hold one entry per position while
     /// a textured draw was requested.
     InvalidUv,
@@ -1891,6 +1893,23 @@ pub fn drawMeshAlloc(
     texture: ?Texture,
 ) DrawError!Stats {
     if (mesh.indices.len % 3 != 0) return error.InvalidIndex;
+    // Validate every index and every coordinate up front: a malformed mesh must
+    // be rejected before a single fragment is written, so a failed draw never
+    // leaves a half-rendered target.
+    for (mesh.indices) |idx| {
+        if (idx >= mesh.positions.len) return error.InvalidIndex;
+    }
+    for (mesh.positions) |p| {
+        if (!std.math.isFinite(p[0]) or !std.math.isFinite(p[1]) or !std.math.isFinite(p[2])) return error.InvalidVertex;
+    }
+    if (mesh.uvs) |uvs| {
+        // Positions and UVs are indexed by the same index buffer, so the
+        // arrays must be the same length even without a texture.
+        if (uvs.len != mesh.positions.len) return error.InvalidUv;
+        for (uvs) |uv| {
+            if (!std.math.isFinite(uv[0]) or !std.math.isFinite(uv[1])) return error.InvalidUv;
+        }
+    }
     if (texture) |tex| {
         try tex.validate();
         const uvs = mesh.uvs orelse return error.InvalidUv;
@@ -2335,6 +2354,38 @@ const quad_indices = [_]u32{ 0, 1, 2, 0, 2, 3 };
 
 fn quadMesh() Mesh {
     return .{ .positions = &quad_positions, .indices = &quad_indices };
+}
+
+test "drawMesh: malformed meshes are rejected before any pixel is written" {
+    // Shared helpers: a 2x2 quad surface with a known cleared state.
+    var s = try TestSurface.init(8, 8);
+    defer s.deinit();
+    const before_color = try testing.allocator.dupe(u8, s.color);
+    defer testing.allocator.free(before_color);
+
+    // Out-of-range index: validation happens up front, not inside the draw loop.
+    const nan_mesh = Mesh{
+        .positions = &.{ .{ 0, 0, 0 }, .{ std.math.nan(f32), 1, 0 }, .{ 1, 0, 0 } },
+        .indices = &.{ 0, 1, 2 },
+    };
+    try testing.expectError(error.InvalidVertex, drawMesh(&s.target, nan_mesh, transform.identity(), orthoSetup(), red, .{}, null));
+    try testing.expectEqualSlices(u8, before_color, s.color);
+
+    const bad_index_mesh = Mesh{
+        .positions = &quad_positions,
+        .indices = &.{ 0, 1, 99 },
+    };
+    try testing.expectError(error.InvalidIndex, drawMesh(&s.target, bad_index_mesh, transform.identity(), orthoSetup(), red, .{}, null));
+    try testing.expectEqualSlices(u8, before_color, s.color);
+
+    // A UV array shorter than the position array is rejected even without a texture.
+    const bad_uv_mesh = Mesh{
+        .positions = &quad_positions,
+        .indices = &quad_indices,
+        .uvs = &.{.{ 0, 0 }},
+    };
+    try testing.expectError(error.InvalidUv, drawMesh(&s.target, bad_uv_mesh, transform.identity(), orthoSetup(), red, .{}, null));
+    try testing.expectEqualSlices(u8, before_color, s.color);
 }
 
 test "drawMesh: a front-facing quad covers the whole viewport" {

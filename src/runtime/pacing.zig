@@ -95,7 +95,12 @@ pub const Pacer = struct {
     /// one and not an approximation of it.
     pub fn init(target_fps: u32) Error!Pacer {
         if (target_fps == 0) return error.InvalidTargetFps;
-        return .{ .budget_ns = std.time.ns_per_s / target_fps };
+        // A rate above 1e9 fps truncates the integer budget to zero, which
+        // would make every frame permanently late and divide by zero in
+        // targetFps(). Reject it instead.
+        const budget = std.time.ns_per_s / target_fps;
+        if (budget == 0) return error.InvalidTargetFps;
+        return .{ .budget_ns = budget };
     }
 
     pub fn enabled(self: Pacer) bool {
@@ -197,10 +202,13 @@ test "pacer: the budget is the exact reciprocal of the target rate" {
     try testing.expectEqual(@as(?u64, 20_000_000), fifty.budget_ns);
     try testing.expectEqual(@as(?u32, 50), fifty.targetFps());
 
-    // A rate faster than the nanosecond budget cannot be represented; it is clamped,
-    // not silently wrapped to zero.
-    const absurd = try Pacer.init(std.time.ns_per_s * 2 + 1);
-    try testing.expectEqual(@as(?u64, 0), absurd.budget_ns);
+    // A rate faster than the nanosecond budget cannot be represented; asking for
+    // it is rejected instead of wrapping the budget to zero.
+    try testing.expectError(error.InvalidTargetFps, Pacer.init(std.time.ns_per_s + 1));
+    try testing.expectError(error.InvalidTargetFps, Pacer.init(std.time.ns_per_s * 2 + 1));
+    // Exactly 1e9 fps is the fastest representable rate (1 ns budget).
+    const fastest = try Pacer.init(std.time.ns_per_s);
+    try testing.expectEqual(@as(?u64, 1), fastest.budget_ns);
 
     try testing.expectError(error.InvalidTargetFps, Pacer.init(0));
 }

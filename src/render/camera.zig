@@ -43,10 +43,25 @@ pub fn orthographic(left: f32, right: f32, bottom: f32, top: f32, near: f32, far
 
 /// Right-handed view matrix looking from `eye` toward `target` with the given
 /// `up` hint. If `eye == target` (degenerate forward), returns the identity.
+/// If `up` is parallel to the forward axis, no basis can be built from it, so
+/// a fallback up from the axis least aligned with `f` is used instead of
+/// emitting an all-zero basis.
 pub fn lookAt(eye: Vec3, target: Vec3, up: Vec3) Mat4 {
     const f = transform.normalize(transform.sub(target, eye));
     if (transform.length(f) < 1e-6) return transform.identity();
-    const s = transform.normalize(transform.cross(f, up));
+    var up_hint = up;
+    if (transform.length(transform.cross(f, up_hint)) < 1e-6) {
+        // World up (or whatever was passed) is parallel to the view axis:
+        // pick the world axis least aligned with `f` as a stable surrogate.
+        const ax = transform.Vec3{ 1, 0, 0 };
+        const ay = transform.Vec3{ 0, 1, 0 };
+        const az = transform.Vec3{ 0, 0, 1 };
+        const afx = @abs(transform.dot(f, ax));
+        const afy = @abs(transform.dot(f, ay));
+        const afz = @abs(transform.dot(f, az));
+        up_hint = if (afx <= afy and afx <= afz) ax else if (afy <= afz) ay else az;
+    }
+    const s = transform.normalize(transform.cross(f, up_hint));
     const u = transform.cross(s, f);
 
     var m = transform.identity();
@@ -138,6 +153,21 @@ test "lookAt puts the eye at the origin and looks down -Z" {
     try testing.expectApproxEqAbs(@as(f32, -5), ahead[2], eps);
     // The up direction maps to +Y.
     try expectVec3(.{ 0, 1, 0 }, transform.transformDirection(v, .{ 0, 1, 0 }));
+}
+
+test "lookAt with up parallel to the view axis still yields a finite orthonormal basis" {
+    // Looking straight down -Y with the world up (0,1,0): no basis can be built
+    // from that hint, so a fallback axis must kick in instead of an all-zero basis.
+    const v = lookAt(.{ 0, 5, 0 }, .{ 0, 0, 0 }, .{ 0, 1, 0 });
+    // The forward row is finite and unit length.
+    const f = Vec3{ -v[2], -v[6], -v[10] };
+    const flen = @sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
+    try testing.expectApproxEqAbs(@as(f32, 1), flen, eps);
+    const s = Vec3{ v[0], v[4], v[8] };
+    const slen = @sqrt(s[0] * s[0] + s[1] * s[1] + s[2] * s[2]);
+    try testing.expectApproxEqAbs(@as(f32, 1), slen, eps);
+    // Eye maps to the origin.
+    try expectVec3(.{ 0, 0, 0 }, transform.transformPoint(v, .{ 0, 5, 0 }));
 }
 
 test "lookAt degenerate eye==target returns identity" {

@@ -130,7 +130,10 @@ const pacing = try pacer.end(io, started);    // .work_ns, .slept_ns, .late
 Pacing is **pure arithmetic plus one sleep**, so it is testable without a window:
 
 - The budget is the integer reciprocal `1e9 / fps`, so 60 fps means exactly
-  `16_666_666 ns` — the documented rate, not an approximation of it.
+  `16_666_666 ns` — the documented rate, not an approximation of it. A rate above
+  `1e9` fps would truncate the budget to zero and is rejected with
+  `error.InvalidTargetFps` instead of busy-looping and dividing by zero in
+  `targetFps()`.
 - **No drift.** The deadline is anchored to `previous_deadline + budget`, so a frame that
   overshoots its sleep (timer granularity, scheduler) is repaid by the next one instead
   of accumulating into a loop that slowly runs slower than asked.

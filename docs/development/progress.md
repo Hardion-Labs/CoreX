@@ -5,16 +5,20 @@ task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
 
-**Current state:** `main` = `9417344` (merge of PR #73, from branch
-`arena/8f42f3c7-corex`). Retested **on the merged tree** in this sandbox: **965/965** in each
-of Debug, ReleaseSafe and ReleaseFast, every one with a **cold `--cache-dir`** — a warm cache
-prints `3/3 steps succeeded` without re-executing a single test, so a cached step is not a
-retest — plus `zig fmt --check src/ tools/ build.zig` clean, `zig build` OK, `editor-frame` +
-`qoi-decode` + the headless launch contract OK, CI green. Authored sibling order is now pinned
-on the paths that go through real files (`saveScene`, `Stream.loadSector`), and
-`docs/scene-streaming.md` no longer claims roots are cloned by ID when they are cloned by paint
-order. **One item is blocked on a decision, not on work:** fold-state persistence needs to know
-who owns editor view state (see the 2026-11-08 (d) entry) — do not re-derive that from scratch.
+**Current state:** working tree on top of `ab64c39` (merge of PR #74) carries an
+uncommitted full-engine audit pass — see the 2026-11-08 (e) entry and
+`CHANGELOG.md` (Unreleased / Fixed). Retested **on this tree** in this sandbox:
+**972/972** in each of Debug, ReleaseSafe and ReleaseFast, every one with a
+**cold `--cache-dir`** — a warm cache prints `3/3 steps succeeded` without
+re-executing a single test, so a cached step is not a retest — plus
+`zig fmt --check src/ tools/ build.zig` clean, `zig build` OK and the CI
+launch-contract smoke (validate, headless editor, runtime, `editor-frame` +
+`qoi-decode`) OK. **Regression status on main today: the JPEG IDCT vector test
+fails in ReleaseSafe and ReleaseFast on `ab64c39` itself and on this tree
+before the fix; the fix (truncating vector cast) makes all three modes green.**
+**One item is blocked on a decision, not on work:** fold-state persistence needs
+to know who owns editor view state (see the 2026-11-08 (d) entry) — do not
+re-derive that from scratch.
 
 Toolchain note for the next continuation: Zig 0.17.0 lives in a venv under `/tmp`
 (`/tmp/zigvenv`, wrapper `/home/user/zig.sh`), and `/tmp` **is wiped between sessions**,
@@ -23,6 +27,104 @@ below still works):
 `python3 -m venv /tmp/zigvenv && /tmp/zigvenv/bin/pip install ziglang==0.17.0` (pip
 warns the wheel is yanked for a partial PyPI upload; the binary is still 0.17.0 and
 works). Window / swapchain remains blocked in this sandbox.
+
+## Cycle 2026-11-08 (e) — Full-engine audit applied (audit, architecture, review)
+
+**What was asked:** analyse the project in the order 1 code audit, 2 architecture,
+3 review, 4 evolution; apply fixes. Four parallel deep-dive passes plus the
+maintainer's own sweeps; everything verified against the code, then applied as
+one working tree. **The depth of the two review passes found one real production
+bug that Debug and CI never could see** (see the JPEG item — it failed on main
+in every optimized build, on a wrong IDCT narrowing).
+
+**Failure modes found and fixed (all regression-tested or pinned by existing tests):**
+
+- **JPEG: `@intCast` i32→u8 on a vector lowered to signed-saturating packs**
+  (`vpackssdw`/`vpacksswb`) on AVX2 — channel values above 127 were silently
+  clamped to 127. The pinned `gray_8x8` libjpeg vector failed in ReleaseSafe and
+  ReleaseFast **on pristine main too** (masked until now because CI runs Debug).
+  The inputs are clamped to [0,255], so the cast is now a truncating bit cast.
+  All three optimize modes: 972/972 cold-cache. (a Zig 0.17.0 vector-intCast
+  lowering behaviour worth reporting upstream)
+- **FLAC**: a Rice partition shorter than the subframe warmup underflowed
+  (`part_len - warmup` with `partitions > 1`) → OOB writes on crafted input.
+  `readSigned(64)` also sign-extended via a wrapping `sign_bit << 1`.
+- **JPEG**: AC skip-16 (ZRL) had no coefficient64 bound (silent re-sync on
+  crafted scans); the DC predictor accumulated in `i32` (overflow → panic/UB).
+- **Inflate/QOI**: trailing bytes after a valid zlib trailer / QOI end marker
+  were accepted, unlike every other decoder; PNG `tRNS` keys now must fit the
+  source bit depth.
+- **Pipeline**: `Report.liveKeys` reported would-be keys of failed imports,
+  pinning stale artifacts in the content-addressed cache against GC.
+- **Rasterizer**: mipmap chains validated their input only *after* building
+  (now `Chain.generate` rejects `error.InvalidTexture` at entry); all mesh
+  indices/positions/UVs are validated **before any fragment is written** (a
+  failed draw cannot half-render the target), a UV array shorter than the
+  position array is rejected without a texture, and `Renderable.isValid()` is
+  enforced in extraction (NaN bounds no longer defeat frustum culling).
+- **GUI**: canvas compositing stored the **premultiplied** sum in a
+  straight-alpha target; it now normalises by `out_a` like the rasterizer.
+  Layout consumed the inter-child gap and pushed siblings out of the parent rect
+  when a child collapsed; the cross axis was unclamped; `Rect.below`/`after`
+  grew on negative cuts; slider arithmetic overflowed i32.
+- **Runtime**: `Pacer.init` accepted rates above 1e9 fps, truncating the budget
+  to zero (permanent late frames + division by zero in `targetFps()`).
+- **Core**: asset indexing leaked a dir handle and walker per scanned directory
+  for the whole run; the manifest read collapsed every failure into
+  `ProjectNotFound` (exit 5) — now mapped precisely; a missing project root on
+  `settings.json` was treated as defaults (now an error) and an oversized file
+  reported as IO error (now `InvalidConfig`); `manifest.id` was stored with zero
+  validation (now validated like `name`, it is an identity never a path);
+  `--jobs` is capped at 1024 and duplicate `--mode`/`--jobs`/`--log-level`
+  arguments are rejected like every other argument; DEL (0x7f) joins the
+  control-character rejections.
+- **Jobs/diagnostics**: `jobs.Batch.wait` swallowed task errors (now propagates);
+  `Profiler.record` silently discarded samples on OOM (now counted and reported);
+  undo/redo depth walkers saturate on a corrupt `group_len`.
+- **Scene/runtime**: `findCamera` used ECS storage order, which changes after
+  swap-removes — now picks the lowest stable-ID usable camera, and the editor's
+  `cameraFov`/`findCameraEntity` apply the same rule. `Stream` now distinguishes
+  `oversized` (sector can never fit, retrying is hopeless — sets no `pending`)
+  from transient capacity shortfall (`pending`), so a hot loop cannot spin forever.
+- **ECS**: pools carry a mutation counter and views assert it in Debug/ReleaseSafe,
+  catching a dense array reordered mid-iteration instead of silently
+  skipping/duplicating entities.
+- **Occlusion**: a back_to_front (potentially transparency-sorted) draw list no
+  longer lets commands claim occluder tiles.
+- **Editor**: `undoDepth` saturates.
+
+**Validation:** 972/972 in Debug, ReleaseSafe and ReleaseFast (cold
+`--cache-dir`); `zig fmt` clean; CI launch-contract smoke (validate/headless/
+runtime/editor-frame/qoi-decode) OK. New regression tests: FLAC residual
+partition bound, pipeline liveKeys, layout collapsed-child gap, canvas
+translucent-destination blending, camera parallel-up lookAt, manifest invalid
+`id`, raster pre-write validation (NaN positions, OOB index, short UVs).
+
+**Open items (unchanged):** fold-state persistence remains blocked on the
+view-state ownership decision (2026-11-08 (d)). The occlusion/format/lifetime
+refactors listed under **Evolution proposals** below (unified observer loops,
+per-frame transform snapshot caching, undo history cap, native ABI reserved
+slots) are proposals, not landings — do not implement them silently.
+
+**Evolution proposals (not implemented):**
+
+1. **One iteration/observer kernel** shared by `schedule`/`graph`/`frame`
+   instead of three near-identical observed-system loops.
+2. **Frame-scoped transform snapshot**: `findCamera` → `cameraOf` recomputes
+   `computeWorldTransforms` per call per frame; pass the snapshot through the
+   frame instead. The editor frame and the runtime loop both pay this today.
+3. **View-mutation policy**: the debug assert added this cycle is a tripwire;
+   decide whether views should keep a stable-copy iterator (allocation) or
+   keep the current contract with the assert as the enforcement.
+4. **Undo/history memory**: entries are unbounded; consider a gesture-count
+   cap tied to `max_batch` plus an explicit `clearRedo` metric.
+5. **Native module ABI**: reserved padding slots in `CorexHostApi` and a
+   documented max string length/alignment contract for `CorexModuleInfo`.
+6. **Scene snapshot cost**: `computeWorldTransforms` sorts per call and does
+   ~6 allocations; an order-maintenance structure would remove the O(n log n)
+   per frame entirely.
+7. **Asset index memory**: `totalBytes()`/entry path duplication is fine at
+   current scale; a `max_entries` budget would make the bound explicit.
 
 ## Cycle 2026-11-08 (d) — Authored order through the file, and a docs claim that was wrong
 

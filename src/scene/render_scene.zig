@@ -329,21 +329,26 @@ pub const EngineRenderer = struct {
         return report;
     }
 
-    /// The first entity in the scene that is a usable camera, or null when the
-    /// scene authors none. Iteration is over the ECS view, so the answer is
-    /// deterministic: entities are visited in storage order, which the scene keeps
-    /// in ascending stable-ID order.
+    /// The lowest stable-ID entity in the scene that is a usable camera, or null
+    /// when the scene authors none. Entities are compared by stable ID rather than
+    /// by ECS storage order: the dense array's order changes after swap-removes,
+    /// so storage order would make the choice frame-dependent.
     pub fn findCamera(scene: anytype, gpa: Allocator) !?CameraView {
         var view = scene.ecsWorld().view(.{CameraComponent});
+        var best: ?CameraView = null;
+        var best_id: u64 = std.math.maxInt(u64);
         while (view.next()) |entry| {
             const entity = entry[0];
             const component = entry[1];
             if (!component.isValid()) continue;
+            const id = scene.idOf(entity) orelse std.math.maxInt(u64);
+            if (id >= best_id) continue;
             if (try cameraOf(scene, entity, gpa)) |cam| {
-                return .{ .entity = entity, .component = component.*, .camera = cam };
+                best = .{ .entity = entity, .component = component.*, .camera = cam };
+                best_id = id;
             }
         }
-        return null;
+        return best;
     }
 
     /// Render one frame of `scene` with the scene's own camera, into a headless
@@ -601,8 +606,18 @@ pub fn loadAssets(
                     return error.OutOfMemory;
                 };
                 const mips = generateMips(gpa, &loaded.mip_chains, parsed.width, parsed.height, level0) catch |err| {
-                    _ = loaded.evict(item.path);
-                    return err;
+                    switch (err) {
+                        error.InvalidAsset => {
+                            log.warn("texture \"{s}\" failed mip generation; skipped", .{item.path});
+                            _ = loaded.evict(item.path);
+                            loaded.report.skipped += 1;
+                            continue;
+                        },
+                        error.OutOfMemory => {
+                            _ = loaded.evict(item.path);
+                            return error.OutOfMemory;
+                        },
+                    }
                 };
                 if (mips.len > 0) loaded.report.mipmapped += 1;
                 // A generated chain is the last entry of `mip_chains` at this point;
@@ -674,10 +689,11 @@ fn generateMips(
     width: u32,
     height: u32,
     pixels: []const u8,
-) error{OutOfMemory}![]const r.MipLevel {
+) error{ OutOfMemory, InvalidAsset }![]const r.MipLevel {
     if (r.mipmap.levelCount(width, height) < 2) return &.{};
     const chain = r.mipmap.Chain.generate(gpa, width, height, pixels) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidTexture => return error.InvalidAsset,
     };
     chains.append(gpa, chain) catch {
         var undo = chain;

@@ -14,7 +14,7 @@ pub const NameError = error{InvalidName};
 pub fn validateDisplayName(name: []const u8) NameError!void {
     if (name.len == 0 or name.len > 128) return error.InvalidName;
     for (name) |c| {
-        if (c < 0x20 or c == '/' or c == '\\') return error.InvalidName;
+        if (c < 0x20 or c == 0x7f or c == '/' or c == '\\') return error.InvalidName;
     }
 }
 

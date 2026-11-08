@@ -1437,14 +1437,13 @@ fn syncCameraView(state: *State, scene: anytype) void {
     state.camera_view = frame_camera.viewOf(t.*, state.camera_view.distance);
 }
 
-/// Fov of the scene's own camera, so framing uses the lens that will render the frame.
+/// Fov of the scene's own camera — the lowest-stable-ID usable camera, the same
+/// one `findCameraEntity` and the renderer's `findCamera` pick — so framing uses
+/// the lens that will render the frame.
 fn cameraFov(scene: anytype) !f32 {
-    var view = scene.ecsWorld().view(.{render_scene.CameraComponent});
-    while (view.next()) |entry| {
-        const component = entry[1];
-        if (component.isValid()) return component.fov;
-    }
-    return error.NoCamera;
+    const entity = findCameraEntity(scene) orelse return error.NoCamera;
+    const component = scene.getComponent(render_scene.CameraComponent, entity) orelse return error.NoCamera;
+    return component.fov;
 }
 
 /// Write `view` onto the scene's camera entity as one undoable command.
@@ -1469,16 +1468,23 @@ fn applyCamera(state: *State, scene: anytype, history: anytype, view: frame_came
     };
 }
 
-/// The first usable camera entity, matching the renderer's own `findCamera` order: the ECS
-/// view visits entities in stable-ID order, so the camera the editor moves is the camera
-/// `renderSceneFrame` would render through.
+/// The usable camera with the lowest stable ID, matching the renderer's own
+/// `findCamera` rule (entities are compared by stable ID, not by ECS storage
+/// order), so the camera the editor moves is the camera `renderSceneFrame`
+/// would render through.
 fn findCameraEntity(scene: anytype) ?@TypeOf(scene.entityById(0).?) {
     var view = scene.ecsWorld().view(.{render_scene.CameraComponent});
+    var best: ?@TypeOf(scene.entityById(0).?) = null;
+    var best_id: u64 = std.math.maxInt(u64);
     while (view.next()) |entry| {
         if (!entry[1].isValid()) continue;
-        return entry[0];
+        const id = scene.idOf(entry[0]) orelse std.math.maxInt(u64);
+        if (id < best_id) {
+            best = entry[0];
+            best_id = id;
+        }
     }
-    return null;
+    return best;
 }
 
 /// Selects the rendered entity under the pointer in the viewport, if any.

@@ -118,24 +118,28 @@ pub fn indexDirectories(
     defer root.close(io);
 
     for (dirs) |sub| {
-        var dir = root.openDir(io, sub, .{ .iterate = true }) catch |err| switch (err) {
-            error.FileNotFound => continue,
-            else => return error.ProjectIo,
-        };
-        defer dir.close(io);
+        // Scope the handles to this iteration; a defer in the loop body would
+        // keep every directory and walker open until the function returns.
+        {
+            var dir = root.openDir(io, sub, .{ .iterate = true }) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return error.ProjectIo,
+            };
+            defer dir.close(io);
 
-        var walker = dir.walk(a) catch return error.OutOfMemory;
-        defer walker.deinit();
+            var walker = dir.walk(a) catch return error.OutOfMemory;
+            defer walker.deinit();
 
-        while (walker.next(io) catch return error.ProjectIo) |entry| {
-            if (entry.kind != .file) continue;
-            const stat = entry.dir.statFile(io, entry.basename, .{}) catch continue;
-            const rel = std.fmt.allocPrint(a, "{s}/{s}", .{ sub, entry.path }) catch return error.OutOfMemory;
-            index.entries.append(gpa, .{
-                .path = rel,
-                .size = stat.size,
-                .kind = AssetKind.fromExtension(std.fs.path.extension(entry.basename)),
-            }) catch return error.OutOfMemory;
+            while (walker.next(io) catch return error.ProjectIo) |entry| {
+                if (entry.kind != .file) continue;
+                const stat = entry.dir.statFile(io, entry.basename, .{}) catch continue;
+                const rel = std.fmt.allocPrint(a, "{s}/{s}", .{ sub, entry.path }) catch return error.OutOfMemory;
+                index.entries.append(gpa, .{
+                    .path = rel,
+                    .size = stat.size,
+                    .kind = AssetKind.fromExtension(std.fs.path.extension(entry.basename)),
+                }) catch return error.OutOfMemory;
+            }
         }
     }
 
