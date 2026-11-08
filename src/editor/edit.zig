@@ -1081,6 +1081,54 @@ test "save: writes the project atomically, marks it clean and keeps the history"
     try testing.expectEqual(@as(usize, 1), files);
 }
 
+// The document tests cover `serialize`/`parse` in memory; the save path is where an authored
+// order becomes a file, which is what a `Ctrl+S` after a tree reorder produces. It is also
+// where the omission rule matters most: a project that nobody reordered must not start
+// carrying `order` fields because the editor wrote it once.
+test "save: an authored sibling order reaches the file, and only where it is not natural" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = tmp.dir;
+
+    var scene = try TestScene.init(testing.allocator, "level");
+    defer scene.deinit();
+    var history = TestHistory.init(testing.allocator);
+    defer history.deinit();
+
+    const root = try scene.createEntity("root", null); // id 1
+    const root_id = scene.idOf(root).?;
+    _ = try scene.createEntity("a", root_id); // id 2
+    _ = try scene.createEntity("b", root_id); // id 3
+    const moved = try scene.createEntity("c", root_id); // id 4
+    // Move `c` to the front exactly as the tree does: one history command, one undo step.
+    try history.apply(&scene, .{ .set_order = .{ .id = scene.idOf(moved).?, .order = 0 } });
+
+    try saveScene(&history, &scene, io, dir, "level.corex", testing.allocator);
+    const written = try dir.readFileAlloc(io, "level.corex", testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(written);
+    // One entity carries a key; the others keep theirs implicit.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, written, "\"order\""));
+
+    // Read it back from disk, not from the buffer: the file is the contract.
+    var reloaded = try TestScene.load(testing.allocator, io, dir, "level.corex");
+    defer reloaded.deinit();
+    try testing.expectEqual(@as(u64, 0), reloaded.orderOf(4));
+    try testing.expectEqual(@as(u64, 2), reloaded.orderOf(2)); // natural key = own ID
+    var ids: [3]u64 = undefined;
+    try testing.expectEqual(@as(usize, 3), reloaded.childIdsInto(root_id, &ids));
+    try testing.expectEqual(@as(u64, 4), ids[0]);
+    try testing.expectEqual(@as(u64, 2), ids[1]);
+    try testing.expectEqual(@as(u64, 3), ids[2]);
+
+    // Undo still reaches the reorder after the save — writing the file did not consume it.
+    try history.undo(&scene);
+    try testing.expectEqual(@as(u64, 4), scene.orderOf(4));
+    ids = undefined;
+    try testing.expectEqual(@as(usize, 3), scene.childIdsInto(root_id, &ids));
+    try testing.expectEqual(@as(u64, 2), ids[0]);
+}
+
 test "save: writes into a scene subdirectory and creates it" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
