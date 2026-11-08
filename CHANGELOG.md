@@ -22,7 +22,7 @@ declared yet.
   - The threshold moved into `gui.input` as `travelled` / `drag_threshold_px`: `ViewportDrag.end`
     had that rule inline, and a second gesture needing it is where two copies would start
     disagreeing.
-  - The Inspector's own documentation was stale on the same way — it still called rotation and
+  - The Inspector's own documentation was stale in the same way — it still called rotation and
     the camera `fov` read-only while both have editable rows and tests — and now lists what the
     code edits: `pos`, `scale`, `rot`, `fov`, `near`, `far`, and the name.
   - 8 new tests (963 total).
