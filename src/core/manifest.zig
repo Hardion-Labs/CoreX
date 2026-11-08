@@ -59,7 +59,13 @@ pub const ParseError = error{
     InvalidEngineVersion,
     UnsafePath,
     OutOfMemory,
+    /// The manifest document is larger than `max_manifest_bytes`.
+    FileTooBig,
 };
+
+/// Maximum accepted manifest size (1 MiB), enforced inside `parse` so the
+/// limit cannot be bypassed by a direct caller.
+pub const max_manifest_bytes: usize = 1024 * 1024;
 
 /// Parse and structurally validate a `.corex` manifest from its bytes.
 ///
@@ -68,6 +74,7 @@ pub const ParseError = error{
 /// `Manifest.compatibility` for that (kept separate so invalid manifests and
 /// incompatible projects map to distinct exit codes).
 pub fn parse(gpa: Allocator, bytes: []const u8) ParseError!Manifest {
+    if (bytes.len > max_manifest_bytes) return error.FileTooBig;
     var arena = try gpa.create(std.heap.ArenaAllocator);
     errdefer gpa.destroy(arena);
     arena.* = std.heap.ArenaAllocator.init(gpa);

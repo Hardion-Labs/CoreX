@@ -1018,6 +1018,29 @@ fn applyShortcuts(ctx: *widgets.Context, state: *State, scene: anytype, history:
     // the gesture. A press that never moved the axis records nothing.
     if (ctx.input.pointer_released and state.viewport_gizmo.active) {
         applyGizmoDrag(state, scene, gpa, ctx.input.pointer, dock.viewport);
+        // Capture the final transform written above, then restore the initial
+        // transform so `history.apply` captures it as "before" and applies the
+        // final transform as "after" — one undoable step for the whole gesture.
+        const entity = scene.entityById(state.selected) orelse {
+            state.viewport_gizmo.cancel();
+            return;
+        };
+        const comp = scene.getComponent(render_scene.Transform, entity) orelse {
+            state.viewport_gizmo.cancel();
+            return;
+        };
+        const final_transform = comp.*;
+        comp.* = render_scene.Transform{
+            .position = state.viewport_gizmo.drag_start_world,
+            .rotation = state.viewport_gizmo.drag_start_rotation,
+            .scale = state.viewport_gizmo.drag_start_scale,
+        };
+        history.apply(scene, .{ .set_component = .{
+            .id = state.selected,
+            .value = edit.valueFor(@TypeOf(scene.*), render_scene.Transform, final_transform),
+        } }) catch |err| {
+            state.edit_error = err;
+        };
         state.viewport_gizmo.cancel();
         return;
     }

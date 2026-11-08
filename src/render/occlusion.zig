@@ -65,6 +65,7 @@ pub const Buffer = struct {
 
     pub fn init(gpa: std.mem.Allocator, tiles_x: u16, tiles_y: u16) !Buffer {
         if (tiles_x == 0 or tiles_y == 0) return error.InvalidGrid;
+        if (tiles_x > 2048 or tiles_y > 2048) return error.InvalidGrid;
         const depths = try gpa.alloc(f32, @as(usize, tiles_x) * tiles_y);
         @memset(depths, empty);
         return .{ .tiles_x = tiles_x, .tiles_y = tiles_y, .depths = depths };
@@ -393,11 +394,11 @@ const testing = std.testing;
 const camera = @import("camera.zig");
 
 fn ortho() Mat4 {
-    return camera.orthographic(-4, 4, -4, 4, 0.1, 100);
+    return camera.orthographic(-4, 4, -4, 4, 0.1, 100) catch unreachable;
 }
 
 fn perspective() Mat4 {
-    return camera.perspective(std.math.pi / 4.0, 16.0 / 9.0, 0.1, 100);
+    return camera.perspective(std.math.pi / 4.0, 16.0 / 9.0, 0.1, 100) catch unreachable;
 }
 
 fn box(center: Vec3, extents: Vec3) Aabb {
@@ -480,7 +481,7 @@ test "occlusion: a perspective projection claims the near wall it sees" {
     // A tighter near plane than the shared fixture: with `near = 0.1`, 20 and 40
     // units both land within a couple of thousandths of NDC 1, so no bias could
     // separate them and the test would be measuring float precision, not the cull.
-    const m = camera.perspective(std.math.pi / 4.0, 16.0 / 9.0, 5.0, 100);
+    const m = camera.perspective(std.math.pi / 4.0, 16.0 / 9.0, 5.0, 100) catch unreachable;
     var buf = try Buffer.init(testing.allocator, 48, 27);
     defer buf.deinit(testing.allocator);
     // 20 units out, filling most of the view; the piece behind its centre is hidden.

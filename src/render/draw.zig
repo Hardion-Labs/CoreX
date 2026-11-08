@@ -95,10 +95,18 @@ pub const Occlusion = struct {
     /// turned into an error. Extraction is not the place to reject a frame over a
     /// quality knob — `occlusion.Buffer` keeps its own `InvalidGrid` for callers
     /// that build a buffer directly.
+    ///
+    /// A hard cap keeps a hostile config from allocating a gigantic tile buffer:
+    /// each tile is one f32, so a 4096x4096 grid would be 64 MiB before any
+    /// drawing happens. The cap is well above the usable default (64x36).
+    pub const max_occlusion_tile: u16 = 2048;
+
     pub fn sanitized(self: Occlusion) Occlusion {
         var out = self;
         out.tiles_x = @max(self.tiles_x, 1);
         out.tiles_y = @max(self.tiles_y, 1);
+        if (out.tiles_x > max_occlusion_tile) out.tiles_x = max_occlusion_tile;
+        if (out.tiles_y > max_occlusion_tile) out.tiles_y = max_occlusion_tile;
         return out;
     }
 };
@@ -255,6 +263,12 @@ pub const RenderFrame = struct {
     ) !struct { culled: usize, occlusion_culled: usize, changed: bool } {
         var next: std.ArrayList(DrawCommand) = .fromOwnedSlice(self.spare);
         next.capacity = self.spare.len;
+        // Steal the spare so it can't dangle if a grow frees it; restored below
+        // on success. On error, `defer` frees the list's storage and `spare`
+        // stays empty (never dangling).
+        self.spare = &[_]DrawCommand{};
+        var stole = false;
+        defer if (!stole) next.deinit(self.gpa);
         // One reset per frame is the whole point of the hand-off: everything the
         // previous frame borrowed from the scratch arena is released at once, and a
         // frame that needs no more memory than last time allocates nothing.
@@ -289,6 +303,7 @@ pub const RenderFrame = struct {
         self.active = next.allocatedSlice();
         self.commands = next.items;
         self.spare = old_active;
+        stole = true;
         self.culled = culled;
         self.culled_occluded = result.occlusion_culled;
         return .{ .culled = culled, .occlusion_culled = result.occlusion_culled, .changed = changed };
@@ -477,6 +492,20 @@ pub fn extractIntoScratchOccluded(
         }
         const world = wt.get(e) orelse continue;
         const world_bounds = culling.transformAabb(world, rend.bounds);
+        // NaN/non-finite world bounds (from a NaN world matrix) defeat frustum
+        // culling: `classifyAabb` never answers `.outside` for a NaN box. Reject
+        // them up front and count as culled.
+        var wb_finite = true;
+        for (world_bounds.center) |v| {
+            if (!std.math.isFinite(v)) wb_finite = false;
+        }
+        for (world_bounds.extents) |v| {
+            if (!std.math.isFinite(v) or v < 0) wb_finite = false;
+        }
+        if (!wb_finite) {
+            culled += 1;
+            continue;
+        }
         if (frustum.classifyAabb(world_bounds) == .outside) {
             culled += 1;
             continue;

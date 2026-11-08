@@ -2381,7 +2381,7 @@ const components = @import("../scene/components.zig");
 /// identity view, x/y in [-2, 2] mapping to the full viewport, and z in [0, -4]
 /// mapping to NDC [-1, 1]. A quad at z = -2 lands at depth 0.
 fn orthoSetup() Mat4 {
-    return camera.orthographic(-2, 2, -2, 2, 0, 4);
+    return camera.orthographic(-2, 2, -2, 2, 0, 4) catch unreachable;
 }
 
 const quad_positions = [_][3]f32{
@@ -4137,7 +4137,7 @@ test "rasterize: the sampling controls reach the pixels" {
     // for anisotropic, so both the bias and the tap cap land on a different level.
     const uvs = [_][2]f32{ .{ 0, 0 }, .{ 1, 0 }, .{ 1, 0.25 }, .{ 0, 0.25 } };
     const mesh = Mesh{ .positions = &positions, .indices = &indices, .uvs = &uvs };
-    const vp = @import("camera.zig").orthographic(-1, 1, -1, 1, 0, 2);
+    const vp = @import("camera.zig").orthographic(-1, 1, -1, 1, 0, 2) catch unreachable;
     const tex = Texture{ .width = w, .height = h, .pixels = &pixels, .mips = chain.levels(), .filter = .bilinear };
     try tex.validate();
 
@@ -4326,7 +4326,7 @@ test "anisotropic mode keeps detail that trilinear blurs away at grazing angles"
     var color: [size * size * 4]u8 = @splat(0);
     var depth: [size * size]f32 = @splat(1.0);
     var target = try Target.init(size, size, &color, &depth);
-    const vp = @import("camera.zig").orthographic(-1, 1, -1, 1, 0, 2);
+    const vp = @import("camera.zig").orthographic(-1, 1, -1, 1, 0, 2) catch unreachable;
     // 16 texels per pixel across x, 2 across y: an 8:1 footprint (the clamp), so
     // the trilinear level follows x (level 4) while the corrected level follows y
     // (level 1).

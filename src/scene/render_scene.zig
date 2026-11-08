@@ -292,7 +292,7 @@ pub const EngineRenderer = struct {
         params: pipeline.FrameParams,
     ) pipeline.Error!pipeline.FrameReport {
         const aspect = @as(f32, @floatFromInt(surface.width)) / @as(f32, @floatFromInt(surface.height));
-        const projection = r.camera.perspective(camera.fov, aspect, camera.near, camera.far);
+        const projection = r.camera.perspective(camera.fov, aspect, camera.near, camera.far) catch |err| return err;
         // The caller's view (from `cameraOf`) supplies the orientation; the lens
         // and the surface supply the projection, so resizing reframes.
         const cam = r.Camera.init(view.view, projection, view.position);
@@ -576,8 +576,9 @@ pub fn loadAssets(
                         continue;
                     },
                     error.OutOfMemory => return error.OutOfMemory,
+                    else => return err,
                 };
-                _ = loaded.table.setColor(item.slot, .{ 1, 1, 1, 1 });
+                _ = loaded.table.setColor(item.slot, .{ 1, 1, 1, 1 }) catch unreachable;
                 loaded.uploads.append(gpa, .{ .slot = item.slot }) catch return error.OutOfMemory;
                 loaded.report.meshes += 1;
             },
@@ -626,14 +627,14 @@ pub fn loadAssets(
                 // A generated chain is the last entry of `mip_chains` at this point;
                 // `generateMips` appends exactly one when it appends any.
                 const chain_index: ?usize = if (mips.len > 0) loaded.mip_chains.items.len - 1 else null;
-                _ = loaded.table.setColor(item.slot, .{ 1, 1, 1, 1 });
+                _ = loaded.table.setColor(item.slot, .{ 1, 1, 1, 1 }) catch unreachable;
                 _ = loaded.table.setTexture(item.slot, .{
                     .width = parsed.width,
                     .height = parsed.height,
                     .pixels = level0,
                     .filter = .bilinear,
                     .mips = mips,
-                });
+                }) catch unreachable;
                 loaded.uploads.append(gpa, .{ .slot = item.slot, .pixel = pixel_index, .chain = chain_index }) catch
                     return error.OutOfMemory;
                 loaded.report.textures += 1;
@@ -709,7 +710,7 @@ fn generateMips(
 
 /// Store one mesh artifact in `slot`. A `CXMH` artifact is parsed zero-copy, so the
 /// table borrows the file bytes the caller holds.
-fn loadArtifactMesh(table: *pipeline.AssetTable, slot: usize, bytes: []const u8) !void {
+fn loadArtifactMesh(table: *pipeline.AssetTable, slot: usize, bytes: []const u8) pipeline.Error!void {
     const view = try assets.mesh.parse(bytes);
     _ = try table.setMesh(slot, view);
 }
@@ -717,7 +718,7 @@ fn loadArtifactMesh(table: *pipeline.AssetTable, slot: usize, bytes: []const u8)
 /// Decode one OBJ source and store it in `slot`. The decoded mesh is transient: only
 /// the tightly-packed scratch copy in the table survives, so no OBJ parse state is
 /// retained. `error.InvalidAsset` covers malformed sources and an empty face list.
-fn loadObjMesh(table: *pipeline.AssetTable, slot: usize, bytes: []const u8) !void {
+fn loadObjMesh(table: *pipeline.AssetTable, slot: usize, bytes: []const u8) pipeline.Error!void {
     var decoded = assets.mesh.decodeObj(table.gpa, bytes) catch |err| switch (err) {
         error.InvalidMesh => return error.InvalidAsset,
         error.OutOfMemory => return error.OutOfMemory,
@@ -1158,8 +1159,8 @@ test "render_scene: the engine renderer draws a projected scene and reuses its l
     defer table.deinit(gpa);
     const positions = [_][3]f32{ .{ -1, -1, 0 }, .{ 1, -1, 0 }, .{ 1, 1, 0 }, .{ -1, 1, 0 } };
     const indices = [_]u32{ 0, 1, 2, 0, 2, 3 };
-    const mesh_handle = table.setMesh(0, .{ .positions = &positions, .indices = &indices });
-    const color_handle = table.setColor(0, .{ 1, 0, 0, 1 });
+    const mesh_handle = table.setMesh(0, .{ .positions = &positions, .indices = &indices }) catch unreachable;
+    const color_handle = table.setColor(0, .{ 1, 0, 0, 1 }) catch unreachable;
     scene.getComponent(Renderable, quad).?.mesh = mesh_handle.toBits();
     scene.getComponent(Renderable, quad).?.material = color_handle.toBits();
 
@@ -1330,8 +1331,8 @@ test "render_scene: the renderer frames a scene through its own camera" {
     defer table.deinit(gpa);
     const positions = [_][3]f32{ .{ -1, -1, 0 }, .{ 1, -1, 0 }, .{ 1, 1, 0 }, .{ -1, 1, 0 } };
     const indices = [_]u32{ 0, 1, 2, 0, 2, 3 };
-    const mesh_handle = table.setMesh(0, .{ .positions = &positions, .indices = &indices });
-    const color_handle = table.setColor(0, .{ 0, 1, 0, 1 });
+    const mesh_handle = table.setMesh(0, .{ .positions = &positions, .indices = &indices }) catch unreachable;
+    const color_handle = table.setColor(0, .{ 0, 1, 0, 1 }) catch unreachable;
     scene.getComponent(Renderable, quad).?.mesh = mesh_handle.toBits();
     scene.getComponent(Renderable, quad).?.material = color_handle.toBits();
 

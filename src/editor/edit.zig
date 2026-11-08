@@ -367,14 +367,26 @@ pub fn History(comptime Scene: type) type {
 
         /// Re-apply the most recent undone gesture. The snapshots are **kept** from the
         /// first application: the state before a redone delete is the same state as before
-        /// the original, so undo after redo restores it again.
+        /// the original, so undo after redo restores it again. A command that fails
+        /// mid-group rolls back the commands already applied in this redo, so the scene is
+        /// never left half-applied relative to the history.
         pub fn redo(self: *Self, scene: anytype) Error!void {
             if (!self.canRedo()) return;
             const begin = self.cursor;
             const end = begin + self.entries.items[begin].group_len;
             var i = begin;
             while (i < end) : (i += 1) {
-                try self.forward(scene, self.entries.items[i].command);
+                self.forward(scene, self.entries.items[i].command) catch |err| {
+                    // Roll back everything applied so far in this redo, newest first,
+                    // then leave cursor at `begin` so the whole gesture is retryable.
+                    var j = i;
+                    while (j > begin) {
+                        j -= 1;
+                        const entry = self.entries.items[j];
+                        restore(scene, commandEntityId(entry.command), entry.before) catch {};
+                    }
+                    return err;
+                };
             }
             self.cursor = end;
             self.dirty = true;
