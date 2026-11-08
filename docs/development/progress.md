@@ -5,12 +5,12 @@ task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
 
-**Current state:** `main` = `5a67cd0` (merge of PR #68, from branch
-`arena/5afdb426-corex`). Retested **on the merged tree** in this sandbox: **955/955**
-in Debug and ReleaseSafe, `zig fmt --check src/ tools/ build.zig` clean, `zig build` OK,
-the headless launch contract OK, CI green on the PR. `History` now treats a gesture as
-one undo step; the suite has been green on `main` since PR #66 fixed the
-allocation-failure probe.
+**Current state:** `main` = `a86a2d9` (merge of PR #69, the documentation correction that
+followed it). The pointer-scrub cycle sits on `arena/924a4516-corex`: **963/963** in Debug,
+ReleaseSafe and ReleaseFast, `zig fmt --check src/` clean, `zig build` OK, `editor-frame` +
+`qoi-decode` + the headless launch contract run at HEAD, and the merged tree is retested
+afterwards. `History` has treated a gesture as one undo step since PR #68; a gesture can now
+also *be* a drag, and both gestures share its commit path.
 
 Toolchain note for the next continuation: Zig 0.17.0 lives in a venv under `/tmp`
 (`/tmp/zigvenv`, wrapper `/home/user/zig.sh`), and `/tmp` **is wiped between sessions**,
@@ -19,6 +19,111 @@ below still works):
 `python3 -m venv /tmp/zigvenv && /tmp/zigvenv/bin/pip install ziglang==0.17.0` (pip
 warns the wheel is yanked for a partial PyPI upload; the binary is still 0.17.0 and
 works). Window / swapchain remains blocked in this sandbox.
+
+## Cycle 2026-11-08 (c) — Dragging an inspector number scrubs it
+
+**Why this was next.** The previous cycle declared it: *"a drag-to-scrub affordance needs
+pointer-drag state the GUI can already report, but it is a separate interaction."* Reading
+that code before writing anything turned up something the declaration did not say: the rule
+for *"has this press become a drag?"* was already in the repo **twice**, and the two copies
+did not agree. `ViewportDrag.end` decided orbit-versus-pick with an inline
+`@abs(dx) > 2.0 or @abs(dy) > 2.0` per-axis test; `widgets.slider` decides it by being the
+active widget from press to release with no threshold at all. So the missing affordance was
+the smaller half of the job — the panel that would get the scrub would have been the third
+copy of a rule that is one GUI-wide decision, and three copies is how two widgets end up
+needing different amounts of slop to do the same thing.
+
+**Delivered (validated):**
+
+- **`input.drag_threshold_px` (2) and `input.travelled(from, to)`** — the click/drag split
+  moved into `gui.input`, the layer that defines a frame's pointer events. `ViewportDrag.end`
+  now delegates to it, with the same semantics it had inline (per-axis, strict `>`), so the
+  viewport and the inspector cannot disagree about when a press became a drag.
+- **`inspector.Scrub`** — the gesture: the field's `Id`, the pixel the press landed on, the
+  value the buffer held then, and whether the pointer has travelled. `units_per_pixel = 0.1`
+  (ten pixels a unit), `fine_divisor = 10` under `Shift`, the **dominant axis** in charge with
+  ties going horizontal (the axis a row is laid out along) and up meaning a gain. Every frame
+  measures from `start`, never from the previous frame, which is what stops a long drag
+  compounding itself.
+- **`Paint.scrub`, and the decision inside `drawRow`.** Arming happens *after*
+  `widgets.textField` runs, on purpose: the press takes the focus and places the caret exactly
+  as any click does, and only movement past the threshold takes the number over — at which
+  point the drag writes through `Field.set` and pins the caret to the end, so the text is what
+  the gesture says and not what the click under the pointer wanted. A release whose gesture
+  travelled returns the row's existing `.{ .commit = ... }`; one that never travelled returns
+  nothing, which is what keeps a click a click.
+- **One commit path for both gestures.** The scrub's outcome is handled by the same
+  `drawTransformRow` / `drawCameraRow` bodies as `Enter`: whole-row `set_component`, the
+  "unchanged values are not an edit" guard, revert-on-garbage. The shell gained exactly one
+  field (`State.inspector_scrub`, beside `tree_drag` / `viewport_drag` / `viewport_gizmo`) and
+  passes it at the three `Paint` sites; all six numeric rows (`pos`, `scale`, `rot`, `fov`,
+  `near`, `far`) are scrubbable because they are all `drawRow`.
+- **`Escape` abandons the drag along with the text** — the row cancels the gesture when it
+  cancels the edit, or the button coming up afterwards would commit the value Escape had just
+  thrown away. That is the ordering this whole cycle could have got wrong silently, so it has
+  its own test rather than a comment.
+- **8 new tests (963 total).** Three on `Scrub` in isolation: the threshold boundary at
+  exactly 2 px (still a click) versus 3 px (a drag), the dominant axis plus the tie case
+  chosen so the two axes mean opposite things, the `Shift` rate, non-compounding, and
+  `end`/`cancel`/`busy`. Five through the `Harness` frame by frame: a 30 px drag on `pos.x`
+  edits the buffer, leaves the scene alone mid-drag, commits on release, adds **exactly one**
+  `history.undoDepth()` step and undoes in one press; a click on a field is not a scrub and
+  records nothing; a drag that returns to the press pixel commits nothing (the typed guard
+  catches it); `Shift` is ten times finer; `Escape` mid-drag leaves the release inert and the
+  scene untouched.
+- **Docs.** `### Scrubbing a number` in the Inspector section; the `Input` section of
+  `docs/gui-foundation.md` now states that the threshold is a GUI rule with one owner; and the
+  Inspector's "rotation, the renderable handles, the camera fov and the parent stay read-only"
+  line — stale since those rows gained editable fields and tests — now lists what the code
+  actually edits.
+
+**Validation (all run here, this cycle):** `zig fmt src/` then `zig fmt --check src/` clean;
+`zig build test` at **963/963 in Debug, ReleaseSafe and ReleaseFast** (`3/3 steps succeeded`);
+`zig build` (default) clean; `zig build editor-frame -- examples/hello-project/HelloProject.corex`
+→ 640x360, 4 entities, 6 widgets, 10369 bytes, and `qoi-decode` back to 921600 bytes of RGBA;
+`corex-engine --project … --mode validate` → "Project is valid and compatible"; the same
+project `--headless --frames 3` → 3 of 3 frames. Note for whoever runs the smokes next:
+there is **no** `-Dcorex-editor-only` option in this `build.zig` and the binary is
+`corex-engine`, not `corex` — both were guessed wrong here before being read out of
+`zig build -h` and `docs/launch-contract.md`.
+
+**Decisions:**
+
+- **A scrub is a number editor, not a second gizmo**: it edits the row's buffer and writes the
+  scene on release, like typing. A gizmo drag writes the scene every frame because it *is* a
+  manipulation of the scene; giving the row a parallel live-preview path would have meant two
+  commit paths to keep in step forever. Recorded as a limitation instead.
+- **One shared slot on `State`, not a flag per row** — the same reason `tree_drag` is one
+  slot: a release lands wherever the pointer ends up, so the gesture has to outlive the row
+  that armed it, and `busy()` exists so a second press cannot arm a second scrub whose release
+  would commit another field's number.
+- **`start = parsed() orelse 0`** — scrubbing a field that holds garbage starts from 0 rather
+  than refusing the gesture, and the result goes through `Field.set`, so what the user gets is
+  always a parseable number.
+- **The threshold is per-axis and strict (`>`)**, taken from the viewport's existing test
+  rather than invented, so this cycle changes no behaviour in the viewport at all — it only
+  stops the viewport from owning the rule alone.
+
+**Known limitations:**
+
+- No live preview while dragging (above); and no snapping, no per-field step, no min/max clamp
+  on the scrub — the rate is the GUI-wide ten pixels per unit. `fov`/`near`/`far` are scrubbed
+  with the same rate as a position, which is coarse for a clip plane; `Shift` is the only
+  precision control until someone needs a per-row rate.
+- `changedMask` is computed on the scrub path exactly as it is on the typed path, and the
+  shell still ignores it: a commit compares the whole row against the whole row and sends the
+  whole component. Fine while one component is one step; wrong the day a row wants to send one
+  axis.
+- `widgets.slider` still has no drag threshold of its own (it is active-from-press with no
+  click semantics to preserve). Deliberately left alone: adding a threshold there would change
+  how far a click on a slider head moves the value, which is a different decision with its own
+  users.
+
+**Next priority:** fold-state persistence (needs a `format_version` bump) or an end-to-end
+`scene.stream` test for sibling order on the shared `town.scene` fixture — the unit tests cover
+`set_order`/`cloneSubtree`, but nothing has yet round-tripped an *authored* order through the
+real save path. The 64-sibling reorder window and "tied groups refuse the swap" stay
+documented as accepted limits.
 
 ## Cycle 2026-11-08 (b) — A gesture is the undo step (`History.applyBatch`)
 

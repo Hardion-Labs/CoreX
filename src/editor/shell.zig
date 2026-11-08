@@ -106,6 +106,10 @@ pub const State = struct {
     /// The gizmo gesture in the viewport, if any: which axis is being dragged and
     /// where the drag started, used to turn pointer motion into an entity move.
     viewport_gizmo: Gizmo = .{},
+    /// The number being dragged in the inspector, if any. One slot for every row, because
+    /// a pointer has one press in flight and releasing one row's field must not commit
+    /// another's.
+    inspector_scrub: inspector.Scrub = .{},
     theme: Theme = .{},
     /// Set when the user clicked an entity this frame, so a caller can react
     /// (re-frame the camera, save the selection, ...) without diffing by hand.
@@ -670,6 +674,7 @@ fn drawTransformRow(
         .entity_id = state.selected,
         .signature = signature,
         .key = key,
+        .scrub = &state.inspector_scrub,
     }, @intCast(font.line_height + 2), seed);
 
     switch (outcome) {
@@ -751,6 +756,7 @@ fn drawCameraRow(
         .entity_id = state.selected,
         .signature = signature,
         .key = key,
+        .scrub = &state.inspector_scrub,
     }, @intCast(font.line_height + 2), seed);
 
     switch (outcome) {
@@ -855,6 +861,7 @@ fn drawCameraScalarRow(
         .entity_id = state.selected,
         .signature = signature,
         .key = key,
+        .scrub = &state.inspector_scrub,
     }, @intCast(font.line_height + 2), seed);
 
     switch (outcome) {
@@ -1283,11 +1290,12 @@ pub const ViewportDrag = struct {
     }
 
     /// End the gesture. Returns `true` when the pointer moved enough to count as a
-    /// drag (rather than a click), so the caller knows whether to do a pick.
+    /// drag (rather than a click), so the caller knows whether to do a pick. The
+    /// threshold is the GUI's own (`input.travelled`), shared with the inspector's
+    /// number scrub so no two panels disagree about when a press became a drag.
     pub fn end(self: *ViewportDrag, pos: canvas.Point) bool {
-        const moved = @abs(@as(f32, @floatFromInt(pos.x - self.start.x))) > 2.0 or @abs(@as(f32, @floatFromInt(pos.y - self.start.y))) > 2.0;
         self.active = false;
-        return moved;
+        return input_mod.travelled(self.start, pos);
     }
 
     /// Cancel the gesture without applying anything.
@@ -2853,6 +2861,142 @@ test "editor: Escape abandons a typed transform value" {
     try testing.expectEqualStrings("1", h.state.transform_scale.fields[1].text());
     try testing.expectEqual(@as(usize, 0), h.history.undoDepth());
     try testing.expect(!h.history.dirty);
+}
+
+/// One frame of a drag: the button is held, the pointer is elsewhere.
+fn scrubTo(h: *Harness, x: i32, y: i32, fine: bool) void {
+    h.frameInput(.{
+        .pointer = .{ .x = x, .y = y },
+        .pointer_in_window = true,
+        .pointer_down = true,
+        .modifiers = if (fine) .{ .shift = true } else .{},
+    }, &h.state);
+}
+
+test "editor: dragging a numeric field scrubs the number and commits one step on release" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.state.selected = h.root_id;
+    h.runFrames(2);
+
+    const field = numFieldRect(&h, seed_pos, "pos", 0);
+    try testing.expect(!field.isEmpty());
+    const at = .{ .x = field.x + 2, .y = field.y + 2 };
+    h.hover(at.x, at.y);
+    h.click(at.x, at.y);
+
+    // 30 px right of the press, at ten pixels per unit: 1 becomes 4.
+    scrubTo(&h, at.x + 30, at.y, false);
+    try testing.expectEqualStrings("4", h.state.transform_pos.fields[0].text());
+    // The row is editing a *number*, like typing does: the scene sees it when the gesture
+    // commits, not on every frame of the drag.
+    var t = h.scene.getComponent(render_scene.Transform, h.scene.entityById(h.root_id).?).?.*;
+    try testing.expectEqual(@as(f32, 1), t.position[0]);
+    try testing.expectEqual(@as(usize, 0), h.history.undoDepth());
+
+    h.release(at.x + 30, at.y);
+    t = h.scene.getComponent(render_scene.Transform, h.scene.entityById(h.root_id).?).?.*;
+    try testing.expectEqual(@as(f32, 4), t.position[0]);
+    // One gesture, one step: the other axes are kept, and Ctrl+Z brings 1 back.
+    try testing.expectEqual(@as(usize, 1), h.history.undoDepth());
+    try h.history.undo(&h.scene);
+    t = h.scene.getComponent(render_scene.Transform, h.scene.entityById(h.root_id).?).?.*;
+    try testing.expectEqual(@as(f32, 1), t.position[0]);
+    try testing.expect(!h.state.inspector_scrub.busy());
+}
+
+test "editor: a click on a numeric field is not a scrub" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.state.selected = h.root_id;
+    h.runFrames(2);
+
+    const field = numFieldRect(&h, seed_pos, "pos", 1);
+    // hover → press → release, all at the same pixel: the click case the threshold exists
+    // to keep. Without it this would be a zero-length scrub.
+    focusNumField(&h, field);
+
+    // The row is ready to type in, and nothing was edited.
+    try testing.expect(h.state.transform_pos.isFocused());
+    try testing.expectEqual(@as(usize, 0), h.history.undoDepth());
+    try testing.expect(!h.history.dirty);
+    try testing.expectEqualStrings("2", h.state.transform_pos.fields[1].text());
+    try testing.expect(!h.state.inspector_scrub.busy());
+}
+
+test "editor: a scrub that returns to where it started commits nothing" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.state.selected = h.root_id;
+    h.runFrames(2);
+
+    const field = numFieldRect(&h, seed_pos, "pos", 2);
+    const at = .{ .x = field.x + 2, .y = field.y + 2 };
+    h.hover(at.x, at.y);
+    h.click(at.x, at.y);
+    scrubTo(&h, at.x + 30, at.y, false);
+    try testing.expectEqualStrings("6", h.state.transform_pos.fields[2].text());
+    // Back to the press pixel. The release still commits, and the commit path finds a value
+    // equal to the scene's and records nothing — the guard is the typed one, reused.
+    scrubTo(&h, at.x, at.y, false);
+    try testing.expectEqualStrings("3", h.state.transform_pos.fields[2].text());
+    h.release(at.x, at.y);
+    try testing.expectEqual(@as(usize, 0), h.history.undoDepth());
+    try testing.expect(!h.history.dirty);
+}
+
+test "editor: Shift scrubs a numeric field ten times finer" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.state.selected = h.root_id;
+    h.runFrames(2);
+
+    const field = numFieldRect(&h, seed_pos, "pos", 0);
+    const at = .{ .x = field.x + 2, .y = field.y + 2 };
+    h.hover(at.x, at.y);
+    h.click(at.x, at.y);
+    // A hundred pixels of plain drag would be ten units; with Shift it is one.
+    scrubTo(&h, at.x + 100, at.y, true);
+    try testing.expectEqualStrings("2", h.state.transform_pos.fields[0].text());
+    h.release(at.x + 100, at.y);
+    const t = h.scene.getComponent(render_scene.Transform, h.scene.entityById(h.root_id).?).?;
+    try testing.expectEqual(@as(f32, 2), t.position[0]);
+}
+
+test "editor: Escape abandons a scrub, and its release commits nothing" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.state.selected = h.root_id;
+    h.runFrames(2);
+
+    const field = numFieldRect(&h, seed_scale, "scale", 1);
+    const at = .{ .x = field.x + 2, .y = field.y + 2 };
+    h.hover(at.x, at.y);
+    h.click(at.x, at.y);
+    scrubTo(&h, at.x + 40, at.y, false);
+    try testing.expectEqualStrings("5", h.state.transform_scale.fields[1].text());
+
+    h.frameInput(.{
+        .pointer = .{ .x = at.x + 40, .y = at.y },
+        .pointer_in_window = true,
+        .pointer_down = true,
+        .key = .escape,
+    }, &h.state);
+    try testing.expectEqualStrings("1", h.state.transform_scale.fields[1].text());
+
+    // The button still comes up. Were the gesture left armed, this release would commit the
+    // value Escape threw away.
+    h.release(at.x + 40, at.y);
+    try testing.expectEqual(@as(usize, 0), h.history.undoDepth());
+    try testing.expect(!h.history.dirty);
+    try testing.expect(!h.state.inspector_scrub.busy());
+    const t = h.scene.getComponent(render_scene.Transform, h.scene.entityById(h.root_id).?).?;
+    try testing.expectEqual(@as(f32, 1), t.scale[1]);
 }
 
 test "editor: typing rotation angles commits one undoable set_component" {

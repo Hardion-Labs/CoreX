@@ -309,13 +309,15 @@ copied. Values are clipped to their own rect so a long name cannot run into the 
 column. With nothing selected the panel says so; an entity with no components still
 shows its name, ID and parent.
 
-The **name**, **position** and **scale** are editable; rotation, the renderable handles,
-the camera fov and the parent stay read-only.
+Editable: the **name**, and every numeric row — **`pos`**, **`scale`**, **`rot`** (Euler
+degrees), and the camera's **`fov`**, **`near`** and **`far`**. Read-only: the renderable's
+mesh and material handles and the parent line.
 
-Every editable field follows the same rule: **typing edits a buffer, Enter commits
-through the history, Escape discards.** The buffer is what keeps a half-typed value out
-of the scene; the history is what makes the commit one undoable step and marks the
-project dirty.
+Every editable field follows the same rule: **the buffer is edited, the commit goes through
+the history, Escape discards.** Typing writes into the buffer and so does a drag; what
+produces a value is a commit — `Enter`, focus leaving a changed field, or the release of a
+scrub. The buffer is what keeps a half-typed value out of the scene; the history is what
+makes the commit one undoable step and marks the project dirty.
 
 - The **name** commits a `rename` command.
 - **`pos`** and **`scale`** are rows of three numeric fields (`src/editor/inspector.zig`).
@@ -328,6 +330,30 @@ project dirty.
   so a typed value is not silently lost.
 - The rows reload from the scene when the entity or the underlying values change (undo, a
   command, a selection change) but **never while the user is typing**.
+
+### Scrubbing a number
+
+A number can be dragged instead of typed. Pressing a field and moving the pointer past the
+GUI's drag threshold turns the gesture into a scrub (`inspector.Scrub`); a press that never
+travelled was a click, and still only takes the focus and places the caret.
+
+- **The threshold is the GUI's, not the inspector's.** `input.travelled` is 2 px and is the
+  same test `ViewportDrag.end` applies to orbit-versus-pick, because two panels disagreeing
+  about when a press became a drag shows up as two widgets that need different amounts of slop
+  to do the same thing.
+- **The gesture is one slot on `State`, not a flag per row**: the field's `Id`, the pixel the
+  press landed on, and the value it held then. One pointer has one press in flight, and a
+  release over one row must not commit another row's number.
+- **It writes the same buffer typing writes into and commits through the same `Outcome.commit`,
+  on release.** One commit path, one `set_component`, one undo step, whether the number was
+  typed or dragged.
+- **Ten pixels per unit, measured from the press** — not from the previous frame, which is
+  what stops a long drag compounding itself. `Shift` divides the rate by ten for the last
+  decimal. The **dominant axis** decides, so a horizontal drag does not also nudge the field
+  beside it and a vertical one means the same field with up as a gain; ties go horizontal, the
+  axis a row is laid out along.
+- **`Escape` abandons a drag along with the typing**, and the button coming up afterwards
+  commits nothing — which is why the release consults the gesture rather than the buffer.
 
 Any focused inspector field holds the keyboard: the frame's shortcuts do not fire, so
 `Delete` is a text key there and never "destroy the entity".
@@ -442,8 +468,12 @@ behaviour, not a workaround.
   `quatFromEuler`, which normalizes: an edit round-trips the *orientation*, not the exact
   authored quaternion. A quaternion widget (four fields, or a draggable arc) is the open
   question, not the history — `set_component` already carries any component.
-- **No scrub/drag on numeric fields.** Values are typed; a drag-to-scrub affordance needs
-  pointer-drag state the GUI can already report, but it is a separate interaction.
+- **A scrub has no live preview.** Dragging a number edits the field and commits on release;
+  the viewport updates when it does. A gizmo drag writes the scene every frame because it *is*
+  a manipulation of the scene, and the row deliberately keeps one commit path for both — but
+  dragging `pos.x` does not sweep the entity across the viewport the way dragging its arrow
+  does. There is also no snapping and no per-field step: the rate is the GUI-wide ten pixels
+  per unit, with `Shift` for a finer one.
 - **The history is in-memory and per-session.** It is not persisted, and there is no
   "reopen and undo" — deliberate for now.
 - **No multi-select, no copy/paste, no grouping.**

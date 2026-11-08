@@ -110,6 +110,13 @@ one-frame events and keeps held state. Widgets never see a platform event, so th
 whole layer is testable headlessly and the (still blocked) window binding stays
 outside the widget code.
 
+`travelled(from, to)` answers the one question every gesture widget has to ask the same
+way: did the pointer move far enough that this press is a drag and not a click? The
+threshold is `drag_threshold_px` (2 px), and it lives here rather than in a widget
+because a widget with its own threshold is a widget whose click/drag split disagrees with
+every other one — the viewport's orbit and the inspector's number scrub are the same
+decision, and they read the same function.
+
 ## Widgets (`gui.widgets`)
 
 Immediate mode: a `Context` holds the canvas, theme, input and the hit-test
