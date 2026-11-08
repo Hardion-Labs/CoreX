@@ -549,6 +549,7 @@ fn applyOcclusion(out: *std.ArrayList(DrawCommand), cam: Camera, config: Occlusi
 const testing = std.testing;
 const scene_mod = @import("../scene/scene.zig");
 const components = @import("../scene/components.zig");
+const alloc_probe = @import("../core/alloc_probe.zig");
 
 const TestScene = scene_mod.Scene(.{
     scene_mod.Component(components.Transform, "transform"),
@@ -863,17 +864,20 @@ test "RenderFrame: occlusion refill reuses its buffer and reports the split" {
 }
 
 test "extract: survives every allocation failure without leaking" {
-    try testing.checkAllAllocationFailures(testing.allocator, struct {
-        fn f(alloc: Allocator) !void {
-            var s = try TestScene.init(alloc, "main");
-            defer s.deinit();
-            const e = try s.createEntity("e", null);
-            try s.addComponent(e, components.Transform{ .position = .{ 0, 0, 0 } });
-            try s.addComponent(e, Renderable{ .mesh = 1 });
-            var frame = try extractDrawList(&s, testCamera(), .front_to_back, alloc);
-            frame.deinit();
-        }
-    }.f, .{});
+    try alloc_probe.check(
+        struct {
+            fn f(alloc: Allocator) !void {
+                var s = try TestScene.init(alloc, "main");
+                defer s.deinit();
+                const e = try s.createEntity("e", null);
+                try s.addComponent(e, components.Transform{ .position = .{ 0, 0, 0 } });
+                try s.addComponent(e, Renderable{ .mesh = 1 });
+                var frame = try extractDrawList(&s, testCamera(), .front_to_back, alloc);
+                frame.deinit();
+            }
+        }.f,
+        .{},
+    );
 }
 
 /// A counting allocator wrapper: how many bytes a stretch of code asked the

@@ -152,6 +152,7 @@ pub const bindings = [_]importer.Registry.Binding{
 // --- tests -----------------------------------------------------------------
 
 const testing = std.testing;
+const alloc_probe = @import("../core/alloc_probe.zig");
 
 fn sampleImage() !image.Image {
     const pixels = try testing.allocator.dupe(u8, &[_]u8{
@@ -260,14 +261,17 @@ test "texture: bindings select the right importer by extension" {
 }
 
 test "texture: serialize and import survive allocation failure" {
-    try testing.checkAllAllocationFailures(testing.allocator, struct {
-        fn f(alloc: Allocator) !void {
-            const pixels = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
-            const img = image.Image{ .width = 2, .height = 1, .pixels = @constCast(&pixels) };
-            const bytes = try serialize(alloc, img);
-            alloc.free(bytes);
-        }
-    }.f, .{});
+    try alloc_probe.check(
+        struct {
+            fn f(alloc: Allocator) !void {
+                const pixels = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+                const img = image.Image{ .width = 2, .height = 1, .pixels = @constCast(&pixels) };
+                const bytes = try serialize(alloc, img);
+                alloc.free(bytes);
+            }
+        }.f,
+        .{},
+    );
 }
 
 test "texture: importPng produces a CXTX artifact with the reference pixels" {
@@ -297,12 +301,15 @@ test "texture: importPng survives allocation failure" {
     const source = try gpa.alloc(u8, vectors.valid[0].png_hex.len / 2);
     defer gpa.free(source);
     _ = try std.fmt.hexToBytes(source, vectors.valid[0].png_hex);
-    try testing.checkAllAllocationFailures(gpa, struct {
-        fn f(alloc: Allocator, bytes_in: []const u8) !void {
-            const bytes = try importPng(alloc, bytes_in);
-            alloc.free(bytes);
-        }
-    }.f, .{source});
+    try alloc_probe.check(
+        struct {
+            fn f(alloc: Allocator, bytes_in: []const u8) !void {
+                const bytes = try importPng(alloc, bytes_in);
+                alloc.free(bytes);
+            }
+        }.f,
+        .{source},
+    );
 }
 
 test "texture: importJpeg produces an opaque CXTX artifact" {
@@ -348,10 +355,13 @@ test "texture: importJpeg survives allocation failure" {
     const source = try gpa.alloc(u8, vectors.valid[8].jpg_hex.len / 2);
     defer gpa.free(source);
     _ = try std.fmt.hexToBytes(source, vectors.valid[8].jpg_hex);
-    try testing.checkAllAllocationFailures(gpa, struct {
-        fn f(alloc: Allocator, bytes_in: []const u8) !void {
-            const bytes = try importJpeg(alloc, bytes_in);
-            alloc.free(bytes);
-        }
-    }.f, .{source});
+    try alloc_probe.check(
+        struct {
+            fn f(alloc: Allocator, bytes_in: []const u8) !void {
+                const bytes = try importJpeg(alloc, bytes_in);
+                alloc.free(bytes);
+            }
+        }.f,
+        .{source},
+    );
 }

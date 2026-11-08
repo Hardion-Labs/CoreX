@@ -138,6 +138,18 @@ pub const State = struct {
     /// the inspector, because the frame-level shortcuts must not fire for *any* focused
     /// field — `Delete` in a text field is a text key, never "destroy the entity".
     text_focused: bool = false,
+
+    /// Choose which gizmo the viewport paints and what a drag on it does. The tool is
+    /// viewport state, not scene state: switching it must not dirty the project, and it
+    /// survives selection changes because it is a mode the user picked, not a property of
+    /// the entity under it.
+    ///
+    /// A switch abandons a drag in flight. The half-moved gesture belongs to the axis it
+    /// started on, so carrying it into another mode would write a rotation for a move.
+    pub fn setGizmoMode(self: *State, mode: GizmoMode) void {
+        self.viewport_gizmo.mode = mode;
+        self.viewport_gizmo.cancel();
+    }
 };
 
 /// The docks a user can move the keyboard focus between.
@@ -1102,6 +1114,23 @@ fn applyShortcuts(ctx: *widgets.Context, state: *State, scene: anytype, history:
             cameraCommand(state, scene, history, gpa, what);
             return;
         }
+        // The gizmo tool, on the keys the mode's own drawing implies: `w` for the axis
+        // arrows, `e` for the rotation rings, `r` for the longer scale arrows. They sit
+        // with the viewport's other keys because the tool is a property of the view —
+        // `Tab` to the viewport, press a letter, drag a handle — and none of them touches
+        // the scene, so the project stays clean.
+        if (ctx.input.key) |key| {
+            const tool: ?GizmoMode = switch (key) {
+                .w => .translate,
+                .e => .rotate,
+                .r => .scale,
+                else => null,
+            };
+            if (tool) |mode| {
+                state.setGizmoMode(mode);
+                return;
+            }
+        }
         if (ctx.input.key) |key| {
             const turn: ?Orbit = switch (key) {
                 .left => .{ .yaw = -0.2, .pitch = 0 },
@@ -1267,9 +1296,9 @@ pub const ViewportDrag = struct {
     }
 };
 
-/// Which gizmo tool is active. Only translate exists in this cycle; rotate and
-/// scale follow once the translate path is proven.
-/// Which gizmo tool is active: translate, rotate or scale.
+/// Which gizmo tool is active: translate, rotate or scale. `W` / `E` / `R` in the
+/// viewport pick one; the tool is state on `State`, so it survives a selection change
+/// and never enters the history.
 pub const GizmoMode = enum { translate, rotate, scale };
 
 /// Which axis of the gizmo is being dragged: X (red), Y (green), Z (blue).
@@ -3806,6 +3835,56 @@ test "editor: viewport selection highlight draws nothing when nothing is selecte
     drawViewportSelected(&h.ctx, &h.state, &h.scene, testing.allocator, dock.viewport);
     // No crash, no pixels changed: the viewport border was already painted by draw.
     try testing.expect(true);
+}
+
+// The rotate and scale gizmos were pickable and paintable before they had a key: a mode
+// the user cannot select is a mode that does not exist, so these three pins are what keeps
+// the three `GizmoMode`s reachable from the viewport.
+test "editor: W, E and R pick the viewport gizmo tool" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.state.dock_focus = .viewport;
+    h.runFrames(1);
+
+    try testing.expectEqual(GizmoMode.translate, h.state.viewport_gizmo.mode); // the default
+    h.frameInput(.{ .key = .e }, &h.state);
+    try testing.expectEqual(GizmoMode.rotate, h.state.viewport_gizmo.mode);
+    h.frameInput(.{ .key = .r }, &h.state);
+    try testing.expectEqual(GizmoMode.scale, h.state.viewport_gizmo.mode);
+    h.frameInput(.{ .key = .w }, &h.state);
+    try testing.expectEqual(GizmoMode.translate, h.state.viewport_gizmo.mode);
+
+    // A tool is view state, so it must not reach the history: `Ctrl+Z` still belongs to
+    // the last real edit, and pressing a letter cannot make a saved project look dirty.
+    try testing.expectEqual(@as(usize, 0), h.history.undoDepth());
+}
+
+test "editor: the gizmo tool keys belong to the viewport" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.runFrames(1);
+    try testing.expectEqual(DockFocus.hierarchy, h.state.dock_focus);
+
+    h.frameInput(.{ .key = .e }, &h.state);
+    try testing.expectEqual(GizmoMode.translate, h.state.viewport_gizmo.mode);
+}
+
+test "editor: switching the gizmo tool abandons a drag in flight" {
+    var h = Harness{};
+    try h.init();
+    defer h.deinit();
+    h.state.dock_focus = .viewport;
+    h.runFrames(1);
+    h.state.viewport_gizmo.begin(.x, .{ .x = 4, .y = 4 }, .{ 0, 0, 0 }, .{ 0, 0, 0, 1 }, .{ 1, 1, 1 });
+    try testing.expect(h.state.viewport_gizmo.active);
+
+    h.frameInput(.{ .key = .e }, &h.state);
+    try testing.expectEqual(GizmoMode.rotate, h.state.viewport_gizmo.mode);
+    try testing.expect(!h.state.viewport_gizmo.active);
+    try testing.expectEqual(@as(?GizmoAxis, null), h.state.viewport_gizmo.axis);
+    try testing.expectEqual(@as(usize, 0), h.history.undoDepth());
 }
 
 test "editor: gizmo pick returns the axis under the pointer" {

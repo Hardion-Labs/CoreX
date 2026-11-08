@@ -414,6 +414,7 @@ pub fn encodeQoi(gpa: Allocator, img: Image) DecodeError![]u8 {
 // --- tests -----------------------------------------------------------------
 
 const testing = std.testing;
+const alloc_probe = @import("../core/alloc_probe.zig");
 
 fn expectPixel(img: Image, x: u32, y: u32, rgba: [4]u8) !void {
     const d = (@as(usize, y) * img.width + x) * 4;
@@ -675,19 +676,22 @@ test "qoi: rejects bad magic, channels, truncation and missing end marker" {
 }
 
 test "image: decoders survive allocation failure" {
-    try testing.checkAllAllocationFailures(testing.allocator, struct {
-        fn f(alloc: Allocator) !void {
-            const bmp = bmp24Fixture();
-            var a = try decodeBmp(alloc, &bmp);
-            a.deinit(alloc);
-            const qoi_src = [_]u8{
-                'q',  'o', 'i', 'f', 0,    0, 0, 2, 0, 0, 0, 1, 4, 0,
-                0xFE, 1,   2,   3,   0xC0, 0, 0, 0, 0, 0, 0, 0, 1,
-            };
-            var b = try decodeQoi(alloc, &qoi_src);
-            b.deinit(alloc);
-        }
-    }.f, .{});
+    try alloc_probe.check(
+        struct {
+            fn f(alloc: Allocator) !void {
+                const bmp = bmp24Fixture();
+                var a = try decodeBmp(alloc, &bmp);
+                a.deinit(alloc);
+                const qoi_src = [_]u8{
+                    'q',  'o', 'i', 'f', 0,    0, 0, 2, 0, 0, 0, 1, 4, 0,
+                    0xFE, 1,   2,   3,   0xC0, 0, 0, 0, 0, 0, 0, 0, 1,
+                };
+                var b = try decodeQoi(alloc, &qoi_src);
+                b.deinit(alloc);
+            }
+        }.f,
+        .{},
+    );
 }
 
 test "image: allocPixels rejects zero and oversized dimensions" {

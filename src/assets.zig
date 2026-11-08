@@ -163,6 +163,8 @@ test {
     _ = audio;
 }
 
+const alloc_probe = @import("core/alloc_probe.zig");
+
 test "scene importer canonicalizes a valid scene" {
     const src =
         \\{ "format_version": 1, "name": "main", "entities": [
@@ -854,5 +856,5 @@ test "stream importer survives every allocation failure without leaking" {
         \\{ "format_version": 1, "name": "world", "sectors": [
         \\  { "name": "town", "scene": "scenes/town.scene", "radius": 10 } ] }
     ;
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, importStreamAllocationProbe, .{source});
+    try alloc_probe.check(importStreamAllocationProbe, .{source});
 }

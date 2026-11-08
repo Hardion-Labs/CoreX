@@ -5,12 +5,132 @@ task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
 
-**Current state:** Branch `arena/77f8b78f-corex` active. Commit `6b83ebf` merges
-cycles (z) Home/End/PageUp/PageDown tree navigation and sibling ordering
-(move_up/move_down). Zig is not installed in this sandbox so `zig build`/`zig
-test` could not be re-run here; validation was done in a prior session
-(940/941 tests pass, 1 pre-existing stream allocation test sensitive to Scene
-struct size). Window/swapchain remains blocked in this sandbox.
+**Current state:** Branch `arena/e07674d5-corex` (base `main` = `f42b221`), working
+tree validated **in this sandbox** — Zig 0.17.0 was reinstalled (`pip install
+ziglang==0.17.0` in `/tmp/zigvenv`, wrapper at `/home/user/zig.sh`), which the note
+above predates. 951/951 tests pass in Debug, ReleaseSafe and ReleaseFast; the
+allocation-failure probe that made `main` fail reproducibly here is fixed. Window /
+swapchain remains blocked in this sandbox.
+
+## Cycle 2026-11-08 — Reachable gizmo tools, and allocation-failure tests that mean it
+
+**Two corrections to the record above first.** Both were wrong as written, and both
+mattered — the cycle started by chasing them:
+
+1. *"`checkAllAllocationFailures` is sensitive to `Scene` struct size."* Not the
+   mechanism. The harness picks the failing allocation by counting `alloc` **calls**,
+   and a container that grows **in place** (`Allocator.resize`/`remap`) is never
+   counted — so a pass that inherited room from the pass before it made one allocation
+   fewer and `alloc_index` drifted with the *layout*, not with the struct. Measured on
+   the isolated probe: `needed_alloc_count = 45`, indices 0..43 raise `OutOfMemory`,
+   index 44 succeeds and induces nothing (`src/scene/stream.zig:1104`). `Scene` is a
+   stack local in the probe; its size was never the variable.
+2. *"the property it tests is not violated — `setOrder` is atomic."* Right verdict,
+   wrong evidence: no `RollbackLeft*` marker in `scene.stream` fired in any pass run
+   across this cycle, so all-or-nothing streaming genuinely holds
+   under OOM. The failure was the harness, not the engine. The claim that the
+   regression was *caused* by `sibling_order` is also unsupported: those fixtures carry
+   no `"order"` key, so the lazily-allocated map is never touched. What the commit
+   changed is `RawEntity`'s layout (`order: ?u64`), which pushed an already
+   knife-edge probe over it. **`main` is therefore red, reproducibly:** 3 runs out of 3
+   at `f42b221` in a throwaway worktree printed
+   `error: 'scene.stream.test.stream: a failing allocator never leaves a half-loaded
+   sector' failed` with `940/941 tests passed (1 failed)` on all 3 runs — the CI red this
+   cycle removes. This branch was green 6 runs out of 6 with the same command.
+
+**Delivered (validated):**
+
+- **`src/core/alloc_probe.zig`** (new, test-only, and deliberately *not* re-exported through
+  `corex.core` — it is the only file in `src/core/` the public module does not list, and it
+  needs no `_ = @import(...)` line in `src/corex.zig` either: once the call sites below refer
+  to it, its tests are reachable from the root test build on their own. Do not "restore" such
+  a line.): `Deterministic`, an allocator view that refuses an in-place growth
+  a container could have saved, so a buffer that does not fit goes through the
+  `alloc` + copy + `free` path the harness counts; and `check`, the harness call. The
+  view sits at the **probe boundary**, under the failing allocator, which is the only
+  place the count can be made layout-independent — see Decisions.
+- **All 34 `std.testing.checkAllAllocationFailures` sites in `src/` now call
+  `alloc_probe.check`.** One mechanism instead of 34 places that each have to remember
+  to wrap an allocator; no probe body changed, no production code touched. `stream`'s
+  three probes were briefly wrapped per-probe; that was reverted so there is exactly one
+  way to do this.
+- **`W` / `E` / `R` select the viewport gizmo tool** (`Key.w/e/r`, `State.setGizmoMode`,
+  `src/editor/shell.zig`). **Diagnosis:** `viewport_gizmo.mode` had *no writer anywhere*
+  — only `pickGizmo` and the paint code read it — so the `.rotate` and `.scale` math,
+  picking, painting and their tests were unreachable from the UI and every drag was a
+  translate. The keys are what make shipped code usable; they are viewport-scoped (a
+  field keeps its letters) and switching mid-drag abandons the gesture.
+- **`cloneSubtree` carries the authored sibling order** (`src/scene/prefab.zig`): a third
+  pass re-ranks a reordered group `0..n-1` in the source's paint order; a natural group
+  copies nothing, because clone IDs ascend with source IDs and would re-derive the same
+  order; a rank equal to a clone's own ID is harmless (`setOrder` treats it as natural);
+  the cloned root keeps no key — it was attached, not moved.
+- **Docs.** `docs/editor-shell.md`: header status, `Home`/`End` and `PageUp`/`PageDown`
+  rows, new `### Pointer gestures` and `### Gizmo` sections, four stale Limitations
+  bullets replaced with verified ones. `docs/scene-format.md`: the `order` row, a
+  `### Sibling order` section, a validation rule. `docs/scene-prefabs.md`: `instantiate`
+  bullet plus a "Paint order" guarantee. `CHANGELOG.md`: entries for this cycle **and**
+  for the three earlier editor cycles that shipped without one (pointer gestures,
+  gizmo, sibling ordering).
+- **One documented claim corrected against the code:** the reorder row said a swap is
+  "two `set_order` commands, one undo". `History.apply` records one entry per command and
+  `History.undo` steps one entry, so it is **two** presses. Pinned by a new test
+  (`tree.zig`: "a half-undone reorder is a tie, which is why a swap records two
+  commands"), which also shows what one press leaves behind: the pair tied on one key —
+  paint order reads as untouched — and an authored key a save would write.
+- **Tests: 941 → 951** (+2 alloc_probe, +4 sibling order, +3 gizmo tool keys, +1 reorder
+  undo granularity).
+
+**Validation (all run here, this cycle):** `zig fmt --check src/ tools/ build.zig`
+clean; `zig build test` green in **Debug / ReleaseSafe / ReleaseFast** (951/951);
+60 runs of the Debug binary at 60 distinct seeds, 0 failures; 6 forced Debug re-runs
+through `zig build`, 0 test failures; `zig build` and `zig build -Doptimize=ReleaseSafe`
+OK; the launch contract smoke set (`--version`, `--mode validate`, `--headless`,
+`--mode runtime --headless`); `zig build editor-frame -- … 2 dirty` +
+`zig build qoi-decode` (640x360, 11968 bytes, decodes).
+*Environment note so the next cycle does not chase it:* `zig build` prints
+`failed command: … --listen=-` on its **first** attempt at running the test binary here —
+in this sandbox, on `main`, on every tree — and then succeeds, with `3/3 steps succeeded`
+and the full pass count. It is the `--listen=-` child, not a test: a bare
+`test --listen=- < /dev/null` aborts the same way. Judge a run by its `N/N tests passed`
+line, never by that message alone.
+
+**Decisions:**
+
+- Fix the count where the count is taken (the probe's allocator), not the code under
+  test. Pre-sizing every container in `cloneSubtree`/`Pool` to make the count stable
+  would bloat the engine for a test harness, and cannot cover `std.json` or
+  `ArenaAllocator` growth anyway.
+- Engine code and `std` stay untouched; the harness is wrapped, not patched.
+- Perf follow-up, explicitly *not* this fix: size `Pool.occupied` together with
+  `generations` in `src/ecs/entity.zig`, which removes one real growth step per pool.
+- The gizmo tool is **view state**: not recorded, never dirtying the project — a mode is
+  not an edit, same rule as folding and selection.
+- A reorder stays two `set_order` commands. Making it one undo step needs a
+  batch/group entry in `History`, which is a feature of its own (it would also fix the
+  tie left behind by a single press); inventing a swap command with a custom inverse now
+  would duplicate what two exact records already do.
+
+**Known limitations:**
+
+- No end-to-end `scene.stream` test for the order carry, and none was needed for the
+  behaviour to hold: `loadInner` parses each sector with `Scene.load` and instantiates it
+  with `Scene.cloneSubtree`, so a streamed sector goes through the same order-aware
+  `parse` and the same carry that are unit-tested here. The missing piece is only an
+  assertion over a fixture that would have to grow an `"order"` key — and `scenes/town.scene`
+  in `src/scene/stream.zig` is shared by tests that assert its painted root order and its
+  entity counts, which is exactly what adding a key would move.
+- Reordering reaches only the first 64 siblings of a parent (`tree.reorderSibling`'s
+  window; documented in `docs/editor-shell.md`), and a group whose two rows share an
+  `order` value refuses the swap rather than guessing.
+- Fold state still is not persisted — putting it in `.corex` needs a `format_version`
+  bump, i.e. an explicit format decision, not a silent one.
+- The OS window layer stays unvalidatable here (no `DISPLAY`, no X11 headers); a Lua VM
+  stays out (no new dependency + "document the VM choice first").
+
+**Next priority:** `History` gaining a batch so one gesture records one step (it also
+closes the half-undo tie above), then the pointer-scrub on inspector numeric fields,
+which the GUI's drag state can already answer.
 
 ## Cycle 2026-11-07 — Sibling ordering in the entity tree (move_up/move_down)
 

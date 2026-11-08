@@ -516,6 +516,10 @@ pub fn Stream(comptime schemas: anytype) type {
 
 const testing = std.testing;
 const Transform = @import("components.zig").Transform;
+/// The allocation-failure probes below run through `alloc_probe.check`, which counts
+/// allocations the way the code path decides them rather than the way the heap
+/// happens to be laid out; see `core/alloc_probe.zig`.
+const alloc_probe = @import("../core/alloc_probe.zig");
 
 const TestScene = scene_mod.Scene(.{scene_mod.Component(Transform, "transform")});
 const TestStream = Stream(.{scene_mod.Component(Transform, "transform")});
@@ -1072,7 +1076,7 @@ fn manifestParseAllocationProbe(allocator: Allocator) !void {
 }
 
 test "stream: manifest parse and serialize survive every allocation failure" {
-    try testing.checkAllAllocationFailures(testing.allocator, manifestParseAllocationProbe, .{});
+    try alloc_probe.check(manifestParseAllocationProbe, .{});
 }
 
 fn streamLoadAllocationProbe(allocator: Allocator, dir: Io.Dir) !void {
@@ -1101,7 +1105,7 @@ fn streamLoadAllocationProbe(allocator: Allocator, dir: Io.Dir) !void {
 test "stream: a failing allocator never leaves a half-loaded sector" {
     var fx = try Fixture.init();
     defer fx.cleanup();
-    try testing.checkAllAllocationFailures(testing.allocator, streamLoadAllocationProbe, .{fx.tmp.dir});
+    try alloc_probe.check(streamLoadAllocationProbe, .{fx.tmp.dir});
 }
 
 fn streamUpdateAllocationProbe(allocator: Allocator, dir: Io.Dir) !void {
@@ -1126,7 +1130,7 @@ fn streamUpdateAllocationProbe(allocator: Allocator, dir: Io.Dir) !void {
 test "stream: update keeps its invariants under every allocation failure" {
     var fx = try Fixture.init();
     defer fx.cleanup();
-    try testing.checkAllAllocationFailures(testing.allocator, streamUpdateAllocationProbe, .{fx.tmp.dir});
+    try alloc_probe.check(streamUpdateAllocationProbe, .{fx.tmp.dir});
 }
 
 fn streamUnloadAllocationProbe(allocator: Allocator, dir: Io.Dir) !void {
@@ -1142,5 +1146,5 @@ fn streamUnloadAllocationProbe(allocator: Allocator, dir: Io.Dir) !void {
 test "stream: unload survives every allocation failure without leaking" {
     var fx = try Fixture.init();
     defer fx.cleanup();
-    try testing.checkAllAllocationFailures(testing.allocator, streamUnloadAllocationProbe, .{fx.tmp.dir});
+    try alloc_probe.check(streamUnloadAllocationProbe, .{fx.tmp.dir});
 }

@@ -48,6 +48,10 @@ pub const Key = enum {
     move_down,
     /// `f` = "frame": the viewport's focus command.
     f,
+    /// `w` / `e` / `r`: pick the viewport's gizmo tool — move, rotate, scale.
+    w,
+    e,
+    r,
 };
 
 pub const PointerButton = enum { left, right, middle };

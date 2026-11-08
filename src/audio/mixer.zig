@@ -986,6 +986,7 @@ fn mixLoop(
 // --- tests -----------------------------------------------------------------
 
 const testing = std.testing;
+const alloc_probe = @import("../core/alloc_probe.zig");
 
 fn monoClip(samples: []const f32, rate: u32) Clip {
     return .{
@@ -1026,29 +1027,34 @@ test "mixer: init validates the configuration" {
 }
 
 test "mixer: init and play survive allocation failure" {
-    const gpa = testing.allocator;
     const samples = [_]f32{ 0.1, 0.2, 0.3, 0.4 };
-    try testing.checkAllAllocationFailures(gpa, struct {
-        fn f(alloc: Allocator) !void {
-            var mixer = try Mixer.init(alloc, .{ .max_voices = 2, .max_buses = 2 });
-            defer mixer.deinit();
-            const handle = try mixer.play(monoClip(&samples, 48000), .{});
-            var out: [8]f32 = undefined;
-            _ = try mixer.render(&out);
-            mixer.stop(handle);
-        }
-    }.f, .{});
+    try alloc_probe.check(
+        struct {
+            fn f(alloc: Allocator) !void {
+                var mixer = try Mixer.init(alloc, .{ .max_voices = 2, .max_buses = 2 });
+                defer mixer.deinit();
+                const handle = try mixer.play(monoClip(&samples, 48000), .{});
+                var out: [8]f32 = undefined;
+                _ = try mixer.render(&out);
+                mixer.stop(handle);
+            }
+        }.f,
+        .{},
+    );
     // The band-limited path adds one table allocation; it must unwind cleanly.
-    try testing.checkAllAllocationFailures(gpa, struct {
-        fn f(alloc: Allocator) !void {
-            var mixer = try Mixer.init(alloc, .{ .max_voices = 2, .max_buses = 2, .resample = .sinc });
-            defer mixer.deinit();
-            const handle = try mixer.play(monoClip(&samples, 44100), .{});
-            var out: [8]f32 = undefined;
-            _ = try mixer.render(&out);
-            mixer.stop(handle);
-        }
-    }.f, .{});
+    try alloc_probe.check(
+        struct {
+            fn f(alloc: Allocator) !void {
+                var mixer = try Mixer.init(alloc, .{ .max_voices = 2, .max_buses = 2, .resample = .sinc });
+                defer mixer.deinit();
+                const handle = try mixer.play(monoClip(&samples, 44100), .{});
+                var out: [8]f32 = undefined;
+                _ = try mixer.render(&out);
+                mixer.stop(handle);
+            }
+        }.f,
+        .{},
+    );
 }
 
 test "mixer: an idle mixer renders digital silence" {
@@ -1879,16 +1885,19 @@ test "mixer: band-limited rendering is deterministic and allocation free" {
         try testing.expectEqual(@as(usize, 2), stats_a.voices_active);
     }
     // Rendering must not allocate: the table was built once at init.
-    try testing.checkAllAllocationFailures(gpa, struct {
-        fn f(alloc: Allocator) !void {
-            const samples = [_]f32{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 };
-            var mixer = try Mixer.init(alloc, .{ .sample_rate = 44100, .resample = .sinc });
-            defer mixer.deinit();
-            _ = try mixer.play(monoClip(&samples, 48000), .{ .looping = true });
-            var out: [32]f32 = undefined;
-            _ = try mixer.render(&out);
-        }
-    }.f, .{});
+    try alloc_probe.check(
+        struct {
+            fn f(alloc: Allocator) !void {
+                const samples = [_]f32{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 };
+                var mixer = try Mixer.init(alloc, .{ .sample_rate = 44100, .resample = .sinc });
+                defer mixer.deinit();
+                _ = try mixer.play(monoClip(&samples, 48000), .{ .looping = true });
+                var out: [32]f32 = undefined;
+                _ = try mixer.render(&out);
+            }
+        }.f,
+        .{},
+    );
 }
 
 test "mixer: an integer step reuses the kernel and still tracks the loop wrap" {
@@ -2138,27 +2147,29 @@ test "mixer: a voice finishing inside a block is counted exactly once" {
 }
 
 test "mixer: effects survive allocation failure and render allocation free" {
-    const gpa = testing.allocator;
-    try testing.checkAllAllocationFailures(gpa, struct {
-        fn f(alloc: Allocator) !void {
-            const samples = [_]f32{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8 };
-            var mixer = try Mixer.init(alloc, .{
-                .channels = 1,
-                .max_buses = 2,
-                .effect_slots = 2,
-                .block_frames = 4,
-                .resample = .sinc,
-            });
-            defer mixer.deinit();
-            try mixer.setBusEffect(0, 0, try Effect.biquad(48000, .{ .cutoff_hz = 2000 }));
-            try mixer.setMasterEffect(1, try Effect.compressor(48000, .{}));
-            _ = try mixer.play(monoClip(&samples, 44100), .{ .looping = true });
-            var out: [32]f32 = undefined;
-            _ = try mixer.render(&out);
-            mixer.resetEffects();
-            _ = try mixer.render(&out);
-        }
-    }.f, .{});
+    try alloc_probe.check(
+        struct {
+            fn f(alloc: Allocator) !void {
+                const samples = [_]f32{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8 };
+                var mixer = try Mixer.init(alloc, .{
+                    .channels = 1,
+                    .max_buses = 2,
+                    .effect_slots = 2,
+                    .block_frames = 4,
+                    .resample = .sinc,
+                });
+                defer mixer.deinit();
+                try mixer.setBusEffect(0, 0, try Effect.biquad(48000, .{ .cutoff_hz = 2000 }));
+                try mixer.setMasterEffect(1, try Effect.compressor(48000, .{}));
+                _ = try mixer.play(monoClip(&samples, 44100), .{ .looping = true });
+                var out: [32]f32 = undefined;
+                _ = try mixer.render(&out);
+                mixer.resetEffects();
+                _ = try mixer.render(&out);
+            }
+        }.f,
+        .{},
+    );
 }
 
 test "mixer: rendering with effects is deterministic" {
@@ -2325,22 +2336,25 @@ test "mixer: delay-based inserts need no mixer allocation" {
 
     // The instances and their memory live outside the probe: the mixer must not
     // allocate anything for them, at insert time or during render.
-    try testing.checkAllAllocationFailures(gpa, struct {
-        fn f(alloc: Allocator, instance: *effects.Reverb, peak: *effects.Limiter, drive: *effects.Saturator) !void {
-            const samples = [_]f32{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8 };
-            var mixer = try Mixer.init(alloc, .{ .channels = 1, .effect_slots = 3, .block_frames = 4 });
-            defer mixer.deinit();
-            try mixer.setMasterEffect(0, Effect.reverb(instance));
-            try mixer.setMasterEffect(1, Effect.limiter(peak));
-            try mixer.setMasterEffect(2, Effect.saturator(drive));
-            try mixer.setBusEffect(0, 0, try Effect.biquad(48000, .{ .cutoff_hz = 4000 }));
-            _ = try mixer.play(monoClip(&samples, 48000), .{ .looping = true });
-            var out: [32]f32 = undefined;
-            _ = try mixer.render(&out);
-            mixer.resetEffects();
-            _ = try mixer.render(&out);
-        }
-    }.f, .{ &reverb, &limiter, &saturator });
+    try alloc_probe.check(
+        struct {
+            fn f(alloc: Allocator, instance: *effects.Reverb, peak: *effects.Limiter, drive: *effects.Saturator) !void {
+                const samples = [_]f32{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8 };
+                var mixer = try Mixer.init(alloc, .{ .channels = 1, .effect_slots = 3, .block_frames = 4 });
+                defer mixer.deinit();
+                try mixer.setMasterEffect(0, Effect.reverb(instance));
+                try mixer.setMasterEffect(1, Effect.limiter(peak));
+                try mixer.setMasterEffect(2, Effect.saturator(drive));
+                try mixer.setBusEffect(0, 0, try Effect.biquad(48000, .{ .cutoff_hz = 4000 }));
+                _ = try mixer.play(monoClip(&samples, 48000), .{ .looping = true });
+                var out: [32]f32 = undefined;
+                _ = try mixer.render(&out);
+                mixer.resetEffects();
+                _ = try mixer.render(&out);
+            }
+        }.f,
+        .{ &reverb, &limiter, &saturator },
+    );
 }
 
 test "mixer: a master limiter removes clipping without touching quiet mixes" {

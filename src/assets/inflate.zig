@@ -387,6 +387,7 @@ fn run(gpa: Allocator, source: []const u8, max_output_bytes: usize, zlib_wrapper
 
 const testing = std.testing;
 const vectors = @import("png_vectors.zig");
+const alloc_probe = @import("../core/alloc_probe.zig");
 
 fn unhex(gpa: Allocator, hex: []const u8) ![]u8 {
     const bytes = try gpa.alloc(u8, hex.len / 2);
@@ -550,10 +551,13 @@ test "inflate: survives allocation failure" {
     const gpa = testing.allocator;
     const source = try unhex(gpa, vectors.zlib_fixed_hex);
     defer gpa.free(source);
-    try testing.checkAllAllocationFailures(gpa, struct {
-        fn f(alloc: Allocator, bytes: []const u8) !void {
-            const out = try zlibInflate(alloc, bytes, 1 << 20);
-            alloc.free(out);
-        }
-    }.f, .{source});
+    try alloc_probe.check(
+        struct {
+            fn f(alloc: Allocator, bytes: []const u8) !void {
+                const out = try zlibInflate(alloc, bytes, 1 << 20);
+                alloc.free(out);
+            }
+        }.f,
+        .{source},
+    );
 }

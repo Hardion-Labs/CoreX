@@ -858,6 +858,7 @@ pub fn decode(gpa: Allocator, source: []const u8) DecodeError!Image {
 
 const testing = std.testing;
 const vectors = @import("jpeg_vectors.zig");
+const alloc_probe = @import("../core/alloc_probe.zig");
 
 fn unhex(gpa: Allocator, hex: []const u8) ![]u8 {
     if (hex.len % 2 != 0) return error.BadHex;
@@ -955,7 +956,7 @@ test "jpeg: allocation failures propagate without leaking" {
             img.deinit(alloc);
         }
     };
-    try testing.checkAllAllocationFailures(gpa, Probe.run, .{src});
+    try alloc_probe.check(Probe.run, .{src});
 }
 
 test "jpeg: partial plane allocation is unwound on failure" {
@@ -970,7 +971,7 @@ test "jpeg: partial plane allocation is unwound on failure" {
             img.deinit(alloc);
         }
     };
-    try testing.checkAllAllocationFailures(gpa, Probe.run, .{src});
+    try alloc_probe.check(Probe.run, .{src});
 }
 
 // --- focused unit tests for paths the reference corpus cannot reach ---------

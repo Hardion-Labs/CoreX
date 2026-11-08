@@ -4,8 +4,9 @@
 //! as a `.scene`, but with exactly one root entity. It can be parsed from disk,
 //! captured from a live scene subtree, serialized deterministically, and
 //! instantiated into any scene with the same component schema. Instantiation
-//! clones entities/components by value and remaps stable IDs and parent links,
-//! so multiple instances are independent and never collide with existing IDs.
+//! clones entities/components by value and remaps stable IDs, parent links and the
+//! authored sibling order, so multiple instances are independent, never collide
+//! with existing IDs, and paint their children the way the asset does.
 //!
 //! This module reuses `Scene` parsing/serialization and `Scene.cloneSubtree`;
 //! it does not duplicate the scene format or ECS storage.
@@ -110,6 +111,7 @@ pub fn Prefab(comptime schemas: anytype) type {
 
 const testing = std.testing;
 const Transform = @import("components.zig").Transform;
+const alloc_probe = @import("../core/alloc_probe.zig");
 
 const Marker = struct { value: i32 };
 const Validated = struct {
@@ -230,25 +232,73 @@ test "prefab: instantiate as root and serialize/parse roundtrip" {
     try testing.expectEqual(p.root_id, p2.root_id);
 }
 
-test "prefab: cloneSubtree survives allocation failure without leaking" {
-    try testing.checkAllAllocationFailures(testing.allocator, struct {
-        fn f(alloc: Allocator) !void {
-            var source = try TestScene.init(alloc, "source");
-            defer source.deinit();
-            const root = try source.createEntity("Root", null);
-            try source.addComponent(root, Marker{ .value = 1 });
-            const child = try source.createEntity("Child", source.idOf(root));
-            try source.addComponent(child, Marker{ .value = 2 });
+// A prefab clones twice — once into the prefab's own scene on capture, once into
+// the target on instantiate — so an authored sibling order has to survive both
+// hops, or every instance repaints its children differently from the asset.
+fn expectPaintedNames(scene: *const TestScene, ids: []const u64, want: []const []const u8) !void {
+    for (ids, want) |id, name| {
+        const entity = scene.entityById(id) orelse return error.EntityNotFound;
+        try testing.expectEqualStrings(name, scene.nameOf(entity).?);
+    }
+}
 
-            var target = try TestScene.init(alloc, "target");
-            defer target.deinit();
-            const anchor = try target.createEntity("Anchor", null);
-            const before = target.count();
-            const inst = try target.cloneSubtree(&source, source.idOf(root).?, target.idOf(anchor));
-            try testing.expectEqual(@as(usize, before + 2), target.count());
-            try testing.expect(target.parent(inst.root).?.eql(anchor));
-        }
-    }.f, .{});
+test "prefab: capture and instantiate carry the authored sibling order" {
+    var source = try TestScene.init(testing.allocator, "world");
+    defer source.deinit();
+    const root = try source.createEntity("Root", null); // id 1
+    _ = try source.createEntity("a", source.idOf(root)); // id 2
+    _ = try source.createEntity("b", source.idOf(root)); // id 3
+    _ = try source.createEntity("c", source.idOf(root)); // id 4
+    try source.setOrder(4, 0); // the source paints c, a, b
+
+    var p = try TestPrefab.fromScene(testing.allocator, &source, root, "captured");
+    defer p.deinit();
+    var in_prefab: [3]u64 = @splat(0);
+    try testing.expectEqual(@as(usize, 3), p.scene.childIdsInto(p.root_id, &in_prefab));
+    try expectPaintedNames(&p.scene, &in_prefab, &.{ "c", "a", "b" });
+
+    // The order lives in the captured document, which is what makes it portable.
+    const bytes = try p.serialize(testing.allocator);
+    defer testing.allocator.free(bytes);
+    try testing.expect(std.mem.indexOf(u8, bytes, "\"order\"") != null);
+    var reparsed = try TestPrefab.parse(testing.allocator, bytes);
+    defer reparsed.deinit();
+    var from_doc: [3]u64 = @splat(0);
+    try testing.expectEqual(@as(usize, 3), reparsed.scene.childIdsInto(reparsed.root_id, &from_doc));
+    try expectPaintedNames(&reparsed.scene, &from_doc, &.{ "c", "a", "b" });
+
+    // An anchor keeps the instance IDs from lining up with the prefab's own.
+    var target = try TestScene.init(testing.allocator, "level");
+    defer target.deinit();
+    const anchor = try target.createEntity("Anchor", null);
+    const inst = try p.instantiate(&target, target.idOf(anchor));
+    var in_target: [3]u64 = @splat(0);
+    try testing.expectEqual(@as(usize, 3), target.childIdsInto(target.idOf(inst).?, &in_target));
+    try expectPaintedNames(&target, &in_target, &.{ "c", "a", "b" });
+}
+
+test "prefab: cloneSubtree survives allocation failure without leaking" {
+    try alloc_probe.check(
+        struct {
+            fn f(alloc: Allocator) !void {
+                var source = try TestScene.init(alloc, "source");
+                defer source.deinit();
+                const root = try source.createEntity("Root", null);
+                try source.addComponent(root, Marker{ .value = 1 });
+                const child = try source.createEntity("Child", source.idOf(root));
+                try source.addComponent(child, Marker{ .value = 2 });
+
+                var target = try TestScene.init(alloc, "target");
+                defer target.deinit();
+                const anchor = try target.createEntity("Anchor", null);
+                const before = target.count();
+                const inst = try target.cloneSubtree(&source, source.idOf(root).?, target.idOf(anchor));
+                try testing.expectEqual(@as(usize, before + 2), target.count());
+                try testing.expect(target.parent(inst.root).?.eql(anchor));
+            }
+        }.f,
+        .{},
+    );
 }
 
 test "scene: cloneSubtree rolls back created entities when a component copy fails" {

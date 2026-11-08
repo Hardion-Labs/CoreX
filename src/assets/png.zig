@@ -643,6 +643,7 @@ fn deinterlace(
 const testing = std.testing;
 const vectors = @import("png_vectors.zig");
 const adam7_vectors = @import("png_adam7_vectors.zig");
+const alloc_probe = @import("../core/alloc_probe.zig");
 
 fn unhex(gpa: Allocator, hex: []const u8) ![]u8 {
     const bytes = try gpa.alloc(u8, hex.len / 2);
@@ -736,12 +737,15 @@ test "png: survives allocation failure" {
         if (!selected) continue;
         const source = try unhex(gpa, vector.png_hex);
         defer gpa.free(source);
-        try testing.checkAllAllocationFailures(gpa, struct {
-            fn f(alloc: Allocator, bytes: []const u8) !void {
-                var img = try decode(alloc, bytes);
-                img.deinit(alloc);
-            }
-        }.f, .{source});
+        try alloc_probe.check(
+            struct {
+                fn f(alloc: Allocator, bytes: []const u8) !void {
+                    var img = try decode(alloc, bytes);
+                    img.deinit(alloc);
+                }
+            }.f,
+            .{source},
+        );
     }
 }
 
@@ -887,7 +891,7 @@ test "png: Adam7 decoding propagates allocation failures without leaking" {
             img.deinit(alloc);
         }
     };
-    try testing.checkAllAllocationFailures(gpa, Probe.run, .{source});
+    try alloc_probe.check(Probe.run, .{source});
 }
 
 test "png: a large interlaced image matches its non-interlaced twin exactly" {

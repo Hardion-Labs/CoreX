@@ -57,9 +57,32 @@ scenes; project creation remains out of the engine's scope (see
 | `id` | integer > 0 | yes | Stable scene identifier, unique within the document. Never reused by the engine when creating new entities at runtime. |
 | `name` | string | no | Display name. Same rules as the scene name. |
 | `parent` | integer > 0 | no | `id` of the parent entity. Must exist, cannot be the entity itself and cannot form a cycle. |
+| `order` | integer ≥ 0 | no | Sibling sort key among children of the same parent. Default: the entity's own `id`. |
 | `components` | object | no | Typed components. Default: `{}`. |
 
 Unknown fields and duplicate fields are rejected (strict JSON).
+
+### Sibling order
+
+`order` is what makes the order a user arranged in the editor **scene data** rather than a
+view detail. Children of one parent are painted — and returned by `childIdsInto` — sorted by
+ascending `(order, id)`, so:
+
+- It is a **key, not an index**: no entity has to be unique or contiguous, and a gap or a
+  duplicate is fine. Ties fall back to ascending `id`, which is why entities that never
+  carried the field keep their creation order.
+- It orders siblings only. The `entities` array itself stays sorted by ascending `id`, so
+  adding an order never reshuffles the document.
+- It is omitted when it equals the entity's own `id` — that value *is* the natural order —
+  so a scene nobody reordered serializes byte for byte as it did before the field existed.
+  `Scene.setOrder(id, id)` removes the entry for the same reason.
+- It is compared inside one parent only: two entities under different parents may hold the
+  same key, and a key may name an id that does not exist.
+
+A subtree cloned into another scene (`cloneSubtree`, which is how prefabs and streamed
+sectors are built) carries its authored order across, so an instance paints its children the
+way its source does; the cloned root keeps none, because it is being attached to a new parent
+rather than moved among its old siblings.
 
 ## The `transform` component
 
@@ -171,6 +194,8 @@ silently failed to load draws nothing at all.
 - Entity IDs must be unique and greater than zero.
 - Parents must reference existing entities; self-parenting and cycles are
   rejected.
+- `order`, when present, must be a non-negative integer. It is a sort key, so it is
+  not checked for uniqueness and it does not have to name an existing entity.
 - Components unknown to the loaded schema are rejected.
 - The document is limited to 16 MiB and 1,000,000 entities.
 - Scene paths coming from the manifest/CLI remain relative to the project root,

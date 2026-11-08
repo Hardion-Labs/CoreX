@@ -329,6 +329,7 @@ pub fn prototype(x: f64, half_support: f64) f64 {
 // --- tests -----------------------------------------------------------------
 
 const testing = std.testing;
+const alloc_probe = @import("../core/alloc_probe.zig");
 
 fn sineBuffer(gpa: Allocator, frames: usize, rate: f64, freq: f64) ![]f32 {
     const buf = try gpa.alloc(f32, frames);
@@ -361,15 +362,18 @@ test "resample: the prototype is a symmetric windowed sinc with zero endpoints" 
 }
 
 test "resample: init survives allocation failure" {
-    try testing.checkAllAllocationFailures(testing.allocator, struct {
-        fn f(alloc: Allocator) !void {
-            var sinc = try Sinc.init(alloc);
-            defer sinc.deinit(alloc);
-            var kernel: Kernel = undefined;
-            sinc.build(3.5, 1.0, &kernel);
-            try testing.expect(kernel.count > 0);
-        }
-    }.f, .{});
+    try alloc_probe.check(
+        struct {
+            fn f(alloc: Allocator) !void {
+                var sinc = try Sinc.init(alloc);
+                defer sinc.deinit(alloc);
+                var kernel: Kernel = undefined;
+                sinc.build(3.5, 1.0, &kernel);
+                try testing.expect(kernel.count > 0);
+            }
+        }.f,
+        .{},
+    );
 }
 
 test "resample: DC gain is unity at every ratio and phase" {
