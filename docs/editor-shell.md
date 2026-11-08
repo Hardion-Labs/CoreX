@@ -4,11 +4,12 @@ The graphical editor's composition layer: one editor frame painted with the engi
 own GUI (`corex.gui`), over a session the startup pipeline already prepared. Code in
 `src/editor/`, exposed as `corex.editor`.
 
-> Status: **shell and editing model implemented and tested** (docks, hierarchy,
-> viewport, inspector with an editable name, status bar, command stack with undo/redo,
-> dirty tracking, atomic save, headless frame renderer). The platform parts of an editor
-> — a window, a swapchain, real input — are **not** implemented. This document says
-> exactly where the line is.
+> Status: **shell and editing model implemented and tested** (docks, hierarchy with
+> keyboard navigation and sibling ordering, viewport with framing / orbit / zoom /
+> click-to-select and a move-rotate-scale gizmo, inspector with editable name, transform
+> and camera fields, status bar, command stack with undo/redo, dirty tracking, atomic
+> save, headless frame renderer). The platform parts of an editor — a window, a swapchain,
+> real input — are **not** implemented. This document says exactly where the line is.
 
 ## What the shell is
 
@@ -79,7 +80,18 @@ history command (one `Ctrl+Z` undoes exactly what one click did):
 | delete | `Delete` | `delete` |
 | reparent | drag a row onto another row (or onto the blank area, for a root) | `reparent` |
 | reparent to a root | `P` | `reparent` with a null parent |
+| reorder among siblings | `move_up` / `move_down` | two `set_order` commands, so two `Ctrl+Z` |
 | fold / unfold | the disclosure, `Enter` on a row with children | none (view only) |
+
+Sibling order is **scene data**, not a view preference: `Scene` keeps an explicit `order`
+key per entity (defaulting to the entity's own stable ID) and writes it into the document
+only when it differs, so a reorder survives a save, a prefab capture and a streamed sector,
+and a scene nobody reordered serializes exactly as it did before the field existed. That is
+also why a swap is two commands rather than one custom inverse: undo restores both keys
+exactly instead of guessing what the previous order was. The cost shows up one press early:
+a single `Ctrl+Z` leaves the swapped pair holding the **same** key, which tie-breaks by ID
+rather than restoring the previous order — so the first press can look like nothing happened,
+while one explicit key stays in the document until the second press clears it.
 
 ### Drag and drop
 
@@ -115,6 +127,8 @@ this one" is not "the next entity in the scene".
 | `Down` / `Up` | next / previous visible row, skipping the hidden children of a folded branch |
 | `Right` | unfold a folded branch; on an open branch, step into its first child |
 | `Left` | fold an open branch; on a folded row or a leaf, step out to its parent |
+| `Home` / `End` | first / last visible row of the **whole** tree, not of the painted window |
+| `PageUp` / `PageDown` | one panel-full of rows (`list.visible`), clamped at both ends |
 | `Enter` | fold / unfold the selected row |
 
 Two details make it behave rather than nearly behave:
@@ -221,6 +235,63 @@ The viewport answers the keyboard, so the editor is usable without a pointer at 
 - **It starts from the screen, not from a default.** Each command re-reads the camera's
   placement from the scene (`viewOf`) and keeps the distance the editor last worked with,
   so an orbit after an inspector edit or an undo turns from what is actually on screen.
+
+### Pointer gestures
+
+The viewport answers the pointer as well as the keyboard, and — like `tree.Drag` — each
+gesture is a **value** (`ViewportDrag`, `Gizmo`) the shell owns and the paint loop reads, so
+"did this press mean a drag or a click?" is testable without a pointer.
+
+| Gesture, with the pointer inside the viewport | Effect |
+| --- | --- |
+| press on nothing, drag | orbit the camera by the pointer's movement |
+| press and release without moving past 2 px | select the entity under the pointer |
+| wheel | dolly the camera in / out around the point it already looks at |
+| press on a gizmo handle or ring, drag | move / rotate / scale the selected entity |
+
+- **Click and drag are one press.** `ViewportDrag.end` is what says whether the pointer
+  travelled far enough to have been an orbit, so the release resolves to "the orbit already
+  happened" or "this was a click — pick something" instead of two handlers guessing.
+- **Picking uses the camera the renderer used.** `pickEntity` un-projects the pointer through
+  the inverse view-projection into a screen ray (`frame_camera.pickRay`) and tests it against
+  each candidate's world box — the eight corners of the local unit box, the same box framing
+  measures — taking the nearest hit. Only entities carrying **both** a `Transform` and a
+  `Renderable` are candidates, so an empty or a camera cannot be clicked. No camera, a
+  non-invertible matrix or a miss selects nothing rather than selecting whatever the view
+  happened to hold first.
+- **Zoom is an edit; a tool switch is not.** The wheel goes through the same `cameraCommand`
+  as `F`, so it records one `set_component` and marks the project dirty, and
+  `min_distance` keeps the eye out of its own target — a wheel at that floor changes nothing
+  and records nothing.
+
+### Gizmo
+
+The selected entity gets a gizmo painted at its projected world position. Which tool is
+active decides both what is painted and what a drag on it does:
+
+| Key (viewport focused) | `GizmoMode` | Handles | A drag means |
+| --- | --- | --- | --- |
+| `W` | `.translate` | one arrow per axis, half a world unit long | displacement along that axis, on a plane facing the camera |
+| `E` | `.rotate` | one ring per axis, 24 segments at radius 0.5 | the signed angle around that axis, measured from the press point |
+| `R` | `.scale` | the same arrows, with larger tips | displacement along that axis, as a factor |
+
+- **The keys are load-bearing.** They are the only way to reach `.rotate` and `.scale`, so
+  the tools the shell can pick, paint and apply are also the tools the user can actually
+  choose. The tool is viewport state (`State.setGizmoMode`): it survives a selection change,
+  never enters the history and cannot dirty the project. Switching tools mid-drag abandons
+  the drag, because a gesture that started as a move must not finish as a rotation.
+- **Handles are picked in the pixels they were drawn in.** `pickGizmo` projects the axis tips
+  and the ring segments through `projectToViewport` and takes the closest within 8 px by
+  point-to-segment distance, so clicking *near* a handle is enough. A point behind the eye is
+  dropped, not divided through onto the wrong side of the screen.
+- **The drag writes live, the history records once.** Every frame `applyGizmoDrag` writes the
+  new transform straight to the scene so the entity follows the pointer; the undoable
+  `set_component` is recorded on release, and a press that never moved the axis records
+  nothing. Each mode measures against the world transform captured at `Gizmo.begin`, so a
+  drag cannot compound itself.
+- **Rotate keeps its angle in range.** The angle is `atan2` of the cross and dot products of
+  the start and current hit vectors around the axis, wrapped to `[-π, π]`, so a long drag
+  cannot accumulate turns the user never made.
 
 `editor.shell.projectToViewport(view_projection, world, rect)` maps a world position to
 a viewport pixel using the **same** matrix the renderer used, so a marker lands on the
@@ -355,24 +426,32 @@ behaviour, not a workaround.
 - **No window, no swapchain, no real input.** Blocked in this environment (no X11
   headers, no `DISPLAY`). The shell paints into a caller-owned buffer; wiring it to a
   window is `present()` of that same buffer.
-- **Rotation and camera fields are read-only.** Rotation needs a field that can express a
-  normalized quaternion honestly (or an Euler editor with its own conversion rules), and
-  the camera fov is a single value with no angle widget yet. Neither is a model gap: the
-  history already carries `set_component` for any component.
+- **Rotation is edited as Euler degrees.** The row shows `quatToEuler` (roll / pitch / yaw,
+  pitch clamped to ±90 for the gimbal-lock singularity) and writes back through
+  `quatFromEuler`, which normalizes: an edit round-trips the *orientation*, not the exact
+  authored quaternion. A quaternion widget (four fields, or a draggable arc) is the open
+  question, not the history — `set_component` already carries any component.
 - **No scrub/drag on numeric fields.** Values are typed; a drag-to-scrub affordance needs
   pointer-drag state the GUI can already report, but it is a separate interaction.
 - **The history is in-memory and per-session.** It is not persisted, and there is no
   "reopen and undo" — deliberate for now.
 - **No multi-select, no copy/paste, no grouping.**
 - **No drop *between* rows and no drop onto the panel title.** A drag reparents ("be a
-  child of this node") or roots ("be a root"); ordering siblings needs an explicit child
-  order in the scene, which the model does not have.
-- **The viewport has no pointer interaction.** Framing and orbit are keyboard-only: no
-  click-to-select in the viewport, no drag to orbit, no zoom (the distance is set by `F`,
-  not by a wheel or a scale factor), no gizmos, and no drag-across-the-edge auto-scroll.
+  child of this node") or roots ("be a root"). Ordering siblings is `move_up` / `move_down`
+  instead, because a drop between rows would need a boundary to land on and an 8 px row has
+  none to hit.
+- **The gizmo and the pick are screen-space approximations.** A handle is found by distance
+  to a projected segment, the drag plane faces the camera, and a click selects an entity by
+  its **unit box** rather than its mesh triangles — so a wide flat mesh is picked by a box
+  taller than it looks, and geometry outside that box cannot be clicked. There is no snapping,
+  no drag-across-the-edge auto-scroll, and the handles shrink with the view instead of keeping
+  a fixed size on screen.
 - **No focus ring on individual fields.** The outline marks the dock; the field inside it
   draws its own border when focused.
-- **No Home/End, PageUp/PageDown or multi-select in the tree.** One selected entity.
+- **No multi-select in the tree.** One selected entity, so a gizmo drag and every edit act on
+  one entity at a time. Reordering reaches only the first 64 siblings of a parent (the window
+  `childIdsInto` fills): a row outside it has no neighbour inside to swap with, and the action
+  reports "nothing changed" rather than moving rows the user cannot see.
 - **No inline rename in the tree.** Renaming goes through the inspector's name field.
 - **Fold state is not persisted.** It lives in `shell.State`, so reopening a project
   starts unfolded.

@@ -150,6 +150,7 @@ fn downsample(src: []const u8, sw: u32, sh: u32, dst: []u8, dw: u32, dh: u32) vo
 }
 
 const testing = std.testing;
+const alloc_probe = @import("../core/alloc_probe.zig");
 
 test "mipmap: level count and dims match repeated halving down to 1x1" {
     try testing.expectEqual(@as(u32, 1), levelCount(1, 1));
@@ -229,5 +230,5 @@ test "mipmap: generation failure surfaces as OutOfMemory and leaks nothing" {
     };
     var src: [8 * 8 * 4]u8 = undefined;
     for (&src, 0..) |*b, i| b.* = @intCast(i % 251);
-    try testing.checkAllAllocationFailures(testing.allocator, Probe.run, .{&src});
+    try alloc_probe.check(Probe.run, .{&src});
 }

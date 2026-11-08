@@ -538,7 +538,11 @@ fn reorderSibling(scene: anytype, row: u64, delta: i32, history: anytype) anyerr
     // Find `row`'s position.
     var pos: usize = 0;
     while (pos < n and ids[pos] != row) : (pos += 1) {}
-    if (pos == n) return false; // not a sibling of itself? shouldn't happen
+    // A parent with more children than this window holds paints the first `ids.len`
+    // of them, and `childIdsInto` keeps the *smallest* IDs — so a row outside the
+    // window has no neighbour inside it to swap with. Refusing is the honest answer:
+    // moving it would reorder rows the user is not looking at.
+    if (pos == n) return false;
 
     var target: usize = 0;
     if (delta < 0) {
@@ -749,6 +753,49 @@ test "tree actions: move_up and move_down reorder siblings, undoable" {
     // move_up/down on a root with no siblings is a no-op.
     const root_noop = apply(.move_up, root_id, &collapsed, &scene, &history);
     try testing.expect(!root_noop.changed);
+}
+
+test "tree actions: a half-undone reorder is a tie, which is why a swap records two commands" {
+    const testing = std.testing;
+    const scene_mod = @import("../scene/scene.zig");
+    const components = @import("../scene/components.zig");
+    const edit = @import("edit.zig");
+    const Scene = scene_mod.Scene(.{scene_mod.Component(components.Transform, "transform")});
+    const History = edit.History(Scene);
+
+    var scene = try Scene.init(testing.allocator, "level");
+    defer scene.deinit();
+    var history = History.init(testing.allocator);
+    defer history.deinit();
+    var collapsed = Collapsed{};
+
+    const root = try scene.createEntity("root", null);
+    const root_id = scene.idOf(root).?;
+    const a = try scene.createEntity("a", root_id);
+    const b = try scene.createEntity("b", root_id);
+    const c = try scene.createEntity("c", root_id);
+    const a_id = scene.idOf(a).?;
+    const b_id = scene.idOf(b).?;
+    const c_id = scene.idOf(c).?;
+
+    try testing.expect(apply(.move_up, b_id, &collapsed, &scene, &history).changed);
+
+    // Undo the second command only: `a` gets its own ID back as its key while `b` keeps the key
+    // it took, so the two are tied and the tie breaks by ID -- the paint order reads as if the
+    // swap never happened, and `b` is left carrying an authored key a save would write.
+    try history.undo(&scene);
+    var ids: [3]u64 = @splat(0);
+    try testing.expectEqual(@as(usize, 3), scene.childIdsInto(root_id, &ids));
+    try testing.expectEqual(a_id, ids[0]);
+    try testing.expectEqual(b_id, ids[1]);
+    try testing.expectEqual(c_id, ids[2]);
+    try testing.expectEqual(a_id, scene.orderOf(b_id));
+    try testing.expectEqual(a_id, scene.orderOf(a_id));
+
+    // The second press is what makes the pair natural again, so nothing is left to serialize.
+    try history.undo(&scene);
+    try testing.expectEqual(b_id, scene.orderOf(b_id));
+    try testing.expectEqual(a_id, scene.orderOf(a_id));
 }
 
 test "tree actions: delete is one command and does not touch the fold state of others" {

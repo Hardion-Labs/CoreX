@@ -429,6 +429,7 @@ fn countStartFailure(stats: *Stats, err: mixer_mod.PlayError) void {
 const testing = std.testing;
 const scene_mod = @import("../scene/scene.zig");
 const components = @import("../scene/components.zig");
+const alloc_probe = @import("../core/alloc_probe.zig");
 
 const TestScene = scene_mod.Scene(.{
     scene_mod.Component(components.Transform, "transform"),
@@ -913,28 +914,30 @@ test "audio system: AudioSource serializes and parses as a scene component" {
 }
 
 test "audio system: update survives allocation failure without leaking voices" {
-    const gpa = testing.allocator;
-    try testing.checkAllAllocationFailures(gpa, struct {
-        fn f(alloc: Allocator) !void {
-            var mixer = try Mixer.init(alloc, .{ .channels = 2, .max_voices = 4 });
-            defer mixer.deinit();
-            var scene = try TestScene.init(alloc, "audio");
-            defer scene.deinit();
-            var system = try AudioSystem.init(alloc, &mixer, .{});
-            defer system.deinit();
+    try alloc_probe.check(
+        struct {
+            fn f(alloc: Allocator) !void {
+                var mixer = try Mixer.init(alloc, .{ .channels = 2, .max_voices = 4 });
+                defer mixer.deinit();
+                var scene = try TestScene.init(alloc, "audio");
+                defer scene.deinit();
+                var system = try AudioSystem.init(alloc, &mixer, .{});
+                defer system.deinit();
 
-            const e = try scene.createEntity(null, null);
-            try scene.addComponent(e, components.Transform{ .position = .{ 2, 0, 0 } });
-            try scene.addComponent(e, AudioSource{ .playing = true, .looping = true });
-            const e2 = try scene.createEntity(null, null);
-            try scene.addComponent(e2, AudioSource{ .playing = true, .looping = true, .clip = 1 });
+                const e = try scene.createEntity(null, null);
+                try scene.addComponent(e, components.Transform{ .position = .{ 2, 0, 0 } });
+                try scene.addComponent(e, AudioSource{ .playing = true, .looping = true });
+                const e2 = try scene.createEntity(null, null);
+                try scene.addComponent(e2, AudioSource{ .playing = true, .looping = true, .clip = 1 });
 
-            _ = try system.update(&scene, Listener{}, &test_clips);
-            _ = try system.update(&scene, Listener{}, &test_clips);
-            scene.getComponent(AudioSource, e).?.playing = false;
-            _ = try system.update(&scene, Listener{}, &test_clips);
-        }
-    }.f, .{});
+                _ = try system.update(&scene, Listener{}, &test_clips);
+                _ = try system.update(&scene, Listener{}, &test_clips);
+                scene.getComponent(AudioSource, e).?.playing = false;
+                _ = try system.update(&scene, Listener{}, &test_clips);
+            }
+        }.f,
+        .{},
+    );
 }
 
 test "audio system: two identical scenes produce identical audio" {

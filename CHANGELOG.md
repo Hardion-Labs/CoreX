@@ -8,6 +8,48 @@ declared yet.
 
 ### Added
 
+- **Gizmo tool keys** (`W` / `E` / `R`, `State.setGizmoMode`, `shell.GizmoMode`).
+  - The rotate and scale gizmos already measured, picked and painted — and could not be reached:
+    `viewport_gizmo.mode` had no writer anywhere, so every drag was a translate. `W` moves,
+    `E` rotates, `R` scales, and the keys are now the way to choose a tool.
+  - The tool is **viewport state, not scene state**: it survives a selection change, never
+    enters the history and cannot dirty the project, because aiming a tool is not an edit.
+  - Switching tools mid-drag abandons the gesture, so a drag that started as a move cannot
+    finish as a rotation and leave half of it in the history.
+  - Handled while the viewport holds the keyboard, so the same letters typed into a field stay
+    text. 3 new tests (951 total).
+
+- **Sibling ordering in the entity tree** (`Scene.setOrder` / `orderOf`, the `order` field,
+  `tree.reorderSibling`).
+  - Paint order is authored data, not the order the allocator happened to produce: `rootIds`
+    and `childIdsInto` sort by `(order, id)` within a parent, where a key defaults to the
+    entity's own stable ID and ties break by ID.
+  - `move_up` / `move_down` swap a row with its neighbour as two `set_order` commands — two
+    `Ctrl+Z` presses to undo, which is what lets undo restore both keys exactly instead of
+    guessing what the previous order was.
+  - `order` is written **only when it differs from that default**, so a scene nobody reordered
+    serializes as it did before the field existed. `cloneSubtree`, prefab capture and a streamed
+    sector all carry it; a cloned root keeps no key, because it was attached rather than moved.
+
+- **Manipulating the viewport with the pointer** (`State.ViewportDrag`, `pickGizmo`,
+  `pickEntity`, `applyGizmoDrag`).
+  - A press becomes a gesture once the pointer has travelled 2 px, so one press is either an
+    orbit that already happened or a click that selects: `ViewportDrag.end` decides, instead of
+    two handlers guessing at the same release.
+  - A click selects through the inverse view-projection against each candidate's world box — the
+    eight corners of the local unit box, the same box framing measures — nearest hit wins. Only
+    entities with **both** a `Transform` and a `Renderable` are candidates, so a light or an
+    empty group cannot be clicked by accident.
+  - A handle is picked by distance to the **projected** segment, within 8 px, so clicking near a
+    handle is enough; a point at or behind the eye is dropped rather than divided through onto the
+    wrong side of the screen.
+  - The drag writes the transform on every frame it moves and records **one** `set_component` on
+    release: the entity follows the pointer, one undo steps back over the whole drag, and a press
+    that never moved the axis records nothing.
+  - Rotate measures the angle `atan2` around the axis against the world transform captured at
+    `Gizmo.begin`, wrapped to `[-π, π]`, so a long drag cannot accumulate turns the user never
+    made, and a drag cannot compound itself.
+
 - **Drag and drop reparenting** in the hierarchy (`tree.Drag`, `tree.isAncestor`).
   - Press a row, drag it, release it on another row to make it that row's child; release on
     the panel's blank area to make it a root. A drop is one `reparent` command, so it is one
@@ -497,6 +539,26 @@ declared yet.
 
 ### Fixed
 
+- **Allocation-failure tests could pass on one heap layout and fail on the next.** The standard
+  harness picks which allocation fails by counting `alloc` calls, but a container that grows
+  **in place** (`resize` / `remap`) is not counted — so a pass that inherited room from the pass
+  before it made one allocation fewer, and the failing index drifted with the layout instead of
+  with the code. A verdict then describes the heap the earlier passes left behind, not the code
+  under test: one such probe needed 45 allocations, failed at every index from 0 to 43 and
+  passed at 44, and the whole suite failed 60 runs out of 60 at one seed before this fix and 0
+  of 60 after — which is why `zig build test` on `main` reported
+  `940/941 tests passed (1 failed)` on every run here, with only `scene.stream`'s
+  half-loaded-sector probe failing.
+  - `corex.core.alloc_probe` holds a view of the backing allocator that refuses to grow a buffer
+    where it fits, so every allocation is asked for where the code path decides to ask. It changes
+    no behaviour: the code under test sees the same allocator interface, and a refused growth
+    takes the copy path the harness already counts.
+  - `alloc_probe.check` is the harness call sites use. All 34 `checkAllAllocationFailures` sites
+    in `src/` go through it, which is one mechanism rather than 34 places each remembering to wrap
+    its own allocator. No probe body changed.
+  - The property was never actually violated: the rollback markers `scene.stream` sets stayed
+    untouched across every pass, so this is a test-harness correctness fix, not an engine fix. The
+    Debug suite runs in the same ~2 s either way.
 - `inspector.Field.text()`/`parsed()` and `Row.values()` took `self` **by value**, so the
   returned slice pointed at a temporary copy. They take a pointer now; the by-value
   version could hand back garbage or a dead slice.

@@ -399,6 +399,7 @@ pub const bindings = [_]importer.Registry.Binding{
 
 const testing = std.testing;
 const vectors = @import("audio_vectors.zig");
+const alloc_probe = @import("../core/alloc_probe.zig");
 
 fn unhex(gpa: Allocator, hex: []const u8) ![]u8 {
     const bytes = try gpa.alloc(u8, hex.len / 2);
@@ -647,15 +648,18 @@ test "audio: decode, serialize and import survive allocation failure" {
         if (!selected) continue;
         const source = try unhex(gpa, vector.wav_hex);
         defer gpa.free(source);
-        try testing.checkAllAllocationFailures(gpa, struct {
-            fn f(alloc: Allocator, bytes: []const u8) !void {
-                var clip = try decodeWav(alloc, bytes);
-                defer clip.deinit(alloc);
-                const artifact = try serialize(alloc, clip);
-                alloc.free(artifact);
-                const imported = try importWav(alloc, bytes);
-                alloc.free(imported);
-            }
-        }.f, .{source});
+        try alloc_probe.check(
+            struct {
+                fn f(alloc: Allocator, bytes: []const u8) !void {
+                    var clip = try decodeWav(alloc, bytes);
+                    defer clip.deinit(alloc);
+                    const artifact = try serialize(alloc, clip);
+                    alloc.free(artifact);
+                    const imported = try importWav(alloc, bytes);
+                    alloc.free(imported);
+                }
+            }.f,
+            .{source},
+        );
     }
 }

@@ -337,6 +337,7 @@ fn diff(gpa: Allocator, old: []const Entry, new: []const Entry) Error!ChangeSet 
 // --- tests -----------------------------------------------------------------
 
 const testing = std.testing;
+const alloc_probe = @import("../core/alloc_probe.zig");
 
 fn seed(tmp: *testing.TmpDir, io: Io, path: []const u8, data: []const u8) !void {
     try tmp.dir.writeFile(io, .{ .sub_path = path, .data = data });
@@ -598,7 +599,6 @@ test "changes: empty projects and empty change sets" {
 }
 
 test "changes: capture and detect survive allocation failure" {
-    const gpa = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -608,22 +608,25 @@ test "changes: capture and detect survive allocation failure" {
     var buf: [Io.Dir.max_path_bytes]u8 = undefined;
     const root_path = try rootPath(&tmp, io, &buf);
 
-    try testing.checkAllAllocationFailures(gpa, struct {
-        fn f(alloc: Allocator, path: []const u8, io_in: Io) !void {
-            var index = try assets.indexDirectories(alloc, io_in, path, &.{"assets"});
-            defer index.deinit();
-            var root = try Io.Dir.openDirAbsolute(io_in, path, .{});
-            defer root.close(io_in);
-            var snap = try capture(alloc, io_in, root, index, .{});
-            defer snap.deinit();
-            const keys = try snap.cacheKeys(alloc, importer_mod.defaultRegistry(), "");
-            alloc.free(keys);
-            var result = try detect(alloc, io_in, root, &snap, index, .{});
-            defer result.deinit();
-            const paths = try result.changes.changedPaths(alloc);
-            alloc.free(paths);
-        }
-    }.f, .{ root_path, io });
+    try alloc_probe.check(
+        struct {
+            fn f(alloc: Allocator, path: []const u8, io_in: Io) !void {
+                var index = try assets.indexDirectories(alloc, io_in, path, &.{"assets"});
+                defer index.deinit();
+                var root = try Io.Dir.openDirAbsolute(io_in, path, .{});
+                defer root.close(io_in);
+                var snap = try capture(alloc, io_in, root, index, .{});
+                defer snap.deinit();
+                const keys = try snap.cacheKeys(alloc, importer_mod.defaultRegistry(), "");
+                alloc.free(keys);
+                var result = try detect(alloc, io_in, root, &snap, index, .{});
+                defer result.deinit();
+                const paths = try result.changes.changedPaths(alloc);
+                alloc.free(paths);
+            }
+        }.f,
+        .{ root_path, io },
+    );
 }
 
 test "changes: snapshots are deterministic and independent" {

@@ -48,7 +48,9 @@ use `Prefab(.{ Component(T, "name"), ... })`.
   captured root's original parent is dropped.
 - `instantiate(target, parent_id) !ecs.Entity` — instantiates into `target` (same
   schema), attaching the cloned root to `parent_id` (or as a root when `null`).
-  Returns the new root handle.
+  Returns the new root handle. Children of every entity inside the subtree keep the
+  `order` the asset authored (see [scene-format.md](scene-format.md)); the cloned
+  root is given none, since it is attached rather than moved.
 - `serialize(gpa) ![]u8` / `save(io, dir, path)` — deterministic serialization (same
   layout as a scene, entities in ascending ID order).
 - `deinit`, `count`, `root`, `name`, `root_id`.
@@ -64,6 +66,9 @@ available directly on any `Scene(schemas)` for scene composition.
   attached to the requested `parent_id`.
 - **Copy by value**: components are plain data and copied by value; multiple
   instances are independent (mutating one does not affect another or the prefab).
+- **Paint order**: an authored sibling order survives both clone hops — into the
+  prefab's own scene on capture and out of it on instantiate — and a group nobody
+  reordered stays unwritten, so capturing a prefab never grows the document.
 - **Atomicity on error**: if any step fails (for example, an invalid component or an
   allocation failure), the entities created by the call are destroyed and the target
   remains unchanged, except for monotonic ID advancement (IDs are never reused).

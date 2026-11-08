@@ -671,6 +671,7 @@ pub const bindings = [_]importer.Registry.Binding{
 
 const testing = std.testing;
 const vectors = @import("flac_vectors.zig");
+const alloc_probe = @import("../core/alloc_probe.zig");
 
 fn unhex(gpa: Allocator, hex: []const u8) ![]u8 {
     if (hex.len % 2 != 0) return error.BadHex;
@@ -772,7 +773,7 @@ test "flac: allocation failures propagate without leaking" {
             clip.deinit(alloc);
         }
     };
-    try testing.checkAllAllocationFailures(gpa, Probe.run, .{src});
+    try alloc_probe.check(Probe.run, .{src});
 }
 
 test "flac: importing produces a CXAW artifact identical to the WAV path" {

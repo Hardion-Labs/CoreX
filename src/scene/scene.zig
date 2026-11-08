@@ -442,16 +442,8 @@ pub fn Scene(comptime schemas: anytype) type {
             return self.entityById(pid);
         }
 
-        /// Sorted stable IDs of the direct children of `parent_id` (the roots when
-        /// `parent_id` is null), written into `out` in ascending order.
-        ///
-        /// Returns how many IDs were written, which is `min(match_count, out.len)`:
-        /// the buffer is never overflowed. When a parent has more children than the
-        /// buffer holds, the **smallest** stable IDs are kept, so the result is a
-        /// deterministic prefix rather than whatever the hash map happened to visit
-        /// first. Allocation-free — the scan is over the scene's own records — which
-        /// is what lets a tree view ask for one node's children per frame.
-        /// Whether sibling `a` sorts before sibling `b`: ascending `(order, id)`.
+        /// Whether sibling `a` sorts before sibling `b`: ascending `(order, id)`,
+        /// where an entity without an explicit order uses its own stable ID.
         fn siblingLess(self: *const Self, a: u64, b: u64) bool {
             const oa = self.orderOf(a);
             const ob = self.orderOf(b);
@@ -459,6 +451,16 @@ pub fn Scene(comptime schemas: anytype) type {
             return a < b;
         }
 
+        /// Stable IDs of the direct children of `parent_id` (the roots when
+        /// `parent_id` is null), written into `out` in paint order — ascending
+        /// `(order, id)`, see `siblingLess`.
+        ///
+        /// Returns how many IDs were written, which is `min(match_count, out.len)`:
+        /// the buffer is never overflowed. When a parent has more children than the
+        /// buffer holds, the first `out.len` in paint order are kept, so the result
+        /// is a deterministic prefix rather than whatever the hash map happened to
+        /// visit first. Allocation-free — the scan is over the scene's own records —
+        /// which is what lets a tree view ask for one node's children per frame.
         pub fn childIdsInto(self: *const Self, parent_id: ?u64, out: []u64) usize {
             var written: usize = 0;
             var it = self.records.iterator();
@@ -520,7 +522,10 @@ pub fn Scene(comptime schemas: anytype) type {
         /// Clone the subtree rooted at `source.root_id` into `self`, attaching
         /// the cloned root to `parent_id` (or as a root when null). New stable
         /// IDs are allocated in ascending source-ID order, so the operation is
-        /// deterministic. Components are copied by value (plain data). On error
+        /// deterministic. Components are copied by value (plain data) and an
+        /// authored sibling order *inside* the subtree is carried over; the cloned
+        /// root keeps no order of its own, because it is being attached to a new
+        /// parent rather than moved among its old siblings. On error
         /// any entities created by this call are destroyed, leaving the target
         /// scene unchanged except for monotonic ID advancement.
         pub fn cloneSubtree(self: *Self, source: *Self, root_id: u64, parent_id: ?u64) Error!Instance {
@@ -599,6 +604,35 @@ pub fn Scene(comptime schemas: anytype) type {
                     const pid = rec.parent orelse return error.InvalidParent;
                     const pe = map.get(pid) orelse return error.InvalidParent;
                     try self.setParent(entity, pe);
+                }
+            }
+
+            // Third pass: carry the authored sibling order, so a subtree cloned for
+            // a prefab or a streamed sector paints its children the way the source
+            // does. Clone IDs ascend with source IDs, which means a group whose
+            // members all use their natural key is already in the right shape and
+            // needs nothing written; a group that was reordered is re-ranked 0..n-1
+            // in the source's paint order. Re-ranking cannot change the order back
+            // on its own: dropping a key that equals the entity's own ID (what
+            // `setOrder` treats as natural) leaves that entity's sort key equal to
+            // the rank it was given. The cloned root is not re-ranked, because it is
+            // being attached to a new parent, not moved among its old siblings.
+            var group_it = children.iterator();
+            while (group_it.next()) |group| {
+                if (!map.contains(group.key_ptr.*)) continue; // outside the subtree
+                const kids = group.value_ptr.items;
+                var reordered = false;
+                for (kids) |cid| reordered = reordered or source.orderOf(cid) != cid;
+                if (!reordered) continue;
+                std.mem.sort(u64, kids, source, struct {
+                    fn less(src: *const Self, a: u64, b: u64) bool {
+                        return src.siblingLess(a, b);
+                    }
+                }.less);
+                for (kids, 0..) |sid, rank| {
+                    const cloned = map.get(sid) orelse return error.EntityNotFound;
+                    const clone_id = self.idOf(cloned) orelse return error.EntityNotFound;
+                    try self.setOrder(clone_id, rank);
                 }
             }
 
@@ -977,6 +1011,7 @@ pub fn Scene(comptime schemas: anytype) type {
 // --- tests -----------------------------------------------------------------
 
 const Transform = @import("components.zig").Transform;
+const alloc_probe = @import("../core/alloc_probe.zig");
 const TestScene = Scene(.{Component(Transform, "transform")});
 
 const empty_scene =
@@ -1135,6 +1170,120 @@ test "scene: serialize is deterministic and sorted by ID" {
     try std.testing.expect(std.mem.indexOf(u8, a, "\"id\": 1").? < std.mem.indexOf(u8, a, "\"id\": 2").?);
 }
 
+// The sibling sort key lives in the document, because a reordering made in the
+// editor has to survive a save. It is written only when it differs from the
+// entity's own ID, so a natural-order document stays byte-identical to what it
+// was before the field existed.
+test "scene: sibling order round-trips through the document" {
+    var s = try TestScene.init(std.testing.allocator, "levels");
+    defer s.deinit();
+    const root = try s.createEntity("Root", null);
+    const root_id = s.idOf(root).?;
+    _ = try s.createEntity("a", root_id); // id 2
+    _ = try s.createEntity("b", root_id); // id 3
+    _ = try s.createEntity("c", root_id); // id 4
+
+    const plain = try s.serialize(std.testing.allocator);
+    defer std.testing.allocator.free(plain);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, plain, "\"order\""));
+
+    try s.setOrder(4, 0);
+    var ids: [4]u64 = @splat(0);
+    try std.testing.expectEqual(@as(usize, 3), s.childIdsInto(root_id, &ids));
+    try std.testing.expectEqual(@as(u64, 4), ids[0]);
+    try std.testing.expectEqual(@as(u64, 2), ids[1]);
+    try std.testing.expectEqual(@as(u64, 3), ids[2]);
+
+    const bytes = try s.serialize(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"order\": 0") != null);
+    // exactly one entity carries an explicit key; the others stay natural
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\"order\""));
+
+    var loaded = try TestScene.parse(std.testing.allocator, bytes);
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(u64, 0), loaded.orderOf(4));
+    try std.testing.expectEqual(@as(u64, 2), loaded.orderOf(2)); // natural key = own id
+    var restored: [4]u64 = @splat(0);
+    try std.testing.expectEqual(@as(usize, 3), loaded.childIdsInto(root_id, &restored));
+    try std.testing.expectEqual(@as(u64, 4), restored[0]);
+    try std.testing.expectEqual(@as(u64, 2), restored[1]);
+    try std.testing.expectEqual(@as(u64, 3), restored[2]);
+
+    // An explicit order equal to the entity's own ID is the natural key: the entry
+    // is dropped, so the document loses the field again.
+    try s.setOrder(4, 4);
+    try std.testing.expectEqual(@as(u64, 4), s.orderOf(4));
+    const back = try s.serialize(std.testing.allocator);
+    defer std.testing.allocator.free(back);
+    try std.testing.expectEqualStrings(plain, back);
+}
+
+// Prefabs and streamed sectors are cloned subtrees, so the authored order has to
+// survive `cloneSubtree` or a reorder would be lost exactly where the scene format
+// promises it is data. A group nobody reordered must stay unwritten, so cloning
+// never grows the document.
+test "scene: cloneSubtree carries the authored sibling order" {
+    var source = try TestScene.init(std.testing.allocator, "source");
+    defer source.deinit();
+    const root = try source.createEntity("Root", null); // id 1
+    const root_id = source.idOf(root).?;
+    _ = try source.createEntity("a", root_id); // id 2
+    _ = try source.createEntity("b", root_id); // id 3
+    _ = try source.createEntity("c", root_id); // id 4
+    _ = try source.createEntity("plain", null); // id 5, with a reordered child of its own
+    _ = try source.createEntity("d", 5); // id 6
+    try source.setOrder(6, 0); // reordered, but outside the cloned subtree
+
+    var natural = try TestScene.init(std.testing.allocator, "natural");
+    defer natural.deinit();
+    const plain_inst = try natural.cloneSubtree(&source, root_id, null);
+    var natural_ids: [4]u64 = @splat(0);
+    try std.testing.expectEqual(@as(usize, 3), natural.childIdsInto(plain_inst.root_id, &natural_ids));
+    try std.testing.expectEqual(@as(u64, 2), natural_ids[0]);
+    try std.testing.expectEqual(@as(u64, 3), natural_ids[1]);
+    try std.testing.expectEqual(@as(u64, 4), natural_ids[2]);
+    const natural_bytes = try natural.serialize(std.testing.allocator);
+    defer std.testing.allocator.free(natural_bytes);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, natural_bytes, "\"order\""));
+
+    // Paint `c` before `a` and `b` in the source, then clone into a scene that
+    // already holds entities so the cloned IDs cannot line up with the source's.
+    try source.setOrder(4, 0);
+    var target = try TestScene.init(std.testing.allocator, "target");
+    defer target.deinit();
+    const anchor = try target.createEntity("anchor", null); // shifts every cloned ID by one
+
+    const inst = try target.cloneSubtree(&source, root_id, target.idOf(anchor).?);
+    var got: [4]u64 = @splat(0);
+    try std.testing.expectEqual(@as(usize, 3), target.childIdsInto(inst.root_id, &got));
+    try std.testing.expectEqual(@as(u64, 5), got[0]); // c
+    try std.testing.expectEqual(@as(u64, 3), got[1]); // a
+    try std.testing.expectEqual(@as(u64, 4), got[2]); // b
+
+    // The cloned root is attached, not moved: it keeps no key of its own. And the
+    // reordered group that lives outside the subtree was not copied at all, so it
+    // cannot have dragged an order key in with it: the target holds five entities.
+    try std.testing.expectEqual(inst.root_id, target.orderOf(inst.root_id));
+    try std.testing.expectEqual(@as(usize, 5), target.count());
+
+    // ...and the ranks the clone was given round-trip through its own document.
+    const bytes = try target.serialize(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    var loaded = try TestScene.parse(std.testing.allocator, bytes);
+    defer loaded.deinit();
+    var restored: [4]u64 = @splat(0);
+    try std.testing.expectEqual(@as(usize, 3), loaded.childIdsInto(inst.root_id, &restored));
+    try std.testing.expectEqualSlices(u64, got[0..3], restored[0..3]);
+}
+
+test "scene: parse rejects a sibling order that is not an integer" {
+    try std.testing.expectError(error.InvalidJson, TestScene.parse(std.testing.allocator,
+        \\{ "format_version": 1, "name": "main", "entities": [
+        \\  { "id": 1, "name": "a", "order": "first" } ] }
+    ));
+}
+
 test "scene: parse rejects unsupported version and bad JSON" {
     try std.testing.expectError(error.UnsupportedFormatVersion, TestScene.parse(std.testing.allocator,
         \\{ "format_version": 99, "name": "main", "entities": [] }
@@ -1240,15 +1389,15 @@ fn serializeAllocationProbe(allocator: Allocator) !void {
 }
 
 test "scene: parse survives every allocation failure without leaking" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseAllocationProbe, .{});
+    try alloc_probe.check(parseAllocationProbe, .{});
 }
 
 test "scene: create/add survives every allocation failure without leaking" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, createAllocationProbe, .{});
+    try alloc_probe.check(createAllocationProbe, .{});
 }
 
 test "scene: serialize survives every allocation failure without leaking" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, serializeAllocationProbe, .{});
+    try alloc_probe.check(serializeAllocationProbe, .{});
 }
 
 // --- world-space transforms ------------------------------------------------
@@ -1416,7 +1565,7 @@ fn worldTransformsAllocationProbe(allocator: Allocator) !void {
 }
 
 test "world transforms: compute survives every allocation failure without leaking" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, worldTransformsAllocationProbe, .{});
+    try alloc_probe.check(worldTransformsAllocationProbe, .{});
 }
 
 test "scene: destroySet matches repeated destroyEntity exactly" {

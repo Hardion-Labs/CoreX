@@ -459,6 +459,7 @@ pub const bindings = [_]importer.Registry.Binding{
 // --- tests -----------------------------------------------------------------
 
 const testing = std.testing;
+const alloc_probe = @import("../core/alloc_probe.zig");
 
 const tri_obj =
     \\# a right triangle in the XY plane
@@ -701,14 +702,17 @@ test "mesh: bindings select the obj importer by extension" {
 }
 
 test "mesh: decode, serialize and import survive allocation failure" {
-    try testing.checkAllAllocationFailures(testing.allocator, struct {
-        fn f(alloc: Allocator) !void {
-            var m = try decodeObj(alloc, tri_obj);
-            defer m.deinit(alloc);
-            const bytes = try serialize(alloc, m);
-            alloc.free(bytes);
-            const imported = try importObj(alloc, tri_obj);
-            alloc.free(imported);
-        }
-    }.f, .{});
+    try alloc_probe.check(
+        struct {
+            fn f(alloc: Allocator) !void {
+                var m = try decodeObj(alloc, tri_obj);
+                defer m.deinit(alloc);
+                const bytes = try serialize(alloc, m);
+                alloc.free(bytes);
+                const imported = try importObj(alloc, tri_obj);
+                alloc.free(imported);
+            }
+        }.f,
+        .{},
+    );
 }

@@ -144,6 +144,7 @@ pub fn defaultRegistry() Registry {
 // --- tests -----------------------------------------------------------------
 
 const testing = std.testing;
+const alloc_probe = @import("../core/alloc_probe.zig");
 
 test "raw importer copies bytes verbatim" {
     const src = [_]u8{ 0x00, 0xFF, 0x89, 'P', 'N', 'G', 0x0D, 0x0A };
@@ -217,14 +218,17 @@ test "registry fallback is used for unmatched extensions" {
 }
 
 test "importers survive allocation failure" {
-    try testing.checkAllAllocationFailures(testing.allocator, struct {
-        fn f(alloc: Allocator) !void {
-            const t = try importText(alloc, "a\r\nb\xC3\xA7");
-            alloc.free(t);
-            const j = try importJson(alloc, "{\"a\":[1,2,3]}");
-            alloc.free(j);
-            const r = try importRaw(alloc, "bytes");
-            alloc.free(r);
-        }
-    }.f, .{});
+    try alloc_probe.check(
+        struct {
+            fn f(alloc: Allocator) !void {
+                const t = try importText(alloc, "a\r\nb\xC3\xA7");
+                alloc.free(t);
+                const j = try importJson(alloc, "{\"a\":[1,2,3]}");
+                alloc.free(j);
+                const r = try importRaw(alloc, "bytes");
+                alloc.free(r);
+            }
+        }.f,
+        .{},
+    );
 }

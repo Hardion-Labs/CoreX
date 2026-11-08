@@ -3218,6 +3218,7 @@ test "lit rasterizer matches the independent reference bit for bit" {
 }
 
 const blend_vectors = @import("raster_blend_vectors.zig");
+const alloc_probe = @import("../core/alloc_probe.zig");
 
 test "blended rasterizer matches the independent reference bit for bit" {
     var s = try TestSurface.init(blend_vectors.width, blend_vectors.height);
@@ -3662,7 +3663,7 @@ test "antialias: a failed scratch allocation fails the draw before any write" {
     };
     var color: [16 * 16 * 4]u8 = undefined;
     var depth: [16 * 16]f32 = undefined;
-    try testing.checkAllAllocationFailures(testing.allocator, Probe.run, .{ &color, &depth });
+    try alloc_probe.check(Probe.run, .{ &color, &depth });
 }
 
 test "antialias: a grid-aligned quad is unchanged and writes depth" {
