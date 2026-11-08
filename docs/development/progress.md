@@ -9,10 +9,13 @@ qoi-decode) OK. CI green on both PRs. **Regression status on main: the JPEG
 IDCT vector test fails in ReleaseSafe and ReleaseFast on `ab64c39` itself
 (pre-existing, masked by Debug-only CI); the fix (truncating vector cast)
 makes all three modes green since PR #75.**
-**One item is blocked on a decision, not on work:** fold-state persistence needs
-to know who owns editor view state (see the 2026-11-08 (d) entry) — do not
-re-derive that from scratch. The evolution proposals at the end of cycle (e)
-remain proposals; none is to be implemented silently.
+**Fold-state persistence is decided: do NOT persist.** 2026-11-08, owner's call
+— the editor keeps the status quo (the tree's `revealSelection` already
+unfolds the chain to the selection, which is what makes the status quo
+survivable). View-state persistence is out of the `.scene` contract and out of
+the Hub-owned manifest; revisit only when the editor has a real loop/window,
+as per-user session state outside project files. The evolution proposals at
+the end of cycle (e) remain proposals; none is to be implemented silently.
 
 Toolchain note for the next continuation: Zig 0.17.0 lives in a venv under `/tmp`
 (`/tmp/zigvenv`, wrapper `/home/user/zig.sh`), and `/tmp` **is wiped between sessions**,
@@ -50,12 +53,12 @@ who owns editor view state — sidecar file, `.scene` format bump, or
 "not persisted" with the tree's auto-unfold as the survivable default. That is
 a product decision, not something to guess at in a cycle.
 
-**Next priority:** the fold-state decision. Until it is answered, the next
-candidate from the audit backlog is either (a) the cameraOf → per-frame
-transform-snapshot plumbing (the editor frame recomputes
-`computeWorldTransforms` every frame), or (b) reporting the Zig AVX2
-`@intCast` vector lowering upstream (vs casting to u32 first, which is what
-shipped). Neither is to be started without the owner picking.
+**Next priority:** the cameraOf → per-frame transform-snapshot plumbing is the
+next candidate from the audit backlog — `findCamera` → `cameraOf` recomputes
+`computeWorldTransforms` every frame for the editor and the runtime loop. It
+touches hot-path APIs, so it is to be done as its own reviewed cycle, not
+folded into another change. Reporting the Zig AVX2 `@intCast` vector lowering
+upstream remains valid; the shipped workaround is a truncating bit cast.
 
 ## Cycle 2026-11-08 (e) — Full-engine audit applied (audit, architecture, review)
 
