@@ -5,12 +5,17 @@ task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
 
-**Current state:** Branch `arena/e07674d5-corex` (base `main` = `f42b221`), working
-tree validated **in this sandbox** — Zig 0.17.0 was reinstalled (`pip install
-ziglang==0.17.0` in `/tmp/zigvenv`, wrapper at `/home/user/zig.sh`), which the note
-above predates. 951/951 tests pass in Debug, ReleaseSafe and ReleaseFast; the
-allocation-failure probe that made `main` fail reproducibly here is fixed. Window /
-swapchain remains blocked in this sandbox.
+**Current state:** `main` = `e267a2e` (merge of PR #66, from branch
+`arena/e07674d5-corex`). Retested **on the merged tree** in this sandbox: 951/951 in
+Debug and ReleaseSafe, `zig fmt --check src/ tools/ build.zig` clean, `zig build` and
+the launch contract OK, CI green on the PR. The suite is no longer red on `main` here —
+the allocation-failure probe that made it fail reproducibly is fixed by this cycle.
+Toolchain note for the next continuation: Zig 0.17.0 lives in a venv under `/tmp`
+(`/tmp/zigvenv`, wrapper `/home/user/zig.sh`), and `/tmp` **is wiped between sessions**,
+so reinstall before anything else with
+`python3 -m venv /tmp/zigvenv && /tmp/zigvenv/bin/pip install ziglang==0.17.0` (pip
+warns the wheel is yanked for a partial PyPI upload; the binary is still 0.17.0 and
+works). Window / swapchain remains blocked in this sandbox.
 
 ## Cycle 2026-11-08 — Reachable gizmo tools, and allocation-failure tests that mean it
 
