@@ -1,19 +1,19 @@
-**Current state:** `main` = `232a810` (merge of PR #82) carrying the full-engine
+**Current state:** `main` = `d94abe8` (merge of PR #83) carrying the full-engine
 audit (PR #75), the AA-scratch bound (PR #76), the `cameraOf` chain-walk
-(PR #79), and the hardening round 2 (PR #82). Retested **on merged main** in
-this sandbox: **975/975** with a **cold `--cache-dir`** — a warm cache prints
-`3/3 steps succeeded` without re-executing a single test, so a cached step is
-not a retest — plus `zig fmt --check src/ build.zig tools/` clean and the CI
-launch-contract smoke (validate, editor headless, runtime, editor-frame,
-qoi-decode) OK. CI green on all PRs. **Regression status on main: the JPEG
-IDCT vector test fails in ReleaseSafe and ReleaseFast on `ab64c39` itself
-(pre-existing, masked by Debug-only CI); the fix (truncating vector cast)
+(PR #79), hardening round 2 (PR #82), and the continuity ledger record (PR #83).
+Retested **on merged main** in this sandbox: **975/975** with a **cold `--cache-dir`**
+— a warm cache prints `3/3 steps succeeded` without re-executing a single test,
+so a cached step is not a retest — plus `zig fmt --check src/ build.zig tools/`
+clean and the CI launch-contract smoke (validate, editor headless, runtime,
+editor-frame, qoi-decode) OK. CI green on all PRs. **Regression status on main:
+the JPEG IDCT vector test fails in ReleaseSafe and ReleaseFast on `ab64c39`
+itself (pre-existing, masked by Debug-only CI); the fix (truncating vector cast)
 makes all three modes green since PR #75.**
 **Fold-state persistence is decided: do NOT persist.** 2026-11-08, owner's call
 — revisit only when the editor has a real loop/window, as per-user session
 state outside project files.
 
-**Next steps are blocked pending external input:**
+**All next steps are blocked pending external input:**
 1. **Upstream Zig report (`@intCast` i32vec→u8vec lowers to signed-saturating
    `vpackssdw`/`vpacksswb` on AVX2, clamping 149→127).** ziglang/zig restricts
    issue creation to collaborators; this account cannot file it. Full evidence
