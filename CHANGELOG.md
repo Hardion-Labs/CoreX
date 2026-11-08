@@ -8,6 +8,25 @@ declared yet.
 
 ### Added
 
+- **Dragging an inspector number scrubs it** (`inspector.Scrub`, `inspector.Paint.scrub`,
+  `input.travelled`).
+  - Press a numeric field and move past the GUI's drag threshold and the pointer edits the
+    value: ten pixels per unit, measured from the number under the press, `Shift` for ten
+    times finer, and the **dominant axis** in charge so a horizontal drag cannot also nudge the
+    field beside it. A press that never travelled is still a click — it takes the focus and
+    places the caret, and edits nothing.
+  - It commits the way typing does, through the row's own `Outcome.commit` on release: one
+    commit path, one `set_component`, one undo step for both kinds of edit, and the same
+    "nothing changed, nothing recorded" guard. `Escape` abandons a drag along with the text, so
+    the button coming up afterwards commits nothing.
+  - The threshold moved into `gui.input` as `travelled` / `drag_threshold_px`: `ViewportDrag.end`
+    had that rule inline, and a second gesture needing it is where two copies would start
+    disagreeing.
+  - The Inspector's own documentation was stale on the same way — it still called rotation and
+    the camera `fov` read-only while both have editable rows and tests — and now lists what the
+    code edits: `pos`, `scale`, `rot`, `fov`, `near`, `far`, and the name.
+  - 8 new tests (963 total).
+
 - **A gesture is the undo step** (`History.applyBatch`, `History.Entry.group_len`).
   - `applyBatch(commands)` applies several commands and records them as **one** step, so what
     the user did in one motion is what one `Ctrl+Z` backs out of. `undoDepth` and `redoDepth`

@@ -54,6 +54,18 @@ pub const Key = enum {
     r,
 };
 
+/// How far the pointer has to move before a press counts as a drag rather than a click.
+///
+/// One number for the whole GUI on purpose: a widget that picks its own threshold is a
+/// widget whose click/drag split disagrees with every other one, and the disagreement is
+/// only visible as two panels that need different amounts of slop to do the same thing.
+pub const drag_threshold_px: i32 = 2;
+
+/// Whether the pointer travelled far enough between `from` and `to` to have been a drag.
+pub fn travelled(from: Point, to: Point) bool {
+    return @abs(to.x - from.x) > drag_threshold_px or @abs(to.y - from.y) > drag_threshold_px;
+}
+
 pub const PointerButton = enum { left, right, middle };
 
 /// What one frame observed. Built by the host, read by widgets.
