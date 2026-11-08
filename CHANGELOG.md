@@ -6,6 +6,16 @@ declared yet.
 
 ## Unreleased
 
+### Performance
+
+- **`cameraOf` no longer recomputes the scene snapshot** for one entity: it
+  walks the entity's parent chain (`Scene.worldMatrix`), O(depth) instead of
+  O(n log n) plus the snapshot's allocations — on every findCamera call in the
+  runtime loop and the editor. A scene with a camera now computes exactly one
+  world-transform snapshot per frame (the extraction's own) instead of two or
+  more; `findCamera`'s allocation count is pinned to be independent of scene
+  size by a regression test.
+
 ### Fixed
 
 - **A full-engine audit (code audit, architecture, review) applied as one pass.**

@@ -390,9 +390,12 @@ pub const EngineRenderer = struct {
     pub fn cameraOf(scene: anytype, entity: anytype, gpa: Allocator) !?r.Camera {
         const comp = scene.getComponent(CameraComponent, entity) orelse return null;
         if (!comp.isValid()) return null;
-        var wt = try scene.computeWorldTransforms(gpa);
-        defer wt.deinit();
-        const world = wt.get(entity) orelse return null;
+        // Chain walk, not a full scene snapshot: O(depth) instead of O(n log n)
+        // plus the snapshot's allocations, for one entity's matrix.
+        const world = scene.worldMatrix(gpa, entity) catch |err| {
+            if (err == error.EntityNotAlive) return null;
+            return err;
+        };
         const eye = transform.transformPoint(world, .{ 0, 0, 0 });
         const forward = transform.transformDirection(world, .{ 0, 0, -1 });
         const up = transform.transformDirection(world, .{ 0, 1, 0 });
@@ -1195,6 +1198,84 @@ test "render_scene: the engine renderer draws a projected scene and reuses its l
     _ = try engine.render(surface, &scene, comp, cam, table.resources(false), .{ .antialias = .none });
     try testing.expectEqual(@as(usize, 1), engine.last.culled);
     try testing.expectEqual(@as(usize, 0), engine.last.draws);
+}
+
+/// Counts allocator calls, so "this path allocates nothing" (or a fixed
+/// amount) is measured, not claimed. Test-local copy of the pattern used by
+/// the editor's history tests.
+const TestCountingAllocator = struct {
+    child: std.mem.Allocator,
+    calls: usize = 0,
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *TestCountingAllocator = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        return self.child.rawAlloc(len, alignment, ra);
+    }
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *TestCountingAllocator = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        return self.child.rawResize(memory, alignment, new_len, ra);
+    }
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *TestCountingAllocator = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        return self.child.rawRemap(memory, alignment, new_len, ra);
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *TestCountingAllocator = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        self.child.rawFree(memory, alignment, ra);
+    }
+
+    fn allocator(self: *TestCountingAllocator) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+};
+
+test "render_scene: findCamera costs the same calls at any scene size" {
+    // `cameraOf` used to recompute the whole scene snapshot for one entity, so
+    // the call count grew with scene size (snapshot allocs plus its O(n log n)
+    // sort). The chain walk is O(depth); this fixture proves the call count
+    // does not grow with the number of sibling entities.
+    const gpa = testing.allocator;
+    var small = try EngineRenderScene.init(gpa, "small");
+    defer small.deinit();
+    var large = try EngineRenderScene.init(gpa, "large");
+    defer large.deinit();
+
+    inline for (.{ &small, &large }) |scene| {
+        var i: usize = 0;
+        while (i < 16) : (i += 1) {
+            const filler = try scene.createEntity(null, null);
+            try scene.addComponent(filler, Transform{});
+        }
+        const cam = try scene.createEntity("cam", null);
+        try scene.addComponent(cam, Transform{ .position = .{ 0, 0, 4 } });
+        try scene.addComponent(cam, CameraComponent{ .fov = std.math.pi / 2.0 });
+    }
+    var i: usize = 0;
+    while (i < 240) : (i += 1) {
+        const filler = try large.createEntity(null, null);
+        try large.addComponent(filler, Transform{});
+    }
+
+    var counting = TestCountingAllocator{ .child = gpa };
+    _ = try EngineRenderer.findCamera(&small, counting.allocator());
+    const small_calls = counting.calls;
+    counting.calls = 0;
+    _ = try EngineRenderer.findCamera(&large, counting.allocator());
+    const large_calls = counting.calls;
+    try testing.expect(small_calls > 0);
+    try testing.expectEqual(small_calls, large_calls);
 }
 
 test "render_scene: an entity without a camera component is not a camera" {
