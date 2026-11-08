@@ -5,12 +5,13 @@ task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
 
-**Current state:** `main` = `a86a2d9` (merge of PR #69, the documentation correction that
-followed it). The pointer-scrub cycle sits on `arena/924a4516-corex`: **963/963** in Debug,
-ReleaseSafe and ReleaseFast, `zig fmt --check src/` clean, `zig build` OK, `editor-frame` +
-`qoi-decode` + the headless launch contract run at HEAD, and the merged tree is retested
-afterwards. `History` has treated a gesture as one undo step since PR #68; a gesture can now
-also *be* a drag, and both gestures share its commit path.
+**Current state:** `main` = `21f2b57` (merge of PR #70, from branch
+`arena/924a4516-corex`). Retested **on the merged tree** in this sandbox: **963/963** in
+Debug (cold cache, so the count is a real run and not a cached step) and in ReleaseSafe,
+`zig fmt --check src/ tools/ build.zig` clean, `zig build` OK, `editor-frame` + `qoi-decode`
++ the headless launch contract OK, CI green on the PR. `History` has treated a gesture as one
+undo step since PR #68; a gesture can now also *be* a drag — the inspector's six numeric rows
+scrub, and typing and dragging share one commit path, one guard and one undo step.
 
 Toolchain note for the next continuation: Zig 0.17.0 lives in a venv under `/tmp`
 (`/tmp/zigvenv`, wrapper `/home/user/zig.sh`), and `/tmp` **is wiped between sessions**,
