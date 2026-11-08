@@ -375,6 +375,9 @@ pub const Stats = struct {
     /// Of `pixels`, how many were written with partial antialiased coverage
     /// (`antialias = .edge`). Always zero with the default one-sample path.
     antialiased_pixels: usize = 0,
+    /// True when an `.edge` draw was downgraded to the one-sample path because
+    /// the AA scratch would have exceeded `max_aa_scratch_bytes`.
+    antialias_downgraded: bool = false,
 
     pub fn add(self: *Stats, other: Stats) void {
         self.skipped_draws += other.skipped_draws;
@@ -384,6 +387,7 @@ pub const Stats = struct {
         self.rasterized += other.rasterized;
         self.pixels += other.pixels;
         self.antialiased_pixels += other.antialiased_pixels;
+        self.antialias_downgraded = self.antialias_downgraded or other.antialias_downgraded;
     }
 };
 
@@ -1038,6 +1042,12 @@ const AccumBuffers = struct {
     }
 };
 
+/// Largest antialias scratch permitted for one draw. A hostile mesh can force
+/// `reachRect` to fall back to the whole target; at 16k x 16k that would be
+/// multiple GiB of slots, so draws beyond this are downgraded to the one-sample
+/// path instead of allocating it.
+pub const max_aa_scratch_bytes: usize = 256 * 1024 * 1024;
+
 /// Owns the antialiasing scratch for one draw. The box is computed from the mesh's
 /// conservative screen-space reach (see `reachRect`), which always contains every
 /// touched pixel; a projection that the reach cannot bound falls back to the whole
@@ -1053,10 +1063,9 @@ const AccumStorage = struct {
 
     fn init(gpa: Allocator, target: *Target, mesh: Mesh, mvp: Mat4) DrawError!AccumStorage {
         const rect = reachRect(target, mesh, mvp);
-        const box_w: i64 = @as(i64, rect.max_x) - rect.min_x + 1;
-        const box_h: i64 = @as(i64, rect.max_y) - rect.min_y + 1;
-        const w: usize = @intCast(@max(box_w, 1));
-        const h: usize = @intCast(@max(box_h, 1));
+        const box = aaBoxSize(rect);
+        const w = box.w;
+        const h = box.h;
         // `ids` can never need more entries than there are pixels in the box.
         const slots = gpa.alloc(AccSlot, w * h) catch return error.OutOfMemory;
         errdefer gpa.free(slots);
@@ -1170,6 +1179,25 @@ fn reachRect(target: *Target, mesh: Mesh, mvp: Mat4) Rect {
         .max_x = @intFromFloat(std.math.clamp(hi_x, 0, last_x)),
         .max_y = @intFromFloat(std.math.clamp(hi_y, 0, last_y)),
     };
+}
+
+/// Box dimensions of the AA scratch for a reach rectangle.
+fn aaBoxSize(rect: Rect) struct { w: usize, h: usize } {
+    const box_w: i64 = @as(i64, rect.max_x) - rect.min_x + 1;
+    const box_h: i64 = @as(i64, rect.max_y) - rect.min_y + 1;
+    return .{
+        .w = @intCast(@max(box_w, 1)),
+        .h = @intCast(@max(box_h, 1)),
+    };
+}
+
+/// Exact scratch footprint of an antialiased draw over `reachRect`. Computed
+/// with saturating arithmetic; a full 16384x16384 reach reports a huge value
+/// and the caller downgrades instead of allocating.
+fn aaScratchBytes(target: *Target, mesh: Mesh, mvp: Mat4) usize {
+    const box = aaBoxSize(reachRect(target, mesh, mvp));
+    const pixels = std.math.mul(usize, box.w, box.h) catch return std.math.maxInt(usize);
+    return std.math.mul(usize, pixels, @sizeOf(AccSlot) + @sizeOf(u32)) catch return std.math.maxInt(usize);
 }
 
 const Rect = struct { min_x: i32, min_y: i32, max_x: i32, max_y: i32 };
@@ -1922,16 +1950,25 @@ pub fn drawMeshAlloc(
     // Allocation happens before the first fragment: a failure leaves the target
     // untouched instead of half-rendered.
     const mvp = transform.multiply(view_projection, world);
+    var opts = options;
     var accum_storage: ?AccumStorage = null;
     defer if (accum_storage) |*storage| storage.deinit(gpa);
     var accum: ?*AccumBuffers = null;
+    var antialias_downgraded = false;
     if (options.antialias == .edge) {
-        accum_storage = try AccumStorage.init(gpa, target, mesh, mvp);
-        accum = &accum_storage.?.buffers;
+        if (aaScratchBytes(target, mesh, mvp) <= max_aa_scratch_bytes) {
+            accum_storage = try AccumStorage.init(gpa, target, mesh, mvp);
+            accum = &accum_storage.?.buffers;
+        } else {
+            // A hostile reach can imply several GiB of scratch; downgrade to
+            // the one-sample path rather than allocating it.
+            opts.antialias = .none;
+            antialias_downgraded = true;
+        }
     }
-    const opts = options;
 
     var stats: Stats = .{};
+    stats.antialias_downgraded = antialias_downgraded;
     var i: usize = 0;
     while (i < mesh.indices.len) : (i += 3) {
         stats.submitted += 1;
@@ -3715,6 +3752,32 @@ test "antialias: a failed scratch allocation fails the draw before any write" {
     var color: [16 * 16 * 4]u8 = undefined;
     var depth: [16 * 16]f32 = undefined;
     try alloc_probe.check(Probe.run, .{ &color, &depth });
+}
+
+test "aaScratchBytes: exact footprint and full-target fallback" {
+    var s = try TestSurface.init(8, 8);
+    defer s.deinit();
+    const mvp = transform.multiply(orthoSetup(), transform.identity());
+    const footprint = aaScratchBytes(&s.target, quadMesh(), mvp);
+    // quadMesh fits the whole 8x8 view, and a reach smaller than that is fine
+    // too — both results are exact multiples of the per-pixel footprint and the
+    // function must agree with the scratch sizing below.
+    const per_pixel = @sizeOf(AccSlot) + @sizeOf(u32);
+    try testing.expectEqual(@as(usize, 0), footprint % per_pixel);
+    const expected = std.math.mul(usize, 8 * 8, per_pixel) catch unreachable;
+    try testing.expect(footprint <= expected);
+    // Degenerate reach (no positions) reports the whole target, exactly as the
+    // scratch sizing does.
+    const empty_mesh = Mesh{ .positions = &.{}, .indices = &.{} };
+    try testing.expectEqual(expected, aaScratchBytes(&s.target, empty_mesh, mvp));
+}
+
+test "antialias: a small .edge draw is never downgraded" {
+    var s = try TestSurface.init(8, 8);
+    defer s.deinit();
+    const stats = try drawMeshAlloc(testing.allocator, &s.target, quadMesh(), transform.identity(), orthoSetup(), red, .{ .antialias = .edge }, null);
+    try testing.expect(!stats.antialias_downgraded);
+    try testing.expect(max_aa_scratch_bytes >= 64 * 1024 * 1024);
 }
 
 test "antialias: a grid-aligned quad is unchanged and writes depth" {

@@ -75,6 +75,12 @@ declared yet.
   - ECS: pools carry a mutation counter and views assert it in Debug/ReleaseSafe —
     a dense array reordered mid-iteration is caught instead of silently
     skipping or duplicating entities.
+  - AA scratch is bounded (`render.raster.max_aa_scratch_bytes`, 256 MiB): an
+    adversarial mesh can force `reachRect` to fall back to the whole 16384²
+    target, implying multiple GiB of antialias scratch; such draws downgrade to
+    the one-sample path and report `Stats.antialias_downgraded` instead.
+  - Runtime: an empty frame (no camera) no longer folds sleep/pacing accounting
+    into the report — an empty frame is not a rendered one.
 
 ### Added
 

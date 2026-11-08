@@ -220,10 +220,14 @@ pub const FrameLoop = struct {
         // `io == null` renders without ever sleeping: the headless tests measure work,
         // not wall-clock time.
         const started = if (io) |io_| self.pacer.begin(io_) else null;
-        defer if (io) |io_| self.paceAfter(io_, started);
 
         _ = self.camera_scratch.reset(.retain_capacity);
-        const found = try scene_render.EngineRenderer.findCamera(scene, self.camera_scratch.allocator()) orelse return null;
+        const found = try scene_render.EngineRenderer.findCamera(scene, self.camera_scratch.allocator()) orelse {
+            // No camera: nothing was framed, so the pace folds nothing into the
+            // report — an empty frame must not masquerade as a rendered one.
+            return null;
+        };
+        defer if (io) |io_| self.paceAfter(io_, started);
         const surface = self.target.surface();
         self.target.clear(self.params.clear, self.params.clear_depth);
         const report = try self.renderer.render(
