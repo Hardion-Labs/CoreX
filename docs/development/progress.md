@@ -1,24 +1,18 @@
-# Continuity log — CoreXEngine
-
-Permanent record of real progress, decisions, pending items and the next priority
-task. Kept in sync with the code and Git; recovered at the start of every
-continuation. Newest cycle first.
-
-
-**Current state:** working tree on top of `ab64c39` (merge of PR #74) carries an
-uncommitted full-engine audit pass — see the 2026-11-08 (e) entry and
-`CHANGELOG.md` (Unreleased / Fixed). Retested **on this tree** in this sandbox:
-**972/972** in each of Debug, ReleaseSafe and ReleaseFast, every one with a
-**cold `--cache-dir`** — a warm cache prints `3/3 steps succeeded` without
-re-executing a single test, so a cached step is not a retest — plus
-`zig fmt --check src/ tools/ build.zig` clean, `zig build` OK and the CI
-launch-contract smoke (validate, headless editor, runtime, `editor-frame` +
-`qoi-decode`) OK. **Regression status on main today: the JPEG IDCT vector test
-fails in ReleaseSafe and ReleaseFast on `ab64c39` itself and on this tree
-before the fix; the fix (truncating vector cast) makes all three modes green.**
+**Current state:** `main` = `c7fa1b1` (merge of PR #76), carrying the
+full-engine audit pass (PR #75, `50702ba`) and the AA-scratch bound +
+empty-frame pacing accounting fix (PR #76, `b387ee2`). Retested **on merged
+main** in this sandbox: **974/974** with a **cold `--cache-dir`** — a warm cache
+prints `3/3 steps succeeded` without re-executing a single test, so a cached
+step is not a retest — plus `zig fmt --check src/ build.zig tools/` clean and
+the CI launch-contract smoke (validate, editor headless, runtime, editor-frame,
+qoi-decode) OK. CI green on both PRs. **Regression status on main: the JPEG
+IDCT vector test fails in ReleaseSafe and ReleaseFast on `ab64c39` itself
+(pre-existing, masked by Debug-only CI); the fix (truncating vector cast)
+makes all three modes green since PR #75.**
 **One item is blocked on a decision, not on work:** fold-state persistence needs
 to know who owns editor view state (see the 2026-11-08 (d) entry) — do not
-re-derive that from scratch.
+re-derive that from scratch. The evolution proposals at the end of cycle (e)
+remain proposals; none is to be implemented silently.
 
 Toolchain note for the next continuation: Zig 0.17.0 lives in a venv under `/tmp`
 (`/tmp/zigvenv`, wrapper `/home/user/zig.sh`), and `/tmp` **is wiped between sessions**,
@@ -27,6 +21,41 @@ below still works):
 `python3 -m venv /tmp/zigvenv && /tmp/zigvenv/bin/pip install ziglang==0.17.0` (pip
 warns the wheel is yanked for a partial PyPI upload; the binary is still 0.17.0 and
 works). Window / swapchain remains blocked in this sandbox.
+
+## Cycle 2026-11-08 (f) — Merge the audit, then bound the AA scratch
+
+**Got done,** two cycles in one sitting, each validated on the merged main:
+
+1. **The audit pass merged** (PR #75 → `main` = `f572082`, branch
+   `fix/full-engine-audit-applied` at `50702ba`). CI green. CHANGELOG,
+   `docs/development/progress.md` and the affected module docs updated; main
+   retested cold-cache after the merge (972/972 at the time).
+2. **AA scratch capped** (PR #76 → `main` = `c7fa1b1`): an adversarial mesh can
+   force `reachRect` to fall back to the whole 16384x16384 target, implying
+   multiple GiB of antialias slots. `render.raster.max_aa_scratch_bytes`
+   (256 MiB) downgrades such draws to the one-sample path and reports
+   `Stats.antialias_downgraded` (additive field); the footprint is computed by
+   `aaScratchBytes` with saturating arithmetic, sharing `aaBoxSize` with
+   `AccumStorage.init` so the two cannot drift apart. Also stopped
+   `FrameLoop.frame` folding pacing/sleep accounting into the report for a
+   frame with no camera — an empty frame is not a rendered one (`run` stops on
+   the first empty frame, so no busy loop). 974/974 cold-cache Debug and
+   ReleaseSafe (ReleaseFast run on the same tree),
+   CI green, main retested after merge.
+
+**Not taken:** the cycle (e) evolution proposals stay proposals — they are not
+to be implemented without an owner's call (see the list at the end of cycle
+(e)). The one explicitly named blocked item remains fold-state persistence:
+who owns editor view state — sidecar file, `.scene` format bump, or
+"not persisted" with the tree's auto-unfold as the survivable default. That is
+a product decision, not something to guess at in a cycle.
+
+**Next priority:** the fold-state decision. Until it is answered, the next
+candidate from the audit backlog is either (a) the cameraOf → per-frame
+transform-snapshot plumbing (the editor frame recomputes
+`computeWorldTransforms` every frame), or (b) reporting the Zig AVX2
+`@intCast` vector lowering upstream (vs casting to u32 first, which is what
+shipped). Neither is to be started without the owner picking.
 
 ## Cycle 2026-11-08 (e) — Full-engine audit applied (audit, architecture, review)
 
