@@ -1,11 +1,11 @@
-**Current state:** `main` = `c7fa1b1` (merge of PR #76), carrying the
-full-engine audit pass (PR #75, `50702ba`) and the AA-scratch bound +
-empty-frame pacing accounting fix (PR #76, `b387ee2`). Retested **on merged
-main** in this sandbox: **974/974** with a **cold `--cache-dir`** — a warm cache
-prints `3/3 steps succeeded` without re-executing a single test, so a cached
-step is not a retest — plus `zig fmt --check src/ build.zig tools/` clean and
-the CI launch-contract smoke (validate, editor headless, runtime, editor-frame,
-qoi-decode) OK. CI green on both PRs. **Regression status on main: the JPEG
+**Current state:** `main` = `b4f14f0` (merge of PR #79) carrying the
+full-engine audit (PR #75), the AA-scratch bound (PR #76), and the
+`cameraOf` chain-walk (PR #79). Retested **on merged main** in this sandbox:
+**975/975** with a **cold `--cache-dir`** — a warm cache prints
+`3/3 steps succeeded` without re-executing a single test, so a cached step is
+not a retest — plus `zig fmt --check src/ build.zig tools/` clean and the CI
+launch-contract smoke (validate, editor headless, runtime, editor-frame,
+qoi-decode) OK. CI green on all PRs. **Regression status on main: the JPEG
 IDCT vector test fails in ReleaseSafe and ReleaseFast on `ab64c39` itself
 (pre-existing, masked by Debug-only CI); the fix (truncating vector cast)
 makes all three modes green since PR #75.**
@@ -24,6 +24,27 @@ below still works):
 `python3 -m venv /tmp/zigvenv && /tmp/zigvenv/bin/pip install ziglang==0.17.0` (pip
 warns the wheel is yanked for a partial PyPI upload; the binary is still 0.17.0 and
 works). Window / swapchain remains blocked in this sandbox.
+
+## Cycle 2026-11-08 (g) — cameraOf stops paying for a snapshot it never needed
+
+**Delivered (PR #79 → `main` at `b4f14f0`):** `EngineRenderer.cameraOf` no
+longer recomputes `Scene.computeWorldTransforms` for one entity — it walks the
+entity's parent chain through the existing, tested `Scene.worldMatrix`
+(same matrix math: root→local composition). The runtime frame and every editor
+hit-test that resolves the view camera used to pay an O(n log n) snapshot plus
+~8 allocations *per call*, on top of the extraction's own per-frame snapshot;
+now the frame computes exactly one snapshot, and `cameraOf` is O(depth). A new
+regression test (`findCamera costs the same calls at any scene size`, counting
+allocator) pins the call count to be independent of scene size; it fails with
+the pre-fix implementation — verified by reverting locally. 975/975 cold-cache
+in Debug (and ReleaseSafe on that tree), CI green, main retested after merge.
+
+**Closest next candidates:** reporting the Zig 0.17.0 AVX2 vector `@intCast`
+lowering upstream (the shipped workaround is a truncating bit cast; a focused
+repro against 0.17.0 is one small file). Otherwise the proposals at the end of
+cycle (e) remain proposals and are not to be implemented without an owner's
+call — the leading one being the unified observer kernel for
+`schedule`/`graph`/`frame`.
 
 ## Cycle 2026-11-08 (f) — Merge the audit, then bound the AA scratch
 
