@@ -4,6 +4,7 @@ Permanent record of real progress, decisions, pending items and the next priorit
 task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
+
 **Current state:** Branch `arena/77f8b78f-corex` active. Commit `6b83ebf` merges
 cycles (z) Home/End/PageUp/PageDown tree navigation and sibling ordering
 (move_up/move_down). Zig is not installed in this sandbox so `zig build`/`zig
