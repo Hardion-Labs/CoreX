@@ -156,6 +156,10 @@ pub fn Scene(comptime schemas: anytype) type {
         id: u64,
         name: ?[]const u8 = null,
         parent: ?u64 = null,
+        /// Optional explicit sibling order. When absent, the entity's own stable ID
+        /// is used as its sort key among siblings, which keeps old files (and new
+        /// never-reordered entities) in creation order.
+        order: ?u64 = null,
         components: ComponentsJson = .{},
     };
 
@@ -199,6 +203,9 @@ pub fn Scene(comptime schemas: anytype) type {
         world: WorldType,
         records: std.AutoHashMap(u64, Record),
         entity_ids: std.AutoHashMap(u64, u64),
+        /// Explicit sibling order for entities whose order differs from their stable ID.
+        /// Null until the first `setOrder` call; absent entries mean "natural order".
+        sibling_order: ?std.AutoHashMap(u64, u64) = null,
         next_id: u64,
 
         pub fn init(gpa: Allocator, name: []const u8) Error!Self {
@@ -223,6 +230,7 @@ pub fn Scene(comptime schemas: anytype) type {
             self.world.deinit();
             self.records.deinit();
             self.entity_ids.deinit();
+            if (self.sibling_order) |*so| so.deinit();
             const child = self.arena.child_allocator;
             self.arena.deinit();
             child.destroy(self.arena);
@@ -327,6 +335,7 @@ pub fn Scene(comptime schemas: anytype) type {
             self.world.destroy(entity);
             _ = self.records.remove(id);
             _ = self.entity_ids.remove(entity.key());
+            if (self.sibling_order) |*so| _ = so.remove(id);
         }
 
         /// Destroy a set of entities in a single pass, identified by stable ID.
@@ -369,6 +378,7 @@ pub fn Scene(comptime schemas: anytype) type {
                 self.world.destroy(record.entity);
                 _ = self.entity_ids.remove(record.entity.key());
                 _ = self.records.remove(id);
+                if (self.sibling_order) |*so| _ = so.remove(id);
                 removed += 1;
             }
             return removed;
@@ -441,6 +451,14 @@ pub fn Scene(comptime schemas: anytype) type {
         /// deterministic prefix rather than whatever the hash map happened to visit
         /// first. Allocation-free — the scan is over the scene's own records — which
         /// is what lets a tree view ask for one node's children per frame.
+        /// Whether sibling `a` sorts before sibling `b`: ascending `(order, id)`.
+        fn siblingLess(self: *const Self, a: u64, b: u64) bool {
+            const oa = self.orderOf(a);
+            const ob = self.orderOf(b);
+            if (oa != ob) return oa < ob;
+            return a < b;
+        }
+
         pub fn childIdsInto(self: *const Self, parent_id: ?u64, out: []u64) usize {
             var written: usize = 0;
             var it = self.records.iterator();
@@ -452,13 +470,14 @@ pub fn Scene(comptime schemas: anytype) type {
                 if (written < out.len) {
                     // Insertion sort into the window: a node usually has a handful
                     // of children, so this is cheaper than collecting and sorting.
+                    // Shift right any sibling that sorts after `id`, then insert.
                     var i = written;
-                    while (i > 0 and out[i - 1] > id) : (i -= 1) out[i] = out[i - 1];
+                    while (i > 0 and self.siblingLess(id, out[i - 1])) : (i -= 1) out[i] = out[i - 1];
                     out[i] = id;
                     written += 1;
-                } else if (written > 0 and id < out[written - 1]) {
+                } else if (written > 0 and self.siblingLess(id, out[written - 1])) {
                     var i = written - 1;
-                    while (i > 0 and out[i - 1] > id) : (i -= 1) out[i] = out[i - 1];
+                    while (i > 0 and self.siblingLess(id, out[i - 1])) : (i -= 1) out[i] = out[i - 1];
                     out[i] = id;
                 }
             }
@@ -605,6 +624,31 @@ pub fn Scene(comptime schemas: anytype) type {
                 parent_id = pid;
             }
             self.records.getPtr(id).?.parent = parent_id;
+        }
+
+        /// Set an entity's explicit sibling order. A value equal to the entity's own
+        /// stable ID means "natural order"; any other value sorts siblings by
+        /// `(order, id)` among children of the same parent.
+        pub fn setOrder(self: *Self, id: u64, order: u64) !void {
+            const record = self.records.get(id) orelse return error.EntityNotFound;
+            if (!self.world.alive(record.entity)) return error.EntityNotAlive;
+            if (order == id) {
+                // Natural order: remove any explicit entry.
+                if (self.sibling_order) |*so| _ = so.remove(id);
+            } else {
+                // Lazily allocate the map on first explicit order.
+                if (self.sibling_order == null) {
+                    const hm = std.AutoHashMap(u64, u64).init(self.gpa);
+                    self.sibling_order = hm;
+                }
+                if (self.sibling_order) |*so| try so.put(id, order);
+            }
+        }
+
+        /// The entity's explicit sibling order (defaults to its own stable ID).
+        pub fn orderOf(self: *const Self, id: u64) u64 {
+            if (self.sibling_order) |so| return so.get(id) orelse id;
+            return id;
         }
 
         fn wouldCycle(self: Self, id: u64, parent_id: u64) bool {
@@ -843,6 +887,12 @@ pub fn Scene(comptime schemas: anytype) type {
                     try self.setParent(entity, parent_entity);
                 }
             }
+            // Third pass: apply explicit sibling orders.
+            for (raw.entities) |re| {
+                if (re.order) |o| {
+                    try self.setOrder(re.id, o);
+                }
+            }
             return self;
         }
 
@@ -875,10 +925,12 @@ pub fn Scene(comptime schemas: anytype) type {
                         @field(components, S.component_name) = ptr.*;
                     }
                 }
+                const order = if (self.orderOf(id) != id) @as(?u64, self.orderOf(id)) else null;
                 try entities.append(gpa, .{
                     .id = id,
                     .name = record.name,
                     .parent = record.parent,
+                    .order = order,
                     .components = components,
                 });
             }

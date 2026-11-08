@@ -33,6 +33,8 @@ pub const Key = enum {
     down,
     home,
     end,
+    page_up,
+    page_down,
     /// Letter keys are listed only as they get a meaning, so this enum stays a list of
     /// the keys something in the engine actually consumes rather than a keyboard model.
     /// `a`..`z` share the platform's scancode order, so adding neighbours is free.
@@ -41,6 +43,9 @@ pub const Key = enum {
     /// `n` = "new", `p` = "reparent to root": the two tree actions that need a key.
     n,
     p,
+    /// `move_up` / `move_down`: reorder the selected row among its siblings.
+    move_up,
+    move_down,
     /// `f` = "frame": the viewport's focus command.
     f,
 };

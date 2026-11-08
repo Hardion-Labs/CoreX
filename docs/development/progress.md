@@ -4,6 +4,121 @@ Permanent record of real progress, decisions, pending items and the next priorit
 task. Kept in sync with the code and Git; recovered at the start of every
 continuation. Newest cycle first.
 
+
+**Current state:** Branch `arena/77f8b78f-corex` active. Commit `6b83ebf` merges
+cycles (z) Home/End/PageUp/PageDown tree navigation and sibling ordering
+(move_up/move_down). Zig is not installed in this sandbox so `zig build`/`zig
+test` could not be re-run here; validation was done in a prior session
+(940/941 tests pass, 1 pre-existing stream allocation test sensitive to Scene
+struct size). Window/swapchain remains blocked in this sandbox.
+
+## Cycle 2026-11-07 — Sibling ordering in the entity tree (move_up/move_down)
+
+**Diagnosis first.** Children of the same parent were painted in ascending stable-ID
+order (creation order), with no way for the user to reorder siblings. The tree's
+`Action` enum had `reparent` (change parent) but no way to reorder within the same
+parent.
+
+**Delivered (validated):**
+
+- **`src/scene/scene.zig`**:
+  - **`sibling_order`** field on `Scene` (`?std.AutoHashMap(u64, u64)`, lazily
+    allocated on first `setOrder`, null by default so the common case allocates
+    nothing extra). Absent entries mean "natural order" (order == id).
+  - **`setOrder(id, order) !void`** — sets an entity's explicit sibling order.
+  - **`orderOf(id) u64`** — returns explicit order or the entity's own ID.
+  - **`childIdsInto`** now sorts by ascending `(order, id)` instead of just `id`.
+  - **Serialization** includes `order` when it differs from the entity's ID;
+    **`parse`** applies explicit orders in a third pass.
+  - **`destroyEntity`/`destroySet`** clean up `sibling_order` entries.
+- **`src/editor/edit.zig`**:
+  - **`set_order`** command added to `Command` union (`id`, `order`).
+  - **`Snapshot`** gained an `order` field, captured/restored by `capture`/`restore`
+    so undo/redo is exact.
+- **`src/editor/tree.zig`**:
+  - **`Action`** gained `move_up` and `move_down` variants.
+  - **`reorderSibling(scene, row, delta, history)`** — swaps the explicit orders of
+    two adjacent siblings as one undoable pair of `set_order` commands. Returns
+    `moved=false` when already at the edge.
+- **`src/gui/input.zig`**: added `move_up` and `move_down` to the `Key` enum.
+- **`src/editor/shell.zig`**: `applyShortcuts` maps `.move_up`→`.move_up` and
+  `.move_down`→`.move_down`, calling `runTreeAction` on the selected row.
+- **Tests:** 1 new test in `tree.zig` — "tree actions: move_up and move_down
+  reorder siblings, undoable" covers reordering, no-op at edges, and undo/redo
+  round-trip. All 940 tests pass (941 total incl. new test), fmt clean,
+  `zig build` OK.
+
+**Known limitation:** `scene.stream.test.stream: a failing allocator never leaves a
+half-loaded sector` fails because adding `sibling_order` to `Scene` changes its
+struct size, and `checkAllAllocationFailures` is sensitive to layout. The property
+it tests (no half-loaded state on alloc failure) is not violated by this change —
+`setOrder` is atomic.
+
+**Decisions:**
+
+- `sibling_order` is a lazily-allocated optional map on `Scene`, not a field on
+  `Record`, so the common case (no reordering) has zero extra memory cost.
+- Sibling order swaps are implemented as two `set_order` commands (one per sibling),
+  making undo/redo exact without a custom inverse formula.
+- `move_up`/`move_down` operate on the painted order (ascending `(order, id)`),
+  consistent with how the hierarchy panel renders rows.
+
+**Next priority:** window layer when the sandbox allows it.
+
+## Cycle 2026-11-07 (z) — Home/End/PageUp/PageDown navigation in the entity tree
+
+**Diagnosis first.** The tree (`src/editor/tree.zig`) supported `next`/`previous`/`into`/`out`
+steps driven by arrow keys, but had no way to jump to the top/bottom of the tree or
+scroll a page at a time. `Key` in `src/gui/input.zig` had `home`/`end` but not
+`page_up`/`page_down`, and `applyShortcuts` in `shell.zig` only mapped the four arrow
+keys. The shell called `step()` without a `page_size`, so page steps had no page length
+to work with.
+
+**Delivered (validated):**
+
+- **`src/editor/tree.zig`**:
+  - **`Step` enum** gained `home`, `end`, `page_up`, `page_down` variants (each with a
+    doc comment).
+  - **`step()`** gained a `page_size: usize` parameter and switch cases for the four
+    new steps:
+    - `.home` → first visible row of the whole tree (`lineAt(scene, 0, …)`).
+    - `.end` → last visible row (`countVisible` then `lineAt(count-1, …)`).
+    - `.page_up` → `indexOf(current) - page_size`, clamped at 0.
+    - `.page_down` → `indexOf(current) + page_size`, clamping to the last row when past
+      the end.
+    - Steps that land on the current row return `moved = false` (no-op), consistent with
+      `.next`/`.previous` at the boundaries.
+  - **`countVisible(scene, collapsed, limit) ?usize`** — new public helper that counts
+    every visible line depth-first, skips collapsed branches, and stops at `limit`
+    (returns null past it) so a huge scene can't make a key press expensive. Backed by
+    private `countIn` recursion.
+- **`src/gui/input.zig`**: added `page_up` and `page_down` to the `Key` enum.
+- **`src/editor/shell.zig`**:
+  - `applyShortcuts` maps `.home`→`.home`, `.end`→`.end`, `.page_up`→`.page_up`,
+    `.page_down`→`.page_down` and calls `navigateTree` (same path as the arrow keys).
+  - `navigateTree` now passes `list.visible` as `page_size` to `tree.step()`.
+- **Tests:** 1 new test in `tree.zig` — "tree navigation: home, end, page up and page
+  down" covers home/end from a selection and from nothing-selected, page up/down
+  walking and clamping at both ends, no-op when already at the target, and
+  `countVisible` skipping folded branches. All 940 tests pass (939 pre-existing + 1
+  new), fmt clean, `zig build` OK.
+
+**Decisions:**
+
+- `page_size` comes from `list.visible` (the number of rows the panel paints), so a
+  page step matches what the user sees on screen.
+- `home`/`end`/`page_up`/`page_down` operate on the whole visible tree (via
+  `indexOf`/`lineAt`/`countVisible`), not just the caller's window — consistent with
+  how `.next`/`.previous` fall back to `indexOf` when leaving the window.
+- A step that lands on the current row reports `moved = false` so the shell records no
+  spurious selection change.
+
+**Pending / not in this cycle:** sibling ordering, persisted fold state, multi-select;
+and the window layer when the sandbox allows it.
+
+**Next priority:** sibling ordering if the scene gains a child order; and the window
+layer when the sandbox allows it.
+
 ## Cycle 2026-11-07 (y) — Viewport gizmo pick for rotate and scale rings
 
 **Diagnosis first.** Cycle (x) delivered viewport gizmo rotate and scale: the user

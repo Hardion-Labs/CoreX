@@ -431,6 +431,10 @@ pub const Action = union(enum) {
     add_child,
     /// Move the row under a new parent (`null` = make it a root).
     reparent: ?u64,
+    /// Move the row one position up among its siblings.
+    move_up,
+    /// Move the row one position down among its siblings.
+    move_down,
     /// Remove the row's entity.
     delete,
 };
@@ -500,6 +504,14 @@ pub fn apply(
             if (parent) |p| collapsed.expand(p);
             return .{ .changed = true, .select = row };
         },
+        .move_up => {
+            const moved = reorderSibling(scene, row, -1, history) catch |err| return .{ .failure = err };
+            return .{ .changed = moved, .select = if (moved) row else 0 };
+        },
+        .move_down => {
+            const moved = reorderSibling(scene, row, 1, history) catch |err| return .{ .failure = err };
+            return .{ .changed = moved, .select = if (moved) row else 0 };
+        },
         .delete => {
             if (row == 0) return .{};
             // Deleting the row the user is looking at also drops its fold state: the ID is
@@ -509,6 +521,45 @@ pub fn apply(
             return .{ .changed = true };
         },
     }
+}
+
+/// Move `row` one position among its siblings: `delta` of -1 moves up, +1 down.
+/// Returns whether the order actually changed. Implemented as one `set_order`
+/// command per swapped pair, so undo/redo is exact.
+fn reorderSibling(scene: anytype, row: u64, delta: i32, history: anytype) anyerror!bool {
+    if (row == 0) return false;
+    const parent = scene.parentIdOf(row);
+
+    // Collect siblings in paint order (ascending (order, id)).
+    var ids: [64]u64 = @splat(0);
+    const n = scene.childIdsInto(parent, &ids);
+    if (n < 2) return false;
+
+    // Find `row`'s position.
+    var pos: usize = 0;
+    while (pos < n and ids[pos] != row) : (pos += 1) {}
+    if (pos == n) return false; // not a sibling of itself? shouldn't happen
+
+    var target: usize = 0;
+    if (delta < 0) {
+        if (pos == 0) return false; // already at the top
+        target = pos - 1;
+    } else {
+        target = pos + 1;
+    }
+    if (target >= n) return false; // already at the bottom
+
+    const other = ids[target];
+    const row_order = scene.orderOf(row);
+    const other_order = scene.orderOf(other);
+    if (row_order == other_order) return false;
+
+    // Swap orders: row takes other's order, other takes row's order.
+    history.apply(scene, .{ .set_order = .{ .id = row, .order = other_order } }) catch |err| {
+        return err;
+    };
+    try history.apply(scene, .{ .set_order = .{ .id = other, .order = row_order } });
+    return true;
 }
 
 test "tree actions: add_child creates one undoable entity under the row and selects it" {
@@ -632,6 +683,74 @@ test "tree actions: reparent is one command and refuses no-op moves" {
     try testing.expectEqual(@as(usize, 1), history.undoDepth());
 }
 
+test "tree actions: move_up and move_down reorder siblings, undoable" {
+    const testing = std.testing;
+    const scene_mod = @import("../scene/scene.zig");
+    const components = @import("../scene/components.zig");
+    const edit = @import("edit.zig");
+    const Scene = scene_mod.Scene(.{scene_mod.Component(components.Transform, "transform")});
+    const History = edit.History(Scene);
+
+    var scene = try Scene.init(testing.allocator, "level");
+    defer scene.deinit();
+    var history = History.init(testing.allocator);
+    defer history.deinit();
+    var collapsed = Collapsed{};
+
+    const root = try scene.createEntity("root", null);
+    const root_id = scene.idOf(root).?;
+    const a = try scene.createEntity("a", root_id);
+    const b = try scene.createEntity("b", root_id);
+    const c = try scene.createEntity("c", root_id);
+    const a_id = scene.idOf(a).?;
+    const b_id = scene.idOf(b).?;
+    const c_id = scene.idOf(c).?;
+
+    // Initial paint order: a, b, c (ascending id = creation order).
+    var ids: [8]u64 = @splat(0);
+    const n = scene.childIdsInto(root_id, &ids);
+    try testing.expectEqual(@as(usize, 3), n);
+    try testing.expectEqual(a_id, ids[0]);
+    try testing.expectEqual(b_id, ids[1]);
+    try testing.expectEqual(c_id, ids[2]);
+
+    // Move b up: b swaps order with a -> paint order becomes b, a, c.
+    const mv = apply(.move_up, b_id, &collapsed, &scene, &history);
+    try testing.expect(mv.changed);
+    try testing.expectEqual(mv.select, b_id);
+    const n2 = scene.childIdsInto(root_id, &ids);
+    try testing.expectEqual(@as(usize, 3), n2);
+    try testing.expectEqual(b_id, ids[0]);
+    try testing.expectEqual(a_id, ids[1]);
+    try testing.expectEqual(c_id, ids[2]);
+
+    // Move b up again: already first, no-op.
+    const noop = apply(.move_up, b_id, &collapsed, &scene, &history);
+    try testing.expect(!noop.changed);
+
+    // Undo the move_up: back to a, b, c (2 set_order commands undone).
+    try history.undo(&scene);
+    try history.undo(&scene);
+    const n5 = scene.childIdsInto(root_id, &ids);
+    try testing.expectEqual(@as(usize, 3), n5);
+    try testing.expectEqual(a_id, ids[0]);
+    try testing.expectEqual(b_id, ids[1]);
+    try testing.expectEqual(c_id, ids[2]);
+
+    // Redo: back to b, a, c (2 commands redone).
+    try history.redo(&scene);
+    try history.redo(&scene);
+    const n6 = scene.childIdsInto(root_id, &ids);
+    try testing.expectEqual(@as(usize, 3), n6);
+    try testing.expectEqual(b_id, ids[0]);
+    try testing.expectEqual(a_id, ids[1]);
+    try testing.expectEqual(c_id, ids[2]);
+
+    // move_up/down on a root with no siblings is a no-op.
+    const root_noop = apply(.move_up, root_id, &collapsed, &scene, &history);
+    try testing.expect(!root_noop.changed);
+}
+
 test "tree actions: delete is one command and does not touch the fold state of others" {
     const testing = std.testing;
     const scene_mod = @import("../scene/scene.zig");
@@ -699,6 +818,14 @@ pub const Step = enum {
     into,
     /// One level up: the parent row.
     out,
+    /// The first visible row of the whole tree.
+    home,
+    /// The last visible row of the whole tree.
+    end,
+    /// One page (page_size rows) up.
+    page_up,
+    /// One page (page_size rows) down, clamping to the last row.
+    page_down,
 };
 
 /// Where a step lands.
@@ -729,12 +856,24 @@ pub fn step(
     what: Step,
     collapsed: *Collapsed,
     limit: usize,
+    page_size: usize,
 ) Move {
     if (current == 0) {
         // Nothing selected: any step that has a destination starts at the first visible
         // row, whether or not the caller passed a window (`into` has nowhere to go: there
-        // is no branch to enter).
+        // is no branch to enter). Home goes to the tree's first row; End to its last;
+        // page up/down have nowhere to come from, so they start at the top too.
         if (what == .into) return .{};
+        if (what == .home) {
+            const first = firstVisible(scene, collapsed, limit) orelse return .{};
+            return .{ .id = first, .moved = true };
+        }
+        if (what == .end) {
+            const count = countVisible(scene, collapsed, limit) orelse return .{};
+            if (count == 0) return .{};
+            const last = lineAt(scene, count - 1, collapsed, limit) orelse return .{};
+            return .{ .id = last, .moved = true };
+        }
         if (rows.len > 0) return .{ .id = rows[0].id, .moved = true };
         const first = firstVisible(scene, collapsed, limit) orelse return .{};
         return .{ .id = first, .moved = true };
@@ -784,6 +923,41 @@ pub fn step(
             if (scene.parentIdOf(current)) |parent| return .{ .id = parent, .moved = true };
             return .{};
         },
+        .home => {
+            const first = lineAt(scene, 0, collapsed, limit) orelse return .{};
+            if (first == current) return .{};
+            return .{ .id = first, .moved = true };
+        },
+        .end => {
+            const count = countVisible(scene, collapsed, limit) orelse return .{};
+            if (count == 0) return .{};
+            const last = lineAt(scene, count - 1, collapsed, limit) orelse return .{};
+            if (last == current) return .{};
+            return .{ .id = last, .moved = true };
+        },
+        .page_up => {
+            const whole_index = indexOf(scene, current, limit) orelse return .{};
+            const new_index = if (whole_index < page_size) 0 else whole_index - page_size;
+            if (lineAt(scene, new_index, collapsed, limit)) |found| {
+                if (found == current) return .{};
+                return .{ .id = found, .moved = true };
+            }
+            return .{};
+        },
+        .page_down => {
+            const whole_index = indexOf(scene, current, limit) orelse 0;
+            const new_index = whole_index + page_size;
+            if (lineAt(scene, new_index, collapsed, limit)) |found| {
+                if (found == current) return .{};
+                return .{ .id = found, .moved = true };
+            }
+            // Past the end: clamp to the last line.
+            const count = countVisible(scene, collapsed, limit) orelse return .{};
+            if (count == 0) return .{};
+            const last = lineAt(scene, count - 1, collapsed, limit) orelse return .{};
+            if (last == current) return .{};
+            return .{ .id = last, .moved = true };
+        },
     }
 }
 
@@ -806,6 +980,37 @@ fn firstVisible(scene: anytype, collapsed: *Collapsed, limit: usize) ?u64 {
     var ids: [1]u64 = @splat(0);
     if (scene.childIdsInto(null, &ids) == 0) return null;
     return ids[0];
+}
+
+/// Count every visible line in the whole tree, bounded by `limit`.
+///
+/// Used by `step(.home)` / `step(.end)` and by page up/down to know whether a page
+/// lands past the end. Walks depth-first, skips collapsed branches, and stops at
+/// `limit` so a huge scene cannot make a key press expensive.
+pub fn countVisible(scene: anytype, collapsed: *Collapsed, limit: usize) ?usize {
+    if (limit == 0) return null;
+    var seen: usize = 0;
+    var ids: [64]u64 = @splat(0);
+    const roots = scene.childIdsInto(null, &ids);
+    var i: usize = 0;
+    while (i < roots) : (i += 1) {
+        countIn(scene, ids[i], collapsed, &seen, limit);
+        if (seen > limit) return null;
+    }
+    return seen;
+}
+
+fn countIn(scene: anytype, id: u64, collapsed: *Collapsed, seen: *usize, limit: usize) void {
+    seen.* += 1;
+    if (seen.* > limit) return;
+    if (collapsed.contains(id)) return;
+    var kids: [64]u64 = @splat(0);
+    const n = scene.childIdsInto(id, &kids);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        countIn(scene, kids[i], collapsed, seen, limit);
+        if (seen.* > limit) return;
+    }
 }
 
 /// The next visible row after `current`, for a row at the end of the caller's window.
@@ -890,12 +1095,12 @@ test "tree navigation: down and up walk the visible lines, skipping folded child
     try testing.expectEqual(@as(usize, 3), list.len);
 
     // root -> kid -> other, and back.
-    try testing.expectEqual(kid_id, step(&scene, list.rows[0..list.len], root_id, .next, &collapsed, 100).id);
-    try testing.expectEqual(other_id, step(&scene, list.rows[0..list.len], kid_id, .next, &collapsed, 100).id);
-    try testing.expectEqual(kid_id, step(&scene, list.rows[0..list.len], other_id, .previous, &collapsed, 100).id);
-    try testing.expectEqual(root_id, step(&scene, list.rows[0..list.len], kid_id, .previous, &collapsed, 100).id);
+    try testing.expectEqual(kid_id, step(&scene, list.rows[0..list.len], root_id, .next, &collapsed, 100, 100).id);
+    try testing.expectEqual(other_id, step(&scene, list.rows[0..list.len], kid_id, .next, &collapsed, 100, 100).id);
+    try testing.expectEqual(kid_id, step(&scene, list.rows[0..list.len], other_id, .previous, &collapsed, 100, 100).id);
+    try testing.expectEqual(root_id, step(&scene, list.rows[0..list.len], kid_id, .previous, &collapsed, 100, 100).id);
     // The last row has nowhere to go.
-    try testing.expectEqual(@as(u64, 0), step(&scene, list.rows[0..list.len], other_id, .next, &collapsed, 100).id);
+    try testing.expectEqual(@as(u64, 0), step(&scene, list.rows[0..list.len], other_id, .next, &collapsed, 100, 100).id);
 
     // Folding root hides kid: down from root goes straight to other.
     _ = collapsed.toggle(root_id);
@@ -903,7 +1108,7 @@ test "tree navigation: down and up walk the visible lines, skipping folded child
     var folded = List{ .rows = &folded_rows, .visible = 16, .collapsed = &collapsed };
     build(&scene, &folded);
     try testing.expectEqual(@as(usize, 2), folded.len);
-    try testing.expectEqual(other_id, step(&scene, folded.rows[0..folded.len], root_id, .next, &collapsed, 100).id);
+    try testing.expectEqual(other_id, step(&scene, folded.rows[0..folded.len], root_id, .next, &collapsed, 100, 100).id);
 }
 
 test "tree navigation: into and out expand, enter and leave a branch" {
@@ -922,22 +1127,22 @@ test "tree navigation: into and out expand, enter and leave a branch" {
 
     // Into on a folded branch unfolds it (no selection change).
     _ = collapsed.toggle(root_id);
-    const unfold = step(&scene, &.{}, root_id, .into, &collapsed, 100);
+    const unfold = step(&scene, &.{}, root_id, .into, &collapsed, 100, 100);
     try testing.expect(unfold.folded);
     try testing.expectEqual(@as(u64, 0), unfold.id);
     try testing.expect(!collapsed.contains(root_id));
 
     // Into again enters the first child.
-    const enter = step(&scene, &.{}, root_id, .into, &collapsed, 100);
+    const enter = step(&scene, &.{}, root_id, .into, &collapsed, 100, 100);
     try testing.expectEqual(kid_id, enter.id);
 
     // Out on a leaf goes to its parent; out on an open branch folds it first.
-    try testing.expectEqual(root_id, step(&scene, &.{}, kid_id, .out, &collapsed, 100).id);
-    const fold = step(&scene, &.{}, root_id, .out, &collapsed, 100);
+    try testing.expectEqual(root_id, step(&scene, &.{}, kid_id, .out, &collapsed, 100, 100).id);
+    const fold = step(&scene, &.{}, root_id, .out, &collapsed, 100, 100);
     try testing.expect(fold.folded);
     try testing.expect(collapsed.contains(root_id));
     // A folded root has nowhere to go out to.
-    try testing.expectEqual(@as(u64, 0), step(&scene, &.{}, root_id, .out, &collapsed, 100).id);
+    try testing.expectEqual(@as(u64, 0), step(&scene, &.{}, root_id, .out, &collapsed, 100, 100).id);
 }
 
 test "tree navigation: nothing selected starts at the first visible row" {
@@ -952,13 +1157,13 @@ test "tree navigation: nothing selected starts at the first visible row" {
     const root = try scene.createEntity("root", null);
     const root_id = scene.idOf(root).?;
 
-    try testing.expectEqual(root_id, step(&scene, &.{}, 0, .next, &collapsed, 100).id);
-    try testing.expectEqual(root_id, step(&scene, &.{}, 0, .out, &collapsed, 100).id);
-    try testing.expectEqual(@as(u64, 0), step(&scene, &.{}, 0, .into, &collapsed, 100).id);
+    try testing.expectEqual(root_id, step(&scene, &.{}, 0, .next, &collapsed, 100, 100).id);
+    try testing.expectEqual(root_id, step(&scene, &.{}, 0, .out, &collapsed, 100, 100).id);
+    try testing.expectEqual(@as(u64, 0), step(&scene, &.{}, 0, .into, &collapsed, 100, 100).id);
 
     var empty = try Scene.init(testing.allocator, "empty");
     defer empty.deinit();
-    try testing.expectEqual(@as(u64, 0), step(&empty, &.{}, 0, .next, &collapsed, 100).id);
+    try testing.expectEqual(@as(u64, 0), step(&empty, &.{}, 0, .next, &collapsed, 100, 100).id);
 }
 
 test "tree navigation: down past the caller's window still finds the next row" {
@@ -983,12 +1188,78 @@ test "tree navigation: down past the caller's window still finds the next row" {
     var list = List{ .rows = &rows, .visible = 2, .collapsed = &collapsed };
     build(&scene, &list);
     try testing.expectEqual(@as(usize, 2), list.len);
-    try testing.expectEqual(ids[2], step(&scene, list.rows[0..list.len], ids[1], .next, &collapsed, 100).id);
+    try testing.expectEqual(ids[2], step(&scene, list.rows[0..list.len], ids[1], .next, &collapsed, 100, 100).id);
     // And `previous` from the first row of a scrolled window finds the row above it.
     list.offset = 2;
     build(&scene, &list);
     try testing.expectEqual(ids[2], list.rows[0].id);
-    try testing.expectEqual(ids[1], step(&scene, list.rows[0..list.len], ids[2], .previous, &collapsed, 100).id);
+    try testing.expectEqual(ids[1], step(&scene, list.rows[0..list.len], ids[2], .previous, &collapsed, 100, 100).id);
+}
+
+test "tree navigation: home, end, page up and page down" {
+    const testing = std.testing;
+    const scene_mod = @import("../scene/scene.zig");
+    const components = @import("../scene/components.zig");
+    const Scene = scene_mod.Scene(.{scene_mod.Component(components.Transform, "transform")});
+
+    var scene = try Scene.init(testing.allocator, "level");
+    defer scene.deinit();
+    var collapsed = Collapsed{};
+    var ids: [6]u64 = @splat(0);
+    var i: usize = 0;
+    while (i < 6) : (i += 1) {
+        const e = try scene.createEntity("row", null);
+        ids[i] = scene.idOf(e).?;
+    }
+
+    // All six roots visible in one window.
+    var rows: [6]Row = undefined;
+    var list = List{ .rows = &rows, .visible = 6, .collapsed = &collapsed };
+    build(&scene, &list);
+    try testing.expectEqual(@as(usize, 6), list.len);
+
+    // Home goes to the first row from anywhere; End to the last.
+    try testing.expectEqual(ids[0], step(&scene, list.rows[0..list.len], ids[3], .home, &collapsed, 100, 3).id);
+    try testing.expect(step(&scene, list.rows[0..list.len], ids[3], .home, &collapsed, 100, 3).moved);
+    try testing.expectEqual(ids[5], step(&scene, list.rows[0..list.len], ids[1], .end, &collapsed, 100, 3).id);
+    try testing.expect(step(&scene, list.rows[0..list.len], ids[1], .end, &collapsed, 100, 3).moved);
+    // Already at the target: home/end/page up/page down report nothing moved.
+    try testing.expect(!step(&scene, list.rows[0..list.len], ids[0], .home, &collapsed, 100, 3).moved);
+    try testing.expect(!step(&scene, list.rows[0..list.len], ids[5], .end, &collapsed, 100, 3).moved);
+
+    // With nothing selected, Home/End still jump to the first/last row.
+    try testing.expectEqual(ids[0], step(&scene, &.{}, 0, .home, &collapsed, 100, 3).id);
+    try testing.expectEqual(ids[5], step(&scene, &.{}, 0, .end, &collapsed, 100, 3).id);
+
+    // Page down walks a page at a time and clamps at the last row (page_size 2).
+    try testing.expectEqual(ids[2], step(&scene, list.rows[0..list.len], ids[0], .page_down, &collapsed, 100, 2).id);
+    try testing.expectEqual(ids[4], step(&scene, list.rows[0..list.len], ids[2], .page_down, &collapsed, 100, 2).id);
+    try testing.expectEqual(ids[5], step(&scene, list.rows[0..list.len], ids[4], .page_down, &collapsed, 100, 2).id);
+    try testing.expect(!step(&scene, list.rows[0..list.len], ids[5], .page_down, &collapsed, 100, 2).moved);
+
+    // Page up mirrors page down and clamps at the first row.
+    try testing.expectEqual(ids[3], step(&scene, list.rows[0..list.len], ids[5], .page_up, &collapsed, 100, 2).id);
+    try testing.expectEqual(ids[1], step(&scene, list.rows[0..list.len], ids[3], .page_up, &collapsed, 100, 2).id);
+    try testing.expectEqual(ids[0], step(&scene, list.rows[0..list.len], ids[1], .page_up, &collapsed, 100, 2).id);
+    try testing.expect(!step(&scene, list.rows[0..list.len], ids[0], .page_up, &collapsed, 100, 2).moved);
+
+    // Folded branches are invisible: countVisible skips them and caps at the limit.
+    try testing.expectEqual(@as(usize, 6), countVisible(&scene, &collapsed, 100).?);
+    const parent = try scene.createEntity("parent", null);
+    const parent_id = scene.idOf(parent).?;
+    _ = try scene.createEntity("c1", parent_id);
+    _ = try scene.createEntity("c2", parent_id);
+    // parent é uma raiz nova e seus filhos estão visíveis (não colapsado): 6 + 1 + 2 = 9.
+    try testing.expectEqual(@as(usize, 9), countVisible(&scene, &collapsed, 100).?);
+    _ = collapsed.toggle(parent_id);
+    // Colapsado: 6 raízes + parent = 7.
+    try testing.expectEqual(@as(usize, 7), countVisible(&scene, &collapsed, 100).?);
+    // Home/End ignoram filhos dobrados: home pula para a primeira raiz; end pula para
+    // a última linha visível (o próprio parent, depois de dobrar c1/c2).
+    try testing.expectEqual(ids[0], step(&scene, list.rows[0..list.len], parent_id, .home, &collapsed, 100, 3).id);
+    try testing.expect(step(&scene, list.rows[0..list.len], parent_id, .home, &collapsed, 100, 3).moved);
+    try testing.expectEqual(parent_id, step(&scene, list.rows[0..list.len], ids[2], .end, &collapsed, 100, 3).id);
+    try testing.expect(step(&scene, list.rows[0..list.len], ids[2], .end, &collapsed, 100, 3).moved);
 }
 
 test "drag: a press and a release on different rows is one reparent command" {

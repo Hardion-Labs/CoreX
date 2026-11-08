@@ -1130,6 +1130,14 @@ fn applyShortcuts(ctx: *widgets.Context, state: *State, scene: anytype, history:
         runTreeAction(state, scene, history, .{ .reparent = null }, state.selected);
         return;
     }
+    if (ctx.keyPressed(.move_up)) {
+        runTreeAction(state, scene, history, .move_up, state.selected);
+        return;
+    }
+    if (ctx.keyPressed(.move_down)) {
+        runTreeAction(state, scene, history, .move_down, state.selected);
+        return;
+    }
     // Arrow keys navigate the visible tree. They are resolved against the same row list
     // the panel paints, so a step can never land on a row the user cannot see.
     if (ctx.input.key) |key| {
@@ -1138,6 +1146,10 @@ fn applyShortcuts(ctx: *widgets.Context, state: *State, scene: anytype, history:
             .up => .previous,
             .right => .into,
             .left => .out,
+            .home => .home,
+            .end => .end,
+            .page_up => .page_up,
+            .page_down => .page_down,
             else => null,
         };
         if (step_opt) |step_kind| {
@@ -1186,7 +1198,7 @@ fn navigateTree(state: *State, scene: anytype, history: anytype, kind: tree.Step
         .collapsed = &state.collapsed,
     };
     tree.build(scene, &list);
-    const move = tree.step(scene, list.rows[0..list.len], state.selected, kind, &state.collapsed, tree.max_rows);
+    const move = tree.step(scene, list.rows[0..list.len], state.selected, kind, &state.collapsed, tree.max_rows, list.visible);
     if (!move.moved) return;
     if (move.id != 0 and move.id != state.selected) {
         state.selected = move.id;

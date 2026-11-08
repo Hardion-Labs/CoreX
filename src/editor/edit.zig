@@ -124,6 +124,12 @@ pub fn Command(comptime Scene: type) type {
         delete: struct {
             id: EntityId,
         },
+        /// Change an entity's sibling order. `order` is the new sort key among
+        /// siblings of the same parent; the entity's own ID means "natural order".
+        set_order: struct {
+            id: EntityId,
+            order: u64,
+        },
     };
 }
 
@@ -140,6 +146,8 @@ pub fn History(comptime Scene: type) type {
             existed: bool = false,
             name: ?Name = null,
             parent: ?EntityId = null,
+            /// Sibling order before the edit; restored by undo/redo.
+            order: u64 = 0,
             /// One arm per schema component; `null` for a component that was absent.
             components: [Scene.component_count]?ComponentValue = @splat(null),
         };
@@ -255,6 +263,12 @@ pub fn History(comptime Scene: type) type {
                     const entity = try entityOf(scene, c.id);
                     scene.destroyEntity(entity);
                 },
+                .set_order => |c| {
+                    scene.setOrder(c.id, c.order) catch |err| switch (err) {
+                        error.EntityNotFound => return error.EntityNotFound,
+                        else => return error.Rejected,
+                    };
+                },
             }
         }
 
@@ -284,6 +298,8 @@ pub fn History(comptime Scene: type) type {
             var snap = Snapshot{ .existed = true };
             if (scene.nameOf(entity)) |n| snap.name = Name.init(n) orelse return error.Rejected;
             if (scene.parent(entity)) |p| snap.parent = scene.idOf(p);
+            const id = scene.idOf(entity) orelse return error.EntityNotFound;
+            snap.order = scene.orderOf(id);
             inline for (Scene.component_types, 0..) |T, i| {
                 if (scene.getComponent(T, entity)) |value| {
                     snap.components[i] = @unionInit(ComponentValue, fieldName(i), value.*);
@@ -322,6 +338,13 @@ pub fn History(comptime Scene: type) type {
 
             const current_parent = if (scene.parent(entity)) |p| scene.idOf(p) else null;
             if (!optIdEql(current_parent, snap.parent)) try reparentEntity(scene, entity, snap.parent);
+
+            if (scene.orderOf(id) != snap.order) {
+                scene.setOrder(id, snap.order) catch |err| switch (err) {
+                    error.EntityNotFound => return error.EntityNotFound,
+                    else => return error.Rejected,
+                };
+            }
 
             inline for (Scene.component_types, 0..) |T, i| {
                 const want = snap.components[i];
