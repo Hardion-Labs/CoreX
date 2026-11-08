@@ -269,7 +269,9 @@ const Component = struct {
     tq: usize = 0,
     td: usize = 0,
     ta: usize = 0,
-    dc_pred: i32 = 0,
+    // i64: the DC predictor accumulates over millions of blocks and an i32
+    // would overflow on crafted input.
+    dc_pred: i64 = 0,
     /// Padded plane geometry (whole blocks, MCU-aligned).
     stride: usize = 0,
     rows: usize = 0,
@@ -527,7 +529,7 @@ fn decodeBlock(br: *BitReader, comp: *Component, tables: *const Tables, out: *[6
     if (t > 15) return error.InvalidImage;
     const diff = BitReader.extend(br.getBits(@intCast(t)), @intCast(t));
     comp.dc_pred += diff;
-    out[0] = @floatFromInt(comp.dc_pred * @as(i32, q[0]));
+    out[0] = @floatFromInt(comp.dc_pred * @as(i64, q[0]));
 
     var rows: u8 = if (out[0] != 0) 1 else 0;
     var k: usize = 1;
@@ -538,6 +540,8 @@ fn decodeBlock(br: *BitReader, comp: *Component, tables: *const Tables, out: *[6
         if (s == 0) {
             if (r == 15) { // ZRL: skip 16 zeros
                 k += 16;
+                if (k > 64) return error.InvalidImage;
+                if (k == 64) break; // all remaining coefficients are zero
                 continue;
             }
             break; // EOB
@@ -603,8 +607,12 @@ fn idct(block: *const [64]f32, rows: u8, out: *[64]u8) void {
         var shifted = acc + @as(@Vector(8, f32), @splat(128.5));
         shifted = @max(shifted, @as(@Vector(8, f32), @splat(0)));
         shifted = @min(shifted, @as(@Vector(8, f32), @splat(255)));
+        // shifted is clamped to [0, 255], so the value fits u8; truncate the
+        // low byte rather than @intCast, whose x86 vector lowering on this
+        // CPU uses signed-saturating packs and silently turns 149 into 127.
         const ints: @Vector(8, i32) = @intFromFloat(shifted);
-        const bytes: [8]u8 = @as(@Vector(8, u8), @intCast(ints));
+        const unsigned: @Vector(8, u32) = @bitCast(ints);
+        const bytes: [8]u8 = @as(@Vector(8, u8), @truncate(unsigned));
         @memcpy(out[y * 8 ..][0..8], &bytes);
     }
 }

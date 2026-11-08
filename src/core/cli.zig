@@ -79,9 +79,17 @@ pub const ParseError = error{
     InvalidFps,
 };
 
+/// Maximum accepted `--jobs` value. Beyond this the worker pool is almost
+/// certainly a configuration mistake, not a workload, and sizing a thread
+/// pool from it can exhaust process/thread limits.
+pub const max_jobs: usize = 1024;
+
 /// Parse launch arguments (excluding argv[0]).
 pub fn parse(args: []const []const u8) ParseError!LaunchOptions {
     var opts = LaunchOptions{};
+    var mode_seen = false;
+    var jobs_seen = false;
+    var log_seen = false;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -100,6 +108,8 @@ pub fn parse(args: []const []const u8) ParseError!LaunchOptions {
             if (opts.hub_engine_version != null) return error.DuplicateArgument;
             opts.hub_engine_version = try nextValue(args, &i);
         } else if (eq(arg, "--mode") or eq(arg, "-m")) {
+            if (mode_seen) return error.DuplicateArgument;
+            mode_seen = true;
             const value = try nextValue(args, &i);
             opts.mode = Mode.fromString(value) orelse return error.InvalidMode;
         } else if (eq(arg, "--scene")) {
@@ -118,11 +128,15 @@ pub fn parse(args: []const []const u8) ParseError!LaunchOptions {
             if (n == 0) return error.InvalidFps;
             opts.fps = n;
         } else if (eq(arg, "--jobs")) {
+            if (jobs_seen) return error.DuplicateArgument;
+            jobs_seen = true;
             const value = try nextValue(args, &i);
             const n = std.fmt.parseInt(usize, value, 10) catch return error.InvalidJobs;
-            if (n == 0) return error.InvalidJobs;
+            if (n == 0 or n > max_jobs) return error.InvalidJobs;
             opts.jobs = n;
         } else if (eq(arg, "--log-level")) {
+            if (log_seen) return error.DuplicateArgument;
+            log_seen = true;
             const value = try nextValue(args, &i);
             opts.log_level = LogLevel.fromString(value) orelse return error.InvalidLogLevel;
         } else {

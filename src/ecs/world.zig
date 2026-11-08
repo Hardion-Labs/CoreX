@@ -149,13 +149,23 @@ pub fn World(comptime components: anytype) type {
             return struct {
                 world: *Self,
                 cursor: usize,
+                mutation: u64,
 
                 pub fn init(world: *Self) @This() {
-                    return .{ .world = world, .cursor = 0 };
+                    return .{
+                        .world = world,
+                        .cursor = 0,
+                        .mutation = world.poolPtr(Ts[0]).mutationCount(),
+                    };
                 }
 
                 pub fn next(self: *@This()) ?Entry {
                     const drive = self.world.poolPtr(Ts[0]);
+                    // Dense storage may swap-remove underneath an in-flight
+                    // iteration, silently skipping or duplicating entries.
+                    // Catch that in Debug/ReleaseSafe instead of corrupting
+                    // the frame.
+                    std.debug.assert(drive.mutationCount() == self.mutation);
                     while (self.cursor < drive.len()) {
                         const slot = drive.entities()[self.cursor];
                         self.cursor += 1;

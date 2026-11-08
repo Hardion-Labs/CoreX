@@ -6,7 +6,79 @@ declared yet.
 
 ## Unreleased
 
+### Fixed
+
+- **A full-engine audit (code audit, architecture, review) applied as one pass.**
+  Highlights; the complete list is in `docs/development/progress.md`:
+  - JPEG: the software IDCT narrowed `i32 -> u8` with `@intCast`, whose x86
+    vector lowering on AVX2 uses signed-saturating packs (`vpackssdw`/
+    `vpacksswb`) and silently turned channel values above 127 into 127 — every
+    optimized build decoded valid JPEGs with a wrong right edge column. The
+    cast is now a truncating bit-truncation (the inputs are clamped to
+    [0, 255]); the pinned libjpeg vector test passes in Debug, ReleaseSafe
+    **and** ReleaseFast.
+  - FLAC: a Rice-coded residual partition shorter than the subframe warmup
+    underflowed the partition count arithmetic and wrote far past the block;
+    now rejected. A 64-bit escape-coded raw partition no longer traps in safe
+    builds during sign extension.
+  - JPEG: the AC skip-16 (ZRL) symbol had no coefficient bound, so a crafted
+    scan re-synchronised silently instead of failing; the DC predictor now
+    accumulates in `i64` (it overflowed `i32` on hostile input and panicked in
+    safe builds).
+  - Inflate/QOI: trailing bytes after a valid zlib trailer or QOI end marker
+    are rejected, matching every other decoder in the subsystem. PNG `tRNS`
+    color keys must fit the source bit depth.
+  - Import pipeline: `Report.liveKeys` no longer reports would-be keys of
+    failed assets, so a failed import cannot pin a stale/wrong artifact in
+    the content-addressed cache during GC.
+  - Mipmap chains validate their input at entry (`Chain.generate` now returns
+    `error.InvalidTexture` instead of reading out of bounds), and the raster
+    validates **every** mesh index, position and UV coordinate before any
+    fragment is written — a rejected draw never leaves a half-rendered target.
+    A draw whose UVs are shorter than its positions is rejected even without a
+    texture bound.
+  - GUI canvas compositing stored the premultiplied sum in a straight-alpha
+    target (translucent pixels darkened and poisoned later blends); it now
+    normalises by `out_a`, matching the rasterizer's alpha path.
+  - GUI layout: a collapsed (zero-extent) child no longer consumes the
+    inter-child gap or pushes siblings out of the parent's rect, and the cross
+    axis is clamped to `[0, maximum]` like the main axis. `Rect.below`/`after`
+    clamp negative cuts to zero. Slider arithmetic (i32 multiply overflow) and
+    the caller's out-of-range value are handled in `i64` and normalised at
+    entry.
+  - Core: `indexDirectories` no longer accumulates directory handles and
+    walkers for the whole run (fd exhaustion on large trees); the manifest
+    read maps errors precisely (`ProjectNotFound`/`InvalidManifest`/OOM/`Internal`)
+    instead of reporting everything as "project not found"; `settings.json`
+    with a missing project root is an error, an oversized document is
+    `InvalidConfig`; `manifest.id` is validated like `name` (no separators/
+    control characters — it is an identity, never a path); `--jobs` is capped
+    at 1024 and duplicate `--mode`/`--jobs`/`--log-level` are rejected like
+    every other argument; control-character checks reject DEL (0x7f).
+  - Runtime: `Pacer.init` rejects a rate above 1e9 fps (the budget would
+    truncate to zero — every frame permanently late, division by zero in
+    `targetFps()`).
+  - Scene renderer: `findCamera` picks the lowest stable-ID usable camera
+    (ECS storage order changes after swap-removes, so the camera choice used to
+    drift frame to frame); the editor's `cameraFov`/`findCameraEntity` now
+    apply the same rule. `Renderable.isValid()` is enforced during extraction
+    (non-finite bounds no longer defeat frustum culling).
+  - Occlusion: a `back_to_front` (potentially transparency-sorted) draw list
+    no longer lets its commands claim occluder tiles — a translucent surface
+    cannot erase what is behind it.
+  - Jobs: `jobs.Batch.wait` propagates a failed batch instead of swallowing
+    it; `Profiler.record` counts dropped samples instead of discarding them
+    silently; `undoDepth`/`redoDepth` saturate on a foreign/corrupt `group_len`.
+  - Streaming: `Report.oversized` distinguishes a sector that can **never**
+    fit the resident-entity ceiling from a transient capacity shortfall
+    (`pending`), so hot loops cannot spin forever on a hopeless sector.
+  - ECS: pools carry a mutation counter and views assert it in Debug/ReleaseSafe —
+    a dense array reordered mid-iteration is caught instead of silently
+    skipping or duplicating entities.
+
 ### Added
+
+- **Dragging an inspector number scrubs it** (`inspector.Scrub`, `inspector.Paint.scrub`,
 
 - **Dragging an inspector number scrubs it** (`inspector.Scrub`, `inspector.Paint.scrub`,
   `input.travelled`).

@@ -15,7 +15,7 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 
-pub const Error = error{OutOfMemory};
+pub const Error = error{ OutOfMemory, InvalidTexture };
 
 /// One mip level: RGBA8, row-major, top-down, exactly the framebuffer's layout.
 pub const Level = struct {
@@ -65,7 +65,9 @@ pub const Chain = struct {
     /// chain conserves energy. Per channel the result is
     /// `(sum + count / 2) / count` in integers: one round-half-up, no float.
     ///
-    /// `pixels` must hold `width * height * 4` bytes. The returned chain does
+    /// `pixels` must hold `width * height * 4` bytes; anything else — including a
+    /// zero dimension — is `error.InvalidTexture` rather than an out-of-bounds
+    /// read. The returned chain does
     /// **not** include level 0: it holds `levelCount - 1` levels, exactly the
     /// shape `raster.Texture.mips` expects.
     pub fn generate(
@@ -74,6 +76,9 @@ pub const Chain = struct {
         height: u32,
         pixels: []const u8,
     ) Error!Chain {
+        const expected = std.math.mul(usize, @as(usize, width), @as(usize, height)) catch return error.InvalidTexture;
+        const expected_bytes = std.math.mul(usize, expected, 4) catch return error.InvalidTexture;
+        if (width == 0 or height == 0 or pixels.len != expected_bytes) return error.InvalidTexture;
         const total_levels = levelCount(width, height);
         const below = total_levels - 1;
         const level_slices = gpa.alloc(Level, below) catch return error.OutOfMemory;

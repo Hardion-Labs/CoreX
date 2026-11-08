@@ -92,7 +92,13 @@ pub const Report = struct {
         var list: std.ArrayList(cache_mod.Key) = .empty;
         errdefer list.deinit(gpa);
         for (self.entries) |e| {
-            if (e.key) |k| try list.append(gpa, k);
+            // Only assets that actually produced or reused an artifact
+            // contribute a live key; a failed asset must not pin its would-be
+            // key in the cache (nor a stale one from a previous run).
+            switch (e.status) {
+                .imported, .cached => if (e.key) |k| try list.append(gpa, k),
+                .failed => {},
+            }
         }
         return list.toOwnedSlice(gpa);
     }
@@ -481,6 +487,11 @@ test "pipeline: invalid asset is recorded as failed without aborting the batch" 
             try testing.expectEqualStrings("InvalidAsset", r.error_name.?);
         }
     }
+
+    // Only the successful asset contributes a live cache key.
+    const keys = try report.liveKeys(testing.allocator);
+    defer testing.allocator.free(keys);
+    try testing.expectEqual(@as(usize, 1), keys.len);
 }
 
 test "pipeline: binary assets use the raw fallback importer" {

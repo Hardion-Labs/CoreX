@@ -93,6 +93,7 @@ const report = try stream.update(io, dir, listener_position, .{
     .max_resident_entities = 50_000,
 });
 if (report.pending) { /* a budget ran out; call again next frame */ }
+if (report.oversized > 0) { /* a sector can never fit; retrying will not help */ }
 ```
 
 `update` runs unloads **before** loads, so freed room is available in the same
@@ -112,9 +113,10 @@ authored *among roots* survive being streamed in.
 
 `Options.max_loads` and `max_unloads` cap operations per call.
 `max_resident_entities` is a ceiling on entities **owned by the stream**, not on
-the target scene's total size. A sector that would exceed it is skipped after
-parsing but **before any mutation**, and `Report.pending` is set so the caller
-knows work remains.
+the target scene's total size. A sector that would exceed its share is skipped after
+parsing but **before any mutation**; `Report.oversized` counts the sectors that can
+never fit the ceiling (retrying will not help), while `Report.pending` is set only
+when a budget or transient capacity stopped a sector that may load later.
 
 ### Ownership
 

@@ -132,6 +132,7 @@ const BitReader = struct {
     fn readSigned(self: *BitReader, n: u7) DecodeError!i64 {
         if (n == 0 or n > 64) return error.InvalidAudio;
         const raw = try self.read(u64, n);
+        if (n == 64) return @bitCast(raw);
         const sign_bit = @as(u64, 1) << @intCast(n - 1);
         if (raw & sign_bit == 0) return @intCast(raw);
         // Sign-extend without relying on shifts of a full-width value.
@@ -378,7 +379,7 @@ fn decodeResidual(br: *BitReader, dst: []i64, warmup: usize, block_size: usize) 
     const partitions = @as(usize, 1) << @intCast(order);
     if (block_size % partitions != 0) return error.InvalidAudio;
     const part_len = block_size / partitions;
-    if (part_len < warmup and partitions == 1) return error.InvalidAudio;
+    if (part_len < warmup) return error.InvalidAudio;
     if (partitions > 1 and part_len == 0) return error.InvalidAudio;
 
     var at: usize = warmup;
@@ -871,6 +872,22 @@ test "flac: the bit reader never reads past its slice" {
     try testing.expectEqual(@as(u4, 0xD), try br.read(u4, 4));
     try testing.expectEqual(@as(usize, 0), br.remaining());
     try testing.expectError(error.InvalidAudio, br.read(u1, 1));
+}
+
+test "flac: a residual partition shorter than the warmup is rejected" {
+    // partitions > 1 with part_len < warmup must be rejected, not underflow.
+    // block_size=16, order=3 -> partitions=8 -> part_len=2; warmup=4.
+    var dst: [16]i64 = @splat(0);
+    // method=0 (Rice, u2), order=3 (u4): 0b00_0011 then anything.
+    var br = BitReader{ .data = &.{ 0b0000_0011, 0x00, 0x00 } };
+    try testing.expectError(error.InvalidAudio, decodeResidual(&br, &dst, 4, 16));
+    // partitions == 2 with part_len < warmup is rejected too.
+    var br2 = BitReader{ .data = &.{ 0b0000_0100, 0x00, 0x00 } };
+    try testing.expectError(error.InvalidAudio, decodeResidual(&br2, &dst, 4, 4));
+
+    // partitions == 1 with part_len < warmup is rejected too.
+    var br1 = BitReader{ .data = &.{ 0b0000_0000, 0x00, 0x00 } };
+    try testing.expectError(error.InvalidAudio, decodeResidual(&br1, &dst, 4, 2));
 }
 
 test "flac: signed fields sign-extend and unary runs are bounded" {

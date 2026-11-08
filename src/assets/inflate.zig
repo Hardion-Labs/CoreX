@@ -375,7 +375,7 @@ fn run(gpa: Allocator, source: []const u8, max_output_bytes: usize, zlib_wrapper
 
     if (zlib_wrapper) {
         br.alignByte();
-        if (br.pos + 4 > br.data.len) return error.InvalidStream;
+        if (br.pos + 4 != br.data.len) return error.InvalidStream;
         const expected = std.mem.readInt(u32, br.data[br.pos..][0..4], .big);
         if (adler32(out.items) != expected) return error.InvalidStream;
     }

@@ -210,7 +210,8 @@ pub fn History(comptime Scene: type) type {
             var i = self.cursor;
             var steps: usize = 0;
             while (i > 0) : (steps += 1) {
-                i -= self.entries.items[i - 1].group_len;
+                // Saturate rather than panic if a foreign Entry were ever in the list.
+                i -|= self.entries.items[i - 1].group_len;
             }
             return steps;
         }
@@ -220,7 +221,9 @@ pub fn History(comptime Scene: type) type {
             var i = self.cursor;
             var steps: usize = 0;
             while (i < self.entries.items.len) : (steps += 1) {
-                i += self.entries.items[i].group_len;
+                const next = i +| self.entries.items[i].group_len;
+                if (next <= i or next > self.entries.items.len) break;
+                i = next;
             }
             return steps;
         }

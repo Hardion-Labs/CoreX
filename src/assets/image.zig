@@ -324,8 +324,8 @@ pub fn decodeQoi(gpa: Allocator, source: []const u8) DecodeError!Image {
         i += run;
     }
 
-    // The stream must terminate with the 8-byte end marker.
-    if (pos + 8 > end) return error.InvalidImage;
+    // The stream must terminate with the 8-byte end marker, and nothing after it.
+    if (pos + 8 != end) return error.InvalidImage;
     const marker = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 1 };
     if (!std.mem.eql(u8, source[pos..][0..8], &marker)) return error.InvalidImage;
     return img;
@@ -336,6 +336,10 @@ pub fn decodeQoi(gpa: Allocator, source: []const u8) DecodeError!Image {
 /// bounded by `14 + width*height*5 + 8` bytes.
 pub fn encodeQoi(gpa: Allocator, img: Image) DecodeError![]u8 {
     const count = @as(usize, img.width) * @as(usize, img.height);
+    const needed = std.math.mul(usize, count, 4) catch return error.InvalidImage;
+    // Caller contract: the pixel buffer is exactly width*height RGBA8. Refuse
+    // anything else instead of reading out of bounds.
+    if (img.width == 0 or img.height == 0 or img.pixels.len != needed) return error.InvalidImage;
     const cap = std.math.mul(usize, count, 5) catch return error.OutOfMemory;
     const total = std.math.add(usize, cap, 14 + 8) catch return error.OutOfMemory;
 

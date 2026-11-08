@@ -55,6 +55,7 @@ pub const ParseError = error{
     InvalidJson,
     UnsupportedFormatVersion,
     InvalidName,
+    InvalidId,
     InvalidEngineVersion,
     UnsafePath,
     OutOfMemory,
@@ -83,6 +84,7 @@ pub fn parse(gpa: Allocator, bytes: []const u8) ParseError!Manifest {
     const eng = version.Version.parse(raw.engine_version) catch return error.InvalidEngineVersion;
 
     if (raw.initial_scene) |scene| try validateRelPath(scene);
+    if (raw.id) |s| validation.validateDisplayName(s) catch return error.InvalidId;
 
     const asset_dirs = try dupePaths(a, raw.asset_directories orelse &default_asset_directories);
     const script_dirs = try dupePaths(a, raw.script_directories orelse &default_script_directories);
@@ -185,6 +187,15 @@ test "parse: invalid name" {
     ));
     try std.testing.expectError(error.InvalidName, parse(std.testing.allocator,
         \\{ "format_version": 1, "name": "a/b", "engine_version": "0.1.0" }
+    ));
+}
+
+test "parse: invalid id is rejected" {
+    try std.testing.expectError(error.InvalidId, parse(std.testing.allocator,
+        \\{ "format_version": 1, "name": "X", "id": "a/b", "engine_version": "0.1.0" }
+    ));
+    try std.testing.expectError(error.InvalidId, parse(std.testing.allocator,
+        \\{ "format_version": 1, "name": "X", "id": "bad\\nid", "engine_version": "0.1.0" }
     ));
 }
 

@@ -505,15 +505,21 @@ pub fn decode(gpa: Allocator, source: []const u8) DecodeError!Image {
                 },
                 .grayscale => {
                     if (chunk.data.len != 2) return error.InvalidImage;
-                    trns.gray_key = std.mem.readInt(u16, chunk.data[0..2], .big);
+                    const key = std.mem.readInt(u16, chunk.data[0..2], .big);
+                    // The key must be representable at this bit depth.
+                    if (header.depth < 16 and key >= (@as(u32, 1) << @intCast(header.depth))) return error.InvalidImage;
+                    trns.gray_key = key;
                 },
                 .rgb => {
                     if (chunk.data.len != 6) return error.InvalidImage;
-                    trns.rgb_key = .{
-                        std.mem.readInt(u16, chunk.data[0..2], .big),
-                        std.mem.readInt(u16, chunk.data[2..4], .big),
-                        std.mem.readInt(u16, chunk.data[4..6], .big),
-                    };
+                    const r = std.mem.readInt(u16, chunk.data[0..2], .big);
+                    const g = std.mem.readInt(u16, chunk.data[2..4], .big);
+                    const b = std.mem.readInt(u16, chunk.data[4..6], .big);
+                    if (header.depth < 16) {
+                        const max_sample = (@as(u32, 1) << @intCast(header.depth)) - 1;
+                        if (r > max_sample or g > max_sample or b > max_sample) return error.InvalidImage;
+                    }
+                    trns.rgb_key = .{ r, g, b };
                 },
                 .grayscale_alpha, .rgba => return error.InvalidImage, // already has alpha
             }

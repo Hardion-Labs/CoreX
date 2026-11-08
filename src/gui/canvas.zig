@@ -151,14 +151,16 @@ pub const Rect = struct {
 
     /// This rectangle with `height` taken off the top — the remainder after a
     /// `sliceTop`. Never inverts: the result is empty once the slice consumed all.
+    /// Negative heights are clamped to zero (nothing is taken off).
     pub fn below(self: Rect, height: i32) Rect {
-        const cut = @min(height, self.h);
+        const cut = @min(@max(height, 0), self.h);
         return .{ .x = self.x, .y = self.y + cut, .w = self.w, .h = self.h - cut };
     }
 
-    /// This rectangle with `width` taken off the left.
+    /// This rectangle with `width` taken off the left. Negative widths are
+    /// clamped to zero (nothing is taken off).
     pub fn after(self: Rect, width: i32) Rect {
-        const cut = @min(width, self.w);
+        const cut = @min(@max(width, 0), self.w);
         return .{ .x = self.x + cut, .y = self.y, .w = self.w - cut, .h = self.h };
     }
 };
@@ -225,19 +227,20 @@ pub const Canvas = struct {
             self.pixels[i + 3] = 255;
             return;
         }
-        // `a`/`da` are fractions in 0..1; `src`/`dst` stay in byte units because the
-        // destination is multiplied by its own alpha before being scaled by the
-        // source's, which is straight-alpha source-over written out.
+        // Straight-alpha source-over: out_a = a + da*(1-a), and out_rgb is the
+        // alpha-weighted sum normalised by out_a — not the premultiplied sum,
+        // which darkens translucent layers and misfeeds later blends.
         const a = @as(f64, @floatFromInt(sa)) / 255.0;
         const keep = 1.0 - a;
         const da = @as(f64, @floatFromInt(self.pixels[i + 3])) / 255.0;
+        const out_a = a + da * keep;
+        const inv_out_a = if (out_a > 0.0) 1.0 / out_a else 0.0;
         inline for (0..3) |c| {
             const src = @as(f64, @floatFromInt(color[c])) * a;
             const dst = @as(f64, @floatFromInt(self.pixels[i + c])) * da * keep;
-            self.pixels[i + c] = @intFromFloat(std.math.clamp(std.math.floor(src + dst + 0.5), 0.0, 255.0));
+            self.pixels[i + c] = @intFromFloat(std.math.clamp(std.math.floor((src + dst) * inv_out_a + 0.5), 0.0, 255.0));
         }
-        const out_a = (a + da * keep) * 255.0;
-        self.pixels[i + 3] = @intFromFloat(std.math.clamp(std.math.floor(out_a + 0.5), 0.0, 255.0));
+        self.pixels[i + 3] = @intFromFloat(std.math.clamp(std.math.floor(out_a * 255.0 + 0.5), 0.0, 255.0));
     }
 
     /// Fill `rect`, clipped to the canvas. Empty and off-screen rectangles are
@@ -414,6 +417,21 @@ test "canvas: an opaque fill stores the colour exactly and clips to the edge" {
     // An empty rectangle is a no-op too, not a zero-size special case.
     c.fillRect(.{ .x = 0, .y = 0, .w = 0, .h = 4 }, blue);
     try testing.expectEqual(Color{ 255, 0, 0, 255 }, c.get(0, 0).?);
+}
+
+test "canvas: blending onto a translucent destination normalises by out_a" {
+    var buf: [1 * 1 * 4]u8 = @splat(0);
+    var c = try Canvas.init(1, 1, &buf);
+    // Opaque black with 50% alpha: premultiplied rgb would be (0,0,0,128).
+    c.fillRect(.{ .x = 0, .y = 0, .w = 1, .h = 1 }, .{ 0, 0, 0, 128 });
+    // Half-transparent white source-over it: out_a = 128 + 128*(1-0.5) = 192,
+    // and rgb = 255*0.5 / (192/255) = 170, not 128 (the premultiplied result).
+    c.fillRect(.{ .x = 0, .y = 0, .w = 1, .h = 1 }, .{ 255, 255, 255, 128 });
+    const px = c.get(0, 0).?;
+    try testing.expectEqual(@as(u8, 192), px[3]);
+    try testing.expectEqual(@as(u8, 170), px[0]);
+    try testing.expectEqual(@as(u8, 170), px[1]);
+    try testing.expectEqual(@as(u8, 170), px[2]);
 }
 
 test "canvas: alpha compositing is source-over and opaque is exact" {

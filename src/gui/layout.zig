@@ -158,24 +158,42 @@ pub const Layout = struct {
     }
 
     /// `measure` with a maximum extent taken from the caller (a widget narrower
-    /// than the row, for example).
+    /// than the row, for example). Both axes are clamped to `[0, maximum]`, and
+    /// an inter-child gap is only consumed when the child occupies a non-zero
+    /// extent — a collapsed child must not walk the cursor past `rect`.
     pub fn measureClamped(self: *Layout, size: Size, maximum: Size) Rect {
-        if (self.cursor > 0) self.cursor += self.spacing;
-        const room = self.available();
+        const gap: i32 = if (self.cursor > 0) self.spacing else 0;
+        const start = self.cursor + gap;
+        const room = switch (self.axis) {
+            .vertical => @max(self.rect.h - start, 0),
+            .horizontal => @max(self.rect.w - start, 0),
+        };
         const out = switch (self.axis) {
             .vertical => blk: {
                 const h = clampInt(size.h, 0, @min(room, maximum.h));
-                break :blk Rect.init(self.rect.x, self.rect.y + self.cursor, @min(size.w, maximum.w), h);
+                const w = clampInt(size.w, 0, @max(maximum.w, 0));
+                break :blk Rect.init(self.rect.x, self.rect.y + start, w, h);
             },
             .horizontal => blk: {
                 const w = clampInt(size.w, 0, @min(room, maximum.w));
-                break :blk Rect.init(self.rect.x + self.cursor, self.rect.y, w, @min(size.h, maximum.h));
+                const h = clampInt(size.h, 0, @max(maximum.h, 0));
+                break :blk Rect.init(self.rect.x + start, self.rect.y, w, h);
             },
         };
-        self.cursor += switch (self.axis) {
+        const extent = switch (self.axis) {
             .vertical => out.h,
             .horizontal => out.w,
         };
+        if (extent > 0) {
+            self.cursor = start + extent;
+        } else {
+            // Zero-extent child: emit a rect at the current cursor, consume
+            // nothing — not even the gap.
+            return switch (self.axis) {
+                .vertical => Rect.init(out.x, self.rect.y + self.cursor, out.w, 0),
+                .horizontal => Rect.init(self.rect.x + self.cursor, out.y, 0, out.h),
+            };
+        }
         return out;
     }
 
@@ -272,6 +290,24 @@ test "layout: spacing applies between items but not before the first" {
     try testing.expectEqual(Rect.init(0, 10, 10, 4), l.measure(.{ .w = 10, .h = 4 }));
     l.reset();
     try testing.expectEqual(@as(i32, 0), l.measure(.{ .w = 1, .h = 1 }).y);
+}
+
+test "layout: a collapsed child consumes neither gap nor room" {
+    var l = Layout.init(Rect.init(0, 0, 10, 100), .vertical).withSpacing(6);
+    _ = l.measure(.{ .w = 10, .h = 10 }); // cursor = 10
+    // A zero-height child must not advance the cursor past the spacing it
+    // would have taken; the next real child starts right after the first.
+    const collapsed = l.measure(.{ .w = 10, .h = 0 });
+    try testing.expectEqual(@as(i32, 10), collapsed.y);
+    const next = l.measure(.{ .w = 10, .h = 10 });
+    try testing.expectEqual(@as(i32, 16), next.y); // 10 + gap(6)
+}
+
+test "layout: the cross axis is clamped to [0, maximum] too" {
+    var l = Layout.init(Rect.init(0, 0, 100, 100), .vertical);
+    const out = l.measureClamped(.{ .w = -5, .h = 20 }, .{ .w = 50, .h = 50 });
+    try testing.expectEqual(@as(i32, 0), out.w);
+    try testing.expectEqual(@as(i32, 20), out.h);
 }
 
 test "layout: padding insets the content rect and never inverts it" {

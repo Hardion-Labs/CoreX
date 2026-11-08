@@ -468,6 +468,13 @@ pub fn extractIntoScratchOccluded(
     while (view.next()) |entry| {
         const e = entry[0];
         const rend = entry[1];
+        // A renderable with non-finite or negative-extent bounds produces NaN
+        // plane distances; `classifyAabb` would answer `.inside` and the mesh
+        // would never frustum-cull. Skip it and count it as culled.
+        if (!rend.isValid()) {
+            culled += 1;
+            continue;
+        }
         const world = wt.get(e) orelse continue;
         const world_bounds = culling.transformAabb(world, rend.bounds);
         if (frustum.classifyAabb(world_bounds) == .outside) {
@@ -487,7 +494,13 @@ pub fn extractIntoScratchOccluded(
 
     var occlusion_culled: usize = 0;
     if (config != null and occ_scratch != null) {
-        occlusion_culled = try applyOcclusion(out, cam, config.?, occ_scratch.?);
+        // A back_to_front list is (potentially) transparency-sorted; blended
+        // geometry must never act as an opaque occluder, or translucent surfaces
+        // would erase what is behind them. Claims are disabled for the whole
+        // list in that case — the occlusion pass then changes nothing, just
+        // like switching it off.
+        const allow_claims = mode != .back_to_front;
+        occlusion_culled = try applyOcclusion(out, cam, config.?, occ_scratch.?, allow_claims);
     }
 
     sortCommands(out.items, mode);
@@ -508,7 +521,7 @@ pub fn extractIntoScratchOccluded(
 /// Sorting first also makes the result independent of entity iteration order: the
 /// same scene produces the same survivors whatever order the ECS hands the
 /// components out in.
-fn applyOcclusion(out: *std.ArrayList(DrawCommand), cam: Camera, config: Occlusion, scratch: *OcclusionScratch) !usize {
+fn applyOcclusion(out: *std.ArrayList(DrawCommand), cam: Camera, config: Occlusion, scratch: *OcclusionScratch, allow_claims: bool) !usize {
     try scratch.reset(config);
     const vp = cam.view_projection;
     if (out.items.len == 0) return 0;
@@ -535,6 +548,7 @@ fn applyOcclusion(out: *std.ArrayList(DrawCommand), cam: Camera, config: Occlusi
         }
         scratch.pending[kept] = cmd;
         kept += 1;
+        if (!allow_claims) continue;
         // Then claim, so the commands that follow are tested against this bound too —
         // but only when it covers enough of the screen to be worth the tiles.
         const coverage = scratch.buffer.tileCoverage(vp, cmd.bounds) orelse continue;

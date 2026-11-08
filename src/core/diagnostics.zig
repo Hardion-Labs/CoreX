@@ -41,6 +41,10 @@ pub const Profiler = struct {
     gpa: Allocator,
     io: Io,
     samples: std.ArrayList(Sample),
+    /// Samples that could not be recorded because the append failed. Recording
+    /// never aborts the profiled operation; dropped samples are counted here so
+    /// a partial report is visible as partial.
+    dropped: usize = 0,
 
     pub const Sample = struct {
         name: []const u8,
@@ -62,7 +66,9 @@ pub const Profiler = struct {
     }
 
     pub fn record(self: *Profiler, name: []const u8, duration_ns: i64) void {
-        self.samples.append(self.gpa, .{ .name = name, .duration_ns = duration_ns }) catch {};
+        self.samples.append(self.gpa, .{ .name = name, .duration_ns = duration_ns }) catch {
+            self.dropped += 1;
+        };
     }
 
     pub fn totalNanoseconds(self: Profiler) i64 {
@@ -80,6 +86,7 @@ pub const Profiler = struct {
         }
         const total_ms = @as(f64, @floatFromInt(self.totalNanoseconds())) / 1_000_000.0;
         try writer.print("  total: {d:.3}\n", .{total_ms});
+        if (self.dropped > 0) try writer.print("  ({d} sample(s) dropped: out of memory)\n", .{self.dropped});
     }
 
     pub const Stage = struct {

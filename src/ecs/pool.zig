@@ -30,6 +30,9 @@ pub fn Pool(comptime T: type) type {
         dense_entities: std.ArrayList(u32),
         /// dense index -> component.
         dense_components: std.ArrayList(T),
+        /// Bumped on every structural change (insert/remove). Views capture it
+        /// to detect a dense array being reordered underneath them.
+        mutation: u64 = 0,
 
         pub fn init(gpa: Allocator) Self {
             return .{
@@ -63,6 +66,7 @@ pub fn Pool(comptime T: type) type {
             errdefer _ = self.dense_entities.pop();
             try self.dense_components.append(self.gpa, value);
             self.sparse.items[slot] = dense_index;
+            self.mutation +|= 1;
         }
 
         /// Remove the component for a slot, if present. Swap-remove; no-op when
@@ -82,6 +86,7 @@ pub fn Pool(comptime T: type) type {
             _ = self.dense_entities.pop();
             _ = self.dense_components.pop();
             self.sparse.items[slot] = absent;
+            self.mutation +|= 1;
         }
 
         /// Pointer to the component for a slot, or null if absent.
@@ -110,6 +115,12 @@ pub fn Pool(comptime T: type) type {
         /// Dense slice of components (parallel to `entities`).
         pub fn components(self: *Self) []T {
             return self.dense_components.items;
+        }
+
+        /// Number of structural changes made since the pool was created. Views
+        /// capture this to detect a dense array reordered underneath iteration.
+        pub fn mutationCount(self: *const Self) u64 {
+            return self.mutation;
         }
     };
 }
