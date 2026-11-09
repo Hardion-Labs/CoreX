@@ -846,3 +846,13 @@ first to discuss the goal, scope, and architectural impact. Also see the
 ## License
 
 CoreXEngine is distributed under the MIT License. See [`LICENSE`](LICENSE).
+
+<div align="center">
+
+**Hardion Labs**
+Engineered to the core.
+
+[![GitHub](https://img.shields.io/badge/GitHub-Hardion--Labs-181717?style=flat-square&logo=github&logoColor=white)](https://github.com/Hardion-Labs)
+[![Repo](https://img.shields.io/badge/Repo-CoreX-181717?style=flat-square&logo=github&logoColor=white)](https://github.com/Hardion-Labs/CoreX)
+
+</div>
