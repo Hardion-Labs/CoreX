@@ -853,6 +853,6 @@ CoreXEngine is distributed under the MIT License. See [`LICENSE`](LICENSE).
 Engineered to the core.
 
 [![GitHub](https://img.shields.io/badge/GitHub-Hardion--Labs-181717?style=flat-square&logo=github&logoColor=white)](https://github.com/Hardion-Labs)
-[![Repo](https://img.shields.io/badge/Repo-Kyn-181717?style=flat-square&logo=github&logoColor=white)](https://github.com/Hardion-Labs/CoreX)
+[![Repo](https://img.shields.io/badge/Repo-CoreX-181717?style=flat-square&logo=github&logoColor=white)](https://github.com/Hardion-Labs/CoreX)
 
 </div>
